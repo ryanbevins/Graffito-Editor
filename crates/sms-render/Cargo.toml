@@ -1,0 +1,11 @@
+[package]
+name = "sms-render"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+sms-scene.workspace = true
+wgpu.workspace = true

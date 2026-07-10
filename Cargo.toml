@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    "apps/sms-cli",
+    "apps/sms-editor",
+    "crates/sms-formats",
+    "crates/sms-render",
+    "crates/sms-scene",
+    "crates/sms-schema",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ryanbevins/sms-level-editor"
+
+[workspace.dependencies]
+anyhow = "1.0"
+bytemuck = { version = "1.25", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
+eframe = "0.35.0"
+egui = "0.35.0"
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha1 = "0.10"
+thiserror = "2.0"
+toml = "0.9"
+walkdir = "2.5"
+wgpu = "29.0.3"
+
+sms-formats = { path = "crates/sms-formats" }
+sms-render = { path = "crates/sms-render" }
+sms-scene = { path = "crates/sms-scene" }
+sms-schema = { path = "crates/sms-schema" }

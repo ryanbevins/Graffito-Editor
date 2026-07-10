@@ -1,0 +1,21 @@
+/target/
+
+# Local editor projects, extracted retail data, and generated mod output.
+smsmod.toml
+*.gcm
+*.iso
+*.szs
+*.arc
+/mods/
+/cache/
+
+# Local agent guidance is intentionally not published.
+/AGENTS.md
+
+# IDE and OS files.
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+*.pdb
+
