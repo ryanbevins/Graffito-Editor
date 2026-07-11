@@ -2222,12 +2222,12 @@ fn gpu_blend_state(key: GpuBlendKey) -> Option<wgpu::BlendState> {
             color: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::One,
                 dst_factor: wgpu::BlendFactor::One,
-                operation: wgpu::BlendOperation::Subtract,
+                operation: wgpu::BlendOperation::ReverseSubtract,
             },
             alpha: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::One,
                 dst_factor: wgpu::BlendFactor::One,
-                operation: wgpu::BlendOperation::Subtract,
+                operation: wgpu::BlendOperation::ReverseSubtract,
             },
         }),
         _ => None,
@@ -2378,6 +2378,22 @@ mod tests {
     fn gx_source_color_blend_factors_do_not_change_with_blend_slot() {
         assert_eq!(gx_blend_factor(2), wgpu::BlendFactor::Src);
         assert_eq!(gx_blend_factor(3), wgpu::BlendFactor::OneMinusSrc);
+    }
+
+    #[test]
+    fn gx_subtract_blend_subtracts_source_from_framebuffer() {
+        let blend = gpu_blend_state(GpuBlendKey {
+            mode: 3,
+            src_factor: 4,
+            dst_factor: 5,
+            logic_op: 3,
+        })
+        .expect("GX subtract enables blending");
+
+        assert_eq!(blend.color.src_factor, wgpu::BlendFactor::One);
+        assert_eq!(blend.color.dst_factor, wgpu::BlendFactor::One);
+        assert_eq!(blend.color.operation, wgpu::BlendOperation::ReverseSubtract);
+        assert_eq!(blend.alpha.operation, wgpu::BlendOperation::ReverseSubtract);
     }
 
     #[test]
