@@ -104,6 +104,7 @@ pub(super) enum PreviewRenderLayer {
     Water,
     Goop,
     Shadow,
+    Heatwave,
 }
 
 #[derive(Debug, Clone, Copy)]

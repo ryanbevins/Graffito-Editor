@@ -657,6 +657,18 @@ fn infer_preview_model_path(
         }
     }
 
+    // TShimmer::load reads the model basename directly from its placement
+    // stream (for example ShimmerLow or ShimmerLowFar). Prefer that authored
+    // resource name over the generic `Shimmer` factory name.
+    if object.factory_name.eq_ignore_ascii_case("Shimmer") {
+        if let Some(model_name) = object.raw_params.get("stream_string_0") {
+            let key = normalize_model_key(model_name);
+            if let Some(path) = exact_model_key_match(&key, model_index) {
+                return Some(path);
+            }
+        }
+    }
+
     let mut keys = Vec::new();
     keys.push(normalize_model_key(&object.factory_name));
     if let Some(class_name) = &object.class_name {
@@ -975,6 +987,29 @@ mod tests {
         assert_eq!(
             infer_preview_model_path(&object, &models).as_deref(),
             Some("stage.szs!/montema/moma_model.bmd")
+        );
+    }
+
+    #[test]
+    fn shimmer_uses_the_model_basename_stored_in_its_placement_stream() {
+        let models = vec![
+            (
+                "stage.szs!/mapobj/shimmerlow.bmd".to_string(),
+                "shimmerlow".to_string(),
+            ),
+            (
+                "stage.szs!/mapobj/shimmerlowfar.bmd".to_string(),
+                "shimmerlowfar".to_string(),
+            ),
+        ];
+        let mut object = SceneObject::new("heatwave", "Shimmer");
+        object
+            .raw_params
+            .insert("stream_string_0".to_string(), "ShimmerLowFar".to_string());
+
+        assert_eq!(
+            infer_preview_model_path(&object, &models).as_deref(),
+            Some("stage.szs!/mapobj/shimmerlowfar.bmd")
         );
     }
 }

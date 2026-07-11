@@ -11,6 +11,7 @@ struct Material {
     counts: vec4<u32>,
     alpha_compare: vec4<u32>,
     alpha_refs: vec4<f32>,
+    texture_sizes: array<vec4<f32>, 8>,
     material_colors: array<vec4<f32>, 2>,
     ambient_colors: array<vec4<f32>, 2>,
     tev_colors: array<vec4<f32>, 4>,
@@ -50,7 +51,8 @@ struct VertexIn {
     @location(9) uv5: vec2<f32>,
     @location(10) uv6: vec2<f32>,
     @location(11) uv7: vec2<f32>,
-    @location(12) camera_relative: u32,
+    // 0 = world, 1 = camera-relative world (sky), 2 = GX view space (shimmer).
+    @location(12) coordinate_space: u32,
 };
 
 struct VertexOut {
@@ -201,25 +203,30 @@ fn vs_main(input: VertexIn) -> VertexOut {
     let rel = select(
         input.position - camera.camera_position.xyz,
         input.position,
-        input.camera_relative != 0u,
+        input.coordinate_space != 0u,
     );
-    let depth = dot(rel, camera.forward.xyz);
-    let clip_x = dot(rel, camera.right.xyz) * camera.projection.x + camera.projection.z * depth;
-    let clip_y = dot(rel, camera.up.xyz) * camera.projection.y + camera.projection.w * depth;
-    let depth_range = max(camera.clip.y - camera.clip.x, 1.0);
-    let clip_z = (camera.clip.y / depth_range) * depth
-        - (camera.clip.y * camera.clip.x / depth_range);
-
-    let view_position = vec3<f32>(
+    var view_position = vec3<f32>(
         dot(rel, camera.right.xyz),
         dot(rel, camera.up.xyz),
-        depth,
+        dot(rel, camera.forward.xyz),
     );
-    let view_normal = normalize(vec3<f32>(
+    var view_normal = normalize(vec3<f32>(
         dot(input.normal, camera.right.xyz),
         dot(input.normal, camera.up.xyz),
         dot(input.normal, camera.forward.xyz),
     ));
+    if (input.coordinate_space == 2u) {
+        // TShimmer cancels the camera view matrix before drawing its -Z-facing
+        // quad, so its model coordinates arrive in GX view space.
+        view_position = vec3<f32>(input.position.xy, -input.position.z);
+        view_normal = normalize(vec3<f32>(input.normal.xy, -input.normal.z));
+    }
+    let depth = view_position.z;
+    let clip_x = view_position.x * camera.projection.x + camera.projection.z * depth;
+    let clip_y = view_position.y * camera.projection.y + camera.projection.w * depth;
+    let depth_range = max(camera.clip.y - camera.clip.x, 1.0);
+    let clip_z = (camera.clip.y / depth_range) * depth
+        - (camera.clip.y * camera.clip.x / depth_range);
 
     var coords: array<vec3<f32>, 8>;
     for (var i = 0u; i < 8u; i = i + 1u) {
@@ -253,6 +260,17 @@ fn vs_main(input: VertexIn) -> VertexOut {
         }
 
         let matrix_plus_one = config.z;
+        if (input.coordinate_space == 2u && i == 1u) {
+            // SMS_GetLightPerspectiveForEffectMtx maps this view-space quad
+            // onto the current EFB. Use the live editor projection so resizing,
+            // zoom, and pan keep the copied scene aligned.
+            coords[i] = vec3<f32>(
+                0.5 * (clip_x / depth + 1.0),
+                0.5 * (1.0 - clip_y / depth),
+                1.0,
+            );
+            continue;
+        }
         if (matrix_plus_one != 0u) {
             let matrix_index = matrix_plus_one - 1u;
             let uses_effect = mode == 2u || mode == 3u || mode == 4u || mode == 5u
@@ -616,15 +634,36 @@ fn indirect_offset(stage_index: u32, input: VertexOut) -> vec2<f32> {
     }
     var uv = tex_coord(input, order.x - 1u);
     uv = uv * vec2<f32>(exp2(-f32(order.z)), exp2(-f32(order.w)));
-    let sample_value = sample_texture(order.y - 1u, uv).rgb * 2.0 - vec3<f32>(1.0);
+    // GX performs indirect operations on integer texture samples. ITF_8 keeps
+    // all eight bits and STU bias converts 0..255 to signed -128..127 values.
+    // Lower formats discard the low bits and use a +1 bias instead.
+    var sample_value = floor(sample_texture(order.y - 1u, uv).rgb * 255.0 + 0.5);
+    var format_shift = 0.0;
+    if (stage0.y == 1u) {
+        format_shift = 3.0;
+    } else if (stage0.y == 2u) {
+        format_shift = 4.0;
+    } else if (stage0.y == 3u) {
+        format_shift = 5.0;
+    }
+    sample_value = floor(sample_value / exp2(format_shift));
+    let bias_value = select(-128.0, 1.0, stage0.y != 0u);
+    if ((stage0.z & 1u) != 0u) {
+        sample_value.x = sample_value.x + bias_value;
+    }
+    if ((stage0.z & 2u) != 0u) {
+        sample_value.y = sample_value.y + bias_value;
+    }
+    if ((stage0.z & 4u) != 0u) {
+        sample_value.z = sample_value.z + bias_value;
+    }
     let matrix_id = stage0.w;
     if (matrix_id >= 1u && matrix_id <= 3u) {
         let matrix_index = matrix_id - 1u;
         let row = matrix_index * 2u;
-        let source = vec3<f32>(sample_value.rg, 1.0);
         return vec2<f32>(
-            dot(material.indirect_matrix_rows[row].xyz, source),
-            dot(material.indirect_matrix_rows[row + 1u].xyz, source),
+            dot(material.indirect_matrix_rows[row].xyz, sample_value),
+            dot(material.indirect_matrix_rows[row + 1u].xyz, sample_value),
         );
     }
     if (matrix_id >= 5u && matrix_id <= 7u) {
@@ -675,7 +714,11 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         var tex = vec4<f32>(1.0);
         if (order.x != 0u && order.y != 0u) {
             var uv = tex_coord(input, order.x - 1u);
-            uv = uv + indirect_offset(stage_index, input);
+            // GX regular coordinates are measured in destination texels. The
+            // matrix result is therefore a texel displacement, not normalized
+            // UV. Sunshine's shimmer destination is its 320x224 screen copy.
+            let texture_size = material.texture_sizes[order.y - 1u].xy;
+            uv = uv + indirect_offset(stage_index, input) / texture_size;
             tex = sample_texture(order.y - 1u, uv);
         }
         tex = swap_color(tex, selectors.w);

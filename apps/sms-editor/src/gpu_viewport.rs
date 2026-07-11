@@ -21,6 +21,7 @@ const GX_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const TEXTURE_SLOT_COUNT: usize = 8;
 const TEV_STAGE_COUNT: usize = 16;
 const TEX_MATRIX_ROW_COUNT: usize = TEXTURE_SLOT_COUNT * 3;
+const SMS_SCREEN_TEXTURE_SIZE: [f32; 2] = [320.0, 224.0];
 static NEXT_SCENE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 const J3D_SHADER: &str = include_str!("shaders/j3d.wgsl");
@@ -151,12 +152,22 @@ impl CallbackTrait for GpuViewportCallback {
         let resources = callback_resources
             .entry::<GpuViewportResources>()
             .or_insert_with(|| GpuViewportResources::new(device, shared.target_format));
+        let target_size = [
+            (shared.frame.viewport_size[0] * screen_descriptor.pixels_per_point)
+                .round()
+                .max(1.0) as u32,
+            (shared.frame.viewport_size[1] * screen_descriptor.pixels_per_point)
+                .round()
+                .max(1.0) as u32,
+        ];
+        let target_changed = resources.ensure_viewport_target(device, target_size);
         resources.ensure_scene(
             device,
             queue,
             &shared.scene,
             shared.generation,
             shared.geometry_generation,
+            target_changed,
         );
         resources.write_geometry(
             queue,
@@ -168,15 +179,6 @@ impl CallbackTrait for GpuViewportCallback {
         resources.write_materials(device, queue, &shared.scene, &shared.dirty_materials);
         shared.dirty_materials.clear();
         resources.write_frame(queue, shared.frame, &shared.scene);
-        let target_size = [
-            (shared.frame.viewport_size[0] * screen_descriptor.pixels_per_point)
-                .round()
-                .max(1.0) as u32,
-            (shared.frame.viewport_size[1] * screen_descriptor.pixels_per_point)
-                .round()
-                .max(1.0) as u32,
-        ];
-        resources.ensure_viewport_target(device, target_size);
         resources.render_scene(egui_encoder);
         Vec::new()
     }
@@ -308,10 +310,19 @@ impl GpuSceneData {
                     uv5: tex_coords[5],
                     uv6: tex_coords[6],
                     uv7: tex_coords[7],
-                    camera_relative: camera_relative_for_render_layer(triangle.render_layer),
+                    coordinate_space: coordinate_space_for_render_layer(triangle.render_layer),
                 });
             }
             batch.indices.extend_from_slice(&[base, base + 1, base + 2]);
+        }
+
+        for batch in &batches {
+            if batch.pipeline_key.pass == GpuBatchPass::Heatwave {
+                if let Some(material) = materials.get_mut(batch.material_index) {
+                    material.uniform.texture_sizes[1] =
+                        texture_size_uniform(SMS_SCREEN_TEXTURE_SIZE);
+                }
+            }
         }
 
         Self {
@@ -392,11 +403,16 @@ fn render_layer_id(layer: PreviewRenderLayer) -> u8 {
         PreviewRenderLayer::Water => 2,
         PreviewRenderLayer::Goop => 3,
         PreviewRenderLayer::Shadow => 4,
+        PreviewRenderLayer::Heatwave => 5,
     }
 }
 
-fn camera_relative_for_render_layer(layer: PreviewRenderLayer) -> u32 {
-    u32::from(layer == PreviewRenderLayer::Sky)
+fn coordinate_space_for_render_layer(layer: PreviewRenderLayer) -> u32 {
+    match layer {
+        PreviewRenderLayer::Sky => 1,
+        PreviewRenderLayer::Heatwave => 2,
+        _ => 0,
+    }
 }
 
 #[derive(Clone)]
@@ -545,8 +561,17 @@ impl GpuMaterialData {
                     })
             })
             .collect();
+        let mut uniform = GpuMaterialUniform::from_j3d(material);
+        for (slot, texture_index) in material.texture_indices.iter().enumerate() {
+            if let Some(texture) = texture_index.and_then(|index| preview.textures.get(index)) {
+                uniform.texture_sizes[slot] = texture_size_uniform([
+                    texture.image.size[0] as f32,
+                    texture.image.size[1] as f32,
+                ]);
+            }
+        }
         Self {
-            uniform: GpuMaterialUniform::from_j3d(material),
+            uniform,
             texture_indices,
             state: GpuMaterialState::from_j3d(material),
             tex_matrices: material.tex_matrices,
@@ -570,6 +595,20 @@ impl GpuMaterialData {
             .filter(|index| *index < preview.textures.len())
             .map(|index| index + 1)
             .unwrap_or(0);
+        if let Some(texture) = triangle
+            .texture_index
+            .and_then(|index| preview.textures.get(index))
+        {
+            uniform.texture_sizes[0] =
+                texture_size_uniform([texture.image.size[0] as f32, texture.image.size[1] as f32]);
+        }
+        if let Some(texture) = triangle
+            .mask_texture_index
+            .and_then(|index| preview.textures.get(index))
+        {
+            uniform.texture_sizes[1] =
+                texture_size_uniform([texture.image.size[0] as f32, texture.image.size[1] as f32]);
+        }
         Self {
             uniform,
             texture_indices,
@@ -634,7 +673,9 @@ impl GpuMaterialState {
     }
 
     fn pipeline_key(self, render_layer: PreviewRenderLayer) -> GpuPipelineKey {
-        let pass = if render_layer == PreviewRenderLayer::Sky {
+        let pass = if render_layer == PreviewRenderLayer::Heatwave {
+            GpuBatchPass::Heatwave
+        } else if render_layer == PreviewRenderLayer::Sky {
             GpuBatchPass::Sky
         } else if self
             .draw_mode
@@ -703,6 +744,7 @@ struct GpuMaterialUniform {
     counts: [u32; 4],
     alpha_compare: [u32; 4],
     alpha_refs: [f32; 4],
+    texture_sizes: [[f32; 4]; TEXTURE_SLOT_COUNT],
     material_colors: [[f32; 4]; 2],
     ambient_colors: [[f32; 4]; 2],
     tev_colors: [[f32; 4]; 4],
@@ -739,6 +781,7 @@ impl GpuMaterialUniform {
             material.indirect.stage_count.min(3) as u32,
         ];
         uniform.set_alpha_compare(material.alpha_compare);
+        uniform.texture_sizes = [texture_size_uniform([1.0, 1.0]); TEXTURE_SLOT_COUNT];
         uniform.material_colors = material.material_colors.map(color_u8_to_f32);
         uniform.ambient_colors = material.ambient_colors.map(color_u8_to_f32);
         uniform.tev_colors = material
@@ -838,6 +881,7 @@ impl GpuMaterialUniform {
         let mut uniform = Self::zeroed();
         uniform.counts = [1, 1, 0, 0];
         uniform.set_alpha_compare(always_alpha_compare());
+        uniform.texture_sizes = [texture_size_uniform([1.0, 1.0]); TEXTURE_SLOT_COUNT];
         uniform.material_colors = [[1.0; 4]; 2];
         uniform.ambient_colors = [[1.0; 4]; 2];
         uniform.tev_k_colors = [[1.0; 4]; 4];
@@ -923,6 +967,12 @@ impl GpuMaterialUniform {
         ];
         self.indirect_stages2[index][0] = stage.indirect.alpha as u32;
     }
+}
+
+fn texture_size_uniform(size: [f32; 2]) -> [f32; 4] {
+    let width = size[0].max(1.0);
+    let height = size[1].max(1.0);
+    [width, height, 1.0 / width, 1.0 / height]
 }
 
 fn tex_matrix_slot(matrix: u8) -> Option<usize> {
@@ -1011,6 +1061,7 @@ enum GpuBatchPass {
     Opaque,
     AlphaTest,
     Translucent,
+    Heatwave,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1062,7 +1113,7 @@ struct GpuVertex {
     uv5: [f32; 2],
     uv6: [f32; 2],
     uv7: [f32; 2],
-    camera_relative: u32,
+    coordinate_space: u32,
 }
 
 impl GpuVertex {
@@ -1135,6 +1186,7 @@ struct GpuViewportResources {
     textures: Vec<GpuTextureResource>,
     material_buffers: Vec<wgpu::Buffer>,
     material_bind_groups: Vec<wgpu::BindGroup>,
+    heatwave_materials: BTreeSet<usize>,
     batches: Vec<GpuBatchResources>,
     draw_order: Vec<GpuDrawCommand>,
     generation: u64,
@@ -1250,6 +1302,7 @@ impl GpuViewportResources {
             textures: Vec::new(),
             material_buffers: Vec::new(),
             material_bind_groups: Vec::new(),
+            heatwave_materials: BTreeSet::new(),
             batches: Vec::new(),
             draw_order: Vec::new(),
             generation: 0,
@@ -1264,8 +1317,9 @@ impl GpuViewportResources {
         scene: &GpuSceneData,
         generation: u64,
         geometry_generation: u64,
+        force_rebuild: bool,
     ) {
-        if self.generation == generation {
+        if self.generation == generation && !force_rebuild {
             return;
         }
         for batch in &scene.batches {
@@ -1278,33 +1332,19 @@ impl GpuViewportResources {
             .collect();
         self.material_buffers.clear();
         self.material_bind_groups.clear();
+        self.heatwave_materials = scene
+            .batches
+            .iter()
+            .filter(|batch| batch.pipeline_key.pass == GpuBatchPass::Heatwave)
+            .map(|batch| batch.material_index)
+            .collect();
         for (index, material) in scene.materials.iter().enumerate() {
             let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("sms viewport J3D material uniform"),
                 contents: bytemuck::bytes_of(&material.uniform),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
-            let mut entries = vec![wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffer.as_entire_binding(),
-            }];
-            for slot in 0..TEXTURE_SLOT_COUNT {
-                let texture_index = material.texture_indices[slot].min(self.textures.len() - 1);
-                let texture = &self.textures[texture_index];
-                entries.push(wgpu::BindGroupEntry {
-                    binding: 1 + slot as u32 * 2,
-                    resource: wgpu::BindingResource::TextureView(&texture.view),
-                });
-                entries.push(wgpu::BindGroupEntry {
-                    binding: 2 + slot as u32 * 2,
-                    resource: wgpu::BindingResource::Sampler(&texture.sampler),
-                });
-            }
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(&format!("sms viewport J3D material {index}")),
-                layout: &self.material_layout,
-                entries: &entries,
-            });
+            let bind_group = self.create_material_bind_group(device, index, material, &buffer);
             self.material_buffers.push(buffer);
             self.material_bind_groups.push(bind_group);
         }
@@ -1364,30 +1404,49 @@ impl GpuViewportResources {
                 contents: bytemuck::bytes_of(&material.uniform),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
-            let mut entries = vec![wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffer.as_entire_binding(),
-            }];
-            for slot in 0..TEXTURE_SLOT_COUNT {
-                let texture_index = material.texture_indices[slot].min(self.textures.len() - 1);
-                let texture = &self.textures[texture_index];
-                entries.push(wgpu::BindGroupEntry {
-                    binding: 1 + slot as u32 * 2,
-                    resource: wgpu::BindingResource::TextureView(&texture.view),
-                });
-                entries.push(wgpu::BindGroupEntry {
-                    binding: 2 + slot as u32 * 2,
-                    resource: wgpu::BindingResource::Sampler(&texture.sampler),
-                });
-            }
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(&format!("sms viewport animated J3D material {index}")),
-                layout: &self.material_layout,
-                entries: &entries,
-            });
+            let bind_group = self.create_material_bind_group(device, index, material, &buffer);
             self.material_buffers[index] = buffer;
             self.material_bind_groups[index] = bind_group;
         }
+    }
+
+    fn create_material_bind_group(
+        &self,
+        device: &wgpu::Device,
+        index: usize,
+        material: &GpuMaterialData,
+        buffer: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        let mut entries = vec![wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buffer.as_entire_binding(),
+        }];
+        let heatwave = self.heatwave_materials.contains(&index);
+        for slot in 0..TEXTURE_SLOT_COUNT {
+            let texture_index = material.texture_indices[slot].min(self.textures.len() - 1);
+            let texture = &self.textures[texture_index];
+            let view = if heatwave && slot == 1 {
+                self.viewport_target
+                    .as_ref()
+                    .map(|target| &target.efb_copy_view)
+                    .unwrap_or(&texture.view)
+            } else {
+                &texture.view
+            };
+            entries.push(wgpu::BindGroupEntry {
+                binding: 1 + slot as u32 * 2,
+                resource: wgpu::BindingResource::TextureView(view),
+            });
+            entries.push(wgpu::BindGroupEntry {
+                binding: 2 + slot as u32 * 2,
+                resource: wgpu::BindingResource::Sampler(&texture.sampler),
+            });
+        }
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(&format!("sms viewport J3D material {index}")),
+            layout: &self.material_layout,
+            entries: &entries,
+        })
     }
 
     fn ensure_pipeline(&mut self, device: &wgpu::Device, key: GpuPipelineKey) {
@@ -1397,13 +1456,13 @@ impl GpuViewportResources {
         }
     }
 
-    fn ensure_viewport_target(&mut self, device: &wgpu::Device, size: [u32; 2]) {
+    fn ensure_viewport_target(&mut self, device: &wgpu::Device, size: [u32; 2]) -> bool {
         if self
             .viewport_target
             .as_ref()
             .is_some_and(|target| target.size == size)
         {
-            return;
+            return false;
         }
         self.viewport_target = Some(GpuViewportTarget::new(
             device,
@@ -1411,6 +1470,7 @@ impl GpuViewportResources {
             &self.composite_sampler,
             size,
         ));
+        true
     }
 
     fn write_frame(&mut self, queue: &wgpu::Queue, frame: GpuViewportFrame, scene: &GpuSceneData) {
@@ -1432,14 +1492,90 @@ impl GpuViewportResources {
         let Some(target) = &self.viewport_target else {
             return;
         };
+        let has_heatwave = self
+            .draw_order
+            .iter()
+            .filter_map(|command| self.batches.get(command.batch_index))
+            .any(|batch| batch.pipeline_key.pass == GpuBatchPass::Heatwave);
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sms GX viewport scene render"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // TDisplay initializes Sunshine's display clear color to black.
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &target.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: if has_heatwave {
+                            wgpu::StoreOp::Store
+                        } else {
+                            wgpu::StoreOp::Discard
+                        },
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            for command in &self.draw_order {
+                let Some(batch) = self.batches.get(command.batch_index) else {
+                    continue;
+                };
+                if batch.pipeline_key.pass == GpuBatchPass::Heatwave {
+                    continue;
+                }
+                let Some(pipeline) = self.pipelines.get(&batch.pipeline_key) else {
+                    continue;
+                };
+                let Some(material) = self.material_bind_groups.get(batch.material_index) else {
+                    continue;
+                };
+                render_pass.set_pipeline(pipeline);
+                render_pass.set_bind_group(1, material, &[]);
+                render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
+                render_pass
+                    .set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..batch.index_count, 0, 0..1);
+            }
+        }
+
+        if !has_heatwave {
+            return;
+        }
+
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target.color,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &target.efb_copy,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            target.extent(),
+        );
+
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("sms GX viewport render"),
+            label: Some("sms GX shimmer render"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &target.color_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    // TDisplay initializes Sunshine's display clear color to black.
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
                 depth_slice: None,
@@ -1447,7 +1583,7 @@ impl GpuViewportResources {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &target.depth_view,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
+                    load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Discard,
                 }),
                 stencil_ops: None,
@@ -1461,6 +1597,9 @@ impl GpuViewportResources {
             let Some(batch) = self.batches.get(command.batch_index) else {
                 continue;
             };
+            if batch.pipeline_key.pass != GpuBatchPass::Heatwave {
+                continue;
+            }
             let Some(pipeline) = self.pipelines.get(&batch.pipeline_key) else {
                 continue;
             };
@@ -1487,8 +1626,10 @@ impl GpuViewportResources {
 
 struct GpuViewportTarget {
     size: [u32; 2],
-    _color: wgpu::Texture,
+    color: wgpu::Texture,
     color_view: wgpu::TextureView,
+    efb_copy: wgpu::Texture,
+    efb_copy_view: wgpu::TextureView,
     _depth: wgpu::Texture,
     depth_view: wgpu::TextureView,
     composite_bind_group: wgpu::BindGroup,
@@ -1513,10 +1654,23 @@ impl GpuViewportTarget {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: GX_COLOR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        let efb_copy = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sms GX shimmer EFB copy"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: GX_COLOR_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let efb_copy_view = efb_copy.create_view(&wgpu::TextureViewDescriptor::default());
         let depth = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("sms GX viewport depth"),
             size: extent,
@@ -1544,11 +1698,21 @@ impl GpuViewportTarget {
         });
         Self {
             size,
-            _color: color,
+            color,
             color_view,
+            efb_copy,
+            efb_copy_view,
             _depth: depth,
             depth_view,
             composite_bind_group,
+        }
+    }
+
+    fn extent(&self) -> wgpu::Extent3d {
+        wgpu::Extent3d {
+            width: self.size[0],
+            height: self.size[1],
+            depth_or_array_layers: 1,
         }
     }
 }
@@ -1678,20 +1842,24 @@ fn sorted_gpu_draw_order_from_info(
     let mut solid = Vec::<(usize, usize, usize)>::new();
     let mut translucent = Vec::<(usize, usize, usize)>::new();
     let mut sky = Vec::<(usize, usize, usize)>::new();
+    let mut heatwave = Vec::<(usize, usize, usize)>::new();
     for batch in batches {
         let entry = (batch.material_index, batch.packet_index, batch.batch_index);
         match batch.pass {
             GpuBatchPass::Sky => sky.push(entry),
             GpuBatchPass::Translucent => translucent.push(entry),
+            GpuBatchPass::Heatwave => heatwave.push(entry),
             GpuBatchPass::Opaque | GpuBatchPass::AlphaTest => solid.push(entry),
         }
     }
     sky.sort_unstable();
     solid.sort_unstable();
     translucent.sort_unstable();
+    heatwave.sort_unstable();
     sky.into_iter()
         .chain(solid)
         .chain(translucent)
+        .chain(heatwave)
         .map(|(_, _, batch_index)| GpuDrawCommand { batch_index })
         .collect()
 }

@@ -828,6 +828,12 @@ impl SmsEditorApp {
             }
             let loader_flags = npc_model_loader_flags(object)
                 .unwrap_or_else(|| model_loader_flags_for_path(&model_path));
+            let object_render_layer = preview_render_layer_for_model_path(&model_path);
+            let object_preview_transform = if object_render_layer == PreviewRenderLayer::Heatwave {
+                shimmer_preview_transform(object.transform)
+            } else {
+                object.transform
+            };
             let model_cache_key = (model_path.clone(), loader_flags);
 
             if !object_model_cache.contains_key(&model_cache_key) {
@@ -911,43 +917,48 @@ impl SmsEditorApp {
                 .map(|index| index + 1)
                 .unwrap_or(1);
 
-            let transformed_bounds_min =
-                transform_preview_point(cached.preview.bounds_min, object.transform);
-            let transformed_bounds_max =
-                transform_preview_point(cached.preview.bounds_max, object.transform);
-            merge_bounds(
-                &mut bounds_min,
-                &mut bounds_max,
-                [
-                    transformed_bounds_min[0].min(transformed_bounds_max[0]),
-                    transformed_bounds_min[1].min(transformed_bounds_max[1]),
-                    transformed_bounds_min[2].min(transformed_bounds_max[2]),
-                ],
-                [
-                    transformed_bounds_min[0].max(transformed_bounds_max[0]),
-                    transformed_bounds_min[1].max(transformed_bounds_max[1]),
-                    transformed_bounds_min[2].max(transformed_bounds_max[2]),
-                ],
-            );
+            if object_render_layer != PreviewRenderLayer::Heatwave {
+                let transformed_bounds_min =
+                    transform_preview_point(cached.preview.bounds_min, object_preview_transform);
+                let transformed_bounds_max =
+                    transform_preview_point(cached.preview.bounds_max, object_preview_transform);
+                merge_bounds(
+                    &mut bounds_min,
+                    &mut bounds_max,
+                    [
+                        transformed_bounds_min[0].min(transformed_bounds_max[0]),
+                        transformed_bounds_min[1].min(transformed_bounds_max[1]),
+                        transformed_bounds_min[2].min(transformed_bounds_max[2]),
+                    ],
+                    [
+                        transformed_bounds_min[0].max(transformed_bounds_max[0]),
+                        transformed_bounds_min[1].max(transformed_bounds_max[1]),
+                        transformed_bounds_min[2].max(transformed_bounds_max[2]),
+                    ],
+                );
+            }
 
             let point_stride = (cached.preview.positions.len() / POINTS_PER_OBJECT_INSTANCE).max(1);
             let point_start = points.len();
-            for position in cached.preview.positions.iter().step_by(point_stride) {
-                points.push(PreviewPoint {
-                    position: transform_preview_point(*position, object.transform),
-                    model_index,
-                });
+            if object_render_layer != PreviewRenderLayer::Heatwave {
+                for position in cached.preview.positions.iter().step_by(point_stride) {
+                    points.push(PreviewPoint {
+                        position: transform_preview_point(*position, object_preview_transform),
+                        model_index,
+                    });
+                }
             }
 
             let triangle_start = triangles.len();
             for triangle in &cached.preview.triangles {
-                let vertices = transform_preview_vertices(triangle.vertices, object.transform);
+                let vertices =
+                    transform_preview_vertices(triangle.vertices, object_preview_transform);
                 if triangle_vertices_are_finite(vertices) {
                     triangles.push(PreviewTriangle {
                         vertices,
-                        normals: triangle
-                            .normals
-                            .map(|normals| transform_preview_normals(normals, object.transform)),
+                        normals: triangle.normals.map(|normals| {
+                            transform_preview_normals(normals, object_preview_transform)
+                        }),
                         color_channels: triangle.color_channels,
                         tex_coord_sets: triangle.tex_coord_sets,
                         material_index: triangle.material_index.and_then(|index| {
@@ -956,7 +967,7 @@ impl SmsEditorApp {
                         }),
                         packet_index: packet_base + triangle.packet_index,
                         model_index,
-                        render_layer: PreviewRenderLayer::Main,
+                        render_layer: object_render_layer,
                         color: triangle.color,
                         vertex_colors: triangle.vertex_colors,
                         combine_mode: triangle.combine_mode,
@@ -1596,9 +1607,12 @@ fn robust_preview_bounds(
     points: &[PreviewPoint],
 ) -> Option<([f32; 3], [f32; 3])> {
     let mut axes = [Vec::new(), Vec::new(), Vec::new()];
-    let has_world_triangles = triangles
-        .iter()
-        .any(|triangle| triangle.render_layer != PreviewRenderLayer::Sky);
+    let has_world_triangles = triangles.iter().any(|triangle| {
+        !matches!(
+            triangle.render_layer,
+            PreviewRenderLayer::Sky | PreviewRenderLayer::Heatwave
+        )
+    });
     if !has_world_triangles {
         for point in points {
             for (axis, value) in axes.iter_mut().zip(point.position) {
@@ -1608,10 +1622,12 @@ fn robust_preview_bounds(
             }
         }
     } else {
-        for triangle in triangles
-            .iter()
-            .filter(|triangle| triangle.render_layer != PreviewRenderLayer::Sky)
-        {
+        for triangle in triangles.iter().filter(|triangle| {
+            !matches!(
+                triangle.render_layer,
+                PreviewRenderLayer::Sky | PreviewRenderLayer::Heatwave
+            )
+        }) {
             for vertex in triangle.vertices {
                 for (axis, value) in axes.iter_mut().zip(vertex) {
                     if value.is_finite() {
@@ -1754,7 +1770,9 @@ fn is_camera_bounds_model_path(path: &str) -> bool {
 
 fn preview_render_layer_for_model_path(path: &str) -> PreviewRenderLayer {
     let path = path.to_ascii_lowercase();
-    if path_is_sky_model_path(&path) {
+    if path_is_shimmer_model_path(&path) {
+        PreviewRenderLayer::Heatwave
+    } else if path_is_sky_model_path(&path) {
         PreviewRenderLayer::Sky
     } else if path_is_goop_model_path(&path) {
         PreviewRenderLayer::Goop
@@ -1762,6 +1780,27 @@ fn preview_render_layer_for_model_path(path: &str) -> PreviewRenderLayer {
         PreviewRenderLayer::Water
     } else {
         PreviewRenderLayer::Main
+    }
+}
+
+fn path_is_shimmer_model_path(path: &str) -> bool {
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    path.rsplit('/').next().is_some_and(|name| {
+        name == "shimmerlow.bmd"
+            || name == "shimmerlow.bdl"
+            || name == "shimmerlowfar.bmd"
+            || name == "shimmerlowfar.bdl"
+    })
+}
+
+fn shimmer_preview_transform(transform: Transform) -> Transform {
+    // TShimmer::perform builds inverse(view) * translate(runtime position) *
+    // scale. In normal outdoor preview state that runtime position is zero;
+    // the placement translation and rotation are not part of the draw matrix.
+    Transform {
+        translation: [0.0; 3],
+        rotation_degrees: [0.0; 3],
+        scale: transform.scale,
     }
 }
 
@@ -1856,6 +1895,9 @@ fn model_loader_flags_for_path(path: &str) -> u32 {
         .trim_end_matches(".bdl");
 
     match model_name {
+        // TShimmer::load passes 0x11010000 so the authored indirect block is
+        // retained and can displace the screen-copy texture.
+        "shimmerlow" | "shimmerlowfar" => 0x1101_0000,
         // TSky::load uses SMS_MakeMActorWithAnmData(..., 0x10220000).
         "sky" if path_is_sky_model_path(&path) => SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS,
         // TMapStaticObj::actor_data_table in MapStaticObject.cpp.
@@ -2029,7 +2071,10 @@ fn apply_layer_preview_tint(
                 rgba[3].min(0.78),
             ])
         }
-        PreviewRenderLayer::Sky | PreviewRenderLayer::Main | PreviewRenderLayer::Shadow => color,
+        PreviewRenderLayer::Sky
+        | PreviewRenderLayer::Main
+        | PreviewRenderLayer::Shadow
+        | PreviewRenderLayer::Heatwave => color,
     }
 }
 

@@ -3094,6 +3094,7 @@ dependencies = [
  "bytemuck",
  "eframe",
  "egui",
+ "naga",
  "sms-formats",
  "sms-render",
  "sms-scene",

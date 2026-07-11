@@ -14,3 +14,6 @@ sms-formats.workspace = true
 sms-render.workspace = true
 sms-scene.workspace = true
 sms-schema.workspace = true
+
+[dev-dependencies]
+naga.workspace = true

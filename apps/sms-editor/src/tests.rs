@@ -354,6 +354,39 @@ fn skybox_model_is_loaded_as_camera_relative_environment() {
 }
 
 #[test]
+fn shimmer_models_use_the_heatwave_layer_and_indirect_loader_flags() {
+    for path in [
+        "stage.szs!/mapobj/shimmerlow.bmd",
+        "stage.szs!/mapobj/shimmerlowfar.bmd",
+    ] {
+        assert!(path_is_shimmer_model_path(path));
+        assert_eq!(
+            preview_render_layer_for_model_path(path),
+            PreviewRenderLayer::Heatwave
+        );
+        assert_eq!(model_loader_flags_for_path(path), 0x1101_0000);
+    }
+}
+
+#[test]
+fn shimmer_draw_transform_keeps_scale_but_cancels_placement_pose() {
+    let transform = Transform {
+        translation: [10.0, 20.0, 30.0],
+        rotation_degrees: [40.0, 50.0, 60.0],
+        scale: [1.12, 1.12, 1.0],
+    };
+
+    assert_eq!(
+        shimmer_preview_transform(transform),
+        Transform {
+            translation: [0.0; 3],
+            rotation_degrees: [0.0; 3],
+            scale: transform.scale,
+        }
+    );
+}
+
+#[test]
 fn skybox_vertices_track_camera_translation() {
     let vertices = [[1.0, 2.0, 3.0], [-4.0, 5.0, 6.0], [7.0, 8.0, -9.0]];
     let camera = [100.0, 200.0, 300.0];

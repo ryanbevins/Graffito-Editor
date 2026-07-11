@@ -188,7 +188,7 @@ pub(super) fn preview_triangle_is_translucent(
     }
     if matches!(
         triangle.render_layer,
-        PreviewRenderLayer::Goop | PreviewRenderLayer::Shadow
+        PreviewRenderLayer::Goop | PreviewRenderLayer::Shadow | PreviewRenderLayer::Heatwave
     ) {
         return true;
     }

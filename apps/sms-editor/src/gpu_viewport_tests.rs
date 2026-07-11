@@ -12,6 +12,17 @@ fn material_uniform_is_uniform_buffer_aligned() {
 }
 
 #[test]
+fn j3d_shader_parses_and_validates() {
+    let module = naga::front::wgsl::parse_str(J3D_SHADER).expect("J3D WGSL parses");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .expect("J3D WGSL validates");
+}
+
+#[test]
 fn geometry_updates_touch_only_requested_triangle_batches() {
     let mut preview = geometry_update_preview();
     let mut scene = GpuSceneData::from_preview(&preview);
@@ -119,15 +130,49 @@ fn specialized_material_modes_resolve_before_gpu_state() {
 }
 
 #[test]
-fn only_sky_vertices_are_camera_relative() {
-    assert_eq!(camera_relative_for_render_layer(PreviewRenderLayer::Sky), 1);
+fn render_layers_select_their_runtime_coordinate_space() {
     assert_eq!(
-        camera_relative_for_render_layer(PreviewRenderLayer::Main),
+        coordinate_space_for_render_layer(PreviewRenderLayer::Sky),
+        1
+    );
+    assert_eq!(
+        coordinate_space_for_render_layer(PreviewRenderLayer::Heatwave),
+        2
+    );
+    assert_eq!(
+        coordinate_space_for_render_layer(PreviewRenderLayer::Main),
         0
     );
     assert_eq!(
-        camera_relative_for_render_layer(PreviewRenderLayer::Water),
+        coordinate_space_for_render_layer(PreviewRenderLayer::Water),
         0
+    );
+}
+
+#[test]
+fn heatwave_materials_render_after_the_efb_snapshot_boundary() {
+    assert_eq!(
+        GpuMaterialState::from_j3d(&test_material(4))
+            .pipeline_key(PreviewRenderLayer::Heatwave)
+            .pass,
+        GpuBatchPass::Heatwave
+    );
+}
+
+#[test]
+fn heatwave_offsets_use_sunshines_half_resolution_screen_texture() {
+    let mut preview = geometry_update_preview();
+    preview.triangles[0].render_layer = PreviewRenderLayer::Heatwave;
+    let scene = GpuSceneData::from_preview(&preview);
+    let batch = scene
+        .batches
+        .iter()
+        .find(|batch| batch.pipeline_key.pass == GpuBatchPass::Heatwave)
+        .expect("heatwave batch");
+
+    assert_eq!(
+        scene.materials[batch.material_index].uniform.texture_sizes[1],
+        [320.0, 224.0, 1.0 / 320.0, 1.0 / 224.0]
     );
 }
 
