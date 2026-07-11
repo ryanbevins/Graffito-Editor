@@ -1,11 +1,10 @@
-//! Editable stage document and filesystem mod export model.
+//! Editable stage documents and safe editor-project persistence.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use sha1::{Digest, Sha1};
 use sms_formats::{
     parse_jdrama_object_records, read_stage_asset_bytes, scan_stage_assets, SourceLocation,
     StageAsset, StageAssetKind,
@@ -25,29 +24,35 @@ pub enum SceneError {
     TomlSer(#[from] toml::ser::Error),
     #[error("scene overlay serialization error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("invalid stage id for an editor project path: {0}")]
+    InvalidStageId(String),
+    #[error("project output path must be relative and traversal-free: {0}")]
+    UnsafeProjectPath(PathBuf),
+    #[error("project output folder must have a parent and file name: {0}")]
+    InvalidProjectRoot(PathBuf),
+    #[error("project output folder overlaps the extracted base game directory: {0}")]
+    ProjectOverlapsBase(PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, SceneError>;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SmsModManifest {
-    pub game_id: String,
-    pub region: String,
-    pub base_hash: String,
+pub struct EditorProjectManifest {
+    pub format_version: u32,
+    pub kind: String,
     pub base_path: PathBuf,
-    pub mod_files_path: PathBuf,
+    pub project_files_path: PathBuf,
     pub created_with: String,
     pub changed_files: Vec<PathBuf>,
 }
 
-impl SmsModManifest {
-    pub fn new(base_path: PathBuf, mod_files_path: PathBuf) -> Self {
+impl EditorProjectManifest {
+    pub fn new(base_path: PathBuf, project_files_path: PathBuf) -> Self {
         Self {
-            game_id: "GMSJ01".to_string(),
-            region: "JP".to_string(),
-            base_hash: hash_path_hint(&base_path),
+            format_version: 1,
+            kind: "sms-editor-project".to_string(),
             base_path,
-            mod_files_path,
+            project_files_path,
             created_with: env!("CARGO_PKG_VERSION").to_string(),
             changed_files: Vec::new(),
         }
@@ -62,6 +67,7 @@ pub struct StageDocument {
     pub objects: Vec<SceneObject>,
     pub changed_files: BTreeMap<PathBuf, Vec<u8>>,
     pub registry: Option<ObjectRegistry>,
+    pub load_issues: Vec<ValidationIssue>,
 }
 
 impl StageDocument {
@@ -73,7 +79,7 @@ impl StageDocument {
 
         let stage_id = stage_id.into();
         let assets = scan_stage_assets(&base_root, &stage_id)?;
-        let objects = load_scene_objects_from_assets(&assets);
+        let (objects, load_issues) = load_scene_objects_from_assets(&assets);
         Ok(Self {
             stage_id,
             base_root,
@@ -81,6 +87,7 @@ impl StageDocument {
             objects,
             changed_files: BTreeMap::new(),
             registry: None,
+            load_issues,
         })
     }
 
@@ -93,12 +100,19 @@ impl StageDocument {
         self.objects.push(object);
     }
 
-    pub fn mark_changed_file(&mut self, relative_path: impl Into<PathBuf>, bytes: Vec<u8>) {
-        self.changed_files.insert(relative_path.into(), bytes);
+    pub fn mark_changed_file(
+        &mut self,
+        relative_path: impl Into<PathBuf>,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        let relative_path = relative_path.into();
+        validate_project_relative_path(&relative_path)?;
+        self.changed_files.insert(relative_path, bytes);
+        Ok(())
     }
 
     pub fn queue_editor_overlay_change(&mut self) -> Result<()> {
-        let path = self.editor_overlay_path();
+        let path = self.editor_overlay_path()?;
         if self.objects.is_empty() {
             self.changed_files.remove(&path);
             return Ok(());
@@ -109,25 +123,57 @@ impl StageDocument {
             objects: self.objects.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&overlay)?;
-        self.mark_changed_file(path, bytes);
+        self.mark_changed_file(path, bytes)?;
         Ok(())
     }
 
-    pub fn editor_overlay_path(&self) -> PathBuf {
-        PathBuf::from("editor")
+    pub fn editor_overlay_path(&self) -> Result<PathBuf> {
+        validate_stage_id(&self.stage_id)?;
+        Ok(PathBuf::from("editor")
             .join("stages")
-            .join(format!("{}.scene.json", self.stage_id))
+            .join(format!("{}.scene.json", self.stage_id)))
     }
 
-    pub fn save_to_mod_folder(&self, mod_root: impl AsRef<Path>) -> Result<SmsModManifest> {
-        let mod_root = mod_root.as_ref();
-        fs::create_dir_all(mod_root)?;
+    pub fn save_project_folder(
+        &self,
+        project_root: impl AsRef<Path>,
+    ) -> Result<EditorProjectManifest> {
+        let project_root = project_root.as_ref();
+        if project_root
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(SceneError::InvalidProjectRoot(project_root.to_path_buf()));
+        }
+        let project_comparison = normalized_absolute_for_comparison(project_root)?;
+        let base_comparison = normalized_absolute_for_comparison(&self.base_root)?;
+        if path_is_same_or_child(&project_comparison, &base_comparison)
+            || path_is_same_or_child(&base_comparison, &project_comparison)
+        {
+            return Err(SceneError::ProjectOverlapsBase(project_root.to_path_buf()));
+        }
+        let parent = project_root
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let name = project_root
+            .file_name()
+            .ok_or_else(|| SceneError::InvalidProjectRoot(project_root.to_path_buf()))?
+            .to_string_lossy();
+        fs::create_dir_all(parent)?;
 
-        let files_root = mod_root.join("files");
+        let unique = std::process::id();
+        let staging_root = parent.join(format!(".{name}.staging-{unique}"));
+        let backup_root = parent.join(format!(".{name}.backup-{unique}"));
+        remove_dir_if_exists(&staging_root)?;
+        remove_dir_if_exists(&backup_root)?;
+
+        let files_root = staging_root.join("files");
         fs::create_dir_all(&files_root)?;
 
         let mut changed_files = Vec::new();
         for (relative_path, bytes) in &self.changed_files {
+            validate_project_relative_path(relative_path)?;
             let out_path = files_root.join(relative_path);
             if let Some(parent) = out_path.parent() {
                 fs::create_dir_all(parent)?;
@@ -137,16 +183,28 @@ impl StageDocument {
         }
 
         changed_files.sort();
-        let mut manifest = SmsModManifest::new(self.base_root.clone(), files_root);
+        let mut manifest =
+            EditorProjectManifest::new(self.base_root.clone(), project_root.join("files"));
         manifest.changed_files = changed_files;
 
         let manifest_text = toml::to_string_pretty(&manifest)?;
-        fs::write(mod_root.join("smsmod.toml"), manifest_text)?;
+        fs::write(staging_root.join("sms-project.toml"), manifest_text)?;
+
+        if project_root.exists() {
+            fs::rename(project_root, &backup_root)?;
+        }
+        if let Err(err) = fs::rename(&staging_root, project_root) {
+            if backup_root.exists() {
+                let _ = fs::rename(&backup_root, project_root);
+            }
+            return Err(SceneError::Io(err));
+        }
+        remove_dir_if_exists(&backup_root)?;
         Ok(manifest)
     }
 
     pub fn validate(&self) -> Vec<ValidationIssue> {
-        let mut issues = Vec::new();
+        let mut issues = self.load_issues.clone();
 
         if !self.base_root.exists() {
             issues.push(ValidationIssue::error(
@@ -162,7 +220,33 @@ impl StageDocument {
             ));
         }
 
+        if validate_stage_id(&self.stage_id).is_err() {
+            issues.push(ValidationIssue::error(
+                "invalid-stage-id",
+                format!(
+                    "Stage id '{}' is not safe for project output",
+                    self.stage_id
+                ),
+            ));
+        }
+
+        for path in self.changed_files.keys() {
+            if validate_project_relative_path(path).is_err() {
+                issues.push(ValidationIssue::error(
+                    "unsafe-project-path",
+                    format!("Changed file path is unsafe: {}", path.display()),
+                ));
+            }
+        }
+
+        let mut object_ids = BTreeSet::new();
         for object in &self.objects {
+            if !object_ids.insert(object.id.as_str()) {
+                issues.push(ValidationIssue::error(
+                    "duplicate-object-id",
+                    format!("Object id '{}' is duplicated", object.id),
+                ));
+            }
             if object.factory_name.trim().is_empty() {
                 issues.push(ValidationIssue::error(
                     "empty-factory-name",
@@ -174,6 +258,17 @@ impl StageDocument {
                 issues.push(ValidationIssue::error(
                     "invalid-transform",
                     format!("Object {} has a non-finite transform", object.id),
+                ));
+            }
+            if object
+                .transform
+                .scale
+                .iter()
+                .any(|value| value.abs() <= f32::EPSILON)
+            {
+                issues.push(ValidationIssue::warning(
+                    "zero-scale",
+                    format!("Object {} has a non-invertible scale", object.id),
                 ));
             }
 
@@ -311,15 +406,72 @@ pub enum ValidationSeverity {
     Error,
 }
 
-fn hash_path_hint(path: &Path) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(path.to_string_lossy().as_bytes());
-    format!("{:x}", hasher.finalize())
+fn validate_stage_id(stage_id: &str) -> Result<()> {
+    let valid = !stage_id.is_empty()
+        && stage_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        && stage_id != "."
+        && stage_id != "..";
+    if valid {
+        Ok(())
+    } else {
+        Err(SceneError::InvalidStageId(stage_id.to_string()))
+    }
 }
 
-fn load_scene_objects_from_assets(assets: &[StageAsset]) -> Vec<SceneObject> {
+fn validate_project_relative_path(path: &Path) -> Result<()> {
+    let valid = !path.as_os_str().is_empty()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)));
+    if valid {
+        Ok(())
+    } else {
+        Err(SceneError::UnsafeProjectPath(path.to_path_buf()))
+    }
+}
+
+fn remove_dir_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(SceneError::Io(err)),
+    }
+}
+
+fn normalized_absolute_for_comparison(path: &Path) -> Result<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let canonical = fs::canonicalize(&absolute).unwrap_or(absolute);
+    let normalized = canonical
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
+    Ok(normalized
+        .strip_prefix("\\\\?\\")
+        .unwrap_or(&normalized)
+        .to_string())
+}
+
+fn path_is_same_or_child(path: &str, parent: &str) -> bool {
+    path == parent
+        || path
+            .strip_prefix(parent)
+            .is_some_and(|suffix| suffix.starts_with('\\'))
+}
+
+fn load_scene_objects_from_assets(
+    assets: &[StageAsset],
+) -> (Vec<SceneObject>, Vec<ValidationIssue>) {
     let mut objects = Vec::new();
+    let mut issues = Vec::new();
     let model_index = stage_model_index(assets);
+    let mut placement_files = 0usize;
 
     for asset in assets
         .iter()
@@ -329,18 +481,30 @@ fn load_scene_objects_from_assets(assets: &[StageAsset]) -> Vec<SceneObject> {
         if !path_text.to_ascii_lowercase().ends_with("/map/scene.bin") {
             continue;
         }
+        placement_files += 1;
 
-        let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
-            continue;
+        let bytes = match read_stage_asset_bytes(&asset.path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                issues.push(ValidationIssue::error(
+                    "placement-read-failed",
+                    format!("Could not read {}: {err}", asset.path.display()),
+                ));
+                continue;
+            }
         };
-        let Ok(records) = parse_jdrama_object_records(&bytes) else {
-            continue;
+        let records = match parse_jdrama_object_records(&bytes) {
+            Ok(records) => records,
+            Err(err) => {
+                issues.push(ValidationIssue::error(
+                    "placement-parse-failed",
+                    format!("Could not parse {}: {err}", asset.path.display()),
+                ));
+                continue;
+            }
         };
 
         for record in records {
-            if scene_record_is_editor_internal(&record.type_name) {
-                continue;
-            }
             let Some(transform) = record.transform else {
                 continue;
             };
@@ -411,7 +575,14 @@ fn load_scene_objects_from_assets(assets: &[StageAsset]) -> Vec<SceneObject> {
         }
     }
 
-    objects
+    if placement_files == 0 {
+        issues.push(ValidationIssue::warning(
+            "missing-placement-file",
+            "No map/scene.bin placement file was found for this stage",
+        ));
+    }
+
+    (objects, issues)
 }
 
 fn scene_object_is_preview_helper(object: &SceneObject) -> bool {
@@ -429,17 +600,6 @@ fn scene_object_is_preview_helper(object: &SceneObject) -> bool {
         .to_ascii_lowercase();
 
     factory == "palmleaf" || class_name == "palmleaf" || placement_name.starts_with("palmleaf")
-}
-
-fn scene_record_is_editor_internal(type_name: &str) -> bool {
-    let lower = type_name.to_ascii_lowercase();
-    lower.contains("manager")
-        || lower.contains("group")
-        || lower.contains("table")
-        || lower.contains("camera")
-        || lower.contains("light")
-        || lower.contains("scenario")
-        || lower.contains("stageevent")
 }
 
 fn stage_model_index(assets: &[StageAsset]) -> Vec<(String, String)> {
@@ -627,6 +787,7 @@ mod tests {
             objects: vec![],
             changed_files: BTreeMap::new(),
             registry: None,
+            load_issues: Vec::new(),
         };
         let mut object = SceneObject::new("obj-1", "coin");
         object.transform.translation[0] = f32::NAN;
@@ -645,12 +806,114 @@ mod tests {
             objects: vec![SceneObject::new("obj-1", "coin")],
             changed_files: BTreeMap::new(),
             registry: None,
+            load_issues: Vec::new(),
         };
 
         doc.queue_editor_overlay_change().unwrap();
         assert!(doc
             .changed_files
             .contains_key(&PathBuf::from("editor/stages/dolpic.scene.json")));
+    }
+
+    #[test]
+    fn rejects_project_paths_that_escape_the_output_root() {
+        let mut doc = empty_document("dolpic");
+        let err = doc
+            .mark_changed_file(PathBuf::from("../outside.bin"), vec![1, 2, 3])
+            .unwrap_err();
+        assert!(matches!(err, SceneError::UnsafeProjectPath(_)));
+
+        doc.stage_id = "../../outside".to_string();
+        assert!(matches!(
+            doc.queue_editor_overlay_change().unwrap_err(),
+            SceneError::InvalidStageId(_)
+        ));
+    }
+
+    #[test]
+    fn project_export_replaces_stale_files() {
+        let root = std::env::temp_dir().join(format!(
+            "sms-editor-project-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut doc = empty_document("dolpic");
+        doc.mark_changed_file("first.bin", vec![1]).unwrap();
+        doc.save_project_folder(&root).unwrap();
+        assert!(root.join("files/first.bin").exists());
+
+        doc.changed_files.clear();
+        doc.mark_changed_file("second.bin", vec![2]).unwrap();
+        doc.save_project_folder(&root).unwrap();
+        assert!(!root.join("files/first.bin").exists());
+        assert!(root.join("files/second.bin").exists());
+        assert!(root.join("sms-project.toml").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_export_rejects_base_directory_overlap() {
+        let root = std::env::temp_dir().join(format!(
+            "sms-editor-overlap-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let base_root = root.join("base");
+        fs::create_dir_all(&base_root).unwrap();
+        let mut document = empty_document("dolpic0");
+        document.base_root = base_root.clone();
+
+        assert!(matches!(
+            document
+                .save_project_folder(base_root.join("editor-project"))
+                .unwrap_err(),
+            SceneError::ProjectOverlapsBase(_)
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn placement_parse_failures_are_reported_as_validation_errors() {
+        let root = std::env::temp_dir().join(format!(
+            "sms-editor-load-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let scene_dir = root.join("data/scene/dolpic0/map");
+        fs::create_dir_all(&scene_dir).unwrap();
+        fs::write(scene_dir.join("scene.bin"), b"not a JDrama stream").unwrap();
+
+        let document = StageDocument::open(&root, "dolpic0").unwrap();
+        assert!(document
+            .validate()
+            .iter()
+            .any(|issue| issue.code == "placement-parse-failed"
+                && issue.severity == ValidationSeverity::Error));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn empty_document(stage_id: &str) -> StageDocument {
+        StageDocument {
+            stage_id: stage_id.to_string(),
+            base_root: PathBuf::from("."),
+            assets: vec![],
+            objects: vec![],
+            changed_files: BTreeMap::new(),
+            registry: None,
+            load_issues: Vec::new(),
+        }
     }
 
     #[test]

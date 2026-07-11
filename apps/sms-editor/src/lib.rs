@@ -1,0 +1,2070 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::{
+    mpsc::{self, Receiver, TryRecvError},
+    Arc,
+};
+use std::thread;
+use std::time::Instant;
+
+use eframe::egui;
+use sms_formats::{
+    decode_bti_texture, discover_scene_archives, read_stage_asset_bytes, J3dAlphaCompare,
+    J3dBlendMode, J3dFile, J3dGeometryPreview, J3dJointAnimation, J3dMaterial, J3dMatrix34,
+    J3dPreviewCombineMode, J3dTexturePatternAnimation, J3dTextureSrtAnimation, J3dTriangle,
+    J3dZMode, SceneArchiveInfo, StageAsset, StageAssetKind, SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS,
+    SMS_MAP_MODEL_LOAD_FLAGS, SMS_POLLUTION_MODEL_LOAD_FLAGS,
+};
+use sms_render::{RenderScene, RendererConfig, ViewportRenderer};
+use sms_scene::{
+    AssetRef, AssetRole, SceneObject, StageDocument, Transform, ValidationIssue, ValidationSeverity,
+};
+use sms_schema::{ObjectDefinition, ObjectRegistry, SchemaGenerator};
+
+mod camera;
+mod document_commands;
+mod gpu_viewport;
+mod ui_panels;
+mod viewport_ui;
+
+const VIEWPORT_NEAR_CLIP: f32 = 8.0;
+
+pub fn run() -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("SMS Editor")
+            .with_inner_size([1560.0, 940.0]),
+        renderer: eframe::Renderer::Wgpu,
+        depth_buffer: 24,
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "SMS Editor",
+        options,
+        Box::new(|cc| {
+            install_style(&cc.egui_ctx);
+            Ok(Box::new(SmsEditorApp::new(cc)))
+        }),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorTool {
+    Select,
+    Move,
+    Rotate,
+    Scale,
+    Place,
+}
+
+impl EditorTool {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Select => "Select",
+            Self::Move => "Move",
+            Self::Rotate => "Rotate",
+            Self::Scale => "Scale",
+            Self::Place => "Place",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Lit,
+    Collision,
+    Objects,
+}
+
+impl ViewMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Lit => "Lit",
+            Self::Collision => "Collision",
+            Self::Objects => "Objects",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeftTab {
+    Project,
+    Content,
+    Palette,
+    Outliner,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RightTab {
+    Inspector,
+    Assets,
+    Issues,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreviewVisibility {
+    environment: bool,
+    goop: bool,
+    effects: bool,
+}
+
+struct LoadedStage {
+    base_root: String,
+    archives: Vec<SceneArchiveInfo>,
+    registry: Option<ObjectRegistry>,
+    schema_warning: Option<String>,
+    document: StageDocument,
+    scene: RenderScene,
+    preview: Option<ModelPreview>,
+}
+
+enum BackgroundResult {
+    Schema(Result<ObjectRegistry, String>),
+    Scan {
+        base_root: String,
+        result: Result<Vec<SceneArchiveInfo>, String>,
+    },
+    Open(Result<Box<LoadedStage>, String>),
+}
+
+mod preview_types;
+use preview_types::*;
+struct SmsEditorApp {
+    repo_root: String,
+    base_root: String,
+    project_root: String,
+    stage_id: String,
+    dolphin_path: String,
+    game_path: String,
+    dolphin_user_dir: String,
+    registry: Option<ObjectRegistry>,
+    document: Option<StageDocument>,
+    scene_archives: Vec<SceneArchiveInfo>,
+    model_preview: Option<ModelPreview>,
+    gpu_viewport: Option<gpu_viewport::GpuViewportScene>,
+    gpu_target_format: Option<eframe::wgpu::TextureFormat>,
+    model_framebuffer: Option<egui::TextureHandle>,
+    model_framebuffer_key: Option<ModelFramebufferKey>,
+    issues: Vec<ValidationIssue>,
+    log: Vec<String>,
+    renderer: ViewportRenderer,
+    selected_object_id: Option<String>,
+    palette_factory: Option<String>,
+    object_filter: String,
+    scene_filter: String,
+    last_scanned_base_root: String,
+    tool: EditorTool,
+    view_mode: ViewMode,
+    left_tab: LeftTab,
+    right_tab: RightTab,
+    snap_enabled: bool,
+    snap_translation: f32,
+    snap_rotation: f32,
+    snap_scale: f32,
+    show_environment_meshes: bool,
+    show_goop_meshes: bool,
+    show_effect_meshes: bool,
+    startup_camera_focus: Option<[f32; 3]>,
+    startup_focus_object: Option<String>,
+    startup_camera_distance: Option<f32>,
+    startup_camera_yaw: Option<f32>,
+    startup_camera_pitch: Option<f32>,
+    viewport_pan: egui::Vec2,
+    viewport_zoom: f32,
+    camera_speed: f32,
+    next_object_serial: u32,
+    saved_objects: Vec<SceneObject>,
+    undo_stack: Vec<Vec<SceneObject>>,
+    redo_stack: Vec<Vec<SceneObject>>,
+    undo_transaction: Option<Vec<SceneObject>>,
+    pending_stage_open: Option<String>,
+    close_confirmation_requested: bool,
+    close_authorized: bool,
+    background_receiver: Option<Receiver<BackgroundResult>>,
+    background_label: Option<String>,
+    animation_started_at: Instant,
+    last_skeletal_animation_tick: u64,
+}
+
+impl Default for SmsEditorApp {
+    fn default() -> Self {
+        let args = editor_startup_args();
+        let base_root = args.base_root.unwrap_or_else(default_base_root);
+        Self {
+            repo_root: args.repo_root.unwrap_or_else(default_repo_root),
+            base_root,
+            project_root: "sms-editor-project".to_string(),
+            stage_id: args.stage_id.unwrap_or_else(|| "dolpic0".to_string()),
+            dolphin_path: String::new(),
+            game_path: String::new(),
+            dolphin_user_dir: String::new(),
+            registry: None,
+            document: None,
+            scene_archives: Vec::new(),
+            model_preview: None,
+            gpu_viewport: None,
+            gpu_target_format: None,
+            model_framebuffer: None,
+            model_framebuffer_key: None,
+            issues: Vec::new(),
+            log: vec!["Ready.".to_string()],
+            renderer: ViewportRenderer::new(RendererConfig::default()),
+            selected_object_id: None,
+            palette_factory: None,
+            object_filter: String::new(),
+            scene_filter: String::new(),
+            last_scanned_base_root: String::new(),
+            tool: EditorTool::Select,
+            view_mode: ViewMode::Lit,
+            left_tab: LeftTab::Content,
+            right_tab: RightTab::Inspector,
+            snap_enabled: true,
+            snap_translation: 50.0,
+            snap_rotation: 15.0,
+            snap_scale: 0.1,
+            show_environment_meshes: true,
+            show_goop_meshes: true,
+            show_effect_meshes: false,
+            startup_camera_focus: args.camera_focus,
+            startup_focus_object: args.focus_object,
+            startup_camera_distance: args.camera_distance,
+            startup_camera_yaw: args.camera_yaw,
+            startup_camera_pitch: args.camera_pitch,
+            viewport_pan: egui::Vec2::ZERO,
+            viewport_zoom: 1.0,
+            camera_speed: 1.0,
+            next_object_serial: 1,
+            saved_objects: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            undo_transaction: None,
+            pending_stage_open: None,
+            close_confirmation_requested: false,
+            close_authorized: false,
+            background_receiver: None,
+            background_label: None,
+            animation_started_at: Instant::now(),
+            last_skeletal_animation_tick: u64::MAX,
+        }
+    }
+}
+
+impl SmsEditorApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        Self {
+            gpu_target_format: cc
+                .wgpu_render_state
+                .as_ref()
+                .map(|render_state| render_state.target_format),
+            ..Self::default()
+        }
+    }
+}
+
+impl eframe::App for SmsEditorApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_background_task(ctx);
+        if ctx.input(|input| input.viewport().close_requested())
+            && self.is_dirty()
+            && !self.close_authorized
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_confirmation_requested = true;
+        }
+
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Z)) {
+            self.undo();
+        }
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Y)) {
+            self.redo();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
+            self.delete_selected();
+        }
+        if ctx.input(|i| i.pointer.secondary_down()) {
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::W)) {
+            self.tool = EditorTool::Move;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::E)) {
+            self.tool = EditorTool::Rotate;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::R)) {
+            self.tool = EditorTool::Scale;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Q)) {
+            self.tool = EditorTool::Select;
+        }
+    }
+
+    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.refresh_scene_browser_if_needed();
+
+        egui::Panel::top("toolbar")
+            .default_size(48.0)
+            .show(root_ui, |ui| self.toolbar(ui));
+
+        egui::Panel::left("left_dock")
+            .resizable(true)
+            .default_size(350.0)
+            .show(root_ui, |ui| self.left_dock(ui));
+
+        egui::Panel::right("right_dock")
+            .resizable(true)
+            .default_size(390.0)
+            .show(root_ui, |ui| self.right_dock(ui));
+
+        egui::Panel::bottom("console")
+            .resizable(true)
+            .default_size(150.0)
+            .show(root_ui, |ui| self.console(ui));
+
+        egui::CentralPanel::default().show(root_ui, |ui| self.viewport(ui));
+        self.unsaved_changes_dialog(root_ui.ctx());
+    }
+}
+
+impl SmsEditorApp {
+    // Panel implementations live in ui_panels.rs.
+
+    // Viewport interaction and painting live in viewport_ui.rs.
+
+    fn generate_schema(&mut self) {
+        if self.background_receiver.is_some() {
+            self.log
+                .push("Another background operation is already running.".to_string());
+            return;
+        }
+        let repo_root = self.repo_root.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = SchemaGenerator::new(repo_root)
+                .generate()
+                .map_err(|err| err.to_string());
+            let _ = sender.send(BackgroundResult::Schema(result));
+        });
+        self.background_receiver = Some(receiver);
+        self.background_label = Some("Generating schema".to_string());
+        self.log.push("Generating object schema...".to_string());
+    }
+
+    fn refresh_scene_browser_if_needed(&mut self) {
+        let base_root = self.base_root.trim();
+        if base_root.is_empty() || self.last_scanned_base_root == base_root {
+            return;
+        }
+
+        if PathBuf::from(base_root).exists() {
+            let should_open = self.document.is_none();
+            if should_open && !self.stage_id.trim().is_empty() {
+                self.open_stage();
+            } else {
+                self.scan_scenes();
+            }
+        }
+    }
+
+    fn scan_scenes(&mut self) {
+        if self.background_receiver.is_some() {
+            self.log
+                .push("Another background operation is already running.".to_string());
+            return;
+        }
+        let base_root = self.base_root.trim().to_string();
+        if base_root.is_empty() {
+            self.log
+                .push("Base root is required for scene scan.".to_string());
+            return;
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        let task_base_root = base_root.clone();
+        thread::spawn(move || {
+            let result = discover_scene_archives(PathBuf::from(&task_base_root))
+                .map_err(|err| err.to_string());
+            let _ = sender.send(BackgroundResult::Scan {
+                base_root: task_base_root,
+                result,
+            });
+        });
+        self.background_receiver = Some(receiver);
+        self.background_label = Some("Scanning scenes".to_string());
+        self.log
+            .push(format!("Scanning scenes under {base_root}..."));
+    }
+
+    fn open_scene_archive(&mut self, archive: SceneArchiveInfo) {
+        self.log
+            .push(format!("Selected scene '{}'.", archive.stage_id));
+        self.request_open_stage(archive.stage_id);
+    }
+
+    fn request_open_stage(&mut self, stage_id: String) {
+        if self.is_dirty() {
+            self.pending_stage_open = Some(stage_id);
+        } else {
+            self.stage_id = stage_id;
+            self.open_stage();
+        }
+    }
+
+    fn open_stage(&mut self) {
+        if self.background_receiver.is_some() {
+            self.log
+                .push("Another background operation is already running.".to_string());
+            return;
+        }
+        let base_root = self.base_root.trim().to_string();
+        let repo_root = self.repo_root.trim().to_string();
+        let stage_id = self.stage_id.trim().to_string();
+        if base_root.is_empty() || stage_id.is_empty() {
+            self.log
+                .push("Base root and stage are required.".to_string());
+            return;
+        }
+
+        let visibility = self.preview_visibility();
+        let existing_registry = self.registry.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = (|| -> Result<Box<LoadedStage>, String> {
+                let archives = discover_scene_archives(PathBuf::from(&base_root))
+                    .map_err(|err| err.to_string())?;
+                let (registry, schema_warning) = if let Some(registry) = existing_registry {
+                    (Some(registry), None)
+                } else {
+                    match SchemaGenerator::new(&repo_root).generate() {
+                        Ok(registry) => (Some(registry), None),
+                        Err(err) => (None, Some(err.to_string())),
+                    }
+                };
+                let mut document = StageDocument::open(PathBuf::from(&base_root), stage_id)
+                    .map_err(|err| err.to_string())?;
+                if let Some(registry) = registry.clone() {
+                    document = document.with_registry(registry);
+                }
+                let scene = RenderScene::from_document(&document);
+                let preview = SmsEditorApp::build_model_preview(&document, visibility);
+                Ok(Box::new(LoadedStage {
+                    base_root,
+                    archives,
+                    registry,
+                    schema_warning,
+                    document,
+                    scene,
+                    preview,
+                }))
+            })();
+            let _ = sender.send(BackgroundResult::Open(result));
+        });
+        self.background_receiver = Some(receiver);
+        self.background_label = Some(format!("Opening {}", self.stage_id));
+        self.log
+            .push(format!("Opening stage '{}'...", self.stage_id));
+    }
+
+    fn poll_background_task(&mut self, ctx: &egui::Context) {
+        let result = self.background_receiver.as_ref().map(Receiver::try_recv);
+        match result {
+            Some(Ok(result)) => {
+                self.background_receiver = None;
+                self.background_label = None;
+                match result {
+                    BackgroundResult::Schema(result) => match result {
+                        Ok(registry) => {
+                            self.log.push(format!(
+                                "Generated {} object entries.",
+                                registry.objects.len()
+                            ));
+                            if let Some(document) = &mut self.document {
+                                document.registry = Some(registry.clone());
+                                self.issues = document.validate();
+                            }
+                            self.registry = Some(registry);
+                        }
+                        Err(err) => self.log.push(format!("Schema generation failed: {err}")),
+                    },
+                    BackgroundResult::Scan { base_root, result } => match result {
+                        Ok(archives) => {
+                            if self.base_root.trim() != base_root {
+                                self.log.push(format!(
+                                    "Discarded scene scan for superseded base root {base_root}."
+                                ));
+                                return;
+                            }
+                            let count = archives.len();
+                            self.scene_archives = archives;
+                            self.last_scanned_base_root = base_root;
+                            if self.stage_id.trim().is_empty() {
+                                if let Some(first) = self.scene_archives.first() {
+                                    self.stage_id = first.stage_id.clone();
+                                }
+                            }
+                            self.log
+                                .push(format!("Discovered {count} scene archive(s)."));
+                        }
+                        Err(err) => self.log.push(format!("Scene scan failed: {err}")),
+                    },
+                    BackgroundResult::Open(result) => match result {
+                        Ok(loaded) => self.apply_loaded_stage(*loaded),
+                        Err(err) => self.log.push(format!("Open stage failed: {err}")),
+                    },
+                }
+            }
+            Some(Err(TryRecvError::Empty)) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.background_receiver = None;
+                self.background_label = None;
+                self.log
+                    .push("Background operation ended unexpectedly.".to_string());
+            }
+            None => {}
+        }
+    }
+
+    fn apply_loaded_stage(&mut self, loaded: LoadedStage) {
+        let LoadedStage {
+            base_root,
+            archives,
+            registry,
+            schema_warning,
+            document,
+            scene,
+            preview,
+        } = loaded;
+        if self.base_root.trim() != base_root {
+            self.log.push(format!(
+                "Discarded stage load for superseded base root {base_root}."
+            ));
+            return;
+        }
+        if let Some(warning) = schema_warning {
+            self.log.push(format!(
+                "Schema generation failed; stage opened without it: {warning}"
+            ));
+        }
+        self.registry = registry;
+        self.scene_archives = archives;
+        self.last_scanned_base_root = self.base_root.trim().to_string();
+        self.log.push(format!(
+            "Opened stage '{}' with {} asset(s), {} model(s), {} collision file(s).",
+            document.stage_id,
+            document.assets.len(),
+            scene.model_paths.len(),
+            scene.collision_paths.len()
+        ));
+        if let Some(preview) = &preview {
+            self.log.push(format!(
+                "Viewport preview loaded {} model(s), {} sampled point(s), {} triangle(s), {} texture(s), {} BTK material animation(s), {} BCK skeletal animation(s), {} source vertex/vertices.",
+                preview.loaded_models,
+                preview.points.len(),
+                preview.triangles.len(),
+                preview.textures.len(),
+                preview.texture_srt_animations.len(),
+                preview.animated_models.len(),
+                preview.source_vertices
+            ));
+        } else if !scene.model_paths.is_empty() {
+            self.log
+                .push("Viewport preview could not decode BMD vertex data.".to_string());
+        }
+        self.issues = document.validate();
+        self.saved_objects = document.objects.clone();
+        self.stage_id = document.stage_id.clone();
+        self.document = Some(document);
+        self.model_preview = preview;
+        self.animation_started_at = Instant::now();
+        self.last_skeletal_animation_tick = u64::MAX;
+        self.rebuild_gpu_viewport_scene();
+        self.clear_viewport_preview_cache();
+        self.selected_object_id = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.undo_transaction = None;
+        self.reset_camera();
+        self.apply_startup_camera_focus();
+    }
+
+    fn build_model_preview(
+        document: &StageDocument,
+        visibility: PreviewVisibility,
+    ) -> Option<ModelPreview> {
+        const POINT_BUDGET: usize = 16_000;
+        const POINTS_PER_MODEL: usize = 1_200;
+        const POINTS_PER_OBJECT_INSTANCE: usize = 500;
+
+        let models: Vec<_> = document
+            .assets
+            .iter()
+            .filter(|asset| asset.kind == StageAssetKind::Model)
+            .collect();
+        let preferred: Vec<_> = models
+            .iter()
+            .copied()
+            .filter(|asset| {
+                let path = asset.path.to_string_lossy().replace('\\', "/");
+                is_default_preview_model_path(
+                    &path,
+                    visibility.environment,
+                    visibility.goop,
+                    visibility.effects,
+                )
+            })
+            .collect();
+        let models = if preferred.is_empty() {
+            models
+        } else {
+            preferred
+        };
+        let world_model_paths: BTreeSet<_> = models
+            .iter()
+            .map(|asset| normalized_preview_asset_path(&asset.path.to_string_lossy()))
+            .collect();
+
+        let mut points = Vec::new();
+        let mut triangles = Vec::new();
+        let mut textures = Vec::new();
+        let mut materials = Vec::new();
+        let mut texture_srt_animations = Vec::new();
+        let mut texture_pattern_animations = Vec::new();
+        let mut material_animation_bindings = Vec::new();
+        let mut next_packet_index = 0usize;
+        let mut bounds_min = [f32::INFINITY; 3];
+        let mut bounds_max = [f32::NEG_INFINITY; 3];
+        let mut camera_bounds_min = [f32::INFINITY; 3];
+        let mut camera_bounds_max = [f32::NEG_INFINITY; 3];
+        let mut sky_radius = 0.0f32;
+        let mut camera_bound_points = Vec::new();
+        let mut loaded_models = 0;
+        let mut failed_models = 0;
+        let mut source_vertices = 0;
+        let mut source_triangles = 0;
+        let mut source_textures = 0;
+        let mut object_model_indices = BTreeMap::new();
+
+        for asset in models {
+            let asset_path = asset.path.to_string_lossy().replace('\\', "/");
+            let include_in_camera_bounds = is_camera_bounds_model_path(&asset_path);
+            let model_render_layer = preview_render_layer_for_model_path(&asset_path);
+            let is_sky = model_render_layer == PreviewRenderLayer::Sky;
+            let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+                failed_models += 1;
+                continue;
+            };
+            let Ok(file) = J3dFile::parse(&bytes) else {
+                failed_models += 1;
+                continue;
+            };
+
+            let loader_flags = model_loader_flags_for_path(&asset_path);
+            match file.geometry_preview_with_loader_flags(loader_flags) {
+                Ok(mut preview) => {
+                    apply_model_material_table(document, &asset_path, loader_flags, &mut preview);
+                    loaded_models += 1;
+                    let model_index = loaded_models;
+                    let texture_base = push_preview_textures(&mut textures, &preview);
+                    let material_base =
+                        push_preview_materials(&mut materials, &preview, texture_base);
+                    material_animation_bindings.resize_with(materials.len(), Vec::new);
+                    attach_model_texture_srt_animation(
+                        document,
+                        &asset_path,
+                        material_base,
+                        &preview.materials,
+                        &mut texture_srt_animations,
+                        &mut material_animation_bindings,
+                    );
+                    let packet_base = next_packet_index;
+                    next_packet_index += preview
+                        .triangles
+                        .iter()
+                        .map(|triangle| triangle.packet_index)
+                        .max()
+                        .map(|index| index + 1)
+                        .unwrap_or(1);
+                    source_vertices += preview.positions.len();
+                    source_triangles += preview.triangles.len();
+                    source_textures += preview.textures.len();
+                    if is_sky {
+                        sky_radius = sky_radius.max(max_distance_from_origin(&preview.positions));
+                    } else {
+                        merge_bounds(
+                            &mut bounds_min,
+                            &mut bounds_max,
+                            preview.bounds_min,
+                            preview.bounds_max,
+                        );
+                    }
+                    if include_in_camera_bounds {
+                        merge_bounds(
+                            &mut camera_bounds_min,
+                            &mut camera_bounds_max,
+                            preview.bounds_min,
+                            preview.bounds_max,
+                        );
+                        camera_bound_points.extend(preview.positions.iter().copied());
+                    }
+
+                    if !is_sky {
+                        let point_stride = (preview.positions.len() / POINTS_PER_MODEL).max(1);
+                        for position in preview.positions.iter().step_by(point_stride) {
+                            points.push(PreviewPoint {
+                                position: *position,
+                                model_index,
+                            });
+                        }
+                    }
+
+                    for triangle in &preview.triangles {
+                        if triangle_vertices_are_finite(triangle.vertices) {
+                            triangles.push(PreviewTriangle {
+                                vertices: triangle.vertices,
+                                normals: triangle.normals,
+                                color_channels: triangle.color_channels,
+                                tex_coord_sets: triangle.tex_coord_sets,
+                                material_index: triangle.material_index.and_then(|index| {
+                                    let global_index = material_base + index;
+                                    (global_index < materials.len()).then_some(global_index)
+                                }),
+                                packet_index: packet_base + triangle.packet_index,
+                                model_index,
+                                render_layer: model_render_layer,
+                                color: triangle.color,
+                                vertex_colors: triangle.vertex_colors,
+                                combine_mode: triangle.combine_mode,
+                                tex_coords: triangle.tex_coords,
+                                texture_index: triangle.texture_index.and_then(|index| {
+                                    let global_index = texture_base + index;
+                                    (global_index < textures.len()).then_some(global_index)
+                                }),
+                                mask_tex_coords: triangle.mask_tex_coords,
+                                mask_texture_index: triangle.mask_texture_index.and_then(|index| {
+                                    let global_index = texture_base + index;
+                                    (global_index < textures.len()).then_some(global_index)
+                                }),
+                                cull_mode: triangle.cull_mode,
+                                alpha_compare: triangle.alpha_compare,
+                                blend_mode: triangle.blend_mode,
+                                z_mode: triangle.z_mode,
+                            });
+                        }
+                    }
+                }
+                Err(_) => {
+                    let Ok(preview) = file.vertex_preview() else {
+                        failed_models += 1;
+                        continue;
+                    };
+
+                    loaded_models += 1;
+                    let model_index = loaded_models;
+                    source_vertices += preview.positions.len();
+                    if is_sky {
+                        sky_radius = sky_radius.max(max_distance_from_origin(&preview.positions));
+                    } else {
+                        merge_bounds(
+                            &mut bounds_min,
+                            &mut bounds_max,
+                            preview.bounds_min,
+                            preview.bounds_max,
+                        );
+                    }
+                    if include_in_camera_bounds {
+                        merge_bounds(
+                            &mut camera_bounds_min,
+                            &mut camera_bounds_max,
+                            preview.bounds_min,
+                            preview.bounds_max,
+                        );
+                        camera_bound_points.extend(preview.positions.iter().copied());
+                    }
+
+                    if !is_sky {
+                        let stride = (preview.positions.len() / POINTS_PER_MODEL).max(1);
+                        for position in preview.positions.iter().step_by(stride) {
+                            points.push(PreviewPoint {
+                                position: *position,
+                                model_index,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut object_model_cache = BTreeMap::<(String, u32), CachedObjectModelPreview>::new();
+        let mut accessory_model_cache = BTreeMap::<String, CachedAccessoryModelPreview>::new();
+        for object in &document.objects {
+            if !should_render_object_model(object) {
+                continue;
+            }
+            let Some(model_path) = object
+                .asset_hints
+                .iter()
+                .find(|hint| hint.role == AssetRole::PreviewModel)
+                .map(|hint| hint.path.clone())
+            else {
+                continue;
+            };
+            if !should_instance_object_preview_model(&model_path, &world_model_paths) {
+                continue;
+            }
+            let loader_flags = npc_model_loader_flags(object)
+                .unwrap_or_else(|| model_loader_flags_for_path(&model_path));
+            let model_cache_key = (model_path.clone(), loader_flags);
+
+            if !object_model_cache.contains_key(&model_cache_key) {
+                let Ok(bytes) = read_stage_asset_bytes(&model_path) else {
+                    failed_models += 1;
+                    continue;
+                };
+                let Ok(file) = J3dFile::parse(&bytes) else {
+                    failed_models += 1;
+                    continue;
+                };
+                let joint_animation = starting_joint_animation(document, object, &model_path);
+                let preview_result = joint_animation.as_ref().map_or_else(
+                    || file.geometry_preview_with_loader_flags(loader_flags),
+                    |animation| {
+                        file.geometry_preview_with_joint_animation(loader_flags, animation, 0.0)
+                    },
+                );
+                let Ok(mut preview) = preview_result else {
+                    failed_models += 1;
+                    continue;
+                };
+                apply_model_material_table(document, &model_path, loader_flags, &mut preview);
+                apply_npc_runtime_textures(document, object, &mut preview);
+                apply_npc_eye_decal_culling(object, &mut preview);
+                let texture_base = push_preview_textures(&mut textures, &preview);
+                let material_base = push_preview_materials(&mut materials, &preview, texture_base);
+                let joint_names = file.joint_names().unwrap_or_default();
+                object_model_cache.insert(
+                    model_cache_key.clone(),
+                    CachedObjectModelPreview {
+                        file,
+                        joint_animation,
+                        loader_flags,
+                        preview,
+                        texture_base,
+                        material_base,
+                        joint_names,
+                        instances: Vec::new(),
+                    },
+                );
+            }
+
+            let Some(cached) = object_model_cache.get(&model_cache_key) else {
+                continue;
+            };
+            let object_material_base =
+                push_object_preview_materials(&mut materials, cached, object);
+            material_animation_bindings.resize_with(materials.len(), Vec::new);
+            attach_model_texture_srt_animation(
+                document,
+                &model_path,
+                object_material_base,
+                &cached.preview.materials,
+                &mut texture_srt_animations,
+                &mut material_animation_bindings,
+            );
+            attach_npc_texture_pattern_animation(
+                document,
+                object,
+                &model_path,
+                object_material_base,
+                cached.texture_base,
+                &cached.preview.materials,
+                &mut materials,
+                &mut texture_pattern_animations,
+            );
+            loaded_models += 1;
+            let model_index = loaded_models;
+            object_model_indices.insert(object.id.clone(), model_index);
+            source_vertices += cached.preview.positions.len();
+            source_triangles += cached.preview.triangles.len();
+            source_textures += cached.preview.textures.len();
+            let packet_base = next_packet_index;
+            next_packet_index += cached
+                .preview
+                .triangles
+                .iter()
+                .map(|triangle| triangle.packet_index)
+                .max()
+                .map(|index| index + 1)
+                .unwrap_or(1);
+
+            let transformed_bounds_min =
+                transform_preview_point(cached.preview.bounds_min, object.transform);
+            let transformed_bounds_max =
+                transform_preview_point(cached.preview.bounds_max, object.transform);
+            merge_bounds(
+                &mut bounds_min,
+                &mut bounds_max,
+                [
+                    transformed_bounds_min[0].min(transformed_bounds_max[0]),
+                    transformed_bounds_min[1].min(transformed_bounds_max[1]),
+                    transformed_bounds_min[2].min(transformed_bounds_max[2]),
+                ],
+                [
+                    transformed_bounds_min[0].max(transformed_bounds_max[0]),
+                    transformed_bounds_min[1].max(transformed_bounds_max[1]),
+                    transformed_bounds_min[2].max(transformed_bounds_max[2]),
+                ],
+            );
+
+            let point_stride = (cached.preview.positions.len() / POINTS_PER_OBJECT_INSTANCE).max(1);
+            let point_start = points.len();
+            for position in cached.preview.positions.iter().step_by(point_stride) {
+                points.push(PreviewPoint {
+                    position: transform_preview_point(*position, object.transform),
+                    model_index,
+                });
+            }
+
+            let triangle_start = triangles.len();
+            for triangle in &cached.preview.triangles {
+                let vertices = transform_preview_vertices(triangle.vertices, object.transform);
+                if triangle_vertices_are_finite(vertices) {
+                    triangles.push(PreviewTriangle {
+                        vertices,
+                        normals: triangle
+                            .normals
+                            .map(|normals| transform_preview_normals(normals, object.transform)),
+                        color_channels: triangle.color_channels,
+                        tex_coord_sets: triangle.tex_coord_sets,
+                        material_index: triangle.material_index.and_then(|index| {
+                            let global_index = object_material_base + index;
+                            (global_index < materials.len()).then_some(global_index)
+                        }),
+                        packet_index: packet_base + triangle.packet_index,
+                        model_index,
+                        render_layer: PreviewRenderLayer::Main,
+                        color: triangle.color,
+                        vertex_colors: triangle.vertex_colors,
+                        combine_mode: triangle.combine_mode,
+                        tex_coords: triangle.tex_coords,
+                        texture_index: triangle.texture_index.and_then(|index| {
+                            let global_index = cached.texture_base + index;
+                            (global_index < textures.len()).then_some(global_index)
+                        }),
+                        mask_tex_coords: triangle.mask_tex_coords,
+                        mask_texture_index: triangle.mask_texture_index.and_then(|index| {
+                            let global_index = cached.texture_base + index;
+                            (global_index < textures.len()).then_some(global_index)
+                        }),
+                        cull_mode: triangle.cull_mode,
+                        alpha_compare: triangle.alpha_compare,
+                        blend_mode: triangle.blend_mode,
+                        z_mode: triangle.z_mode,
+                    });
+                }
+            }
+            let body_triangle_end = triangles.len();
+            let mut accessories = Vec::new();
+            let joint_matrices = cached
+                .joint_animation
+                .as_ref()
+                .map_or_else(
+                    || cached.file.joint_matrices(cached.loader_flags),
+                    |animation| {
+                        cached.file.joint_matrices_with_joint_animation(
+                            cached.loader_flags,
+                            animation,
+                            0.0,
+                        )
+                    },
+                )
+                .unwrap_or_default();
+            for spec in monte_accessory_specs(object) {
+                let Some(joint_index) = cached
+                    .joint_names
+                    .iter()
+                    .position(|name| name.eq_ignore_ascii_case(spec.joint_name))
+                else {
+                    continue;
+                };
+                let Some(joint_matrix) = joint_matrices.get(joint_index).copied() else {
+                    continue;
+                };
+                if !accessory_model_cache.contains_key(spec.asset_suffix) {
+                    let Some(asset) = find_stage_asset_by_suffix(
+                        document,
+                        StageAssetKind::Model,
+                        spec.asset_suffix,
+                    ) else {
+                        continue;
+                    };
+                    let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+                        continue;
+                    };
+                    let Ok(file) = J3dFile::parse(&bytes) else {
+                        continue;
+                    };
+                    let Ok(preview) = file.geometry_preview_with_loader_flags(0x1021_0000) else {
+                        continue;
+                    };
+                    let local_triangles = Arc::new(preview.triangles.clone());
+                    let texture_base = push_preview_textures(&mut textures, &preview);
+                    let material_base =
+                        push_preview_materials(&mut materials, &preview, texture_base);
+                    accessory_model_cache.insert(
+                        spec.asset_suffix.to_string(),
+                        CachedAccessoryModelPreview {
+                            preview,
+                            local_triangles,
+                            texture_base,
+                            material_base,
+                        },
+                    );
+                }
+                let Some(accessory) = accessory_model_cache.get(spec.asset_suffix) else {
+                    continue;
+                };
+                source_vertices += accessory.preview.positions.len();
+                source_triangles += accessory.preview.triangles.len();
+                source_textures += accessory.preview.textures.len();
+                let accessory_packet_base = next_packet_index;
+                next_packet_index += accessory
+                    .preview
+                    .triangles
+                    .iter()
+                    .map(|triangle| triangle.packet_index)
+                    .max()
+                    .map(|index| index + 1)
+                    .unwrap_or(1);
+                let accessory_triangle_start = triangles.len();
+                let accessory_material_base = push_accessory_instance_materials(
+                    &mut materials,
+                    accessory,
+                    object,
+                    spec.asset_suffix,
+                );
+                push_attached_preview_triangles(
+                    &mut triangles,
+                    accessory,
+                    joint_matrix,
+                    object.transform,
+                    model_index,
+                    accessory_packet_base,
+                    accessory_material_base,
+                    materials.len(),
+                    textures.len(),
+                );
+                accessories.push(AnimatedAccessoryInstance {
+                    joint_index,
+                    local_triangles: accessory.local_triangles.clone(),
+                    triangle_range: accessory_triangle_start..triangles.len(),
+                });
+            }
+            if object.factory_name.to_ascii_lowercase().starts_with("npc") {
+                push_npc_circle_shadow(
+                    &mut triangles,
+                    object.transform,
+                    model_index,
+                    next_packet_index,
+                );
+                next_packet_index += 1;
+            }
+            let instance = AnimatedModelInstance {
+                transform: object.transform,
+                model_index,
+                point_range: point_start..points.len(),
+                point_stride,
+                triangle_range: triangle_start..body_triangle_end,
+                accessories,
+            };
+            if let Some(cached) = object_model_cache.get_mut(&model_cache_key) {
+                cached.instances.push(instance);
+            }
+        }
+
+        let animated_models: Vec<AnimatedModelPreview> = object_model_cache
+            .into_values()
+            .filter_map(|cached| {
+                cached
+                    .joint_animation
+                    .map(|animation| AnimatedModelPreview {
+                        file: cached.file,
+                        animation,
+                        loader_flags: cached.loader_flags,
+                        instances: cached.instances,
+                    })
+            })
+            .collect();
+
+        if points.len() > POINT_BUDGET && animated_models.is_empty() {
+            let stride = (points.len() / POINT_BUDGET).max(1);
+            points = points
+                .into_iter()
+                .step_by(stride)
+                .take(POINT_BUDGET)
+                .collect();
+        }
+
+        material_animation_bindings.resize_with(materials.len(), Vec::new);
+
+        if loaded_models == 0 || (points.is_empty() && triangles.is_empty()) {
+            return None;
+        }
+
+        if !bounds_are_finite(bounds_min, bounds_max) {
+            if let Some((robust_min, robust_max)) = robust_preview_bounds(&triangles, &points) {
+                bounds_min = robust_min;
+                bounds_max = robust_max;
+            }
+        }
+
+        if !bounds_are_finite(camera_bounds_min, camera_bounds_max) {
+            camera_bounds_min = bounds_min;
+            camera_bounds_max = bounds_max;
+        }
+        if let Some((robust_min, robust_max)) = robust_position_bounds(&camera_bound_points) {
+            camera_bounds_min = robust_min;
+            camera_bounds_max = robust_max;
+        }
+
+        Some(ModelPreview {
+            points,
+            triangles,
+            textures,
+            materials,
+            texture_srt_animations,
+            texture_pattern_animations,
+            material_animation_bindings,
+            bounds_min,
+            bounds_max,
+            camera_bounds_min,
+            camera_bounds_max,
+            sky_radius,
+            loaded_models,
+            failed_models,
+            source_vertices,
+            source_triangles,
+            source_textures,
+            object_model_indices,
+            animated_models,
+        })
+    }
+
+    fn preview_visibility(&self) -> PreviewVisibility {
+        PreviewVisibility {
+            environment: self.show_environment_meshes,
+            goop: self.show_goop_meshes,
+            effects: self.show_effect_meshes,
+        }
+    }
+
+    // Document lifecycle and edit commands live in document_commands.rs.
+
+    // Camera projection and selection queries live in camera.rs.
+}
+
+fn install_style(ctx: &egui::Context) {
+    install_japanese_font(ctx);
+
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = egui::Color32::from_rgb(28, 30, 31);
+    visuals.window_fill = egui::Color32::from_rgb(32, 34, 35);
+    visuals.faint_bg_color = egui::Color32::from_rgb(38, 41, 42);
+    visuals.extreme_bg_color = egui::Color32::from_rgb(18, 20, 21);
+    visuals.selection.bg_fill = egui::Color32::from_rgb(54, 124, 116);
+    visuals.hyperlink_color = egui::Color32::from_rgb(104, 186, 214);
+    ctx.set_visuals(visuals);
+
+    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
+    style.spacing.item_spacing = egui::vec2(8.0, 7.0);
+    style.spacing.button_padding = egui::vec2(10.0, 5.0);
+    style.spacing.indent = 16.0;
+    ctx.set_style_of(egui::Theme::Dark, style);
+}
+
+fn install_japanese_font(ctx: &egui::Context) {
+    let Some(font_bytes) = japanese_font_candidates()
+        .into_iter()
+        .find_map(|path| std::fs::read(path).ok())
+    else {
+        return;
+    };
+
+    const FONT_NAME: &str = "sms-japanese-fallback";
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        FONT_NAME.to_owned(),
+        std::sync::Arc::new(egui::FontData::from_owned(font_bytes)),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        if let Some(family_fonts) = fonts.families.get_mut(&family) {
+            family_fonts.push(FONT_NAME.to_owned());
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
+fn japanese_font_candidates() -> Vec<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        let fonts = std::env::var_os("WINDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+            .join("Fonts");
+        ["YuGothR.ttc", "meiryo.ttc", "msgothic.ttc"]
+            .into_iter()
+            .map(|name| fonts.join(name))
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        [
+            "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+            "/System/Library/Fonts/ヒラギノ丸ゴ ProN W4.ttc",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansJP-Regular.otf",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+    }
+}
+
+fn command_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(egui::RichText::new(label).strong())
+            .fill(egui::Color32::from_rgb(48, 56, 54)),
+    )
+}
+
+mod preview_assets;
+use preview_assets::*;
+
+mod npc_accessories;
+use npc_accessories::*;
+
+#[allow(clippy::too_many_arguments)]
+fn push_attached_preview_triangles(
+    triangles: &mut Vec<PreviewTriangle>,
+    accessory: &CachedAccessoryModelPreview,
+    joint_matrix: J3dMatrix34,
+    transform: Transform,
+    model_index: usize,
+    packet_base: usize,
+    material_base: usize,
+    material_count: usize,
+    texture_count: usize,
+) {
+    for triangle in &accessory.preview.triangles {
+        let vertices = transform_preview_vertices(
+            triangle
+                .vertices
+                .map(|vertex| transform_j3d_matrix_point(joint_matrix, vertex)),
+            transform,
+        );
+        if !triangle_vertices_are_finite(vertices) {
+            continue;
+        }
+        triangles.push(PreviewTriangle {
+            vertices,
+            normals: triangle.normals.map(|normals| {
+                transform_preview_normals(
+                    normals.map(|normal| transform_j3d_matrix_normal(joint_matrix, normal)),
+                    transform,
+                )
+            }),
+            color_channels: triangle.color_channels,
+            tex_coord_sets: triangle.tex_coord_sets,
+            material_index: triangle.material_index.and_then(|index| {
+                let global_index = material_base + index;
+                (global_index < material_count).then_some(global_index)
+            }),
+            packet_index: packet_base + triangle.packet_index,
+            model_index,
+            render_layer: PreviewRenderLayer::Main,
+            color: triangle.color,
+            vertex_colors: triangle.vertex_colors,
+            combine_mode: triangle.combine_mode,
+            tex_coords: triangle.tex_coords,
+            texture_index: triangle.texture_index.and_then(|index| {
+                let global_index = accessory.texture_base + index;
+                (global_index < texture_count).then_some(global_index)
+            }),
+            mask_tex_coords: triangle.mask_tex_coords,
+            mask_texture_index: triangle.mask_texture_index.and_then(|index| {
+                let global_index = accessory.texture_base + index;
+                (global_index < texture_count).then_some(global_index)
+            }),
+            cull_mode: triangle.cull_mode,
+            alpha_compare: triangle.alpha_compare,
+            blend_mode: triangle.blend_mode,
+            z_mode: triangle.z_mode,
+        });
+    }
+}
+
+fn push_npc_circle_shadow(
+    triangles: &mut Vec<PreviewTriangle>,
+    transform: Transform,
+    model_index: usize,
+    packet_index: usize,
+) {
+    const SEGMENTS: usize = 20;
+    let radius = 60.0 * transform.scale[0].abs().max(transform.scale[2].abs());
+    let center = [
+        transform.translation[0],
+        transform.translation[1] + 1.5,
+        transform.translation[2],
+    ];
+    let color = [0, 0, 0, 82];
+    for segment in 0..SEGMENTS {
+        let angle0 = segment as f32 * std::f32::consts::TAU / SEGMENTS as f32;
+        let angle1 = (segment + 1) as f32 * std::f32::consts::TAU / SEGMENTS as f32;
+        triangles.push(PreviewTriangle {
+            vertices: [
+                center,
+                [
+                    center[0] + angle0.cos() * radius,
+                    center[1],
+                    center[2] + angle0.sin() * radius,
+                ],
+                [
+                    center[0] + angle1.cos() * radius,
+                    center[1],
+                    center[2] + angle1.sin() * radius,
+                ],
+            ],
+            normals: Some([[0.0, 1.0, 0.0]; 3]),
+            color_channels: [Some([color; 3]), None],
+            tex_coord_sets: [None; 8],
+            material_index: None,
+            packet_index,
+            model_index,
+            render_layer: PreviewRenderLayer::Shadow,
+            color: Some(color),
+            vertex_colors: Some([color; 3]),
+            combine_mode: J3dPreviewCombineMode::VertexOnly,
+            tex_coords: None,
+            texture_index: None,
+            mask_tex_coords: None,
+            mask_texture_index: None,
+            cull_mode: Some(0),
+            alpha_compare: None,
+            blend_mode: Some(J3dBlendMode {
+                mode: 1,
+                src_factor: 4,
+                dst_factor: 5,
+                logic_op: 3,
+            }),
+            z_mode: Some(J3dZMode {
+                compare_enable: 1,
+                func: 3,
+                update_enable: 0,
+            }),
+        });
+    }
+}
+
+fn material_table_candidates_for_model(model_path: &str) -> Vec<String> {
+    let normalized = model_path.replace('\\', "/").to_ascii_lowercase();
+    let Some(base) = normalized.rsplit_once('.').map(|(base, _)| base) else {
+        return Vec::new();
+    };
+    let mut candidates = vec![format!("{base}.bmt")];
+    let (directory, stem) = base
+        .rsplit_once('/')
+        .map(|(directory, stem)| (format!("{directory}/"), stem))
+        .unwrap_or_else(|| (String::new(), base));
+    for suffix in ["_crash", "crash", "_alpha", "alpha"] {
+        if let Some(base_stem) = stem.strip_suffix(suffix) {
+            if !base_stem.is_empty() {
+                candidates.push(format!("{directory}{base_stem}.bmt"));
+            }
+            break;
+        }
+    }
+    candidates
+}
+
+mod npc_materials;
+use npc_materials::*;
+
+mod preview_geometry;
+use preview_geometry::*;
+
+fn normalized_preview_asset_path(path: &str) -> String {
+    path.replace('\\', "/").to_ascii_lowercase()
+}
+
+fn is_supported_object_preview_model_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    (path.ends_with(".bmd") || path.ends_with(".bdl"))
+        && (path.contains("!/") || path.contains("/scene/"))
+}
+
+fn should_instance_object_preview_model(path: &str, world_model_paths: &BTreeSet<String>) -> bool {
+    is_supported_object_preview_model_path(path)
+        && !world_model_paths.contains(&normalized_preview_asset_path(path))
+}
+
+fn should_render_object_model(object: &SceneObject) -> bool {
+    let factory = object.factory_name.to_ascii_lowercase();
+    let class_name = object
+        .class_name
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let placement_name = object
+        .raw_params
+        .get("name")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    !(factory == "palmleaf" || class_name == "palmleaf" || placement_name.starts_with("palmleaf"))
+}
+
+fn object_matches_focus(object: &SceneObject, needle: &str) -> bool {
+    object.id.to_ascii_lowercase().contains(needle)
+        || object.factory_name.to_ascii_lowercase().contains(needle)
+        || object
+            .class_name
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .contains(needle)
+        || object.raw_params.values().any(|value| {
+            value
+                .trim_matches('"')
+                .to_ascii_lowercase()
+                .contains(needle)
+        })
+}
+
+fn object_display_name(object: &SceneObject) -> String {
+    object
+        .raw_params
+        .get("name")
+        .cloned()
+        .unwrap_or_else(|| object.factory_name.clone())
+}
+
+fn labeled_text(ui: &mut egui::Ui, label: &str, value: &mut String) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.text_edit_singleline(value);
+    });
+}
+
+mod startup;
+use startup::*;
+fn format_bytes_short(bytes: u64) -> String {
+    if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{:.0} KB", bytes as f64 / 1_000.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn merge_bounds(
+    bounds_min: &mut [f32; 3],
+    bounds_max: &mut [f32; 3],
+    next_min: [f32; 3],
+    next_max: [f32; 3],
+) {
+    for axis in 0..3 {
+        bounds_min[axis] = bounds_min[axis].min(next_min[axis]);
+        bounds_max[axis] = bounds_max[axis].max(next_max[axis]);
+    }
+}
+
+fn max_distance_from_origin(points: &[[f32; 3]]) -> f32 {
+    points
+        .iter()
+        .filter(|point| point.iter().all(|value| value.is_finite()))
+        .map(|point| vec3_dot(*point, *point).sqrt())
+        .fold(0.0, f32::max)
+}
+
+fn preview_triangle_world_vertices(
+    vertices: [[f32; 3]; 3],
+    render_layer: PreviewRenderLayer,
+    camera_position: [f32; 3],
+) -> [[f32; 3]; 3] {
+    if render_layer == PreviewRenderLayer::Sky {
+        vertices.map(|vertex| vec3_add(vertex, camera_position))
+    } else {
+        vertices
+    }
+}
+
+fn clip_world_segment_to_near_plane(
+    camera: CameraFrame,
+    start: [f32; 3],
+    end: [f32; 3],
+    near: f32,
+) -> Option<[[f32; 3]; 2]> {
+    let mut clipped = [start, end];
+    let mut depths = [
+        vec3_dot(vec3_sub(start, camera.position), camera.forward),
+        vec3_dot(vec3_sub(end, camera.position), camera.forward),
+    ];
+    if !near.is_finite() || depths.iter().any(|depth| !depth.is_finite()) {
+        return None;
+    }
+    if depths[0] < near && depths[1] < near {
+        return None;
+    }
+
+    for endpoint in 0..2 {
+        if depths[endpoint] >= near {
+            continue;
+        }
+        let other = 1 - endpoint;
+        let depth_span = depths[other] - depths[endpoint];
+        if depth_span.abs() <= f32::EPSILON {
+            return None;
+        }
+        let t = ((near - depths[endpoint]) / depth_span).clamp(0.0, 1.0);
+        clipped[endpoint] = vec3_add(
+            clipped[endpoint],
+            vec3_scale(vec3_sub(clipped[other], clipped[endpoint]), t),
+        );
+        depths[endpoint] = near;
+    }
+
+    Some(clipped)
+}
+
+fn recompute_model_preview_bounds(preview: &mut ModelPreview) {
+    if let Some((bounds_min, bounds_max)) =
+        robust_preview_bounds(&preview.triangles, &preview.points)
+    {
+        preview.bounds_min = bounds_min;
+        preview.bounds_max = bounds_max;
+        if !bounds_are_finite(preview.camera_bounds_min, preview.camera_bounds_max) {
+            preview.camera_bounds_min = bounds_min;
+            preview.camera_bounds_max = bounds_max;
+        }
+    }
+}
+
+fn bounds_are_finite(bounds_min: [f32; 3], bounds_max: [f32; 3]) -> bool {
+    bounds_min
+        .iter()
+        .chain(bounds_max.iter())
+        .all(|value| value.is_finite())
+        && (0..3).all(|axis| bounds_max[axis] > bounds_min[axis])
+}
+
+fn triangle_vertices_are_finite(vertices: [[f32; 3]; 3]) -> bool {
+    vertices
+        .iter()
+        .flatten()
+        .all(|value| value.is_finite() && value.abs() < 2_000_000.0)
+}
+
+fn robust_preview_bounds(
+    triangles: &[PreviewTriangle],
+    points: &[PreviewPoint],
+) -> Option<([f32; 3], [f32; 3])> {
+    let mut axes = [Vec::new(), Vec::new(), Vec::new()];
+    let has_world_triangles = triangles
+        .iter()
+        .any(|triangle| triangle.render_layer != PreviewRenderLayer::Sky);
+    if !has_world_triangles {
+        for point in points {
+            for (axis, value) in axes.iter_mut().zip(point.position) {
+                if value.is_finite() {
+                    axis.push(value);
+                }
+            }
+        }
+    } else {
+        for triangle in triangles
+            .iter()
+            .filter(|triangle| triangle.render_layer != PreviewRenderLayer::Sky)
+        {
+            for vertex in triangle.vertices {
+                for (axis, value) in axes.iter_mut().zip(vertex) {
+                    if value.is_finite() {
+                        axis.push(value);
+                    }
+                }
+            }
+        }
+    }
+
+    robust_axes_bounds(axes)
+}
+
+fn robust_position_bounds(points: &[[f32; 3]]) -> Option<([f32; 3], [f32; 3])> {
+    let mut axes = [Vec::new(), Vec::new(), Vec::new()];
+    for point in points {
+        for axis in 0..3 {
+            if point[axis].is_finite() {
+                axes[axis].push(point[axis]);
+            }
+        }
+    }
+
+    robust_axes_bounds(axes)
+}
+
+fn robust_axes_bounds(mut axes: [Vec<f32>; 3]) -> Option<([f32; 3], [f32; 3])> {
+    if axes[0].len() < 16 || axes.iter().any(Vec::is_empty) {
+        return None;
+    }
+
+    let mut min = [0.0; 3];
+    let mut max = [0.0; 3];
+    for axis in 0..3 {
+        axes[axis].sort_by(|a, b| a.total_cmp(b));
+        let trim = (axes[axis].len() / 20).min(axes[axis].len().saturating_sub(1));
+        let high = axes[axis].len().saturating_sub(1 + trim);
+        min[axis] = axes[axis][trim];
+        max[axis] = axes[axis][high];
+        if !min[axis].is_finite() || !max[axis].is_finite() || max[axis] <= min[axis] {
+            return None;
+        }
+    }
+
+    for axis in 0..3 {
+        let pad = ((max[axis] - min[axis]) * 0.06).max(120.0);
+        min[axis] -= pad;
+        max[axis] += pad;
+    }
+
+    Some((min, max))
+}
+
+fn perspective_focal_length(rect: egui::Rect, viewport_zoom: f32) -> f32 {
+    const VERTICAL_FOV_DEGREES: f32 = 50.0;
+    let fov = VERTICAL_FOV_DEGREES.to_radians();
+    rect.height().min(rect.width()) * 0.5 / (fov * 0.5).tan() * viewport_zoom.max(0.05)
+}
+
+fn vec3_add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn vec3_sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn vec3_scale(value: [f32; 3], scale: f32) -> [f32; 3] {
+    [value[0] * scale, value[1] * scale, value[2] * scale]
+}
+
+fn vec3_dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn vec3_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn vec3_normalize(value: [f32; 3]) -> [f32; 3] {
+    let length = vec3_dot(value, value).sqrt();
+    if length <= 0.0001 || !length.is_finite() {
+        [0.0, 0.0, 0.0]
+    } else {
+        vec3_scale(value, 1.0 / length)
+    }
+}
+
+mod software_renderer;
+use software_renderer::*;
+
+fn is_default_preview_model_path(
+    path: &str,
+    show_environment_meshes: bool,
+    show_goop_meshes: bool,
+    show_effect_meshes: bool,
+) -> bool {
+    let path = path.to_ascii_lowercase();
+    if !(path.contains("!/map/") || path.contains("/scene/map/")) {
+        return false;
+    }
+    if path_is_sky_model_path(&path) {
+        return true;
+    }
+    if path_is_indirect_water_model_path(&path) {
+        return false;
+    }
+    if path_is_water_model_path(&path) {
+        return show_environment_meshes;
+    }
+    if path_is_goop_model_path(&path) {
+        return show_goop_meshes;
+    }
+    if path.contains("/map/mirror/") {
+        return show_effect_meshes;
+    }
+    if path.contains("/map/map/reflect") || path.contains("/map/reflect") {
+        return show_effect_meshes;
+    }
+    true
+}
+
+fn is_camera_bounds_model_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    if !(path.contains("!/map/") || path.contains("/scene/map/")) {
+        return false;
+    }
+    !(path_is_sky_model_path(&path)
+        || path_is_water_model_path(&path)
+        || path_is_indirect_water_model_path(&path)
+        || path_is_goop_model_path(&path)
+        || path.contains("/map/mirror/")
+        || path.contains("/map/map/reflect")
+        || path.contains("/map/reflect"))
+}
+
+fn preview_render_layer_for_model_path(path: &str) -> PreviewRenderLayer {
+    let path = path.to_ascii_lowercase();
+    if path_is_sky_model_path(&path) {
+        PreviewRenderLayer::Sky
+    } else if path_is_goop_model_path(&path) {
+        PreviewRenderLayer::Goop
+    } else if path_is_water_model_path(&path) {
+        PreviewRenderLayer::Water
+    } else {
+        PreviewRenderLayer::Main
+    }
+}
+
+fn path_is_sky_model_path(path: &str) -> bool {
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    path.ends_with("/map/map/sky.bmd") || path.ends_with("/map/map/sky.bdl")
+}
+
+fn path_is_water_model_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    if path_is_indirect_water_model_path(&path) {
+        return false;
+    }
+    let model_name = path
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(".bmd")
+        .trim_end_matches(".bdl");
+    matches!(model_name, "sea" | "biancoriver" | "monteriver")
+        || path.contains("/map/map/water")
+        || path.contains("/map/water/")
+        || path.contains("/map/mirror/puddle")
+        || path.contains("/map/map/puddle")
+        || path.contains("/map/map/yogan")
+        || path.contains("/map/map/lava")
+}
+
+fn path_is_indirect_water_model_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    path.contains("seaindirect") || path.contains("puddle_ind")
+}
+
+fn path_is_goop_model_path(path: &str) -> bool {
+    path.contains("/map/pollution/") || path.contains("pollution")
+}
+
+fn model_loader_flags_for_path(path: &str) -> u32 {
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    let model_name = path
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(".bmd")
+        .trim_end_matches(".bdl");
+
+    match model_name {
+        // TSky::load uses SMS_MakeMActorWithAnmData(..., 0x10220000).
+        "sky" if path_is_sky_model_path(&path) => SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS,
+        // TMapStaticObj::actor_data_table in MapStaticObject.cpp.
+        "seaindirect" => 0x1121_0000,
+        "sea" => 0x1022_0000,
+        "riccosea" => 0x1021_0000,
+        name if name.starts_with("riccoseapollution") => 0x1121_0000,
+        _ if path_is_goop_model_path(&path) => SMS_POLLUTION_MODEL_LOAD_FLAGS,
+        _ if path.contains("/mapobj/") || path.contains("/scene/mapobj/") => {
+            // TMapObjBase::makeMActors uses this unless the object's indirect flag is set.
+            SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS
+        }
+        _ => SMS_MAP_MODEL_LOAD_FLAGS,
+    }
+}
+
+fn npc_model_loader_flags(object: &SceneObject) -> Option<u32> {
+    let factory = object.factory_name.to_ascii_lowercase();
+    Some(match factory.as_str() {
+        "npcmontem" | "npcmontema" | "npcmontemc" | "npcmontew" | "npcmontewa" => 0x1030_0000,
+        "npcmontemb" | "npcmontemd" | "npcmontemf" | "npcmontemg" | "npcmontemh" | "npcmontewb"
+        | "npcmontewc" => 0x1021_0000,
+        "npcmonteme" => 0x1001_0000,
+        _ => return None,
+    })
+}
+
+fn preview_texture_tints(
+    material_color: Option<[u8; 4]>,
+    vertex_colors: Option<[[u8; 4]; 3]>,
+    combine_mode: J3dPreviewCombineMode,
+    render_layer: PreviewRenderLayer,
+) -> [egui::Color32; 3] {
+    let useful_material = material_color.filter(|color| preview_color_is_useful(*color));
+    let base = match combine_mode {
+        J3dPreviewCombineMode::TextureModulateMaterial => useful_material
+            .map(material_color_rgb_tint)
+            .unwrap_or([255, 255, 255, 255]),
+        _ => [255, 255, 255, 255],
+    };
+    std::array::from_fn(|index| {
+        let vertex = if combine_mode == J3dPreviewCombineMode::TextureModulateVertex {
+            vertex_colors
+                .map(|colors| colors[index])
+                .filter(|color| preview_color_is_useful(*color))
+                .unwrap_or([255, 255, 255, 255])
+        } else {
+            [255, 255, 255, 255]
+        };
+        let has_alpha_source = useful_material.is_some()
+            || (combine_mode == J3dPreviewCombineMode::TextureModulateVertex
+                && vertex_colors.is_some());
+        apply_layer_preview_tint(
+            modulated_color(base, vertex, if has_alpha_source { 0 } else { 255 }),
+            render_layer,
+        )
+    })
+}
+
+fn material_color_rgb_tint(mut color: [u8; 4]) -> [u8; 4] {
+    color[3] = 255;
+    color
+}
+
+fn preview_triangle_color(
+    model_index: usize,
+    normal: [f32; 3],
+    average_y: f32,
+    material_color: Option<[u8; 4]>,
+    vertex_colors: Option<[[u8; 4]; 3]>,
+    combine_mode: J3dPreviewCombineMode,
+) -> egui::Color32 {
+    let palette = [
+        [89.0, 123.0, 102.0],
+        [129.0, 118.0, 86.0],
+        [86.0, 111.0, 130.0],
+        [120.0, 101.0, 82.0],
+        [91.0, 128.0, 122.0],
+        [139.0, 132.0, 102.0],
+    ];
+    let mut base =
+        if let Some(color) = material_color.filter(|color| preview_color_is_useful(*color)) {
+            [color[0] as f32, color[1] as f32, color[2] as f32]
+        } else {
+            palette[model_index % palette.len()]
+        };
+    if material_color.is_none() {
+        if average_y < -3500.0 {
+            base = [42.0, 94.0, 104.0];
+        } else if average_y > 2800.0 {
+            base = [117.0, 129.0, 122.0];
+        }
+    }
+
+    let up = normal[1].abs();
+    let side = (normal[0].abs() + normal[2].abs()) * 0.5;
+    let shade = (0.58 + up * 0.26 + side * 0.08).clamp(0.42, 1.0);
+    if combine_mode == J3dPreviewCombineMode::VertexOnly {
+        if let Some(colors) = vertex_colors {
+            let average = average_vertex_color(colors);
+            if preview_color_is_useful(average) {
+                return egui::Color32::from_rgba_unmultiplied(
+                    average[0], average[1], average[2], average[3],
+                );
+            }
+        }
+    }
+    if let Some(color) = material_color.filter(|color| preview_color_is_useful(*color)) {
+        return egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
+    }
+    egui::Color32::from_rgba_unmultiplied(
+        (base[0] * shade).clamp(0.0, 255.0) as u8,
+        (base[1] * shade).clamp(0.0, 255.0) as u8,
+        (base[2] * shade).clamp(0.0, 255.0) as u8,
+        198,
+    )
+}
+
+fn preview_solid_triangle_colors(
+    triangle: &PreviewTriangle,
+    normal: [f32; 3],
+    average_y: f32,
+) -> [egui::Color32; 3] {
+    if triangle.combine_mode == J3dPreviewCombineMode::VertexOnly {
+        if let Some(colors) = triangle.vertex_colors {
+            if colors.iter().any(|color| preview_color_is_useful(*color)) {
+                return colors.map(|color| {
+                    apply_layer_preview_tint(
+                        egui::Color32::from_rgba_unmultiplied(
+                            color[0], color[1], color[2], color[3],
+                        ),
+                        triangle.render_layer,
+                    )
+                });
+            }
+        }
+    }
+
+    let color = preview_triangle_color(
+        triangle.model_index,
+        normal,
+        average_y,
+        triangle.color,
+        triangle.vertex_colors,
+        triangle.combine_mode,
+    );
+    [apply_layer_preview_tint(color, triangle.render_layer); 3]
+}
+
+fn apply_layer_preview_tint(
+    color: egui::Color32,
+    render_layer: PreviewRenderLayer,
+) -> egui::Color32 {
+    let rgba = color32_to_rgba(color);
+    match render_layer {
+        PreviewRenderLayer::Water => {
+            let water = [0.35, 0.78, 0.96];
+            rgba_to_color32([
+                rgba[0] * 0.72 + water[0] * 0.28,
+                rgba[1] * 0.72 + water[1] * 0.28,
+                rgba[2] * 0.72 + water[2] * 0.28,
+                rgba[3].min(0.82),
+            ])
+        }
+        PreviewRenderLayer::Goop => {
+            let goop = [0.28, 0.12, 0.36];
+            rgba_to_color32([
+                rgba[0] * 0.82 + goop[0] * 0.18,
+                rgba[1] * 0.82 + goop[1] * 0.18,
+                rgba[2] * 0.82 + goop[2] * 0.18,
+                rgba[3].min(0.78),
+            ])
+        }
+        PreviewRenderLayer::Sky | PreviewRenderLayer::Main | PreviewRenderLayer::Shadow => color,
+    }
+}
+
+fn preview_color_is_useful(color: [u8; 4]) -> bool {
+    color[3] > 12
+        && !(color[0] > 242 && color[1] > 242 && color[2] > 242)
+        && !(color[0] < 8 && color[1] < 8 && color[2] < 8)
+}
+
+fn average_vertex_color(colors: [[u8; 4]; 3]) -> [u8; 4] {
+    [
+        ((colors[0][0] as u16 + colors[1][0] as u16 + colors[2][0] as u16) / 3) as u8,
+        ((colors[0][1] as u16 + colors[1][1] as u16 + colors[2][1] as u16) / 3) as u8,
+        ((colors[0][2] as u16 + colors[1][2] as u16 + colors[2][2] as u16) / 3) as u8,
+        ((colors[0][3] as u16 + colors[1][3] as u16 + colors[2][3] as u16) / 3) as u8,
+    ]
+}
+
+fn modulated_color(material: [u8; 4], vertex: [u8; 4], fallback_alpha: u8) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(
+        (material[0] as u16 * vertex[0] as u16 / 255) as u8,
+        (material[1] as u16 * vertex[1] as u16 / 255) as u8,
+        (material[2] as u16 * vertex[2] as u16 / 255) as u8,
+        ((material[3] as u16 * vertex[3] as u16 / 255) as u8).max(fallback_alpha),
+    )
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct VectorDragResponse {
+    changed: bool,
+    started: bool,
+    stopped: bool,
+}
+
+impl VectorDragResponse {
+    fn merge(&mut self, other: Self) {
+        self.changed |= other.changed;
+        self.started |= other.started;
+        self.stopped |= other.stopped;
+    }
+}
+
+fn vector_drag(ui: &mut egui::Ui, values: &mut [f32; 3], speed: f32) -> VectorDragResponse {
+    let mut edit = VectorDragResponse::default();
+    ui.horizontal(|ui| {
+        for (label, value) in ["X", "Y", "Z"].iter().zip(values.iter_mut()) {
+            ui.label(*label);
+            let response = ui.add(egui::DragValue::new(value).speed(speed));
+            edit.changed |= response.changed();
+            edit.started |= response.drag_started();
+            edit.stopped |= response.drag_stopped();
+        }
+    });
+    edit
+}
+
+fn snap_transform(transform: &mut Transform, translation: f32, rotation: f32, scale: f32) {
+    if translation > f32::EPSILON {
+        for value in &mut transform.translation {
+            *value = snap_value(*value, translation);
+        }
+    }
+    if rotation > f32::EPSILON {
+        for value in &mut transform.rotation_degrees {
+            *value = snap_value(*value, rotation);
+        }
+    }
+    if scale > f32::EPSILON {
+        for value in &mut transform.scale {
+            *value = snap_value(*value, scale).max(0.001);
+        }
+    }
+}
+
+fn snap_value(value: f32, step: f32) -> f32 {
+    (value / step).round() * step
+}
+
+fn sanitize_id(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests;

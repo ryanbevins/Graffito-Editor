@@ -1,12 +1,11 @@
 # SMS Level Editor
 
-A native Super Mario Sunshine level editor and mod kit built with Rust,
+A native Super Mario Sunshine level editor and project toolkit built with Rust,
 `egui`, and `wgpu`.
 
 The editor opens stages from a legally obtained, extracted copy of Super Mario
 Sunshine, derives object knowledge from the matching decompilation project, and
-writes changed files to a separate filesystem mod folder. Base game files are
-never modified.
+saves edits to a separate editor project. Base game files are never modified.
 
 ## Current Features
 
@@ -17,12 +16,16 @@ never modified.
 - Unreal-style fly, orbit, pan, focus, and variable-speed viewport controls
 - Collision overlays, object bounds, validation, undo, and redo
 - Decomp-derived object and parameter schema generation
-- Filesystem mod export and isolated Dolphin launch integration
+- Safe, replace-on-save editor projects and isolated Dolphin launch support
 - CLI diagnostics for scenes, assets, objects, formats, and renderer previews
 
 Terrain and model topology authoring are intentionally left to external tools
 for now. The editor focuses on stage assembly, object editing, faithful preview,
 validation, and lossless asset handling.
+
+Editor project overlays are not yet retail `scene.bin` or RARC patches. The UI
+and CLI call this operation **Save Project** / `export-project` so project data
+cannot be mistaken for a directly playable Dolphin mod.
 
 ## Requirements
 
@@ -73,6 +76,7 @@ cargo run -p sms-cli -- scenes --base-root C:\path\to\extracted-game
 cargo run -p sms-cli -- open-stage --base-root C:\path\to\extracted-game --stage dolpic0
 cargo run -p sms-cli -- validate --base-root C:\path\to\extracted-game --stage dolpic0
 cargo run -p sms-cli -- preview-stats --base-root C:\path\to\extracted-game --stage dolpic0 --materials
+cargo run -p sms-cli -- export-project --base-root C:\path\to\extracted-game --stage dolpic0 --project-root C:\path\to\editor-project
 ```
 
 Run `cargo run -p sms-cli -- --help` for the complete command list.
@@ -85,8 +89,13 @@ Run `cargo run -p sms-cli -- --help` for the complete command list.
 | `sms-cli` | Automation, extraction, validation, export, launch, and diagnostics |
 | `sms-formats` | Big-endian SMS/GameCube binary formats and lossless asset access |
 | `sms-schema` | Object and parameter metadata generated from decomp source |
-| `sms-scene` | Editable documents, validation, manifests, and mod-folder export |
+| `sms-scene` | Editable documents, validation, and safe editor-project persistence |
 | `sms-render` | Renderer-facing scene and viewport support types |
+
+The desktop binary entry point is intentionally minimal. Application state,
+panels, viewport interaction, project commands, preview preparation, GPU
+resources, shaders, software fallback rendering, and tests live in separate
+modules under `apps/sms-editor/src`.
 
 ## Development
 

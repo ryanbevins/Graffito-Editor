@@ -94,14 +94,15 @@ enum Commands {
         #[arg(long, default_value = "..")]
         repo_root: PathBuf,
     },
-    /// Export current changed files and smsmod.toml to a filesystem mod folder.
-    ExportMod {
+    /// Save the editable stage overlay and sms-project.toml to an editor project folder.
+    #[command(alias = "export-mod")]
+    ExportProject {
         #[arg(long)]
         base_root: PathBuf,
         #[arg(long)]
         stage: String,
         #[arg(long)]
-        mod_root: PathBuf,
+        project_root: PathBuf,
     },
     /// Launch Dolphin with an isolated user directory when provided.
     LaunchDolphin {
@@ -338,13 +339,14 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Commands::ExportMod {
+        Commands::ExportProject {
             base_root,
             stage,
-            mod_root,
+            project_root,
         } => {
-            let document = StageDocument::open(base_root, stage)?;
-            let manifest = document.save_to_mod_folder(mod_root)?;
+            let mut document = StageDocument::open(base_root, stage)?;
+            document.queue_editor_overlay_change()?;
+            let manifest = document.save_project_folder(project_root)?;
             println!("{}", serde_json::to_string_pretty(&manifest)?);
             Ok(())
         }
@@ -703,4 +705,35 @@ fn launch_dolphin(
         bail!("Dolphin exited with status {status}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_project_command_uses_explicit_project_root() {
+        let args = Args::try_parse_from([
+            "sms-cli",
+            "export-project",
+            "--base-root",
+            "base",
+            "--stage",
+            "dolpic0",
+            "--project-root",
+            "project",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            args.command,
+            Commands::ExportProject {
+                base_root,
+                stage,
+                project_root,
+            } if base_root == std::path::Path::new("base")
+                && stage == "dolpic0"
+                && project_root == std::path::Path::new("project")
+        ));
+    }
 }

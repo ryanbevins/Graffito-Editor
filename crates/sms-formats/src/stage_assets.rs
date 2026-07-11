@@ -47,7 +47,7 @@ pub fn scan_stage_assets(base_root: impl AsRef<Path>, stage_id: &str) -> Result<
     let needle = stage_id.to_ascii_lowercase();
     let mut assets = Vec::new();
     let scene_archives = discover_scene_archives(base_root)?;
-    let selected_archives = select_scene_archives(&scene_archives, &needle);
+    let selected_archives = select_scene_archives(&scene_archives, &needle)?;
 
     for entry in WalkDir::new(base_root)
         .follow_links(false)
@@ -192,23 +192,39 @@ pub fn extract_archive_file(
 fn select_scene_archives<'a>(
     scene_archives: &'a [SceneArchiveInfo],
     needle: &str,
-) -> Vec<&'a SceneArchiveInfo> {
+) -> Result<Vec<&'a SceneArchiveInfo>> {
     if needle.is_empty() {
-        return scene_archives.first().into_iter().collect();
+        return Err(FormatError::Unsupported {
+            format: "stage selection",
+            message: "stage id cannot be empty".to_string(),
+        });
     }
 
     let exact: Vec<&SceneArchiveInfo> = scene_archives
         .iter()
         .filter(|archive| archive.stage_id.eq_ignore_ascii_case(needle))
         .collect();
-    if !exact.is_empty() {
-        return exact;
+    if exact.len() == 1 {
+        return Ok(exact);
+    }
+    if exact.len() > 1 {
+        return Err(FormatError::Unsupported {
+            format: "stage selection",
+            message: format!("stage id '{needle}' matches multiple archives"),
+        });
     }
 
-    scene_archives
+    let fuzzy: Vec<_> = scene_archives
         .iter()
         .filter(|archive| archive.stage_id.to_ascii_lowercase().contains(needle))
-        .collect()
+        .collect();
+    match fuzzy.len() {
+        0 | 1 => Ok(fuzzy),
+        count => Err(FormatError::Unsupported {
+            format: "stage selection",
+            message: format!("stage id '{needle}' is ambiguous across {count} archives"),
+        }),
+    }
 }
 
 fn classify_asset(path: &Path) -> StageAssetKind {
@@ -296,16 +312,15 @@ mod tests {
     #[test]
     fn exact_scene_archive_match_wins() {
         let archives = vec![scene("dolpic0"), scene("dolpic1"), scene("dolpic_ex0")];
-        let selected = select_scene_archives(&archives, "dolpic0");
+        let selected = select_scene_archives(&archives, "dolpic0").unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].stage_id, "dolpic0");
     }
 
     #[test]
-    fn fuzzy_scene_archive_match_supports_old_stage_ids() {
+    fn fuzzy_scene_archive_match_rejects_ambiguous_stage_ids() {
         let archives = vec![scene("dolpic0"), scene("dolpic1"), scene("bianco0")];
-        let selected = select_scene_archives(&archives, "dolpic");
-        assert_eq!(selected.len(), 2);
+        assert!(select_scene_archives(&archives, "dolpic").is_err());
     }
 
     fn scene(stage_id: &str) -> SceneArchiveInfo {

@@ -2,11 +2,13 @@
 
 # Local editor projects, extracted retail data, and generated mod output.
 smsmod.toml
+sms-project.toml
 *.gcm
 *.iso
 *.szs
 *.arc
 /mods/
+/sms-editor-project/
 /cache/
 
 # Local agent guidance is intentionally not published.
@@ -18,4 +20,3 @@ smsmod.toml
 .DS_Store
 Thumbs.db
 *.pdb
-

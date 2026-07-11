@@ -1,0 +1,737 @@
+struct Camera {
+    camera_position: vec4<f32>,
+    right: vec4<f32>,
+    up: vec4<f32>,
+    forward: vec4<f32>,
+    projection: vec4<f32>,
+    clip: vec4<f32>,
+};
+
+struct Material {
+    counts: vec4<u32>,
+    alpha_compare: vec4<u32>,
+    alpha_refs: vec4<f32>,
+    material_colors: array<vec4<f32>, 2>,
+    ambient_colors: array<vec4<f32>, 2>,
+    tev_colors: array<vec4<f32>, 4>,
+    tev_k_colors: array<vec4<f32>, 4>,
+    color_channels: array<vec4<u32>, 4>,
+    tex_gens: array<vec4<u32>, 8>,
+    tex_matrix_rows: array<vec4<f32>, 24>,
+    tex_effect_rows: array<vec4<f32>, 32>,
+    tev_orders: array<vec4<u32>, 16>,
+    tev_color_args: array<vec4<u32>, 16>,
+    tev_color_ops: array<vec4<u32>, 16>,
+    tev_alpha_args: array<vec4<u32>, 16>,
+    tev_alpha_ops: array<vec4<u32>, 16>,
+    tev_selectors: array<vec4<u32>, 16>,
+    swap_tables: array<vec4<u32>, 4>,
+    indirect_orders: array<vec4<u32>, 3>,
+    indirect_matrix_rows: array<vec4<f32>, 6>,
+    indirect_matrix_meta: array<vec4<u32>, 3>,
+    indirect_stages0: array<vec4<u32>, 16>,
+    indirect_stages1: array<vec4<u32>, 16>,
+    indirect_stages2: array<vec4<u32>, 16>,
+    fog_meta: vec4<u32>,
+    fog_params: vec4<f32>,
+    fog_color: vec4<f32>,
+};
+
+struct VertexIn {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) color0: vec4<f32>,
+    @location(3) color1: vec4<f32>,
+    @location(4) uv0: vec2<f32>,
+    @location(5) uv1: vec2<f32>,
+    @location(6) uv2: vec2<f32>,
+    @location(7) uv3: vec2<f32>,
+    @location(8) uv4: vec2<f32>,
+    @location(9) uv5: vec2<f32>,
+    @location(10) uv6: vec2<f32>,
+    @location(11) uv7: vec2<f32>,
+    @location(12) camera_relative: u32,
+};
+
+struct VertexOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color0: vec4<f32>,
+    @location(1) color1: vec4<f32>,
+    @location(2) uv0: vec2<f32>,
+    @location(3) uv1: vec2<f32>,
+    @location(4) uv2: vec2<f32>,
+    @location(5) uv3: vec2<f32>,
+    @location(6) uv4: vec2<f32>,
+    @location(7) uv5: vec2<f32>,
+    @location(8) uv6: vec2<f32>,
+    @location(9) uv7: vec2<f32>,
+    @location(10) view_depth: f32,
+};
+
+@group(0) @binding(0)
+var<uniform> camera: Camera;
+
+@group(1) @binding(0)
+var<uniform> material: Material;
+
+@group(1) @binding(1) var texture0: texture_2d<f32>;
+@group(1) @binding(2) var sampler0: sampler;
+@group(1) @binding(3) var texture1: texture_2d<f32>;
+@group(1) @binding(4) var sampler1: sampler;
+@group(1) @binding(5) var texture2: texture_2d<f32>;
+@group(1) @binding(6) var sampler2: sampler;
+@group(1) @binding(7) var texture3: texture_2d<f32>;
+@group(1) @binding(8) var sampler3: sampler;
+@group(1) @binding(9) var texture4: texture_2d<f32>;
+@group(1) @binding(10) var sampler4: sampler;
+@group(1) @binding(11) var texture5: texture_2d<f32>;
+@group(1) @binding(12) var sampler5: sampler;
+@group(1) @binding(13) var texture6: texture_2d<f32>;
+@group(1) @binding(14) var sampler6: sampler;
+@group(1) @binding(15) var texture7: texture_2d<f32>;
+@group(1) @binding(16) var sampler7: sampler;
+
+fn raw_uv(input: VertexIn, index: u32) -> vec2<f32> {
+    switch index {
+        case 0u: { return input.uv0; }
+        case 1u: { return input.uv1; }
+        case 2u: { return input.uv2; }
+        case 3u: { return input.uv3; }
+        case 4u: { return input.uv4; }
+        case 5u: { return input.uv5; }
+        case 6u: { return input.uv6; }
+        case 7u: { return input.uv7; }
+        default: { return vec2<f32>(0.0); }
+    }
+}
+
+fn generated_uv(coords: array<vec3<f32>, 8>, index: u32) -> vec2<f32> {
+    switch index {
+        case 0u: { return coords[0].xy; }
+        case 1u: { return coords[1].xy; }
+        case 2u: { return coords[2].xy; }
+        case 3u: { return coords[3].xy; }
+        case 4u: { return coords[4].xy; }
+        case 5u: { return coords[5].xy; }
+        case 6u: { return coords[6].xy; }
+        case 7u: { return coords[7].xy; }
+        default: { return vec2<f32>(0.0); }
+    }
+}
+
+fn apply_effect_matrix(matrix_index: u32, value: vec4<f32>) -> vec4<f32> {
+    let row = matrix_index * 4u;
+    return vec4<f32>(
+        dot(material.tex_effect_rows[row], value),
+        dot(material.tex_effect_rows[row + 1u], value),
+        dot(material.tex_effect_rows[row + 2u], value),
+        dot(material.tex_effect_rows[row + 3u], value),
+    );
+}
+
+fn channel_source(source: u32, vertex_color: vec4<f32>, material_color: vec4<f32>) -> vec4<f32> {
+    if (source == 1u) {
+        return vertex_color;
+    }
+    return material_color;
+}
+
+fn compute_color_channel(
+    control_index: u32,
+    material_index: u32,
+    vertex_color: vec4<f32>,
+    normal: vec3<f32>,
+    position: vec3<f32>,
+) -> vec4<f32> {
+    let control = material.color_channels[control_index];
+    let mat = channel_source(
+        control.y,
+        vertex_color,
+        material.material_colors[material_index],
+    );
+    if (control.x == 0u) {
+        return mat;
+    }
+
+    let ambient_source = control.z;
+    let ambient = channel_source(
+        ambient_source,
+        vertex_color,
+        material.ambient_colors[material_index],
+    );
+    let packed = control.w;
+    let diffuse_function = packed & 0xffu;
+    let attenuation_function = (packed >> 8u) & 0xffu;
+    let light_mask = (packed >> 16u) & 0xffu;
+    let light_position = vec3<f32>(200000.0, 500000.0, 200000.0);
+    let light_direction = normalize(light_position - position);
+    let normalized_normal = normalize(normal);
+    if (attenuation_function == 0u) {
+        let camera_light_direction = normalize(light_position - camera.camera_position.xyz);
+        let view_direction = -camera.forward.xyz;
+        let half_direction = normalize(camera_light_direction + view_direction);
+        let half_cosine = max(dot(normalized_normal, half_direction), 0.0);
+        let cosine_squared = half_cosine * half_cosine;
+        let denominator = max(25.0 - 24.0 * cosine_squared, 0.000001);
+        let facing_light = dot(normalized_normal, light_direction) >= 0.0;
+        let specular = select(0.0, cosine_squared / denominator, facing_light);
+        let enabled_specular = select(0.0, specular, (light_mask & 0x04u) != 0u);
+        return clamp(
+            mat * (ambient + vec4<f32>(vec3<f32>(enabled_specular), enabled_specular)),
+            vec4<f32>(0.0),
+            vec4<f32>(1.0),
+        );
+    }
+
+    let n_dot_l = dot(normalized_normal, light_direction);
+    var diffuse = 1.0;
+    if (diffuse_function == 1u) {
+        diffuse = n_dot_l;
+    } else if (diffuse_function == 2u) {
+        diffuse = max(n_dot_l, 0.0);
+    }
+    return clamp(mat * (ambient + vec4<f32>(vec3<f32>(diffuse), diffuse)), vec4<f32>(0.0), vec4<f32>(1.0));
+}
+
+@vertex
+fn vs_main(input: VertexIn) -> VertexOut {
+    // TSky::perform translates sky.bmd to the camera every frame. Keeping the
+    // model in camera-local space here reproduces that behavior without
+    // rebuilding its vertex buffer while the editor camera moves.
+    let rel = select(
+        input.position - camera.camera_position.xyz,
+        input.position,
+        input.camera_relative != 0u,
+    );
+    let depth = dot(rel, camera.forward.xyz);
+    let clip_x = dot(rel, camera.right.xyz) * camera.projection.x + camera.projection.z * depth;
+    let clip_y = dot(rel, camera.up.xyz) * camera.projection.y + camera.projection.w * depth;
+    let depth_range = max(camera.clip.y - camera.clip.x, 1.0);
+    let clip_z = (camera.clip.y / depth_range) * depth
+        - (camera.clip.y * camera.clip.x / depth_range);
+
+    let view_position = vec3<f32>(
+        dot(rel, camera.right.xyz),
+        dot(rel, camera.up.xyz),
+        depth,
+    );
+    let view_normal = normalize(vec3<f32>(
+        dot(input.normal, camera.right.xyz),
+        dot(input.normal, camera.up.xyz),
+        dot(input.normal, camera.forward.xyz),
+    ));
+
+    var coords: array<vec3<f32>, 8>;
+    for (var i = 0u; i < 8u; i = i + 1u) {
+        let config = material.tex_gens[i];
+        let source = config.y;
+        let mode = config.w & 0xffu;
+        let view_space_mode = mode == 1u || mode == 3u || mode == 6u
+            || mode == 7u || mode == 9u;
+        var source_value = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        if (source == 0u) {
+            source_value = select(
+                vec4<f32>(input.position, 1.0),
+                vec4<f32>(view_position, 1.0),
+                view_space_mode,
+            );
+        } else if (source == 1u || source == 2u || source == 3u) {
+            source_value = select(
+                vec4<f32>(input.normal, 0.0),
+                vec4<f32>(view_normal, 0.0),
+                view_space_mode,
+            );
+        } else if (source >= 4u && source <= 11u) {
+            source_value = vec4<f32>(raw_uv(input, source - 4u), 0.0, 1.0);
+        } else if (source >= 12u && source <= 18u) {
+            let prior = coords[source - 12u];
+            source_value = vec4<f32>(prior, 1.0);
+        } else if (source == 19u) {
+            source_value = vec4<f32>(input.color0.rg, 0.0, 1.0);
+        } else if (source == 20u) {
+            source_value = vec4<f32>(input.color1.rg, 0.0, 1.0);
+        }
+
+        let matrix_plus_one = config.z;
+        if (matrix_plus_one != 0u) {
+            let matrix_index = matrix_plus_one - 1u;
+            let uses_effect = mode == 2u || mode == 3u || mode == 4u || mode == 5u
+                || mode == 8u || mode == 9u || mode == 10u || mode == 11u;
+            if (uses_effect) {
+                source_value = apply_effect_matrix(matrix_index, source_value);
+            }
+            if (mode == 6u || mode == 10u) {
+                source_value = vec4<f32>(
+                    0.5 * source_value.x + 0.5 * source_value.w,
+                    -0.5 * source_value.y + 0.5 * source_value.w,
+                    source_value.z,
+                    1.0,
+                );
+            } else if (mode == 7u || mode == 8u || mode == 9u || mode == 11u) {
+                source_value = vec4<f32>(
+                    0.5 * source_value.x + 0.5 * source_value.z,
+                    -0.5 * source_value.y + 0.5 * source_value.z,
+                    source_value.z,
+                    1.0,
+                );
+            }
+            let row = matrix_index * 3u;
+            let generated = vec3<f32>(
+                dot(material.tex_matrix_rows[row], source_value),
+                dot(material.tex_matrix_rows[row + 1u], source_value),
+                dot(material.tex_matrix_rows[row + 2u], source_value),
+            );
+            if (config.x == 0u && abs(generated.z) > 0.000001) {
+                coords[i] = vec3<f32>(generated.xy / generated.z, generated.z);
+            } else {
+                coords[i] = generated;
+            }
+        } else {
+            coords[i] = source_value.xyz;
+        }
+    }
+
+    let rgb0 = compute_color_channel(0u, 0u, input.color0, input.normal, input.position);
+    let alpha0 = compute_color_channel(1u, 0u, input.color0, input.normal, input.position);
+    let rgb1 = compute_color_channel(2u, 1u, input.color1, input.normal, input.position);
+    let alpha1 = compute_color_channel(3u, 1u, input.color1, input.normal, input.position);
+
+    var out: VertexOut;
+    out.position = vec4<f32>(clip_x, clip_y, clip_z, depth);
+    out.color0 = vec4<f32>(rgb0.rgb, alpha0.a);
+    out.color1 = vec4<f32>(rgb1.rgb, alpha1.a);
+    out.uv0 = generated_uv(coords, 0u);
+    out.uv1 = generated_uv(coords, 1u);
+    out.uv2 = generated_uv(coords, 2u);
+    out.uv3 = generated_uv(coords, 3u);
+    out.uv4 = generated_uv(coords, 4u);
+    out.uv5 = generated_uv(coords, 5u);
+    out.uv6 = generated_uv(coords, 6u);
+    out.uv7 = generated_uv(coords, 7u);
+    out.view_depth = depth;
+    return out;
+}
+
+fn tex_coord(input: VertexOut, index: u32) -> vec2<f32> {
+    switch index {
+        case 0u: { return input.uv0; }
+        case 1u: { return input.uv1; }
+        case 2u: { return input.uv2; }
+        case 3u: { return input.uv3; }
+        case 4u: { return input.uv4; }
+        case 5u: { return input.uv5; }
+        case 6u: { return input.uv6; }
+        case 7u: { return input.uv7; }
+        default: { return vec2<f32>(0.0); }
+    }
+}
+
+fn sample_texture(slot: u32, uv: vec2<f32>) -> vec4<f32> {
+    let uv_dx = dpdx(uv);
+    let uv_dy = dpdy(uv);
+    switch slot {
+        case 0u: { return textureSampleGrad(texture0, sampler0, uv, uv_dx, uv_dy); }
+        case 1u: { return textureSampleGrad(texture1, sampler1, uv, uv_dx, uv_dy); }
+        case 2u: { return textureSampleGrad(texture2, sampler2, uv, uv_dx, uv_dy); }
+        case 3u: { return textureSampleGrad(texture3, sampler3, uv, uv_dx, uv_dy); }
+        case 4u: { return textureSampleGrad(texture4, sampler4, uv, uv_dx, uv_dy); }
+        case 5u: { return textureSampleGrad(texture5, sampler5, uv, uv_dx, uv_dy); }
+        case 6u: { return textureSampleGrad(texture6, sampler6, uv, uv_dx, uv_dy); }
+        case 7u: { return textureSampleGrad(texture7, sampler7, uv, uv_dx, uv_dy); }
+        default: { return vec4<f32>(1.0); }
+    }
+}
+
+fn swap_color(value: vec4<f32>, table_index: u32) -> vec4<f32> {
+    let table = material.swap_tables[min(table_index, 3u)];
+    return vec4<f32>(
+        value[min(table.x, 3u)],
+        value[min(table.y, 3u)],
+        value[min(table.z, 3u)],
+        value[min(table.w, 3u)],
+    );
+}
+
+fn raster_color(input: VertexOut, channel: u32) -> vec4<f32> {
+    switch channel {
+        case 0u: { return vec4<f32>(input.color0.rgb, 1.0); }
+        case 1u: { return vec4<f32>(input.color1.rgb, 1.0); }
+        case 2u: { return vec4<f32>(vec3<f32>(input.color0.a), input.color0.a); }
+        case 3u: { return vec4<f32>(vec3<f32>(input.color1.a), input.color1.a); }
+        case 4u: { return input.color0; }
+        case 5u: { return input.color1; }
+        case 6u: { return vec4<f32>(0.0); }
+        default: { return vec4<f32>(0.0); }
+    }
+}
+
+fn konst_color(selector: u32) -> vec3<f32> {
+    switch selector {
+        case 0u: { return vec3<f32>(1.0); }
+        case 1u: { return vec3<f32>(0.875); }
+        case 2u: { return vec3<f32>(0.75); }
+        case 3u: { return vec3<f32>(0.625); }
+        case 4u: { return vec3<f32>(0.5); }
+        case 5u: { return vec3<f32>(0.375); }
+        case 6u: { return vec3<f32>(0.25); }
+        case 7u: { return vec3<f32>(0.125); }
+        case 12u: { return material.tev_k_colors[0].rgb; }
+        case 13u: { return material.tev_k_colors[1].rgb; }
+        case 14u: { return material.tev_k_colors[2].rgb; }
+        case 15u: { return material.tev_k_colors[3].rgb; }
+        default: {
+            if (selector >= 16u && selector <= 31u) {
+                let color_index = (selector - 16u) & 3u;
+                let channel = (selector - 16u) >> 2u;
+                return vec3<f32>(material.tev_k_colors[color_index][channel]);
+            }
+            return vec3<f32>(1.0);
+        }
+    }
+}
+
+fn konst_alpha(selector: u32) -> f32 {
+    switch selector {
+        case 0u: { return 1.0; }
+        case 1u: { return 0.875; }
+        case 2u: { return 0.75; }
+        case 3u: { return 0.625; }
+        case 4u: { return 0.5; }
+        case 5u: { return 0.375; }
+        case 6u: { return 0.25; }
+        case 7u: { return 0.125; }
+        default: {
+            if (selector >= 16u && selector <= 31u) {
+                let color_index = (selector - 16u) & 3u;
+                let channel = (selector - 16u) >> 2u;
+                return material.tev_k_colors[color_index][channel];
+            }
+            return 1.0;
+        }
+    }
+}
+
+fn color_arg(
+    selector: u32,
+    previous: vec4<f32>,
+    reg0: vec4<f32>,
+    reg1: vec4<f32>,
+    reg2: vec4<f32>,
+    tex: vec4<f32>,
+    ras: vec4<f32>,
+    konst: vec3<f32>,
+) -> vec3<f32> {
+    switch selector {
+        case 0u: { return previous.rgb; }
+        case 1u: { return vec3<f32>(previous.a); }
+        case 2u: { return reg0.rgb; }
+        case 3u: { return vec3<f32>(reg0.a); }
+        case 4u: { return reg1.rgb; }
+        case 5u: { return vec3<f32>(reg1.a); }
+        case 6u: { return reg2.rgb; }
+        case 7u: { return vec3<f32>(reg2.a); }
+        case 8u: { return tex.rgb; }
+        case 9u: { return vec3<f32>(tex.a); }
+        case 10u: { return ras.rgb; }
+        case 11u: { return vec3<f32>(ras.a); }
+        case 12u: { return vec3<f32>(1.0); }
+        case 13u: { return vec3<f32>(0.5); }
+        case 14u: { return konst; }
+        case 16u: { return vec3<f32>(tex.r); }
+        case 17u: { return vec3<f32>(tex.g); }
+        case 18u: { return vec3<f32>(tex.b); }
+        default: { return vec3<f32>(0.0); }
+    }
+}
+
+fn alpha_arg(
+    selector: u32,
+    previous: vec4<f32>,
+    reg0: vec4<f32>,
+    reg1: vec4<f32>,
+    reg2: vec4<f32>,
+    tex: vec4<f32>,
+    ras: vec4<f32>,
+    konst: f32,
+) -> f32 {
+    switch selector {
+        case 0u: { return previous.a; }
+        case 1u: { return reg0.a; }
+        case 2u: { return reg1.a; }
+        case 3u: { return reg2.a; }
+        case 4u: { return tex.a; }
+        case 5u: { return ras.a; }
+        case 6u: { return konst; }
+        default: { return 0.0; }
+    }
+}
+
+fn tev_scale(value: vec3<f32>, scale: u32) -> vec3<f32> {
+    switch scale {
+        case 1u: { return value * 2.0; }
+        case 2u: { return value * 4.0; }
+        case 3u: { return value * 0.5; }
+        default: { return value; }
+    }
+}
+
+fn tev_alpha_scale(value: f32, scale: u32) -> f32 {
+    switch scale {
+        case 1u: { return value * 2.0; }
+        case 2u: { return value * 4.0; }
+        case 3u: { return value * 0.5; }
+        default: { return value; }
+    }
+}
+
+fn tev_u8(value: f32) -> u32 {
+    return u32(clamp(round(value * 255.0), 0.0, 255.0));
+}
+
+fn tev_pack_gr(value: vec3<f32>) -> u32 {
+    return tev_u8(value.r) | (tev_u8(value.g) << 8u);
+}
+
+fn tev_pack_bgr(value: vec3<f32>) -> u32 {
+    return tev_u8(value.r) | (tev_u8(value.g) << 8u) | (tev_u8(value.b) << 16u);
+}
+
+fn tev_color_result(
+    a: vec3<f32>,
+    b: vec3<f32>,
+    c: vec3<f32>,
+    d: vec3<f32>,
+    operation: vec4<u32>,
+) -> vec3<f32> {
+    let op = operation.x;
+    var result = vec3<f32>(0.0);
+    if (op == 0u || op == 1u) {
+        let mixed = mix(a, b, c);
+        result = select(d + mixed, d - mixed, op == 1u);
+        if (operation.y == 1u) {
+            result = result + vec3<f32>(0.5);
+        } else if (operation.y == 2u) {
+            result = result - vec3<f32>(0.5);
+        }
+        result = tev_scale(result, operation.z);
+    } else {
+        var comparison = vec3<f32>(0.0);
+        if (op == 8u) {
+            comparison = vec3<f32>(select(0.0, 1.0, tev_u8(a.r) > tev_u8(b.r)));
+        } else if (op == 9u) {
+            comparison = vec3<f32>(select(0.0, 1.0, tev_u8(a.r) == tev_u8(b.r)));
+        } else if (op == 10u) {
+            comparison = vec3<f32>(select(0.0, 1.0, tev_pack_gr(a) > tev_pack_gr(b)));
+        } else if (op == 11u) {
+            comparison = vec3<f32>(select(0.0, 1.0, tev_pack_gr(a) == tev_pack_gr(b)));
+        } else if (op == 12u) {
+            comparison = vec3<f32>(select(0.0, 1.0, tev_pack_bgr(a) > tev_pack_bgr(b)));
+        } else if (op == 13u) {
+            comparison = vec3<f32>(select(0.0, 1.0, tev_pack_bgr(a) == tev_pack_bgr(b)));
+        } else if (op == 14u) {
+            comparison = vec3<f32>(
+                select(0.0, 1.0, tev_u8(a.r) > tev_u8(b.r)),
+                select(0.0, 1.0, tev_u8(a.g) > tev_u8(b.g)),
+                select(0.0, 1.0, tev_u8(a.b) > tev_u8(b.b)),
+            );
+        } else {
+            comparison = vec3<f32>(
+                select(0.0, 1.0, tev_u8(a.r) == tev_u8(b.r)),
+                select(0.0, 1.0, tev_u8(a.g) == tev_u8(b.g)),
+                select(0.0, 1.0, tev_u8(a.b) == tev_u8(b.b)),
+            );
+        }
+        result = d + comparison * c;
+    }
+    let packed = operation.w;
+    if ((packed & 0xffu) != 0u) {
+        return clamp(result, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    return clamp(result, vec3<f32>(-4.0), vec3<f32>(4.0));
+}
+
+fn tev_alpha_result(a: f32, b: f32, c: f32, d: f32, operation: vec4<u32>) -> f32 {
+    let op = operation.x;
+    var result = 0.0;
+    if (op == 0u || op == 1u) {
+        let mixed = mix(a, b, c);
+        result = select(d + mixed, d - mixed, op == 1u);
+        if (operation.y == 1u) {
+            result = result + 0.5;
+        } else if (operation.y == 2u) {
+            result = result - 0.5;
+        }
+        result = tev_alpha_scale(result, operation.z);
+    } else if (op == 14u) {
+        result = d + select(0.0, c, tev_u8(a) > tev_u8(b));
+    } else {
+        result = d + select(0.0, c, tev_u8(a) == tev_u8(b));
+    }
+    let packed = operation.w;
+    if ((packed & 0xffu) != 0u) {
+        return clamp(result, 0.0, 1.0);
+    }
+    return clamp(result, -4.0, 4.0);
+}
+
+fn gx_compare(value: f32, compare: u32, reference: f32) -> bool {
+    let quantized_value = tev_u8(value);
+    let quantized_reference = tev_u8(reference);
+    switch compare {
+        case 0u: { return false; }
+        case 1u: { return quantized_value < quantized_reference; }
+        case 2u: { return quantized_value == quantized_reference; }
+        case 3u: { return quantized_value <= quantized_reference; }
+        case 4u: { return quantized_value > quantized_reference; }
+        case 5u: { return quantized_value != quantized_reference; }
+        case 6u: { return quantized_value >= quantized_reference; }
+        default: { return true; }
+    }
+}
+
+fn alpha_compare_passes(alpha: f32) -> bool {
+    let pass0 = gx_compare(alpha, material.alpha_compare.x, material.alpha_refs.x);
+    let pass1 = gx_compare(alpha, material.alpha_compare.z, material.alpha_refs.y);
+    switch material.alpha_compare.y {
+        case 0u: { return pass0 && pass1; }
+        case 1u: { return pass0 || pass1; }
+        case 2u: { return pass0 != pass1; }
+        case 3u: { return pass0 == pass1; }
+        default: { return true; }
+    }
+}
+
+fn indirect_offset(stage_index: u32, input: VertexOut) -> vec2<f32> {
+    if (material.counts.w == 0u) {
+        return vec2<f32>(0.0);
+    }
+    let stage0 = material.indirect_stages0[stage_index];
+    let indirect_stage = stage0.x;
+    if (indirect_stage >= material.counts.w || stage0.w == 0u) {
+        return vec2<f32>(0.0);
+    }
+    let order = material.indirect_orders[indirect_stage];
+    if (order.x == 0u || order.y == 0u) {
+        return vec2<f32>(0.0);
+    }
+    var uv = tex_coord(input, order.x - 1u);
+    uv = uv * vec2<f32>(exp2(-f32(order.z)), exp2(-f32(order.w)));
+    let sample_value = sample_texture(order.y - 1u, uv).rgb * 2.0 - vec3<f32>(1.0);
+    let matrix_id = stage0.w;
+    if (matrix_id >= 1u && matrix_id <= 3u) {
+        let matrix_index = matrix_id - 1u;
+        let row = matrix_index * 2u;
+        let source = vec3<f32>(sample_value.rg, 1.0);
+        return vec2<f32>(
+            dot(material.indirect_matrix_rows[row].xyz, source),
+            dot(material.indirect_matrix_rows[row + 1u].xyz, source),
+        );
+    }
+    if (matrix_id >= 5u && matrix_id <= 7u) {
+        return vec2<f32>(sample_value.r, 0.0);
+    }
+    if (matrix_id >= 9u && matrix_id <= 11u) {
+        return vec2<f32>(0.0, sample_value.g);
+    }
+    return vec2<f32>(0.0);
+}
+
+fn apply_fog(color: vec4<f32>, depth: f32) -> vec4<f32> {
+    let fog_type = material.fog_meta.x;
+    if (fog_type == 0u) {
+        return color;
+    }
+    let start_z = material.fog_params.x;
+    let end_z = material.fog_params.y;
+    let denominator = max(abs(end_z - start_z), 0.0001);
+    let normalized_depth = max((depth - start_z) / denominator, 0.0);
+    var fog_amount = clamp(normalized_depth, 0.0, 1.0);
+    if (fog_type == 4u) {
+        fog_amount = 1.0 - exp2(-8.0 * normalized_depth);
+    } else if (fog_type == 5u) {
+        fog_amount = 1.0 - exp2(-8.0 * normalized_depth * normalized_depth);
+    } else if (fog_type == 6u) {
+        fog_amount = exp2(-8.0 * max(1.0 - normalized_depth, 0.0));
+    } else if (fog_type == 7u) {
+        let reverse_depth = max(1.0 - normalized_depth, 0.0);
+        fog_amount = exp2(-8.0 * reverse_depth * reverse_depth);
+    }
+    return vec4<f32>(mix(color.rgb, material.fog_color.rgb, clamp(fog_amount, 0.0, 1.0)), color.a);
+}
+
+@fragment
+fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    var previous = vec4<f32>(0.0);
+    var reg0 = material.tev_colors[0];
+    var reg1 = material.tev_colors[1];
+    var reg2 = material.tev_colors[2];
+
+    for (var stage_index = 0u; stage_index < 16u; stage_index = stage_index + 1u) {
+        if (stage_index >= material.counts.x) {
+            break;
+        }
+        let order = material.tev_orders[stage_index];
+        let selectors = material.tev_selectors[stage_index];
+        var tex = vec4<f32>(1.0);
+        if (order.x != 0u && order.y != 0u) {
+            var uv = tex_coord(input, order.x - 1u);
+            uv = uv + indirect_offset(stage_index, input);
+            tex = sample_texture(order.y - 1u, uv);
+        }
+        tex = swap_color(tex, selectors.w);
+        let ras = swap_color(raster_color(input, order.z), selectors.z);
+        let color_konst = konst_color(selectors.x);
+        let alpha_konst = konst_alpha(selectors.y);
+        let color_args = material.tev_color_args[stage_index];
+        let alpha_args = material.tev_alpha_args[stage_index];
+
+        let color_a = color_arg(color_args.x, previous, reg0, reg1, reg2, tex, ras, color_konst);
+        let color_b = color_arg(color_args.y, previous, reg0, reg1, reg2, tex, ras, color_konst);
+        let color_c = color_arg(color_args.z, previous, reg0, reg1, reg2, tex, ras, color_konst);
+        let color_d = color_arg(color_args.w, previous, reg0, reg1, reg2, tex, ras, color_konst);
+        let alpha_a = alpha_arg(alpha_args.x, previous, reg0, reg1, reg2, tex, ras, alpha_konst);
+        let alpha_b = alpha_arg(alpha_args.y, previous, reg0, reg1, reg2, tex, ras, alpha_konst);
+        let alpha_c = alpha_arg(alpha_args.z, previous, reg0, reg1, reg2, tex, ras, alpha_konst);
+        let alpha_d = alpha_arg(alpha_args.w, previous, reg0, reg1, reg2, tex, ras, alpha_konst);
+
+        let color_result = tev_color_result(
+            color_a,
+            color_b,
+            color_c,
+            color_d,
+            material.tev_color_ops[stage_index],
+        );
+        let alpha_result = tev_alpha_result(
+            alpha_a,
+            alpha_b,
+            alpha_c,
+            alpha_d,
+            material.tev_alpha_ops[stage_index],
+        );
+        let color_register = material.tev_color_ops[stage_index].w >> 8u;
+        let alpha_register = material.tev_alpha_ops[stage_index].w >> 8u;
+        if (color_register == 0u) {
+            previous = vec4<f32>(color_result, previous.a);
+        } else if (color_register == 1u) {
+            reg0 = vec4<f32>(color_result, reg0.a);
+        } else if (color_register == 2u) {
+            reg1 = vec4<f32>(color_result, reg1.a);
+        } else {
+            reg2 = vec4<f32>(color_result, reg2.a);
+        }
+        if (alpha_register == 0u) {
+            previous.a = alpha_result;
+        } else if (alpha_register == 1u) {
+            reg0.a = alpha_result;
+        } else if (alpha_register == 2u) {
+            reg1.a = alpha_result;
+        } else {
+            reg2.a = alpha_result;
+        }
+    }
+
+    if (!alpha_compare_passes(previous.a)) {
+        discard;
+    }
+    return apply_fog(previous, input.view_depth);
+}

@@ -1,8 +1,8 @@
-//! Viewport rendering scaffold.
+//! Renderer-facing scene, camera, and viewport configuration boundaries.
 //!
-//! The editor shell can use this crate without owning a GPU device yet. A later
-//! pass can replace `ViewportDrawList` generation with full J3D/GX pipelines
-//! while preserving the document-to-render-scene boundary.
+//! The egui/wgpu callback backend remains in the desktop application because it
+//! depends on eframe integration. This crate owns the editor-independent scene
+//! and camera contract shared by render frontends.
 
 use serde::{Deserialize, Serialize};
 use sms_scene::{AssetRole, StageDocument};
@@ -174,6 +174,7 @@ mod tests {
             objects: vec![],
             changed_files: BTreeMap::new(),
             registry: None,
+            load_issues: Vec::new(),
         };
         let scene = RenderScene::from_document(&document);
         let renderer = ViewportRenderer::new(RendererConfig::default());

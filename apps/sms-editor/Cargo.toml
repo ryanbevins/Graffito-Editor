@@ -2,11 +2,11 @@
 name = "sms-editor"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-anyhow.workspace = true
 bytemuck.workspace = true
 eframe.workspace = true
 egui.workspace = true
