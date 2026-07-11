@@ -17,14 +17,14 @@ use super::{
 };
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
+const GX_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const TEXTURE_SLOT_COUNT: usize = 8;
 const TEV_STAGE_COUNT: usize = 16;
 const TEX_MATRIX_ROW_COUNT: usize = TEXTURE_SLOT_COUNT * 3;
 static NEXT_SCENE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 const J3D_SHADER: &str = include_str!("shaders/j3d.wgsl");
-
-const DEPTH_CLEAR_SHADER: &str = include_str!("shaders/depth_clear.wgsl");
+const COMPOSITE_SHADER: &str = include_str!("shaders/composite.wgsl");
 
 #[derive(Clone)]
 pub struct GpuViewportScene {
@@ -141,8 +141,8 @@ impl CallbackTrait for GpuViewportCallback {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _screen_descriptor: &ScreenDescriptor,
-        _egui_encoder: &mut wgpu::CommandEncoder,
+        screen_descriptor: &ScreenDescriptor,
+        egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         let Ok(mut shared) = self.shared.lock() else {
@@ -168,6 +168,16 @@ impl CallbackTrait for GpuViewportCallback {
         resources.write_materials(device, queue, &shared.scene, &shared.dirty_materials);
         shared.dirty_materials.clear();
         resources.write_frame(queue, shared.frame, &shared.scene);
+        let target_size = [
+            (shared.frame.viewport_size[0] * screen_descriptor.pixels_per_point)
+                .round()
+                .max(1.0) as u32,
+            (shared.frame.viewport_size[1] * screen_descriptor.pixels_per_point)
+                .round()
+                .max(1.0) as u32,
+        ];
+        resources.ensure_viewport_target(device, target_size);
+        resources.render_scene(egui_encoder);
         Vec::new()
     }
 
@@ -178,7 +188,7 @@ impl CallbackTrait for GpuViewportCallback {
         callback_resources: &CallbackResources,
     ) {
         if let Some(resources) = callback_resources.get::<GpuViewportResources>() {
-            resources.paint(render_pass);
+            resources.composite(render_pass);
         }
     }
 }
@@ -413,7 +423,7 @@ impl GpuTextureData {
                 size: [1, 1],
                 rgba: vec![255; 4],
             }],
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: GX_COLOR_FORMAT,
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Nearest,
@@ -445,16 +455,11 @@ impl GpuTextureData {
     }
 }
 
-fn gpu_texture_format_for_j3d(format: u8) -> wgpu::TextureFormat {
-    // GX intensity formats carry numeric intensity/mask values, not sRGB
-    // colors. Sampling them through an sRGB texture view darkens their RGB
-    // before TEV math while leaving alpha untouched, which breaks effects
-    // such as sky cloud masks that use the same intensity in both paths.
-    if matches!(format, 0..=3) {
-        wgpu::TextureFormat::Rgba8Unorm
-    } else {
-        wgpu::TextureFormat::Rgba8UnormSrgb
-    }
+fn gpu_texture_format_for_j3d(_format: u8) -> wgpu::TextureFormat {
+    // GX has no per-texture color-space conversion. Intensity and color BTI
+    // channels alike enter TEV as their stored numeric values, so sampling a
+    // color texture through an sRGB view changes every tint, fog, and blend.
+    GX_COLOR_FORMAT
 }
 
 fn gpu_mip_from_color_image(image: &egui::ColorImage) -> GpuTextureMip {
@@ -1120,8 +1125,10 @@ impl From<GpuViewportFrame> for GpuCameraUniform {
 struct GpuViewportResources {
     pipeline_layout: wgpu::PipelineLayout,
     material_layout: wgpu::BindGroupLayout,
-    depth_clear_pipeline: wgpu::RenderPipeline,
-    target_format: wgpu::TextureFormat,
+    composite_layout: wgpu::BindGroupLayout,
+    composite_pipeline: wgpu::RenderPipeline,
+    composite_sampler: wgpu::Sampler,
+    viewport_target: Option<GpuViewportTarget>,
     pipelines: BTreeMap<GpuPipelineKey, wgpu::RenderPipeline>,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
@@ -1186,6 +1193,36 @@ impl GpuViewportResources {
             bind_group_layouts: &[Some(&camera_layout), Some(&material_layout)],
             immediate_size: 0,
         });
+        let composite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sms viewport composite layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let composite_pipeline =
+            create_composite_pipeline(device, &composite_layout, target_format);
+        let composite_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("sms viewport composite sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sms viewport camera buffer"),
             size: std::mem::size_of::<GpuCameraUniform>() as u64,
@@ -1203,8 +1240,10 @@ impl GpuViewportResources {
         Self {
             pipeline_layout,
             material_layout,
-            depth_clear_pipeline: create_depth_clear_pipeline(device, target_format),
-            target_format,
+            composite_layout,
+            composite_pipeline,
+            composite_sampler,
+            viewport_target: None,
             pipelines: BTreeMap::new(),
             camera_buffer,
             camera_bind_group,
@@ -1353,9 +1392,25 @@ impl GpuViewportResources {
 
     fn ensure_pipeline(&mut self, device: &wgpu::Device, key: GpuPipelineKey) {
         if !self.pipelines.contains_key(&key) {
-            let pipeline = create_pipeline(device, &self.pipeline_layout, self.target_format, key);
+            let pipeline = create_pipeline(device, &self.pipeline_layout, GX_COLOR_FORMAT, key);
             self.pipelines.insert(key, pipeline);
         }
+    }
+
+    fn ensure_viewport_target(&mut self, device: &wgpu::Device, size: [u32; 2]) {
+        if self
+            .viewport_target
+            .as_ref()
+            .is_some_and(|target| target.size == size)
+        {
+            return;
+        }
+        self.viewport_target = Some(GpuViewportTarget::new(
+            device,
+            &self.composite_layout,
+            &self.composite_sampler,
+            size,
+        ));
     }
 
     fn write_frame(&mut self, queue: &wgpu::Queue, frame: GpuViewportFrame, scene: &GpuSceneData) {
@@ -1373,9 +1428,34 @@ impl GpuViewportResources {
         }
     }
 
-    fn paint(&self, render_pass: &mut wgpu::RenderPass<'static>) {
-        render_pass.set_pipeline(&self.depth_clear_pipeline);
-        render_pass.draw(0..3, 0..1);
+    fn render_scene(&self, encoder: &mut wgpu::CommandEncoder) {
+        let Some(target) = &self.viewport_target else {
+            return;
+        };
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("sms GX viewport render"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target.color_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    // TDisplay initializes Sunshine's display clear color to black.
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &target.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Discard,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
         render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
         for command in &self.draw_order {
             let Some(batch) = self.batches.get(command.batch_index) else {
@@ -1392,6 +1472,83 @@ impl GpuViewportResources {
             render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
             render_pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             render_pass.draw_indexed(0..batch.index_count, 0, 0..1);
+        }
+    }
+
+    fn composite(&self, render_pass: &mut wgpu::RenderPass<'static>) {
+        let Some(target) = &self.viewport_target else {
+            return;
+        };
+        render_pass.set_pipeline(&self.composite_pipeline);
+        render_pass.set_bind_group(0, &target.composite_bind_group, &[]);
+        render_pass.draw(0..3, 0..1);
+    }
+}
+
+struct GpuViewportTarget {
+    size: [u32; 2],
+    _color: wgpu::Texture,
+    color_view: wgpu::TextureView,
+    _depth: wgpu::Texture,
+    depth_view: wgpu::TextureView,
+    composite_bind_group: wgpu::BindGroup,
+}
+
+impl GpuViewportTarget {
+    fn new(
+        device: &wgpu::Device,
+        composite_layout: &wgpu::BindGroupLayout,
+        composite_sampler: &wgpu::Sampler,
+        size: [u32; 2],
+    ) -> Self {
+        let extent = wgpu::Extent3d {
+            width: size[0],
+            height: size[1],
+            depth_or_array_layers: 1,
+        };
+        let color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sms GX viewport color"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: GX_COLOR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sms GX viewport depth"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+        let composite_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sms GX viewport composite bind group"),
+            layout: composite_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&color_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(composite_sampler),
+                },
+            ],
+        });
+        Self {
+            size,
+            _color: color,
+            color_view,
+            _depth: depth,
+            depth_view,
+            composite_bind_group,
         }
     }
 }
@@ -1539,21 +1696,22 @@ fn sorted_gpu_draw_order_from_info(
         .collect()
 }
 
-fn create_depth_clear_pipeline(
+fn create_composite_pipeline(
     device: &wgpu::Device,
+    composite_layout: &wgpu::BindGroupLayout,
     target_format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("sms viewport depth clear layout"),
-        bind_group_layouts: &[],
+        label: Some("sms viewport composite pipeline layout"),
+        bind_group_layouts: &[Some(composite_layout)],
         immediate_size: 0,
     });
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("sms viewport depth clear shader"),
-        source: wgpu::ShaderSource::Wgsl(DEPTH_CLEAR_SHADER.into()),
+        label: Some("sms viewport composite shader"),
+        source: wgpu::ShaderSource::Wgsl(COMPOSITE_SHADER.into()),
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("sms viewport depth clear pipeline"),
+        label: Some("sms viewport composite pipeline"),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
@@ -1563,26 +1721,41 @@ fn create_depth_clear_pipeline(
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some(composite_fragment_entry(target_format)),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: target_format,
                 blend: None,
-                write_mask: wgpu::ColorWrites::empty(),
+                write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
         primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
-            depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::Always),
-            stencil: Default::default(),
-            bias: Default::default(),
-        }),
+        depth_stencil: Some(composite_depth_stencil_state()),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
     })
+}
+
+fn composite_fragment_entry(target_format: wgpu::TextureFormat) -> &'static str {
+    if target_format.is_srgb() {
+        "fs_srgb_target"
+    } else {
+        "fs_unorm_target"
+    }
+}
+
+fn composite_depth_stencil_state() -> wgpu::DepthStencilState {
+    // eframe's main render pass includes the depth buffer requested in
+    // NativeOptions. wgpu requires every pipeline used by that pass to declare
+    // the same attachment format, even when the draw ignores depth entirely.
+    wgpu::DepthStencilState {
+        format: DEPTH_FORMAT,
+        depth_write_enabled: Some(false),
+        depth_compare: Some(wgpu::CompareFunction::Always),
+        stencil: Default::default(),
+        bias: Default::default(),
+    }
 }
 
 fn create_pipeline(

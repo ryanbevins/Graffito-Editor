@@ -132,17 +132,33 @@ fn only_sky_vertices_are_camera_relative() {
 }
 
 #[test]
-fn gx_intensity_textures_are_sampled_in_linear_space() {
-    for format in 0..=3 {
+fn gx_texture_channels_are_sampled_as_numeric_values() {
+    for format in [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 14] {
         assert_eq!(
             gpu_texture_format_for_j3d(format),
             wgpu::TextureFormat::Rgba8Unorm
         );
     }
+}
+
+#[test]
+fn gx_composite_only_decodes_for_an_srgb_surface() {
     assert_eq!(
-        gpu_texture_format_for_j3d(6),
-        wgpu::TextureFormat::Rgba8UnormSrgb
+        composite_fragment_entry(wgpu::TextureFormat::Bgra8UnormSrgb),
+        "fs_srgb_target"
     );
+    assert_eq!(
+        composite_fragment_entry(wgpu::TextureFormat::Bgra8Unorm),
+        "fs_unorm_target"
+    );
+}
+
+#[test]
+fn gx_composite_matches_eframe_depth_attachment_without_writing_it() {
+    let depth = composite_depth_stencil_state();
+    assert_eq!(depth.format, wgpu::TextureFormat::Depth24Plus);
+    assert_eq!(depth.depth_write_enabled, Some(false));
+    assert_eq!(depth.depth_compare, Some(wgpu::CompareFunction::Always));
 }
 
 #[test]

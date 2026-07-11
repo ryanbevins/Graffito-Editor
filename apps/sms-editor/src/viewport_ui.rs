@@ -249,13 +249,15 @@ impl SmsEditorApp {
     ) {
         painter.add(egui::Shape::mesh(viewport_background_mesh(rect)));
 
-        if self.renderer.config().show_grid {
-            self.paint_grid(painter, rect);
-        }
         if self.model_preview.is_some() {
             self.paint_model_preview(ui.ctx(), painter, rect);
         } else {
             self.paint_stage_silhouette(painter, rect);
+        }
+        // The grid is an editor aid rather than part of Sunshine's EFB. Keep it
+        // above the source-accurate offscreen game render.
+        if self.renderer.config().show_grid {
+            self.paint_grid(painter, rect);
         }
 
         let object_positions = self.object_screen_positions(rect);
