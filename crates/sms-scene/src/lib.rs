@@ -585,13 +585,11 @@ fn load_scene_objects_from_assets(
                 );
             }
 
-            if !scene_object_is_preview_helper(&object) {
-                if let Some(model_path) = infer_preview_model_path(&object, &model_index) {
-                    object.asset_hints.push(AssetRef {
-                        path: model_path,
-                        role: AssetRole::PreviewModel,
-                    });
-                }
+            if let Some(model_path) = infer_preview_model_path(&object, &model_index) {
+                object.asset_hints.push(AssetRef {
+                    path: model_path,
+                    role: AssetRole::PreviewModel,
+                });
             }
 
             objects.push(object);
@@ -606,23 +604,6 @@ fn load_scene_objects_from_assets(
     }
 
     (objects, issues)
-}
-
-fn scene_object_is_preview_helper(object: &SceneObject) -> bool {
-    let factory = object.factory_name.to_ascii_lowercase();
-    let class_name = object
-        .class_name
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let placement_name = object
-        .raw_params
-        .get("name")
-        .map(String::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    factory == "palmleaf" || class_name == "palmleaf" || placement_name.starts_with("palmleaf")
 }
 
 fn stage_model_index(assets: &[StageAsset]) -> Vec<(String, String)> {
@@ -657,10 +638,12 @@ fn infer_preview_model_path(
         }
     }
 
-    // TShimmer::load reads the model basename directly from its placement
-    // stream (for example ShimmerLow or ShimmerLowFar). Prefer that authored
-    // resource name over the generic `Shimmer` factory name.
-    if object.factory_name.eq_ignore_ascii_case("Shimmer") {
+    // TMapObjBase::load and TShimmer::load read their resource identity from
+    // the first placement stream string. Prefer that authored basename over
+    // generic factories such as `Palm` and `Shimmer`.
+    if object.factory_name.eq_ignore_ascii_case("Palm")
+        || object.factory_name.eq_ignore_ascii_case("Shimmer")
+    {
         if let Some(model_name) = object.raw_params.get("stream_string_0") {
             let key = normalize_model_key(model_name);
             if let Some(path) = exact_model_key_match(&key, model_index) {
@@ -1010,6 +993,32 @@ mod tests {
         assert_eq!(
             infer_preview_model_path(&object, &models).as_deref(),
             Some("stage.szs!/mapobj/shimmerlowfar.bmd")
+        );
+    }
+
+    #[test]
+    fn palm_uses_the_model_basename_stored_in_its_placement_stream() {
+        let models = vec![
+            (
+                "stage.szs!/mapobj/palmnormal.bmd".to_string(),
+                "palmnormal".to_string(),
+            ),
+            (
+                "stage.szs!/mapobj/palmleaf.bmd".to_string(),
+                "palmleaf".to_string(),
+            ),
+        ];
+        let mut object = SceneObject::new("PalmLeaf 2", "Palm");
+        object
+            .raw_params
+            .insert("name".to_string(), "PalmLeaf 2".to_string());
+        object
+            .raw_params
+            .insert("stream_string_0".to_string(), "palmLeaf".to_string());
+
+        assert_eq!(
+            infer_preview_model_path(&object, &models).as_deref(),
+            Some("stage.szs!/mapobj/palmleaf.bmd")
         );
     }
 }

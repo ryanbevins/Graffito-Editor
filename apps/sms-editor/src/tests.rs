@@ -386,6 +386,23 @@ fn world_model_path_normalization_deduplicates_scene_instances() {
     ));
 }
 
+#[test]
+fn palm_leaf_placement_is_kept_as_an_object_preview() {
+    let mut palm_leaf = SceneObject::new("PalmLeaf 2", "Palm");
+    palm_leaf
+        .raw_params
+        .insert("name".to_string(), "PalmLeaf 2".to_string());
+    palm_leaf.asset_hints.push(AssetRef {
+        path: "stage.szs!/mapobj/palmleaf.bmd".to_string(),
+        role: AssetRole::PreviewModel,
+    });
+
+    assert_eq!(
+        object_preview_model_path(&palm_leaf, &BTreeSet::new()).as_deref(),
+        Some("stage.szs!/mapobj/palmleaf.bmd")
+    );
+}
+
 fn preview_for_texture_alpha(has_alpha: bool, has_translucent_alpha: bool) -> ModelPreview {
     let image = egui::ColorImage::filled([1, 1], egui::Color32::WHITE);
     ModelPreview {

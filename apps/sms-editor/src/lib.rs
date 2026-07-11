@@ -812,20 +812,9 @@ impl SmsEditorApp {
         let mut object_model_cache = BTreeMap::<(String, u32), CachedObjectModelPreview>::new();
         let mut accessory_model_cache = BTreeMap::<String, CachedAccessoryModelPreview>::new();
         for object in &document.objects {
-            if !should_render_object_model(object) {
-                continue;
-            }
-            let Some(model_path) = object
-                .asset_hints
-                .iter()
-                .find(|hint| hint.role == AssetRole::PreviewModel)
-                .map(|hint| hint.path.clone())
-            else {
+            let Some(model_path) = object_preview_model_path(object, &world_model_paths) else {
                 continue;
             };
-            if !should_instance_object_preview_model(&model_path, &world_model_paths) {
-                continue;
-            }
             let loader_flags = npc_model_loader_flags(object)
                 .unwrap_or_else(|| model_loader_flags_for_path(&model_path));
             let object_render_layer = preview_render_layer_for_model_path(&model_path);
@@ -1582,20 +1571,17 @@ fn should_instance_object_preview_model(path: &str, world_model_paths: &BTreeSet
         && !world_model_paths.contains(&normalized_preview_asset_path(path))
 }
 
-fn should_render_object_model(object: &SceneObject) -> bool {
-    let factory = object.factory_name.to_ascii_lowercase();
-    let class_name = object
-        .class_name
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let placement_name = object
-        .raw_params
-        .get("name")
-        .map(String::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    !(factory == "palmleaf" || class_name == "palmleaf" || placement_name.starts_with("palmleaf"))
+fn object_preview_model_path(
+    object: &SceneObject,
+    world_model_paths: &BTreeSet<String>,
+) -> Option<String> {
+    object
+        .asset_hints
+        .iter()
+        .find(|hint| hint.role == AssetRole::PreviewModel)
+        .map(|hint| hint.path.as_str())
+        .filter(|path| should_instance_object_preview_model(path, world_model_paths))
+        .map(str::to_owned)
 }
 
 fn object_matches_focus(object: &SceneObject, needle: &str) -> bool {
