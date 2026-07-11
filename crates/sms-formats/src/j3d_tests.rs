@@ -31,6 +31,35 @@ fn parses_section_table_and_preserves_bytes() {
 }
 
 #[test]
+fn accepts_retail_texture_only_bmt_with_overreported_block_count() {
+    let mut bytes = vec![0u8; 0x28];
+    bytes[0..4].copy_from_slice(b"J3D2");
+    bytes[4..8].copy_from_slice(b"bmt3");
+    bytes[8..12].copy_from_slice(&0x28u32.to_be_bytes());
+    bytes[12..16].copy_from_slice(&2u32.to_be_bytes());
+    bytes[0x20..0x24].copy_from_slice(b"TEX1");
+    bytes[0x24..0x28].copy_from_slice(&8u32.to_be_bytes());
+
+    let file = J3dFile::parse(&bytes).expect("retail texture-only BMT layout");
+    assert_eq!(file.header().section_count, 2);
+    assert_eq!(file.sections().len(), 1);
+    assert_eq!(file.sections()[0].tag, "TEX1");
+}
+
+#[test]
+fn still_rejects_overreported_bmd_block_count() {
+    let mut bytes = vec![0u8; 0x28];
+    bytes[0..4].copy_from_slice(b"J3D2");
+    bytes[4..8].copy_from_slice(b"bmd3");
+    bytes[8..12].copy_from_slice(&0x28u32.to_be_bytes());
+    bytes[12..16].copy_from_slice(&2u32.to_be_bytes());
+    bytes[0x20..0x24].copy_from_slice(b"TEX1");
+    bytes[0x24..0x28].copy_from_slice(&8u32.to_be_bytes());
+
+    assert!(J3dFile::parse(&bytes).is_err());
+}
+
+#[test]
 fn shape_matrix_palette_inherits_ffff_slots_from_previous_packet() {
     let mut palette = Vec::new();
     assert_eq!(

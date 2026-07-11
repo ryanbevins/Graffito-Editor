@@ -1452,7 +1452,9 @@ fn material_table_candidates_for_model(model_path: &str) -> Vec<String> {
         .rsplit_once('/')
         .map(|(directory, stem)| (format!("{directory}/"), stem))
         .unwrap_or_else(|| (String::new(), base));
-    for suffix in ["_crash", "crash", "_alpha", "alpha"] {
+    for suffix in [
+        "_crash", "crash", "_normal", "normal", "_offset", "offset", "_alpha", "alpha",
+    ] {
         if let Some(base_stem) = stem.strip_suffix(suffix) {
             if !base_stem.is_empty() {
                 candidates.push(format!("{directory}{base_stem}.bmt"));
@@ -1460,7 +1462,103 @@ fn material_table_candidates_for_model(model_path: &str) -> Vec<String> {
             break;
         }
     }
+    let model_key = material_table_match_key(stem);
+    let shared_table = if model_key.starts_with("miniwindmill")
+        || model_key.starts_with("lampbianco")
+        || model_key.starts_with("biabell")
+        || model_key.starts_with("biawatermill")
+        || model_key.starts_with("biadoor")
+    {
+        Some("bianco")
+    } else if model_key.starts_with("riccoship")
+        || model_key.starts_with("riccoyacht")
+        || model_key.starts_with("riccoboat")
+    {
+        Some("riccoship")
+    } else if model_key.starts_with("sandleafbase")
+        || model_key.starts_with("sandbombbase")
+        || model_key.starts_with("sandcastle")
+    {
+        Some("sandbombbase")
+    } else {
+        None
+    };
+    if let Some(shared_table) = shared_table {
+        let candidate = format!("{directory}{shared_table}.bmt");
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+
+    // TMareBaseManager loads its shared table from mareCommon rather than the
+    // model's actor directory. The pollution variant is a runtime state change;
+    // the normal table is the correct static editor preview.
+    if matches!(model_key.as_str(), "marem" | "marew") {
+        if let Some((archive, _)) = normalized.split_once("!/") {
+            candidates.push(format!("{archive}!/marecommon/mare.bmt"));
+        }
+    }
     candidates
+}
+
+fn material_table_match_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn material_table_asset_score(
+    model_path: &str,
+    model_textures: &[sms_formats::J3dTexturePreview],
+    table_path: &str,
+) -> Option<(u8, usize)> {
+    let model_path = normalized_preview_asset_path(model_path);
+    let table_path = normalized_preview_asset_path(table_path);
+    let candidates = material_table_candidates_for_model(&model_path);
+    if let Some(index) = candidates
+        .iter()
+        .position(|candidate| candidate == &table_path)
+    {
+        return Some((3, candidates.len().saturating_sub(index)));
+    }
+
+    let (model_directory, model_file) = model_path.rsplit_once('/')?;
+    let (table_directory, table_file) = table_path.rsplit_once('/')?;
+    let same_archive = model_path
+        .split_once("!/")
+        .zip(table_path.split_once("!/"))
+        .is_some_and(|((model_archive, _), (table_archive, _))| model_archive == table_archive);
+    if model_directory != table_directory && !same_archive {
+        return None;
+    }
+
+    let model_stem = model_file
+        .rsplit_once('.')
+        .map_or(model_file, |(stem, _)| stem);
+    let table_stem = table_file
+        .rsplit_once('.')
+        .map_or(table_file, |(stem, _)| stem);
+    let model_key = material_table_match_key(model_stem);
+    let table_key = material_table_match_key(table_stem);
+    if table_key.is_empty() {
+        return None;
+    }
+
+    let dummy_texture_match = model_textures.iter().any(|texture| {
+        let name = texture.name.to_ascii_lowercase();
+        (name.contains("dummy") || name.contains("dammy"))
+            && material_table_match_key(&name).contains(&table_key)
+    });
+    let dummy_model_match = model_directory == table_directory
+        && model_textures.iter().any(|texture| {
+            let name = texture.name.to_ascii_lowercase();
+            name.contains("dummy") || name.contains("dammy")
+        })
+        && model_key.contains(&table_key);
+
+    (dummy_texture_match || dummy_model_match).then_some((2, table_key.len()))
 }
 
 mod npc_materials;

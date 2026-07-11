@@ -86,6 +86,110 @@ fn material_table_candidates_include_base_actor_table() {
             "c:/game/dolpic.szs!/mapobj/kibako.bmt",
         ]
     );
+    assert_eq!(
+        material_table_candidates_for_model("C:/game/dolpic.szs!/mapobj/barrel_normal.bmd"),
+        [
+            "c:/game/dolpic.szs!/mapobj/barrel_normal.bmt",
+            "c:/game/dolpic.szs!/mapobj/barrel.bmt",
+        ]
+    );
+    assert_eq!(
+        material_table_candidates_for_model("C:/game/dolpic.szs!/mapobj/barrel_offset.bmd"),
+        [
+            "c:/game/dolpic.szs!/mapobj/barrel_offset.bmt",
+            "c:/game/dolpic.szs!/mapobj/barrel.bmt",
+        ]
+    );
+    assert_eq!(
+        material_table_candidates_for_model("C:/game/bianco0.szs!/mapobj/miniwindmilll.bmd"),
+        [
+            "c:/game/bianco0.szs!/mapobj/miniwindmilll.bmt",
+            "c:/game/bianco0.szs!/mapobj/bianco.bmt",
+        ]
+    );
+    assert_eq!(
+        material_table_candidates_for_model("C:/game/mare0.szs!/marem/marem.bmd"),
+        [
+            "c:/game/mare0.szs!/marem/marem.bmt",
+            "c:/game/mare0.szs!/marecommon/mare.bmt",
+        ]
+    );
+}
+
+#[test]
+fn dummy_texture_names_resolve_shared_material_tables() {
+    let textures = [sms_formats::J3dTexturePreview {
+        name: "J_barrel_dammy".to_string(),
+        width: 8,
+        height: 8,
+        format: 0,
+        wrap_s: 0,
+        wrap_t: 0,
+        min_filter: 1,
+        mag_filter: 1,
+        mipmap_count: 1,
+        rgba: vec![255; 8 * 8 * 4],
+        mips: Vec::new(),
+    }];
+
+    assert_eq!(
+        material_table_asset_score(
+            "C:/game/dolpic.szs!/mapobj/barrel_normal.bmd",
+            &textures,
+            "C:/game/dolpic.szs!/mapobj/barrel.bmt",
+        ),
+        Some((3, 1))
+    );
+    assert_eq!(
+        material_table_asset_score(
+            "C:/game/dolpic.szs!/mapobj/barrel_variant.bmd",
+            &textures,
+            "C:/game/dolpic.szs!/mapobj/barrel.bmt",
+        ),
+        Some((2, "barrel".len()))
+    );
+    assert_eq!(
+        material_table_asset_score(
+            "C:/game/dolpic.szs!/mapobj/barrel_variant.bmd",
+            &textures,
+            "C:/game/bianco.szs!/mapobj/barrel.bmt",
+        ),
+        None
+    );
+    assert_eq!(
+        material_table_asset_score(
+            "C:/game/dolpic.szs!/actors/barrel_variant.bmd",
+            &textures,
+            "C:/game/dolpic.szs!/mapobj/barrel.bmt",
+        ),
+        Some((2, "barrel".len()))
+    );
+}
+
+#[test]
+fn normalized_dummy_names_resolve_differently_separated_model_names() {
+    let textures = [sms_formats::J3dTexturePreview {
+        name: "nozzleItem_dummy".to_string(),
+        width: 1,
+        height: 1,
+        format: 0,
+        wrap_s: 0,
+        wrap_t: 0,
+        min_filter: 1,
+        mag_filter: 1,
+        mipmap_count: 1,
+        rgba: vec![255; 4],
+        mips: Vec::new(),
+    }];
+
+    assert_eq!(
+        material_table_asset_score(
+            "stage.szs!/mapobj/normal_nozzle_item.bmd",
+            &textures,
+            "stage.szs!/mapobj/nozzleItem.bmt",
+        ),
+        Some((2, "nozzleitem".len()))
+    );
 }
 
 #[test]

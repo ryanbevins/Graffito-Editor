@@ -386,21 +386,18 @@ pub(super) fn apply_model_material_table(
     loader_flags: u32,
     preview: &mut J3dGeometryPreview,
 ) {
-    let candidates = material_table_candidates_for_model(model_path);
-    let Some(table_path) = document.assets.iter().find_map(|asset| {
-        if asset.kind != StageAssetKind::MaterialTable {
-            return None;
-        }
-        let normalized = asset
-            .path
-            .to_string_lossy()
-            .replace('\\', "/")
-            .to_ascii_lowercase();
-        candidates
-            .iter()
-            .any(|candidate| candidate == &normalized)
-            .then_some(asset.path.clone())
-    }) else {
+    let Some(table_path) = document
+        .assets
+        .iter()
+        .filter(|asset| asset.kind == StageAssetKind::MaterialTable)
+        .filter_map(|asset| {
+            let path = asset.path.to_string_lossy();
+            material_table_asset_score(model_path, &preview.textures, &path)
+                .map(|score| (score, asset.path.clone()))
+        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, path)| path)
+    else {
         return;
     };
     let Ok(bytes) = read_stage_asset_bytes(&table_path) else {
@@ -415,25 +412,43 @@ pub(super) fn apply_model_material_table(
     let Ok(textures) = table.texture_previews() else {
         return;
     };
-    let required_materials = preview
-        .triangles
+    if materials
         .iter()
-        .filter_map(|triangle| triangle.material_index)
-        .max()
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    if materials.len() < required_materials
-        || materials
-            .iter()
-            .flat_map(|material| material.texture_indices)
-            .flatten()
-            .any(|index| index >= textures.len())
+        .flat_map(|material| material.texture_indices)
+        .flatten()
+        .any(|index| index >= textures.len())
     {
         return;
     }
 
-    preview.materials = materials;
-    preview.textures = textures;
+    apply_material_table_to_preview(preview, materials, textures);
+}
+
+fn apply_material_table_to_preview(
+    preview: &mut J3dGeometryPreview,
+    materials: Vec<J3dMaterial>,
+    textures: Vec<sms_formats::J3dTexturePreview>,
+) {
+    // J3DModelData::setMaterialTable copies material state by JUT material name;
+    // it does not assume that the BMD and BMT material arrays share an order.
+    for mut replacement in materials {
+        let Some((index, current)) = preview
+            .materials
+            .iter()
+            .enumerate()
+            .find(|(_, current)| current.name == replacement.name)
+        else {
+            continue;
+        };
+        replacement.name.clone_from(&current.name);
+        replacement.material_index = current.material_index;
+        replacement.material_id = current.material_id;
+        preview.materials[index] = replacement;
+    }
+    if !textures.is_empty() {
+        preview.textures = textures;
+    }
+
     for triangle in &mut preview.triangles {
         let Some(material) = triangle
             .material_index
@@ -441,7 +456,11 @@ pub(super) fn apply_model_material_table(
         else {
             continue;
         };
-        triangle.texture_index = material.texture_indices.into_iter().flatten().next();
+        triangle.texture_index = material
+            .texture_indices
+            .into_iter()
+            .flatten()
+            .find(|index| *index < preview.textures.len());
         triangle.cull_mode = Some(material.cull_mode);
         triangle.alpha_compare = Some(material.alpha_compare);
         triangle.blend_mode = Some(material.blend_mode);

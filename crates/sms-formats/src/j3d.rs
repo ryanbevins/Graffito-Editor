@@ -569,10 +569,24 @@ impl J3dFile {
         let file_size = be_u32(bytes, 0x08, FORMAT)?;
         let section_count = be_u32(bytes, 0x0C, FORMAT)?;
 
-        let mut sections = Vec::new();
+        let mut sections = Vec::<J3dSection>::new();
         let mut offset = 0x20usize;
-        for _ in 0..section_count {
+        for section_index in 0..section_count {
             if offset + 8 > bytes.len() {
+                // Retail texture-only BMTs such as Mamma's sandbombbase.bmt
+                // declare a second block even though their sole TEX1 block
+                // ends exactly at the declared file size. J3D's material-table
+                // loader still uses that TEX1 table. Keep this exception as
+                // narrow as possible so truncated BMD/BDL files remain errors.
+                let retail_texture_only_bmt = file_type.starts_with("bmt")
+                    && section_index + 1 == section_count
+                    && offset == bytes.len()
+                    && file_size as usize == bytes.len()
+                    && sections.len() == 1
+                    && sections[0].tag == "TEX1";
+                if retail_texture_only_bmt {
+                    break;
+                }
                 return Err(FormatError::InvalidOffset {
                     format: FORMAT,
                     offset,
