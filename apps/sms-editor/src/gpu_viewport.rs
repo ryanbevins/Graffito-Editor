@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -791,6 +791,9 @@ impl GpuViewportScene {
                 scene: GpuSceneData::from_preview(preview),
                 frame: GpuViewportFrame::default(),
                 generation: NEXT_SCENE_GENERATION.fetch_add(1, Ordering::Relaxed),
+                geometry_generation: 0,
+                dirty_batches: BTreeSet::new(),
+                dirty_materials: BTreeSet::new(),
                 target_format,
             })),
         }
@@ -799,6 +802,35 @@ impl GpuViewportScene {
     pub fn set_frame(&self, frame: GpuViewportFrame) {
         if let Ok(mut shared) = self.shared.lock() {
             shared.frame = frame;
+        }
+    }
+
+    pub fn update_geometry(
+        &self,
+        preview: &ModelPreview,
+        triangle_ranges: &[std::ops::Range<usize>],
+    ) {
+        if let Ok(mut shared) = self.shared.lock() {
+            let dirty = shared.scene.update_geometry(preview, triangle_ranges);
+            if !dirty.is_empty() {
+                shared.dirty_batches.extend(dirty);
+                shared.geometry_generation = shared.geometry_generation.wrapping_add(1);
+            }
+        }
+    }
+
+    pub fn update_materials(&self, preview: &ModelPreview, material_indices: &[usize]) {
+        if let Ok(mut shared) = self.shared.lock() {
+            for index in material_indices.iter().copied() {
+                let Some(material) = preview.materials.get(index) else {
+                    continue;
+                };
+                if index >= shared.scene.materials.len() {
+                    continue;
+                }
+                shared.scene.materials[index] = GpuMaterialData::from_j3d(material, preview);
+                shared.dirty_materials.insert(index);
+            }
         }
     }
 
@@ -847,6 +879,9 @@ struct GpuViewportShared {
     scene: GpuSceneData,
     frame: GpuViewportFrame,
     generation: u64,
+    geometry_generation: u64,
+    dirty_batches: BTreeSet<usize>,
+    dirty_materials: BTreeSet<usize>,
     target_format: wgpu::TextureFormat,
 }
 
@@ -863,13 +898,28 @@ impl CallbackTrait for GpuViewportCallback {
         _egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        let Ok(shared) = self.shared.lock() else {
+        let Ok(mut shared) = self.shared.lock() else {
             return Vec::new();
         };
         let resources = callback_resources
             .entry::<GpuViewportResources>()
             .or_insert_with(|| GpuViewportResources::new(device, shared.target_format));
-        resources.ensure_scene(device, queue, &shared.scene, shared.generation);
+        resources.ensure_scene(
+            device,
+            queue,
+            &shared.scene,
+            shared.generation,
+            shared.geometry_generation,
+        );
+        resources.write_geometry(
+            queue,
+            &shared.scene,
+            &shared.dirty_batches,
+            shared.geometry_generation,
+        );
+        shared.dirty_batches.clear();
+        resources.write_materials(device, queue, &shared.scene, &shared.dirty_materials);
+        shared.dirty_materials.clear();
         resources.write_frame(queue, shared.frame, &shared.scene);
         Vec::new()
     }
@@ -891,6 +941,13 @@ struct GpuSceneData {
     textures: Vec<GpuTextureData>,
     materials: Vec<GpuMaterialData>,
     batches: Vec<GpuBatchData>,
+    triangle_vertices: Vec<Option<GpuTriangleLocation>>,
+}
+
+#[derive(Clone, Copy)]
+struct GpuTriangleLocation {
+    batch_index: usize,
+    vertex_offset: usize,
 }
 
 impl GpuSceneData {
@@ -910,8 +967,9 @@ impl GpuSceneData {
         let mut fallback_materials = BTreeMap::<(usize, usize, u8), usize>::new();
         let mut batch_map = BTreeMap::<(usize, usize, GpuPipelineKey), usize>::new();
         let mut batches = Vec::<GpuBatchData>::new();
+        let mut triangle_vertices = vec![None; preview.triangles.len()];
 
-        for triangle in &preview.triangles {
+        for (triangle_index, triangle) in preview.triangles.iter().enumerate() {
             let material_index = triangle
                 .material_index
                 .filter(|index| *index < materials.len())
@@ -947,6 +1005,10 @@ impl GpuSceneData {
                 });
             let batch = &mut batches[batch_index];
             let base = batch.vertices.len() as u32;
+            triangle_vertices[triangle_index] = Some(GpuTriangleLocation {
+                batch_index,
+                vertex_offset: base as usize,
+            });
             let face_normal = preview_triangle_normal(triangle);
             let legacy_colors = legacy_vertex_colors(triangle, face_normal);
             for vertex_index in 0..3 {
@@ -999,7 +1061,48 @@ impl GpuSceneData {
             textures,
             materials,
             batches,
+            triangle_vertices,
         }
+    }
+
+    fn update_geometry(
+        &mut self,
+        preview: &ModelPreview,
+        triangle_ranges: &[std::ops::Range<usize>],
+    ) -> BTreeSet<usize> {
+        let mut dirty_batches = BTreeSet::new();
+        for triangle_index in triangle_ranges.iter().flat_map(|range| range.clone()) {
+            let Some(triangle) = preview.triangles.get(triangle_index) else {
+                continue;
+            };
+            let Some(location) = self
+                .triangle_vertices
+                .get(triangle_index)
+                .copied()
+                .flatten()
+            else {
+                continue;
+            };
+            let Some(batch) = self.batches.get_mut(location.batch_index) else {
+                continue;
+            };
+            let face_normal = preview_triangle_normal(triangle);
+            for vertex_index in 0..3 {
+                let Some(vertex) = batch
+                    .vertices
+                    .get_mut(location.vertex_offset + vertex_index)
+                else {
+                    continue;
+                };
+                vertex.position = triangle.vertices[vertex_index];
+                vertex.normal = triangle
+                    .normals
+                    .map(|normals| normals[vertex_index])
+                    .unwrap_or(face_normal);
+            }
+            dirty_batches.insert(location.batch_index);
+        }
+        dirty_batches
     }
 }
 
@@ -1031,6 +1134,7 @@ fn render_layer_id(layer: PreviewRenderLayer) -> u8 {
         PreviewRenderLayer::Main => 1,
         PreviewRenderLayer::Water => 2,
         PreviewRenderLayer::Goop => 3,
+        PreviewRenderLayer::Shadow => 4,
     }
 }
 
@@ -1227,6 +1331,7 @@ impl GpuMaterialData {
                     logic_op: 3,
                 }),
                 depth: triangle.z_mode.unwrap_or(default_z_mode()),
+                draw_mode: None,
             },
             tex_matrices: [None; TEXTURE_SLOT_COUNT],
             animations: Vec::new(),
@@ -1262,6 +1367,7 @@ struct GpuMaterialState {
     alpha_compare: J3dAlphaCompare,
     blend: J3dBlendMode,
     depth: J3dZMode,
+    draw_mode: Option<u8>,
 }
 
 impl GpuMaterialState {
@@ -1271,13 +1377,19 @@ impl GpuMaterialState {
             alpha_compare: material.alpha_compare,
             blend: material.blend_mode,
             depth: material.z_mode,
+            draw_mode: Some(material.mode),
         }
     }
 
     fn pipeline_key(self, render_layer: PreviewRenderLayer) -> GpuPipelineKey {
         let pass = if render_layer == PreviewRenderLayer::Sky {
             GpuBatchPass::Sky
-        } else if self.blend.mode == 1 || self.blend.mode == 3 {
+        } else if self
+            .draw_mode
+            .map_or(self.blend.mode == 1 || self.blend.mode == 3, |mode| {
+                mode & 3 == 0
+            })
+        {
             GpuBatchPass::Translucent
         } else if !alpha_compare_is_always(self.alpha_compare) {
             GpuBatchPass::AlphaTest
@@ -1772,6 +1884,7 @@ struct GpuViewportResources {
     batches: Vec<GpuBatchResources>,
     draw_order: Vec<GpuDrawCommand>,
     generation: u64,
+    geometry_generation: u64,
 }
 
 impl GpuViewportResources {
@@ -1854,6 +1967,7 @@ impl GpuViewportResources {
             batches: Vec::new(),
             draw_order: Vec::new(),
             generation: 0,
+            geometry_generation: 0,
         }
     }
 
@@ -1863,6 +1977,7 @@ impl GpuViewportResources {
         queue: &wgpu::Queue,
         scene: &GpuSceneData,
         generation: u64,
+        geometry_generation: u64,
     ) {
         if self.generation == generation {
             return;
@@ -1915,6 +2030,78 @@ impl GpuViewportResources {
             .collect();
         self.draw_order = sorted_gpu_draw_order(&self.batches);
         self.generation = generation;
+        self.geometry_generation = geometry_generation;
+    }
+
+    fn write_geometry(
+        &mut self,
+        queue: &wgpu::Queue,
+        scene: &GpuSceneData,
+        dirty_batches: &BTreeSet<usize>,
+        geometry_generation: u64,
+    ) {
+        if self.geometry_generation == geometry_generation {
+            return;
+        }
+        for batch_index in dirty_batches {
+            let Some(data) = scene.batches.get(*batch_index) else {
+                continue;
+            };
+            let Some(resources) = self.batches.get(*batch_index) else {
+                continue;
+            };
+            queue.write_buffer(
+                &resources.vertex_buffer,
+                0,
+                bytemuck::cast_slice(&data.vertices),
+            );
+        }
+        self.geometry_generation = geometry_generation;
+    }
+
+    fn write_materials(
+        &mut self,
+        device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        scene: &GpuSceneData,
+        dirty_materials: &BTreeSet<usize>,
+    ) {
+        for index in dirty_materials.iter().copied() {
+            let Some(material) = scene.materials.get(index) else {
+                continue;
+            };
+            if index >= self.material_buffers.len() || index >= self.material_bind_groups.len() {
+                continue;
+            }
+            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("sms viewport animated J3D material uniform"),
+                contents: bytemuck::bytes_of(&material.uniform),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+            let mut entries = vec![wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }];
+            for slot in 0..TEXTURE_SLOT_COUNT {
+                let texture_index = material.texture_indices[slot].min(self.textures.len() - 1);
+                let texture = &self.textures[texture_index];
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 1 + slot as u32 * 2,
+                    resource: wgpu::BindingResource::TextureView(&texture.view),
+                });
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 2 + slot as u32 * 2,
+                    resource: wgpu::BindingResource::Sampler(&texture.sampler),
+                });
+            }
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("sms viewport animated J3D material {index}")),
+                layout: &self.material_layout,
+                entries: &entries,
+            });
+            self.material_buffers[index] = buffer;
+            self.material_bind_groups[index] = bind_group;
+        }
     }
 
     fn ensure_pipeline(&mut self, device: &wgpu::Device, key: GpuPipelineKey) {
@@ -2045,7 +2232,7 @@ impl GpuBatchResources {
             vertex_buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("sms viewport J3D vertex buffer"),
                 contents: bytemuck::cast_slice(&batch.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             }),
             index_buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("sms viewport J3D index buffer"),
@@ -2299,14 +2486,87 @@ fn vec4(value: [f32; 3], w: f32) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{PreviewPoint, PreviewRenderLayer};
     use sms_formats::{
-        J3dColorChannel, J3dIndirectMaterial, J3dTevOrder, J3dTexGen, SMS_MAP_MODEL_LOAD_FLAGS,
+        J3dColorChannel, J3dIndirectMaterial, J3dPreviewCombineMode, J3dTevOrder, J3dTexGen,
+        SMS_MAP_MODEL_LOAD_FLAGS,
     };
 
     #[test]
     fn material_uniform_is_uniform_buffer_aligned() {
         assert_eq!(std::mem::size_of::<GpuMaterialUniform>() % 16, 0);
         assert_eq!(std::mem::align_of::<GpuMaterialUniform>(), 4);
+    }
+
+    #[test]
+    fn geometry_updates_touch_only_requested_triangle_batches() {
+        let mut preview = geometry_update_preview();
+        let mut scene = GpuSceneData::from_preview(&preview);
+        let static_location = scene.triangle_vertices[0].unwrap();
+        let animated_location = scene.triangle_vertices[1].unwrap();
+        let static_position = scene.batches[static_location.batch_index].vertices
+            [static_location.vertex_offset]
+            .position;
+
+        preview.triangles[1].vertices[0] = [50.0, 60.0, 70.0];
+        let dirty = scene.update_geometry(&preview, &[0..0, 1..2]);
+
+        assert_eq!(dirty, BTreeSet::from([animated_location.batch_index]));
+        assert_eq!(
+            scene.batches[animated_location.batch_index].vertices[animated_location.vertex_offset]
+                .position,
+            [50.0, 60.0, 70.0]
+        );
+        assert_eq!(
+            scene.batches[static_location.batch_index].vertices[static_location.vertex_offset]
+                .position,
+            static_position
+        );
+    }
+
+    fn geometry_update_preview() -> ModelPreview {
+        let triangle = |packet_index, x| PreviewTriangle {
+            vertices: [[x, 0.0, 0.0], [x + 1.0, 0.0, 0.0], [x, 1.0, 0.0]],
+            normals: Some([[0.0, 0.0, 1.0]; 3]),
+            color_channels: [None; 2],
+            tex_coord_sets: [None; 8],
+            material_index: None,
+            packet_index,
+            model_index: packet_index + 1,
+            render_layer: PreviewRenderLayer::Main,
+            color: Some([255; 4]),
+            vertex_colors: None,
+            combine_mode: J3dPreviewCombineMode::VertexOnly,
+            tex_coords: None,
+            texture_index: None,
+            mask_tex_coords: None,
+            mask_texture_index: None,
+            cull_mode: None,
+            alpha_compare: None,
+            blend_mode: None,
+            z_mode: None,
+        };
+        ModelPreview {
+            points: Vec::<PreviewPoint>::new(),
+            triangles: vec![triangle(0, 0.0), triangle(1, 10.0)],
+            textures: Vec::new(),
+            materials: Vec::new(),
+            texture_srt_animations: Vec::new(),
+            texture_pattern_animations: Vec::new(),
+            material_animation_bindings: Vec::new(),
+            bounds_min: [0.0; 3],
+            bounds_max: [11.0, 1.0, 0.0],
+            camera_bounds_min: [0.0; 3],
+            camera_bounds_max: [11.0, 1.0, 0.0],
+            sky_radius: 0.0,
+            loaded_models: 2,
+            failed_models: 0,
+            source_vertices: 6,
+            source_triangles: 2,
+            source_textures: 0,
+            object_model_indices: BTreeMap::new(),
+            animated_models: Vec::new(),
+        }
     }
 
     #[test]
@@ -2402,6 +2662,26 @@ mod tests {
         material.z_mode.compare_enable = 0;
         let key = GpuMaterialState::from_j3d(&material).pipeline_key(PreviewRenderLayer::Main);
         assert_eq!(key.depth.compare, GpuDepthCompare::Always);
+    }
+
+    #[test]
+    fn j3d_draw_mode_controls_opaque_and_translucent_buffers() {
+        let mut opaque_with_blending = test_material(1);
+        opaque_with_blending.blend_mode.mode = 1;
+        assert_eq!(
+            GpuMaterialState::from_j3d(&opaque_with_blending)
+                .pipeline_key(PreviewRenderLayer::Main)
+                .pass,
+            GpuBatchPass::Opaque
+        );
+
+        let translucent = test_material(4);
+        assert_eq!(
+            GpuMaterialState::from_j3d(&translucent)
+                .pipeline_key(PreviewRenderLayer::Main)
+                .pass,
+            GpuBatchPass::Translucent
+        );
     }
 
     #[test]

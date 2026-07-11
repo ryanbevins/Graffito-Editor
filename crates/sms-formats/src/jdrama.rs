@@ -17,6 +17,20 @@ pub struct JDramaObjectRecord {
     pub object_name: Option<String>,
     pub transform: Option<JDramaTransform>,
     pub stream_strings: Vec<String>,
+    pub npc_params: Option<JDramaNpcParams>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JDramaNpcParams {
+    pub color_indices: [i32; 2],
+    pub pollution_amount: i32,
+    pub parts_color_indices: [i32; 3],
+    pub parts_mask: i32,
+    pub movement_type: i32,
+    pub action_flags: i32,
+    pub motion_min: i32,
+    pub motion_max: i32,
+    pub coin_flag: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -60,6 +74,8 @@ fn parse_record_at(
     let stream_strings = transform
         .map(|_| scan_ascii_stream_strings(bytes, after_name + 36, end))
         .unwrap_or_default();
+    let npc_params =
+        transform.and_then(|_| read_npc_params(bytes, after_name + 36, end, &type_name));
 
     records.push(JDramaObjectRecord {
         offset,
@@ -68,6 +84,7 @@ fn parse_record_at(
         object_name,
         transform,
         stream_strings,
+        npc_params,
     });
 
     let mut scan = after_type;
@@ -81,6 +98,44 @@ fn parse_record_at(
     }
 
     Ok(size)
+}
+
+fn read_npc_params(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    type_name: &str,
+) -> Option<JDramaNpcParams> {
+    if !type_name.to_ascii_lowercase().starts_with("npc") {
+        return None;
+    }
+    let (_, mut cursor) = read_len_string(bytes, start, end).ok()?;
+    let light_count = be_u32(bytes, cursor, FORMAT).ok()? as usize;
+    cursor = cursor.checked_add(4)?;
+    for _ in 0..light_count {
+        cursor = cursor.checked_add(4)?;
+        let (_, next) = read_len_string(bytes, cursor, end).ok()?;
+        cursor = next;
+    }
+    let (_, cursor) = read_len_string(bytes, cursor, end).ok()?;
+    let (_, cursor) = read_len_string(bytes, cursor, end).ok()?;
+    if cursor.checked_add(48)? > end {
+        return None;
+    }
+    let values: [i32; 12] = std::array::from_fn(|index| {
+        be_u32(bytes, cursor + index * 4, FORMAT).unwrap_or_default() as i32
+    });
+    Some(JDramaNpcParams {
+        color_indices: [values[0], values[1]],
+        pollution_amount: values[2],
+        parts_color_indices: [values[3], values[4], values[5]],
+        parts_mask: values[6],
+        movement_type: values[7],
+        action_flags: values[8],
+        motion_min: values[9],
+        motion_max: values[10],
+        coin_flag: values[11],
+    })
 }
 
 fn scan_ascii_stream_strings(bytes: &[u8], start: usize, end: usize) -> Vec<String> {
@@ -241,6 +296,30 @@ mod tests {
             scan_ascii_stream_strings(&bytes, 0, bytes.len()),
             ["NozzleBox", "rocket_nozzle_item"]
         );
+    }
+
+    #[test]
+    fn reads_npc_color_indices_and_parts_mask_after_actor_fields() {
+        let mut bytes = Vec::new();
+        put_len_string(&mut bytes, b"");
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        put_len_string(&mut bytes, b"manager");
+        put_len_string(&mut bytes, b"graph");
+        for value in [9_i32, 3, 0, 1, 255, 2, 264, 0, 100, -1, 0, -1] {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+
+        let params = read_npc_params(&bytes, 0, bytes.len(), "NPCMonteMA").unwrap();
+        assert_eq!(params.color_indices, [9, 3]);
+        assert_eq!(params.pollution_amount, 0);
+        assert_eq!(params.parts_color_indices, [1, 255, 2]);
+        assert_eq!(params.parts_mask, 264);
+        assert_eq!(params.action_flags, 100);
+    }
+
+    fn put_len_string(bytes: &mut Vec<u8>, value: &[u8]) {
+        bytes.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(value);
     }
 
     #[test]

@@ -1,13 +1,15 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Instant;
 
 use eframe::egui;
 use sms_formats::{
-    discover_scene_archives, read_stage_asset_bytes, J3dAlphaCompare, J3dBlendMode, J3dFile,
-    J3dGeometryPreview, J3dMaterial, J3dPreviewCombineMode, J3dTextureSrtAnimation, J3dZMode,
-    SceneArchiveInfo, StageAssetKind, SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS,
+    decode_bti_texture, discover_scene_archives, read_stage_asset_bytes, J3dAlphaCompare,
+    J3dBlendMode, J3dFile, J3dGeometryPreview, J3dJointAnimation, J3dMaterial, J3dMatrix34,
+    J3dPreviewCombineMode, J3dTexturePatternAnimation, J3dTextureSrtAnimation, J3dTriangle,
+    J3dZMode, SceneArchiveInfo, StageAsset, StageAssetKind, SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS,
     SMS_MAP_MODEL_LOAD_FLAGS, SMS_POLLUTION_MODEL_LOAD_FLAGS,
 };
 use sms_render::{RenderScene, RendererConfig, ViewportRenderer};
@@ -100,6 +102,7 @@ struct ModelPreview {
     textures: Vec<PreviewTexture>,
     materials: Vec<J3dMaterial>,
     texture_srt_animations: Vec<J3dTextureSrtAnimation>,
+    texture_pattern_animations: Vec<PreviewTexturePatternAnimation>,
     material_animation_bindings: Vec<Vec<PreviewMaterialAnimationBinding>>,
     bounds_min: [f32; 3],
     bounds_max: [f32; 3],
@@ -112,12 +115,29 @@ struct ModelPreview {
     source_triangles: usize,
     source_textures: usize,
     object_model_indices: BTreeMap<String, usize>,
+    animated_models: Vec<AnimatedModelPreview>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct PreviewMaterialAnimationBinding {
     animation_index: usize,
     binding_index: usize,
+}
+
+#[derive(Clone)]
+struct PreviewTexturePatternAnimation {
+    animation: J3dTexturePatternAnimation,
+    phase_seconds: f32,
+    bindings: Vec<PreviewTexturePatternBinding>,
+}
+
+#[derive(Clone)]
+struct PreviewTexturePatternBinding {
+    material_index: usize,
+    texture_slot: usize,
+    texture_base: usize,
+    animation_binding_index: usize,
+    current_texture_index: Option<usize>,
 }
 
 impl ModelPreview {
@@ -178,6 +198,7 @@ enum PreviewRenderLayer {
     Main,
     Water,
     Goop,
+    Shadow,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -219,9 +240,47 @@ struct PreviewTexture {
 
 #[derive(Clone)]
 struct CachedObjectModelPreview {
+    file: J3dFile,
+    joint_animation: Option<J3dJointAnimation>,
+    loader_flags: u32,
     preview: J3dGeometryPreview,
     texture_base: usize,
     material_base: usize,
+    joint_names: Vec<String>,
+    instances: Vec<AnimatedModelInstance>,
+}
+
+#[derive(Clone)]
+struct CachedAccessoryModelPreview {
+    preview: J3dGeometryPreview,
+    local_triangles: Arc<Vec<J3dTriangle>>,
+    texture_base: usize,
+    material_base: usize,
+}
+
+#[derive(Clone)]
+struct AnimatedModelPreview {
+    file: J3dFile,
+    animation: J3dJointAnimation,
+    loader_flags: u32,
+    instances: Vec<AnimatedModelInstance>,
+}
+
+#[derive(Debug, Clone)]
+struct AnimatedModelInstance {
+    transform: Transform,
+    model_index: usize,
+    point_range: std::ops::Range<usize>,
+    point_stride: usize,
+    triangle_range: std::ops::Range<usize>,
+    accessories: Vec<AnimatedAccessoryInstance>,
+}
+
+#[derive(Debug, Clone)]
+struct AnimatedAccessoryInstance {
+    joint_index: usize,
+    local_triangles: Arc<Vec<J3dTriangle>>,
+    triangle_range: std::ops::Range<usize>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -286,6 +345,7 @@ struct SmsEditorApp {
     undo_stack: Vec<Vec<SceneObject>>,
     redo_stack: Vec<Vec<SceneObject>>,
     animation_started_at: Instant,
+    last_skeletal_animation_tick: u64,
 }
 
 impl Default for SmsEditorApp {
@@ -339,6 +399,7 @@ impl Default for SmsEditorApp {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             animation_started_at: Instant::now(),
+            last_skeletal_animation_tick: u64::MAX,
         }
     }
 }
@@ -1307,17 +1368,16 @@ impl SmsEditorApp {
         painter: &egui::Painter,
         rect: egui::Rect,
     ) {
+        self.update_skeletal_animations();
         let has_triangles = self
             .model_preview
             .as_ref()
             .is_some_and(|preview| !preview.triangles.is_empty());
 
         if has_triangles {
-            if self
-                .model_preview
-                .as_ref()
-                .is_some_and(|preview| !preview.texture_srt_animations.is_empty())
-            {
+            if self.model_preview.as_ref().is_some_and(|preview| {
+                !preview.texture_srt_animations.is_empty() || !preview.animated_models.is_empty()
+            }) {
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
             }
             if let (Some(gpu_viewport), Some(frame)) =
@@ -1362,6 +1422,140 @@ impl SmsEditorApp {
                 self.paint_preview_bounds(painter, rect, preview);
             }
         }
+    }
+
+    fn update_skeletal_animations(&mut self) {
+        let elapsed_seconds = self.animation_started_at.elapsed().as_secs_f32();
+        let tick = (elapsed_seconds.max(0.0) * 30.0) as u64;
+        if tick == self.last_skeletal_animation_tick {
+            return;
+        }
+        let Some(preview) = self.model_preview.as_mut() else {
+            return;
+        };
+        if preview.animated_models.is_empty() && preview.texture_pattern_animations.is_empty() {
+            return;
+        }
+        self.last_skeletal_animation_tick = tick;
+
+        let mut dirty_materials = Vec::new();
+        {
+            let ModelPreview {
+                animated_models,
+                texture_pattern_animations,
+                materials,
+                points,
+                triangles,
+                ..
+            } = preview;
+            for source in animated_models {
+                let Ok(posed_triangles) = source.file.animated_triangles_with_joint_animation(
+                    source.loader_flags,
+                    &source.animation,
+                    elapsed_seconds,
+                ) else {
+                    continue;
+                };
+                let joint_matrices = source
+                    .file
+                    .joint_matrices_with_joint_animation(
+                        source.loader_flags,
+                        &source.animation,
+                        elapsed_seconds,
+                    )
+                    .unwrap_or_default();
+                for instance in &source.instances {
+                    for (point, position) in points[instance.point_range.clone()].iter_mut().zip(
+                        posed_triangles
+                            .iter()
+                            .flat_map(|triangle| triangle.vertices)
+                            .step_by(instance.point_stride),
+                    ) {
+                        point.position = transform_preview_point(position, instance.transform);
+                    }
+                    for (triangle, posed) in
+                        triangles[instance.triangle_range.clone()].iter_mut().zip(
+                            posed_triangles
+                                .iter()
+                                .filter(|triangle| triangle_vertices_are_finite(triangle.vertices)),
+                        )
+                    {
+                        triangle.vertices =
+                            transform_preview_vertices(posed.vertices, instance.transform);
+                        triangle.normals = posed
+                            .normals
+                            .map(|normals| transform_preview_normals(normals, instance.transform));
+                    }
+                    for accessory in &instance.accessories {
+                        let Some(joint_matrix) = joint_matrices.get(accessory.joint_index).copied()
+                        else {
+                            continue;
+                        };
+                        for (triangle, local) in triangles[accessory.triangle_range.clone()]
+                            .iter_mut()
+                            .zip(accessory.local_triangles.iter())
+                        {
+                            triangle.vertices = transform_preview_vertices(
+                                local
+                                    .vertices
+                                    .map(|vertex| transform_j3d_matrix_point(joint_matrix, vertex)),
+                                instance.transform,
+                            );
+                            triangle.normals = local.normals.map(|normals| {
+                                transform_preview_normals(
+                                    normals.map(|normal| {
+                                        transform_j3d_matrix_normal(joint_matrix, normal)
+                                    }),
+                                    instance.transform,
+                                )
+                            });
+                        }
+                    }
+                }
+            }
+            for pattern in texture_pattern_animations {
+                let frame = pattern
+                    .animation
+                    .playback_frame(elapsed_seconds + pattern.phase_seconds);
+                for binding in &mut pattern.bindings {
+                    let next = pattern.animation.bindings[binding.animation_binding_index]
+                        .texture_index(frame)
+                        .map(|index| binding.texture_base + index);
+                    if next == binding.current_texture_index {
+                        continue;
+                    }
+                    let Some(material) = materials.get_mut(binding.material_index) else {
+                        continue;
+                    };
+                    material.texture_indices[binding.texture_slot] = next;
+                    binding.current_texture_index = next;
+                    dirty_materials.push(binding.material_index);
+                }
+            }
+        }
+        if let Some(gpu_viewport) = &self.gpu_viewport {
+            let triangle_ranges = preview
+                .animated_models
+                .iter()
+                .flat_map(|model| {
+                    model.instances.iter().flat_map(|instance| {
+                        std::iter::once(instance.triangle_range.clone()).chain(
+                            instance
+                                .accessories
+                                .iter()
+                                .map(|accessory| accessory.triangle_range.clone()),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            gpu_viewport.update_geometry(preview, &triangle_ranges);
+            if !dirty_materials.is_empty() {
+                dirty_materials.sort_unstable();
+                dirty_materials.dedup();
+                gpu_viewport.update_materials(preview, &dirty_materials);
+            }
+        }
+        self.clear_viewport_preview_cache();
     }
 
     fn gpu_viewport_frame(&self, rect: egui::Rect) -> Option<gpu_viewport::GpuViewportFrame> {
@@ -1805,12 +1999,13 @@ impl SmsEditorApp {
                 ));
                 if let Some(preview) = &model_preview {
                     self.log.push(format!(
-                        "Viewport preview loaded {} model(s), {} sampled point(s), {} triangle(s), {} texture(s), {} BTK material animation(s), {} source vertex/vertices.",
+                        "Viewport preview loaded {} model(s), {} sampled point(s), {} triangle(s), {} texture(s), {} BTK material animation(s), {} BCK skeletal animation(s), {} source vertex/vertices.",
                         preview.loaded_models,
                         preview.points.len(),
                         preview.triangles.len(),
                         preview.textures.len(),
                         preview.texture_srt_animations.len(),
+                        preview.animated_models.len(),
                         preview.source_vertices
                     ));
                 } else if !scene.model_paths.is_empty() {
@@ -1820,6 +2015,8 @@ impl SmsEditorApp {
                 self.issues = document.validate();
                 self.document = Some(document);
                 self.model_preview = model_preview;
+                self.animation_started_at = Instant::now();
+                self.last_skeletal_animation_tick = u64::MAX;
                 self.rebuild_gpu_viewport_scene();
                 self.clear_viewport_preview_cache();
                 self.selected_object_id = None;
@@ -1860,12 +2057,17 @@ impl SmsEditorApp {
         } else {
             preferred
         };
+        let world_model_paths: BTreeSet<_> = models
+            .iter()
+            .map(|asset| normalized_preview_asset_path(&asset.path.to_string_lossy()))
+            .collect();
 
         let mut points = Vec::new();
         let mut triangles = Vec::new();
         let mut textures = Vec::new();
         let mut materials = Vec::new();
         let mut texture_srt_animations = Vec::new();
+        let mut texture_pattern_animations = Vec::new();
         let mut material_animation_bindings = Vec::new();
         let mut next_packet_index = 0usize;
         let mut bounds_min = [f32::INFINITY; 3];
@@ -2031,7 +2233,8 @@ impl SmsEditorApp {
             }
         }
 
-        let mut object_model_cache = BTreeMap::<String, CachedObjectModelPreview>::new();
+        let mut object_model_cache = BTreeMap::<(String, u32), CachedObjectModelPreview>::new();
+        let mut accessory_model_cache = BTreeMap::<String, CachedAccessoryModelPreview>::new();
         for object in &document.objects {
             if !should_render_object_model(object) {
                 continue;
@@ -2044,11 +2247,14 @@ impl SmsEditorApp {
             else {
                 continue;
             };
-            if !is_supported_object_preview_model_path(&model_path) {
+            if !should_instance_object_preview_model(&model_path, &world_model_paths) {
                 continue;
             }
+            let loader_flags = npc_model_loader_flags(object)
+                .unwrap_or_else(|| model_loader_flags_for_path(&model_path));
+            let model_cache_key = (model_path.clone(), loader_flags);
 
-            if !object_model_cache.contains_key(&model_path) {
+            if !object_model_cache.contains_key(&model_cache_key) {
                 let Ok(bytes) = read_stage_asset_bytes(&model_path) else {
                     failed_models += 1;
                     continue;
@@ -2057,25 +2263,39 @@ impl SmsEditorApp {
                     failed_models += 1;
                     continue;
                 };
-                let loader_flags = model_loader_flags_for_path(&model_path);
-                let Ok(mut preview) = file.geometry_preview_with_loader_flags(loader_flags) else {
+                let joint_animation = starting_joint_animation(document, object, &model_path);
+                let preview_result = joint_animation.as_ref().map_or_else(
+                    || file.geometry_preview_with_loader_flags(loader_flags),
+                    |animation| {
+                        file.geometry_preview_with_joint_animation(loader_flags, animation, 0.0)
+                    },
+                );
+                let Ok(mut preview) = preview_result else {
                     failed_models += 1;
                     continue;
                 };
                 apply_model_material_table(document, &model_path, loader_flags, &mut preview);
+                apply_npc_runtime_textures(document, object, &mut preview);
+                apply_npc_eye_decal_culling(object, &mut preview);
                 let texture_base = push_preview_textures(&mut textures, &preview);
                 let material_base = push_preview_materials(&mut materials, &preview, texture_base);
+                let joint_names = file.joint_names().unwrap_or_default();
                 object_model_cache.insert(
-                    model_path.clone(),
+                    model_cache_key.clone(),
                     CachedObjectModelPreview {
+                        file,
+                        joint_animation,
+                        loader_flags,
                         preview,
                         texture_base,
                         material_base,
+                        joint_names,
+                        instances: Vec::new(),
                     },
                 );
             }
 
-            let Some(cached) = object_model_cache.get(&model_path) else {
+            let Some(cached) = object_model_cache.get(&model_cache_key) else {
                 continue;
             };
             let object_material_base =
@@ -2088,6 +2308,16 @@ impl SmsEditorApp {
                 &cached.preview.materials,
                 &mut texture_srt_animations,
                 &mut material_animation_bindings,
+            );
+            attach_npc_texture_pattern_animation(
+                document,
+                object,
+                &model_path,
+                object_material_base,
+                cached.texture_base,
+                &cached.preview.materials,
+                &mut materials,
+                &mut texture_pattern_animations,
             );
             loaded_models += 1;
             let model_index = loaded_models;
@@ -2125,6 +2355,7 @@ impl SmsEditorApp {
             );
 
             let point_stride = (cached.preview.positions.len() / POINTS_PER_OBJECT_INSTANCE).max(1);
+            let point_start = points.len();
             for position in cached.preview.positions.iter().step_by(point_stride) {
                 points.push(PreviewPoint {
                     position: transform_preview_point(*position, object.transform),
@@ -2132,6 +2363,7 @@ impl SmsEditorApp {
                 });
             }
 
+            let triangle_start = triangles.len();
             for triangle in &cached.preview.triangles {
                 let vertices = transform_preview_vertices(triangle.vertices, object.transform);
                 if triangle_vertices_are_finite(vertices) {
@@ -2169,9 +2401,140 @@ impl SmsEditorApp {
                     });
                 }
             }
+            let body_triangle_end = triangles.len();
+            let mut accessories = Vec::new();
+            let joint_matrices = cached
+                .joint_animation
+                .as_ref()
+                .map_or_else(
+                    || cached.file.joint_matrices(cached.loader_flags),
+                    |animation| {
+                        cached.file.joint_matrices_with_joint_animation(
+                            cached.loader_flags,
+                            animation,
+                            0.0,
+                        )
+                    },
+                )
+                .unwrap_or_default();
+            for spec in monte_accessory_specs(object) {
+                let Some(joint_index) = cached
+                    .joint_names
+                    .iter()
+                    .position(|name| name.eq_ignore_ascii_case(spec.joint_name))
+                else {
+                    continue;
+                };
+                let Some(joint_matrix) = joint_matrices.get(joint_index).copied() else {
+                    continue;
+                };
+                if !accessory_model_cache.contains_key(spec.asset_suffix) {
+                    let Some(asset) = find_stage_asset_by_suffix(
+                        document,
+                        StageAssetKind::Model,
+                        spec.asset_suffix,
+                    ) else {
+                        continue;
+                    };
+                    let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+                        continue;
+                    };
+                    let Ok(file) = J3dFile::parse(&bytes) else {
+                        continue;
+                    };
+                    let Ok(preview) = file.geometry_preview_with_loader_flags(0x1021_0000) else {
+                        continue;
+                    };
+                    let local_triangles = Arc::new(preview.triangles.clone());
+                    let texture_base = push_preview_textures(&mut textures, &preview);
+                    let material_base =
+                        push_preview_materials(&mut materials, &preview, texture_base);
+                    accessory_model_cache.insert(
+                        spec.asset_suffix.to_string(),
+                        CachedAccessoryModelPreview {
+                            preview,
+                            local_triangles,
+                            texture_base,
+                            material_base,
+                        },
+                    );
+                }
+                let Some(accessory) = accessory_model_cache.get(spec.asset_suffix) else {
+                    continue;
+                };
+                source_vertices += accessory.preview.positions.len();
+                source_triangles += accessory.preview.triangles.len();
+                source_textures += accessory.preview.textures.len();
+                let accessory_packet_base = next_packet_index;
+                next_packet_index += accessory
+                    .preview
+                    .triangles
+                    .iter()
+                    .map(|triangle| triangle.packet_index)
+                    .max()
+                    .map(|index| index + 1)
+                    .unwrap_or(1);
+                let accessory_triangle_start = triangles.len();
+                let accessory_material_base = push_accessory_instance_materials(
+                    &mut materials,
+                    accessory,
+                    object,
+                    spec.asset_suffix,
+                );
+                push_attached_preview_triangles(
+                    &mut triangles,
+                    accessory,
+                    joint_matrix,
+                    object.transform,
+                    model_index,
+                    accessory_packet_base,
+                    accessory_material_base,
+                    materials.len(),
+                    textures.len(),
+                );
+                accessories.push(AnimatedAccessoryInstance {
+                    joint_index,
+                    local_triangles: accessory.local_triangles.clone(),
+                    triangle_range: accessory_triangle_start..triangles.len(),
+                });
+            }
+            if object.factory_name.to_ascii_lowercase().starts_with("npc") {
+                push_npc_circle_shadow(
+                    &mut triangles,
+                    object.transform,
+                    model_index,
+                    next_packet_index,
+                );
+                next_packet_index += 1;
+            }
+            let instance = AnimatedModelInstance {
+                transform: object.transform,
+                model_index,
+                point_range: point_start..points.len(),
+                point_stride,
+                triangle_range: triangle_start..body_triangle_end,
+                accessories,
+            };
+            if let Some(cached) = object_model_cache.get_mut(&model_cache_key) {
+                cached.instances.push(instance);
+            }
         }
 
-        if points.len() > POINT_BUDGET {
+        let animated_models: Vec<AnimatedModelPreview> = object_model_cache
+            .into_values()
+            .filter_map(|cached| {
+                cached
+                    .joint_animation
+                    .map(|animation| AnimatedModelPreview {
+                        file: cached.file,
+                        animation,
+                        loader_flags: cached.loader_flags,
+                        instances: cached.instances,
+                    })
+            })
+            .collect();
+
+        if points.len() > POINT_BUDGET && animated_models.is_empty() {
             let stride = (points.len() / POINT_BUDGET).max(1);
             points = points
                 .into_iter()
@@ -2208,6 +2571,7 @@ impl SmsEditorApp {
             textures,
             materials,
             texture_srt_animations,
+            texture_pattern_animations,
             material_animation_bindings,
             bounds_min,
             bounds_max,
@@ -2220,6 +2584,7 @@ impl SmsEditorApp {
             source_triangles,
             source_textures,
             object_model_indices,
+            animated_models,
         })
     }
 
@@ -2489,6 +2854,16 @@ impl SmsEditorApp {
         let Some(model_index) = preview.object_model_indices.get(object_id).copied() else {
             return false;
         };
+
+        for model in &mut preview.animated_models {
+            if let Some(instance) = model
+                .instances
+                .iter_mut()
+                .find(|instance| instance.model_index == model_index)
+            {
+                instance.transform = new_transform;
+            }
+        }
 
         let mut changed = false;
         for point in &mut preview.points {
@@ -2957,6 +3332,164 @@ fn model_texture_srt_animation_path(model_path: &str) -> Option<String> {
     Some(format!("{}.btk", &model_path[..extension_offset]))
 }
 
+fn starting_joint_animation(
+    document: &StageDocument,
+    object: &SceneObject,
+    model_path: &str,
+) -> Option<J3dJointAnimation> {
+    let candidates = starting_joint_animation_candidates(object, model_path);
+    let asset = document.assets.iter().find(|asset| {
+        asset.kind == StageAssetKind::Animation
+            && candidates.iter().any(|candidate| {
+                asset
+                    .path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .eq_ignore_ascii_case(candidate)
+            })
+    })?;
+    let bytes = read_stage_asset_bytes(&asset.path).ok()?;
+    J3dJointAnimation::parse(bytes).ok()
+}
+
+fn starting_joint_animation_candidates(object: &SceneObject, model_path: &str) -> Vec<String> {
+    let normalized = model_path.replace('\\', "/");
+    let archive = normalized.split_once("!/").map(|(archive, _)| archive);
+    let factory = object.factory_name.to_ascii_lowercase();
+    let relative_candidates: &[&str] = if factory.starts_with("npcmontem") {
+        &["montemcommon/mom_wait.bck", "montem/mom_wait.bck"]
+    } else if factory.starts_with("npcmontew") {
+        &["montewcommon/mow_wait.bck", "montew/mow_wait.bck"]
+    } else if factory.starts_with("npcmarem") {
+        &["marem/marem_wait.bck"]
+    } else if factory.starts_with("npcmarew") {
+        &["marew/marew_wait.bck"]
+    } else if factory == "npckinopio" {
+        &["kinopio/kinopio_wait.bck"]
+    } else if factory == "npckinojii" {
+        &["kinojii/kinoji_wait.bck"]
+    } else if factory == "npcpeach" {
+        &["peach/peach_wait.bck"]
+    } else if factory == "npcraccoondog" {
+        &["raccoondog/tanuki_wait_a.bck"]
+    } else {
+        &[]
+    };
+
+    relative_candidates
+        .iter()
+        .map(|relative| {
+            archive.map_or_else(
+                || relative.to_string(),
+                |archive| format!("{archive}!/{relative}"),
+            )
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attach_npc_texture_pattern_animation(
+    document: &StageDocument,
+    object: &SceneObject,
+    model_path: &str,
+    material_base: usize,
+    texture_base: usize,
+    model_materials: &[J3dMaterial],
+    materials: &mut [J3dMaterial],
+    animations: &mut Vec<PreviewTexturePatternAnimation>,
+) {
+    let candidates = starting_texture_pattern_candidates(object, model_path);
+    let Some(asset) = document.assets.iter().find(|asset| {
+        asset.kind == StageAssetKind::Animation
+            && candidates.iter().any(|candidate| {
+                asset
+                    .path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .eq_ignore_ascii_case(candidate)
+            })
+    }) else {
+        return;
+    };
+    let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+        return;
+    };
+    let Ok(animation) = J3dTexturePatternAnimation::parse(bytes) else {
+        return;
+    };
+    let phase_frames = if animation.max_frame == 0 {
+        0
+    } else {
+        stable_string_hash(&object.id) % animation.max_frame as u64
+    };
+    let phase_seconds = phase_frames as f32 / 60.0;
+    let frame = animation.playback_frame(phase_seconds);
+    let mut bindings = Vec::new();
+    for (animation_binding_index, binding) in animation.bindings.iter().enumerate() {
+        let Some(local_material_index) = model_materials
+            .iter()
+            .position(|material| material.name.eq_ignore_ascii_case(&binding.material_name))
+        else {
+            continue;
+        };
+        let texture_slot = binding.texture_slot as usize;
+        if texture_slot >= 8 {
+            continue;
+        }
+        let material_index = material_base + local_material_index;
+        let current_texture_index = binding
+            .texture_index(frame)
+            .map(|index| texture_base + index);
+        let Some(material) = materials.get_mut(material_index) else {
+            continue;
+        };
+        material.texture_indices[texture_slot] = current_texture_index;
+        bindings.push(PreviewTexturePatternBinding {
+            material_index,
+            texture_slot,
+            texture_base,
+            animation_binding_index,
+            current_texture_index,
+        });
+    }
+    if !bindings.is_empty() {
+        animations.push(PreviewTexturePatternAnimation {
+            animation,
+            phase_seconds,
+            bindings,
+        });
+    }
+}
+
+fn starting_texture_pattern_candidates(object: &SceneObject, model_path: &str) -> Vec<String> {
+    let normalized = model_path.replace('\\', "/");
+    let archive = normalized.split_once("!/").map(|(archive, _)| archive);
+    let factory = object.factory_name.to_ascii_lowercase();
+    let Some(relative) = (match factory.as_str() {
+        "npcmontema" | "npcmontemh" => Some("montemcommon/moma_wink.btp"),
+        "npcmontemb" => Some("montemcommon/momb_wink.btp"),
+        "npcmontemc" | "npcmontemg" => Some("montemcommon/momc_wink.btp"),
+        "npcmontemd" => Some("montemcommon/momd_wink.btp"),
+        "npcmontem" | "npcmontemf" => Some("montemcommon/mom_wink.btp"),
+        "npcmontewa" => Some("montewcommon/mowa_wink.btp"),
+        "npcmontewb" => Some("montewcommon/mowb_wink.btp"),
+        "npcmontew" | "npcmontewc" => Some("montewcommon/mow_wink.btp"),
+        _ => None,
+    }) else {
+        return Vec::new();
+    };
+    vec![archive.map_or_else(
+        || relative.to_string(),
+        |archive| format!("{archive}!/{relative}"),
+    )]
+}
+
+fn stable_string_hash(value: &str) -> u64 {
+    value.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ byte as u64).wrapping_mul(0x1000_0000_01b3)
+    })
+}
+
 fn apply_model_material_table(
     document: &StageDocument,
     model_path: &str,
@@ -3027,6 +3560,588 @@ fn apply_model_material_table(
     }
 }
 
+fn apply_npc_runtime_textures(
+    document: &StageDocument,
+    object: &SceneObject,
+    preview: &mut J3dGeometryPreview,
+) {
+    if !object.factory_name.to_ascii_lowercase().starts_with("npc") {
+        return;
+    }
+    let factory = object.factory_name.to_ascii_lowercase();
+    let mut replacements = Vec::new();
+    let monte_uses_pollution_texture = matches!(
+        factory.as_str(),
+        "npcmontem" | "npcmontema" | "npcmontemc" | "npcmontew" | "npcmontewa"
+    );
+    if !factory.starts_with("npcmonte") || monte_uses_pollution_texture {
+        replacements.push(("H_ma_rak_dummy", "/map/pollution/h_ma_rak.bti"));
+    }
+    if factory.starts_with("npcmontem") && factory != "npcmonteme" {
+        replacements.push(("I_mom_mino_dummyI4", "/montemcommon/i_mom_mino_rgba.bti"));
+    } else if factory.starts_with("npcmontew") {
+        replacements.push(("I_mow_mino_dummyI4", "/montewcommon/i_mow_mino_rgba.bti"));
+    }
+
+    for (dummy_name, asset_suffix) in replacements {
+        let texture_indices = preview
+            .textures
+            .iter()
+            .enumerate()
+            .filter_map(|(index, texture)| {
+                texture
+                    .name
+                    .eq_ignore_ascii_case(dummy_name)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if texture_indices.is_empty() {
+            continue;
+        }
+        let Some(asset) = document.assets.iter().find(|asset| {
+            asset.kind == StageAssetKind::Texture
+                && asset
+                    .path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_ascii_lowercase()
+                    .ends_with(asset_suffix)
+        }) else {
+            continue;
+        };
+        let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+            continue;
+        };
+        let Ok(mut texture) = decode_bti_texture(bytes) else {
+            continue;
+        };
+        texture.name = dummy_name.to_string();
+        for texture_index in texture_indices {
+            preview.textures[texture_index] = texture.clone();
+        }
+    }
+}
+
+fn apply_npc_eye_decal_culling(object: &SceneObject, preview: &mut J3dGeometryPreview) {
+    if !object.factory_name.to_ascii_lowercase().starts_with("npc") {
+        return;
+    }
+    let eye_materials = preview
+        .materials
+        .iter()
+        .map(|material| is_npc_eye_material_name(&material.name))
+        .collect::<Vec<_>>();
+    for (material, is_eye) in preview.materials.iter_mut().zip(&eye_materials) {
+        if *is_eye {
+            material.cull_mode = 0;
+        }
+    }
+    for triangle in &mut preview.triangles {
+        if triangle
+            .material_index
+            .and_then(|index| eye_materials.get(index))
+            .copied()
+            .unwrap_or(false)
+        {
+            triangle.cull_mode = Some(0);
+        }
+    }
+}
+
+fn is_npc_eye_material_name(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with("_eye_mat")
+}
+
+#[derive(Clone, Copy)]
+struct MonteAccessorySpec {
+    joint_name: &'static str,
+    asset_suffix: &'static str,
+}
+
+fn monte_accessory_specs(object: &SceneObject) -> Vec<MonteAccessorySpec> {
+    let Some(mask) = object
+        .raw_params
+        .get("npc_parts_mask")
+        .and_then(|value| value.parse::<i32>().ok())
+        .map(|value| value as u32)
+    else {
+        return Vec::new();
+    };
+    let factory = object.factory_name.to_ascii_lowercase();
+    let mut available = Vec::new();
+    if factory.starts_with("npcmontem") {
+        available.extend_from_slice(&[
+            (0, "kubi", "/montemcommon/hata_model.bmd"),
+            (1, "kubi", "/montemcommon/higea_model.bmd"),
+            (2, "kubi", "/montemcommon/glassesa_model.bmd"),
+            (3, "kubi", "/montemcommon/glassesb_model.bmd"),
+            (4, "kubi", "/montemcommon/hatb_model.bmd"),
+            (5, "kubi", "/montemcommon/hate_model.bmd"),
+            (6, "kubi", "/montemcommon/hatd_model.bmd"),
+            (7, "kubi", "/montemcommon/hatf_model.bmd"),
+            (8, "kubi", "/montemcommon/hatg_model.bmd"),
+            (9, "body_jnt", "/montemcommon/eria_model.bmd"),
+            (10, "body_jnt", "/montemcommon/tieb_model.bmd"),
+        ]);
+        available.push(if factory == "npcmontemf" {
+            (11, "body_jnt", "/tube_model.bmd")
+        } else if factory == "npcmontemg" {
+            (11, "handR_jnt", "/mop_model.bmd")
+        } else if factory == "npcmontemh" {
+            (11, "body_jnt", "/uklele_model.bmd")
+        } else {
+            (11, "body_jnt", "/montemcommon/nimotsu_model.bmd")
+        });
+    } else if factory.starts_with("npcmontew") {
+        available.extend_from_slice(&[
+            (0, "yashi_jnt", "/montewcommon/flower_model.bmd"),
+            (1, "kubi", "/montewcommon/hwa_model.bmd"),
+            (2, "kubi", "/montewcommon/gwb_model.bmd"),
+            (3, "handR_jnt", "/montewcommon/arrowr_model.bmd"),
+            (4, "handR_jnt", "/montewcommon/arrowl_model.bmd"),
+        ]);
+        if factory == "npcmontewc" {
+            available.extend_from_slice(&[
+                (5, "kubi", "/hwc_model.bmd"),
+                (6, "handR_jnt", "/udewar_model.bmd"),
+                (7, "handL_jnt", "/udewal_model.bmd"),
+            ]);
+        }
+    }
+    available
+        .into_iter()
+        .filter(|(bit, _, _)| mask & (1 << bit) != 0)
+        .map(|(_, joint_name, asset_suffix)| MonteAccessorySpec {
+            joint_name,
+            asset_suffix,
+        })
+        .collect()
+}
+
+fn find_stage_asset_by_suffix<'a>(
+    document: &'a StageDocument,
+    kind: StageAssetKind,
+    suffix: &str,
+) -> Option<&'a StageAsset> {
+    let suffix = suffix.to_ascii_lowercase();
+    document.assets.iter().find(|asset| {
+        asset.kind == kind
+            && asset
+                .path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .ends_with(&suffix)
+    })
+}
+
+fn push_accessory_instance_materials(
+    materials: &mut Vec<J3dMaterial>,
+    cached: &CachedAccessoryModelPreview,
+    object: &SceneObject,
+    asset_suffix: &str,
+) -> usize {
+    if !monte_accessory_has_instance_colors(asset_suffix) {
+        return cached.material_base;
+    }
+    let source_end = cached.material_base + cached.preview.materials.len();
+    let source = materials[cached.material_base..source_end].to_vec();
+    let material_base = materials.len();
+    for mut material in source {
+        material.material_index = materials.len();
+        apply_monte_accessory_material_color(&mut material, object, asset_suffix);
+        materials.push(material);
+    }
+    material_base
+}
+
+fn monte_accessory_has_instance_colors(asset_suffix: &str) -> bool {
+    [
+        "hata_model.bmd",
+        "hatb_model.bmd",
+        "hatd_model.bmd",
+        "hate_model.bmd",
+        "hatf_model.bmd",
+        "hatg_model.bmd",
+        "higea_model.bmd",
+        "glassesb_model.bmd",
+        "eria_model.bmd",
+        "tieb_model.bmd",
+        "flower_model.bmd",
+        "hwa_model.bmd",
+        "gwb_model.bmd",
+    ]
+    .iter()
+    .any(|name| asset_suffix.ends_with(name))
+}
+
+fn npc_parts_color_index(object: &SceneObject, channel: usize) -> Option<usize> {
+    object
+        .raw_params
+        .get(&format!("npc_parts_color_index_{channel}"))?
+        .parse::<i32>()
+        .ok()?
+        .try_into()
+        .ok()
+}
+
+fn apply_monte_accessory_material_color(
+    material: &mut J3dMaterial,
+    object: &SceneObject,
+    asset_suffix: &str,
+) {
+    let reg0 = |material: &mut J3dMaterial, name: &str, colors: &[[i16; 4]], index: usize| {
+        if material.name.eq_ignore_ascii_case(name) {
+            if let Some(color) = colors.get(index) {
+                material.tev_colors[0] = *color;
+            }
+        }
+    };
+    let reg12 = |material: &mut J3dMaterial,
+                 name: &str,
+                 colors1: &[[i16; 4]],
+                 colors2: &[[i16; 4]],
+                 index: usize| {
+        if material.name.eq_ignore_ascii_case(name) {
+            if let (Some(color1), Some(color2)) = (colors1.get(index), colors2.get(index)) {
+                material.tev_colors[1] = *color1;
+                material.tev_colors[2] = *color2;
+            }
+        }
+    };
+    let mat_color = |material: &mut J3dMaterial, name: &str, colors: &[[i16; 4]], index: usize| {
+        if material.name.eq_ignore_ascii_case(name) {
+            if let Some(color) = colors.get(index) {
+                material.material_colors[0] = (*color).map(|value| value as u8);
+            }
+        }
+    };
+
+    if asset_suffix.ends_with("/montemcommon/hata_model.bmd") {
+        let Some(index) = npc_parts_color_index(object, 0) else {
+            return;
+        };
+        reg12(
+            material,
+            "_boushi_mat",
+            &[
+                [200, 200, 120, 255],
+                [70, 70, 70, 255],
+                [200, 200, 150, 255],
+                [100, 200, 200, 255],
+                [0, 30, 150, 255],
+                [200, 220, 120, 255],
+                [140, 50, 0, 255],
+            ],
+            &[
+                [160, 130, 50, 255],
+                [70, 70, 70, 255],
+                [200, 200, 150, 255],
+                [50, 120, 160, 255],
+                [0, 30, 150, 255],
+                [0, 130, 50, 255],
+                [140, 50, 0, 255],
+            ],
+            index,
+        );
+        reg0(
+            material,
+            "_obi_mat",
+            &[
+                [100, 0, 0, 255],
+                [0, 0, 0, 255],
+                [0, 0, 0, 255],
+                [0, 100, 300, 255],
+                [0, 200, 150, 255],
+                [0, 130, 130, 255],
+                [100, 0, 0, 255],
+            ],
+            index,
+        );
+    } else if asset_suffix.ends_with("higea_model.bmd") {
+        if let Some(index) = npc_parts_color_index(object, 1) {
+            reg0(
+                material,
+                "_hige_mat",
+                &[
+                    [0, 0, 0, 255],
+                    [255, 255, 150, 255],
+                    [100, 0, 0, 255],
+                    [255, 200, 0, 255],
+                ],
+                index,
+            );
+        }
+    } else if asset_suffix.ends_with("glassesb_model.bmd") {
+        if let Some(index) = npc_parts_color_index(object, 2) {
+            mat_color(
+                material,
+                "_megane_mat",
+                &[[255, 230, 50, 255], [255, 255, 255, 255], [0, 0, 0, 255]],
+                index,
+            );
+        }
+    } else if asset_suffix.ends_with("hatb_model.bmd") {
+        if let Some(index) = npc_parts_color_index(object, 0) {
+            mat_color(
+                material,
+                "_boushi_mat",
+                &[[255, 255, 60, 255], [255, 130, 0, 255], [255, 255, 0, 255]],
+                index,
+            );
+            reg0(
+                material,
+                "_obi_mat",
+                &[[100, 70, 50, 255], [100, 70, 50, 255], [0, 100, 255, 255]],
+                index,
+            );
+        }
+    } else if asset_suffix.ends_with("hatd_model.bmd") {
+        if let Some(index) = npc_parts_color_index(object, 0) {
+            reg0(
+                material,
+                "_obi_mat",
+                &[[0, 100, 230, 255], [400, 400, 350, 255]],
+                index,
+            );
+        }
+    } else if asset_suffix.ends_with("hate_model.bmd") {
+        if let Some(index) = npc_parts_color_index(object, 0) {
+            reg12(
+                material,
+                "_boushi_mat",
+                &[[0, 70, 150, 255], [230, 230, 210, 255]],
+                &[[230, 230, 210, 255], [0, 70, 150, 255]],
+                index,
+            );
+        }
+    } else if asset_suffix.ends_with("hatf_model.bmd") {
+        if let Some(index) = npc_parts_color_index(object, 0) {
+            reg12(
+                material,
+                "_boushi_mat",
+                &[[50, 150, 130, 255], [60, 40, 0, 255]],
+                &[[230, 230, 210, 255], [160, 150, 60, 255]],
+                index,
+            );
+        }
+    } else if asset_suffix.ends_with("hatg_model.bmd") {
+        if let Some(index) = npc_parts_color_index(object, 0) {
+            reg12(
+                material,
+                "_boushi_mat",
+                &[
+                    [0, 50, 120, 255],
+                    [100, 120, 0, 255],
+                    [170, 120, 0, 255],
+                    [0, 100, 255, 255],
+                    [140, 50, 0, 255],
+                ],
+                &[
+                    [0, 50, 120, 255],
+                    [100, 120, 0, 255],
+                    [170, 120, 0, 255],
+                    [0, 180, 255, 255],
+                    [200, 120, 0, 255],
+                ],
+                index,
+            );
+        }
+    } else if asset_suffix.ends_with("eria_model.bmd") {
+        if let Some(index) = npc_parts_color_index(object, 1) {
+            reg12(
+                material,
+                "_eri_mat",
+                &[[0, 70, 150, 255], [255, 255, 230, 255]],
+                &[[255, 255, 230, 255], [0, 70, 150, 255]],
+                index,
+            );
+        }
+    } else if asset_suffix.ends_with("tieb_model.bmd") {
+        if let Some(index) = npc_parts_color_index(object, 0) {
+            reg12(
+                material,
+                "_tie_mat",
+                &[[100, 0, 0, 255]],
+                &[[150, 130, 0, 255]],
+                index,
+            );
+        }
+    } else if asset_suffix.ends_with("flower_model.bmd") {
+        if let Some(index) = npc_parts_color_index(object, 1) {
+            reg0(material, "_naka_mat", &[[255, 255, 0, 255]; 3], index);
+            mat_color(
+                material,
+                "_hana_mat",
+                &[[220, 40, 120, 255], [220, 40, 0, 255], [200, 220, 0, 255]],
+                index,
+            );
+        }
+    } else if asset_suffix.ends_with("hwa_model.bmd") {
+        if let Some(index) = npc_parts_color_index(object, 0) {
+            reg12(
+                material,
+                "_boushi_mat",
+                &[
+                    [200, 200, 120, 255],
+                    [160, 0, 0, 255],
+                    [190, 150, 120, 255],
+                    [200, 220, 220, 255],
+                ],
+                &[
+                    [160, 130, 50, 255],
+                    [160, 0, 0, 255],
+                    [120, 70, 50, 255],
+                    [100, 170, 200, 255],
+                ],
+                index,
+            );
+            reg0(
+                material,
+                "_obi_mat",
+                &[
+                    [300, 100, 100, 255],
+                    [350, 100, 100, 255],
+                    [100, 0, 0, 255],
+                    [400, 400, 380, 255],
+                ],
+                index,
+            );
+        }
+    } else if asset_suffix.ends_with("gwb_model.bmd") {
+        if let Some(index) = npc_parts_color_index(object, 2) {
+            mat_color(
+                material,
+                "_megane_mat",
+                &[[150, 0, 0, 255], [0, 200, 0, 255], [200, 200, 0, 255]],
+                index,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_attached_preview_triangles(
+    triangles: &mut Vec<PreviewTriangle>,
+    accessory: &CachedAccessoryModelPreview,
+    joint_matrix: J3dMatrix34,
+    transform: Transform,
+    model_index: usize,
+    packet_base: usize,
+    material_base: usize,
+    material_count: usize,
+    texture_count: usize,
+) {
+    for triangle in &accessory.preview.triangles {
+        let vertices = transform_preview_vertices(
+            triangle
+                .vertices
+                .map(|vertex| transform_j3d_matrix_point(joint_matrix, vertex)),
+            transform,
+        );
+        if !triangle_vertices_are_finite(vertices) {
+            continue;
+        }
+        triangles.push(PreviewTriangle {
+            vertices,
+            normals: triangle.normals.map(|normals| {
+                transform_preview_normals(
+                    normals.map(|normal| transform_j3d_matrix_normal(joint_matrix, normal)),
+                    transform,
+                )
+            }),
+            color_channels: triangle.color_channels,
+            tex_coord_sets: triangle.tex_coord_sets,
+            material_index: triangle.material_index.and_then(|index| {
+                let global_index = material_base + index;
+                (global_index < material_count).then_some(global_index)
+            }),
+            packet_index: packet_base + triangle.packet_index,
+            model_index,
+            render_layer: PreviewRenderLayer::Main,
+            color: triangle.color,
+            vertex_colors: triangle.vertex_colors,
+            combine_mode: triangle.combine_mode,
+            tex_coords: triangle.tex_coords,
+            texture_index: triangle.texture_index.and_then(|index| {
+                let global_index = accessory.texture_base + index;
+                (global_index < texture_count).then_some(global_index)
+            }),
+            mask_tex_coords: triangle.mask_tex_coords,
+            mask_texture_index: triangle.mask_texture_index.and_then(|index| {
+                let global_index = accessory.texture_base + index;
+                (global_index < texture_count).then_some(global_index)
+            }),
+            cull_mode: triangle.cull_mode,
+            alpha_compare: triangle.alpha_compare,
+            blend_mode: triangle.blend_mode,
+            z_mode: triangle.z_mode,
+        });
+    }
+}
+
+fn push_npc_circle_shadow(
+    triangles: &mut Vec<PreviewTriangle>,
+    transform: Transform,
+    model_index: usize,
+    packet_index: usize,
+) {
+    const SEGMENTS: usize = 20;
+    let radius = 60.0 * transform.scale[0].abs().max(transform.scale[2].abs());
+    let center = [
+        transform.translation[0],
+        transform.translation[1] + 1.5,
+        transform.translation[2],
+    ];
+    let color = [0, 0, 0, 82];
+    for segment in 0..SEGMENTS {
+        let angle0 = segment as f32 * std::f32::consts::TAU / SEGMENTS as f32;
+        let angle1 = (segment + 1) as f32 * std::f32::consts::TAU / SEGMENTS as f32;
+        triangles.push(PreviewTriangle {
+            vertices: [
+                center,
+                [
+                    center[0] + angle0.cos() * radius,
+                    center[1],
+                    center[2] + angle0.sin() * radius,
+                ],
+                [
+                    center[0] + angle1.cos() * radius,
+                    center[1],
+                    center[2] + angle1.sin() * radius,
+                ],
+            ],
+            normals: Some([[0.0, 1.0, 0.0]; 3]),
+            color_channels: [Some([color; 3]), None],
+            tex_coord_sets: [None; 8],
+            material_index: None,
+            packet_index,
+            model_index,
+            render_layer: PreviewRenderLayer::Shadow,
+            color: Some(color),
+            vertex_colors: Some([color; 3]),
+            combine_mode: J3dPreviewCombineMode::VertexOnly,
+            tex_coords: None,
+            texture_index: None,
+            mask_tex_coords: None,
+            mask_texture_index: None,
+            cull_mode: Some(0),
+            alpha_compare: None,
+            blend_mode: Some(J3dBlendMode {
+                mode: 1,
+                src_factor: 4,
+                dst_factor: 5,
+                logic_op: 3,
+            }),
+            z_mode: Some(J3dZMode {
+                compare_enable: 1,
+                func: 3,
+                update_enable: 0,
+            }),
+        });
+    }
+}
+
 fn material_table_candidates_for_model(model_path: &str) -> Vec<String> {
     let normalized = model_path.replace('\\', "/").to_ascii_lowercase();
     let Some(base) = normalized.rsplit_once('.').map(|(base, _)| base) else {
@@ -3053,19 +4168,258 @@ fn push_object_preview_materials(
     cached: &CachedObjectModelPreview,
     object: &SceneObject,
 ) -> usize {
-    let Some(tev_reg1) = nozzle_box_tev_reg1_color(object) else {
+    let nozzle_tev_reg1 = nozzle_box_tev_reg1_color(object);
+    let has_npc_colors =
+        monte_material_colors(object).is_some() || npc_pollution_k_color(object).is_some();
+    if nozzle_tev_reg1.is_none() && !has_npc_colors {
         return cached.material_base;
-    };
+    }
     let source_end = cached.material_base + cached.preview.materials.len();
     let source_materials = materials[cached.material_base..source_end].to_vec();
     let material_base = materials.len();
     for mut material in source_materials {
         material.material_index = materials.len();
-        material.tev_colors[1] = tev_reg1;
+        if let Some(tev_reg1) = nozzle_tev_reg1 {
+            material.tev_colors[1] = tev_reg1;
+        }
+        if !material.name.eq_ignore_ascii_case("_eye_mat") {
+            if let Some(color) = npc_pollution_k_color(object) {
+                material.tev_k_colors[0] = color;
+            }
+        }
+        apply_monte_material_color(&mut material, object);
         materials.push(material);
     }
     material_base
 }
+
+fn npc_pollution_k_color(object: &SceneObject) -> Option<[u8; 4]> {
+    if !object.factory_name.to_ascii_lowercase().starts_with("npc") {
+        return None;
+    }
+    let amount = object
+        .raw_params
+        .get("npc_pollution_amount")?
+        .parse::<i32>()
+        .ok()?
+        .clamp(0, 255) as u8;
+    Some([255, 255, 255, amount])
+}
+
+#[derive(Clone, Copy)]
+struct MonteMaterialColors {
+    body_reg0: Option<[i16; 4]>,
+    cloth_reg0: Option<[i16; 4]>,
+    cloth_reg1_reg2: Option<[[i16; 4]; 2]>,
+}
+
+fn apply_monte_material_color(material: &mut J3dMaterial, object: &SceneObject) {
+    let Some(colors) = monte_material_colors(object) else {
+        return;
+    };
+    if material.name.eq_ignore_ascii_case("_hand_mat") {
+        if let Some(color) = colors.body_reg0 {
+            material.tev_colors[0] = color;
+        }
+    } else if material.name.eq_ignore_ascii_case("_fuku_mat") {
+        if let Some(color) = colors.cloth_reg0 {
+            material.tev_colors[0] = color;
+        }
+        if let Some([reg1, reg2]) = colors.cloth_reg1_reg2 {
+            material.tev_colors[1] = reg1;
+            material.tev_colors[2] = reg2;
+        }
+    }
+}
+
+fn monte_material_colors(object: &SceneObject) -> Option<MonteMaterialColors> {
+    let factory = object.factory_name.to_ascii_lowercase();
+    if !factory.starts_with("npcmonte") {
+        return None;
+    }
+    let body_index = npc_color_index(object, "npc_body_color_index")?;
+    let cloth_index = npc_color_index(object, "npc_cloth_color_index")?;
+    let male_body = MONTE_M_BODY_COLORS.get(body_index).copied();
+    let female_body = MONTE_W_BODY_COLORS.get(body_index).copied();
+    let (body_reg0, cloth_reg0, cloth_reg1_reg2) = match factory.as_str() {
+        "npcmontemb" => (
+            MONTE_MB_BODY_COLORS.get(body_index).copied(),
+            MONTE_MB_CLOTH_COLORS.get(cloth_index).copied(),
+            None,
+        ),
+        "npcmontema" | "npcmontemh" => (
+            male_body,
+            None,
+            paired_color(&MONTE_MA_CLOTH_REG1, &MONTE_MA_CLOTH_REG2, cloth_index),
+        ),
+        "npcmontemc" | "npcmontemg" => (
+            male_body,
+            None,
+            paired_color(&MONTE_MC_CLOTH_REG1, &MONTE_MC_CLOTH_REG2, cloth_index),
+        ),
+        "npcmontemd" => (
+            male_body,
+            MONTE_MD_CLOTH_COLORS.get(cloth_index).copied(),
+            None,
+        ),
+        "npcmontewa" => (
+            female_body,
+            MONTE_WA_CLOTH_COLORS.get(cloth_index).copied(),
+            None,
+        ),
+        "npcmontewb" => (
+            female_body,
+            None,
+            paired_color(&MONTE_WB_CLOTH_REG1, &MONTE_WB_CLOTH_REG2, cloth_index),
+        ),
+        "npcmontew" | "npcmontewc" => (female_body, None, None),
+        "npcmonteme" => (None, None, None),
+        _ => (male_body, None, None),
+    };
+    Some(MonteMaterialColors {
+        body_reg0,
+        cloth_reg0,
+        cloth_reg1_reg2,
+    })
+}
+
+fn npc_color_index(object: &SceneObject, key: &str) -> Option<usize> {
+    object
+        .raw_params
+        .get(key)?
+        .parse::<i32>()
+        .ok()?
+        .try_into()
+        .ok()
+}
+
+fn paired_color(reg1: &[[i16; 4]], reg2: &[[i16; 4]], index: usize) -> Option<[[i16; 4]; 2]> {
+    Some([*reg1.get(index)?, *reg2.get(index)?])
+}
+
+const MONTE_M_BODY_COLORS: [[i16; 4]; 10] = [
+    [100, 255, 300, 255],
+    [120, 120, 300, 255],
+    [350, 300, 0, 255],
+    [200, 70, 0, 255],
+    [300, 130, 255, 255],
+    [255, 350, 0, 255],
+    [400, 255, 255, 255],
+    [320, 140, 0, 255],
+    [200, 255, 400, 255],
+    [400, 250, 100, 255],
+];
+const MONTE_MA_CLOTH_REG1: [[i16; 4]; 11] = [
+    [255, 255, 255, 255],
+    [255, 255, 255, 255],
+    [255, 255, 255, 255],
+    [200, 200, 170, 255],
+    [50, 50, 50, 255],
+    [150, 200, 255, 255],
+    [0, 70, 150, 255],
+    [400, 300, 200, 255],
+    [255, 255, 255, 255],
+    [255, 255, 255, 255],
+    [255, 255, 150, 255],
+];
+const MONTE_MA_CLOTH_REG2: [[i16; 4]; 11] = [
+    [250, 130, 50, 255],
+    [50, 130, 100, 255],
+    [150, 180, 20, 255],
+    [200, 200, 170, 255],
+    [50, 50, 50, 255],
+    [150, 200, 255, 255],
+    [0, 70, 150, 255],
+    [230, 150, 100, 255],
+    [60, 150, 230, 255],
+    [180, 150, 200, 255],
+    [100, 220, 300, 255],
+];
+const MONTE_MB_BODY_COLORS: [[i16; 4]; 4] = [
+    [160, 200, 300, 255],
+    [255, 160, 150, 255],
+    [300, 200, 80, 255],
+    [200, 300, 100, 255],
+];
+const MONTE_MB_CLOTH_COLORS: [[i16; 4]; 6] = [
+    [70, 130, 200, 255],
+    [200, 20, 20, 255],
+    [130, 30, 80, 255],
+    [130, 200, 80, 255],
+    [230, 200, 80, 255],
+    [50, 100, 150, 255],
+];
+const MONTE_MC_CLOTH_REG1: [[i16; 4]; 11] = [
+    [230, 230, 210, 255],
+    [150, 70, 0, 255],
+    [230, 230, 210, 255],
+    [0, 70, 150, 255],
+    [50, 150, 130, 255],
+    [60, 40, 0, 255],
+    [0, 100, 100, 255],
+    [0, 150, 200, 255],
+    [0, 50, 100, 255],
+    [100, 100, 0, 255],
+    [100, 0, 0, 255],
+];
+const MONTE_MC_CLOTH_REG2: [[i16; 4]; 11] = [
+    [230, 230, 210, 255],
+    [150, 70, 0, 255],
+    [0, 70, 150, 255],
+    [230, 230, 210, 255],
+    [230, 230, 210, 255],
+    [160, 150, 60, 255],
+    [0, 100, 100, 255],
+    [0, 150, 200, 255],
+    [0, 50, 100, 255],
+    [0, 0, 0, 255],
+    [0, 0, 0, 255],
+];
+const MONTE_MD_CLOTH_COLORS: [[i16; 4]; 5] = [
+    [350, 360, 340, 255],
+    [50, 100, 0, 255],
+    [150, 0, 0, 255],
+    [0, 300, 350, 255],
+    [0, 100, 250, 255],
+];
+const MONTE_W_BODY_COLORS: [[i16; 4]; 6] = [
+    [300, 100, 200, 255],
+    [400, 150, 0, 255],
+    [300, 330, 0, 255],
+    [400, 330, 0, 255],
+    [330, 40, 0, 255],
+    [400, 200, 255, 255],
+];
+const MONTE_WA_CLOTH_COLORS: [[i16; 4]; 6] = [
+    [380, 330, 150, 255],
+    [300, 100, 200, 255],
+    [360, 350, 300, 255],
+    [300, 50, 0, 255],
+    [400, 150, 100, 255],
+    [120, 150, 300, 255],
+];
+const MONTE_WB_CLOTH_REG1: [[i16; 4]; 9] = [
+    [220, 200, 220, 255],
+    [200, 220, 220, 255],
+    [255, 255, 255, 255],
+    [255, 255, 255, 255],
+    [220, 230, 220, 255],
+    [180, 100, 110, 255],
+    [200, 100, 0, 255],
+    [0, 100, 150, 255],
+    [255, 200, 100, 255],
+];
+const MONTE_WB_CLOTH_REG2: [[i16; 4]; 9] = [
+    [100, 80, 200, 255],
+    [100, 170, 200, 255],
+    [150, 0, 60, 255],
+    [180, 120, 200, 255],
+    [140, 180, 300, 255],
+    [180, 100, 110, 255],
+    [200, 100, 0, 255],
+    [0, 100, 150, 255],
+    [255, 200, 100, 255],
+];
 
 fn nozzle_box_tev_reg1_color(object: &SceneObject) -> Option<[i16; 4]> {
     let is_nozzle_box = object.factory_name.eq_ignore_ascii_case("NozzleBox")
@@ -3092,6 +4446,25 @@ fn nozzle_box_tev_reg1_color(object: &SceneObject) -> Option<[i16; 4]> {
 
 fn transform_preview_vertices(vertices: [[f32; 3]; 3], transform: Transform) -> [[f32; 3]; 3] {
     vertices.map(|vertex| transform_preview_point(vertex, transform))
+}
+
+fn transform_j3d_matrix_point(matrix: J3dMatrix34, point: [f32; 3]) -> [f32; 3] {
+    [
+        matrix[0][0] * point[0] + matrix[0][1] * point[1] + matrix[0][2] * point[2] + matrix[0][3],
+        matrix[1][0] * point[0] + matrix[1][1] * point[1] + matrix[1][2] * point[2] + matrix[1][3],
+        matrix[2][0] * point[0] + matrix[2][1] * point[1] + matrix[2][2] * point[2] + matrix[2][3],
+    ]
+}
+
+fn transform_j3d_matrix_normal(matrix: J3dMatrix34, normal: [f32; 3]) -> [f32; 3] {
+    let [a, b, c] = [matrix[0][0], matrix[0][1], matrix[0][2]];
+    let [d, e, f] = [matrix[1][0], matrix[1][1], matrix[1][2]];
+    let [g, h, i] = [matrix[2][0], matrix[2][1], matrix[2][2]];
+    vec3_normalize([
+        (e * i - f * h) * normal[0] + (f * g - d * i) * normal[1] + (d * h - e * g) * normal[2],
+        (c * h - b * i) * normal[0] + (a * i - c * g) * normal[1] + (b * g - a * h) * normal[2],
+        (b * f - c * e) * normal[0] + (c * d - a * f) * normal[1] + (a * e - b * d) * normal[2],
+    ])
 }
 
 fn transform_preview_normals(normals: [[f32; 3]; 3], transform: Transform) -> [[f32; 3]; 3] {
@@ -3211,9 +4584,19 @@ fn rotate_z_degrees(point: [f32; 3], degrees: f32) -> [f32; 3] {
     ]
 }
 
+fn normalized_preview_asset_path(path: &str) -> String {
+    path.replace('\\', "/").to_ascii_lowercase()
+}
+
 fn is_supported_object_preview_model_path(path: &str) -> bool {
     let path = path.to_ascii_lowercase();
-    path.contains("!/mapobj/") || path.contains("/scene/mapobj/")
+    (path.ends_with(".bmd") || path.ends_with(".bdl"))
+        && (path.contains("!/") || path.contains("/scene/"))
+}
+
+fn should_instance_object_preview_model(path: &str, world_model_paths: &BTreeSet<String>) -> bool {
+    is_supported_object_preview_model_path(path)
+        && !world_model_paths.contains(&normalized_preview_asset_path(path))
 }
 
 fn should_render_object_model(object: &SceneObject) -> bool {
@@ -3772,7 +5155,10 @@ fn preview_triangle_is_translucent(preview: &ModelPreview, triangle: &PreviewTri
     if preview_triangle_uses_alpha_test(preview, triangle) {
         return false;
     }
-    if triangle.render_layer == PreviewRenderLayer::Goop {
+    if matches!(
+        triangle.render_layer,
+        PreviewRenderLayer::Goop | PreviewRenderLayer::Shadow
+    ) {
         return true;
     }
 
@@ -4311,6 +5697,17 @@ fn model_loader_flags_for_path(path: &str) -> u32 {
     }
 }
 
+fn npc_model_loader_flags(object: &SceneObject) -> Option<u32> {
+    let factory = object.factory_name.to_ascii_lowercase();
+    Some(match factory.as_str() {
+        "npcmontem" | "npcmontema" | "npcmontemc" | "npcmontew" | "npcmontewa" => 0x1030_0000,
+        "npcmontemb" | "npcmontemd" | "npcmontemf" | "npcmontemg" | "npcmontemh" | "npcmontewb"
+        | "npcmontewc" => 0x1021_0000,
+        "npcmonteme" => 0x1001_0000,
+        _ => return None,
+    })
+}
+
 fn preview_texture_tints(
     material_color: Option<[u8; 4]>,
     vertex_colors: Option<[[u8; 4]; 3]>,
@@ -4457,7 +5854,7 @@ fn apply_layer_preview_tint(
                 rgba[3].min(0.78),
             ])
         }
-        PreviewRenderLayer::Sky | PreviewRenderLayer::Main => color,
+        PreviewRenderLayer::Sky | PreviewRenderLayer::Main | PreviewRenderLayer::Shadow => color,
     }
 }
 
@@ -4578,6 +5975,37 @@ mod tests {
     }
 
     #[test]
+    fn monte_material_colors_follow_retail_instance_indices() {
+        let mut monte = SceneObject::new("monte", "NPCMonteMA");
+        monte
+            .raw_params
+            .insert("npc_body_color_index".to_string(), "9".to_string());
+        monte
+            .raw_params
+            .insert("npc_cloth_color_index".to_string(), "3".to_string());
+
+        let colors = monte_material_colors(&monte).unwrap();
+        assert_eq!(colors.body_reg0, Some([400, 250, 100, 255]));
+        assert_eq!(
+            colors.cloth_reg1_reg2,
+            Some([[200, 200, 170, 255], [200, 200, 170, 255]])
+        );
+    }
+
+    #[test]
+    fn npc_pollution_uses_white_k_color_with_amount_as_alpha() {
+        let mut monte = SceneObject::new("monte", "NPCMonteMA");
+        monte
+            .raw_params
+            .insert("npc_pollution_amount".to_string(), "37".to_string());
+        monte
+            .raw_params
+            .insert("npc_parts_color_index_0".to_string(), "2".to_string());
+
+        assert_eq!(npc_pollution_k_color(&monte), Some([255, 255, 255, 37]));
+    }
+
+    #[test]
     fn material_table_candidates_include_base_actor_table() {
         assert_eq!(
             material_table_candidates_for_model("C:/game/dolpic.szs!/mapobj/kibako.bmd"),
@@ -4590,6 +6018,125 @@ mod tests {
                 "c:/game/dolpic.szs!/mapobj/kibako.bmt",
             ]
         );
+    }
+
+    #[test]
+    fn npc_starting_animation_uses_family_wait_resource() {
+        let monte = SceneObject::new("monte", "NPCMonteMA");
+        assert_eq!(
+            starting_joint_animation_candidates(
+                &monte,
+                "C:/game/dolpic0.szs!/montema/moma_model.bmd"
+            ),
+            [
+                "C:/game/dolpic0.szs!/montemcommon/mom_wait.bck",
+                "C:/game/dolpic0.szs!/montem/mom_wait.bck",
+            ]
+        );
+
+        let mare = SceneObject::new("mare", "NPCMareMB");
+        assert_eq!(
+            starting_joint_animation_candidates(&mare, "C:/game/mare0.szs!/marem/marem.bmd"),
+            ["C:/game/mare0.szs!/marem/marem_wait.bck"]
+        );
+    }
+
+    #[test]
+    fn monte_starting_eye_pattern_uses_retail_variant_resource() {
+        let monte = SceneObject::new("monte", "NPCMonteMA");
+        assert_eq!(
+            starting_texture_pattern_candidates(
+                &monte,
+                "C:/game/dolpic10.szs!/montema/moma_model.bmd"
+            ),
+            ["C:/game/dolpic10.szs!/montemcommon/moma_wink.btp"]
+        );
+    }
+
+    #[test]
+    fn npc_eye_material_names_are_treated_as_two_sided_decals() {
+        assert!(is_npc_eye_material_name("_eye_mat"));
+        assert!(is_npc_eye_material_name("1_eye_mat"));
+        assert!(!is_npc_eye_material_name("_hand_mat"));
+    }
+
+    #[test]
+    fn monte_parts_mask_selects_retail_joint_attachments() {
+        let mut monte = SceneObject::new("monte", "NPCMonteMA");
+        monte
+            .raw_params
+            .insert("npc_parts_mask".to_string(), "7".to_string());
+        let parts = monte_accessory_specs(&monte);
+
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].joint_name, "kubi");
+        assert_eq!(parts[0].asset_suffix, "/montemcommon/hata_model.bmd");
+        assert_eq!(parts[2].asset_suffix, "/montemcommon/glassesa_model.bmd");
+    }
+
+    #[test]
+    fn npc_circle_shadow_uses_retail_default_radius() {
+        let mut triangles = Vec::new();
+        push_npc_circle_shadow(
+            &mut triangles,
+            Transform {
+                translation: [10.0, 20.0, 30.0],
+                ..Transform::default()
+            },
+            4,
+            8,
+        );
+
+        assert_eq!(triangles.len(), 20);
+        assert_eq!(triangles[0].render_layer, PreviewRenderLayer::Shadow);
+        assert_eq!(triangles[0].vertices[0], [10.0, 21.5, 30.0]);
+        assert!((triangles[0].vertices[1][0] - 70.0).abs() < 0.001);
+        assert_eq!(triangles[0].blend_mode.unwrap().mode, 1);
+    }
+
+    #[test]
+    fn monte_model_loader_flags_follow_manager_entries() {
+        assert_eq!(
+            npc_model_loader_flags(&SceneObject::new("ma", "NPCMonteMA")),
+            Some(0x1030_0000)
+        );
+        assert_eq!(
+            npc_model_loader_flags(&SceneObject::new("md", "NPCMonteMD")),
+            Some(0x1021_0000)
+        );
+    }
+
+    #[test]
+    fn npc_archive_models_are_supported_object_previews() {
+        assert!(is_supported_object_preview_model_path(
+            "stage.szs!/montema/moma_model.bmd"
+        ));
+        assert!(is_supported_object_preview_model_path(
+            "/scene/kinopio/kinopio_body.bmd"
+        ));
+        assert!(is_supported_object_preview_model_path(
+            "stage.szs!/sambohead/sambohead.bmd"
+        ));
+    }
+
+    #[test]
+    fn world_model_path_normalization_deduplicates_scene_instances() {
+        let world_models = BTreeSet::from([normalized_preview_asset_path(
+            r"C:\game\dolpic0.szs!/map/map/sky.bmd",
+        )]);
+
+        assert!(!should_instance_object_preview_model(
+            "C:/GAME/dolpic0.szs!/map/map/sky.bmd",
+            &world_models
+        ));
+        assert!(should_instance_object_preview_model(
+            "C:/game/dolpic0.szs!/montema/moma_model.bmd",
+            &world_models
+        ));
+        assert!(should_instance_object_preview_model(
+            "C:/game/dolpic0.szs!/sambohead/sambohead.bmd",
+            &world_models
+        ));
     }
 
     fn preview_for_texture_alpha(has_alpha: bool, has_translucent_alpha: bool) -> ModelPreview {
@@ -4611,6 +6158,7 @@ mod tests {
             }],
             materials: Vec::new(),
             texture_srt_animations: Vec::new(),
+            texture_pattern_animations: Vec::new(),
             material_animation_bindings: Vec::new(),
             bounds_min: [0.0, 0.0, 0.0],
             bounds_max: [1.0, 1.0, 1.0],
@@ -4623,6 +6171,7 @@ mod tests {
             source_triangles: 0,
             source_textures: 1,
             object_model_indices: BTreeMap::new(),
+            animated_models: Vec::new(),
         }
     }
 
@@ -5136,6 +6685,7 @@ mod tests {
                 textures: Vec::new(),
                 materials: Vec::new(),
                 texture_srt_animations: Vec::new(),
+                texture_pattern_animations: Vec::new(),
                 material_animation_bindings: Vec::new(),
                 bounds_min: [0.0, 0.0, 0.0],
                 bounds_max: [1.0, 2.0, 3.0],
@@ -5148,6 +6698,7 @@ mod tests {
                 source_triangles: 1,
                 source_textures: 0,
                 object_model_indices,
+                animated_models: Vec::new(),
             }),
             ..SmsEditorApp::default()
         };

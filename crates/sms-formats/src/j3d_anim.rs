@@ -5,11 +5,262 @@ use crate::binary::{
 };
 use crate::{FormatError, PreserveBytes, Result};
 
-const FORMAT: &str = "J3D BTK";
+const FORMAT: &str = "J3D animation";
 const FILE_HEADER_SIZE: usize = 0x20;
 const TTK1_HEADER_SIZE: usize = 0x60;
 const KEY_TABLE_SIZE: usize = 0x06;
 const TRANSFORM_TABLE_SIZE: usize = 0x12;
+const JOINT_TRANSFORM_TABLE_SIZE: usize = 0x36;
+const TEXTURE_PATTERN_TABLE_SIZE: usize = 0x08;
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct J3dJointTransform {
+    pub scale: [f32; 3],
+    pub rotation_degrees: [f32; 3],
+    pub translation: [f32; 3],
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct J3dJointAnimation {
+    pub attribute: u8,
+    pub max_frame: u16,
+    joints: Vec<JointTracks>,
+    bytes: Vec<u8>,
+}
+
+impl J3dJointAnimation {
+    pub fn parse(bytes: impl AsRef<[u8]>) -> Result<Self> {
+        let bytes = bytes.as_ref();
+        require_len(FORMAT, bytes, FILE_HEADER_SIZE)?;
+        require_magic(FORMAT, bytes, b"J3D1bck1")?;
+        let declared_size = be_u32(bytes, 0x08, FORMAT)? as usize;
+        if declared_size > bytes.len() || declared_size < FILE_HEADER_SIZE {
+            return Err(invalid_offset(declared_size, bytes.len()));
+        }
+        let section_count = be_u32(bytes, 0x0C, FORMAT)? as usize;
+        let mut section_offset = FILE_HEADER_SIZE;
+        let mut ank1 = None;
+        for _ in 0..section_count {
+            let header = checked_slice(FORMAT, bytes, section_offset, 8)?;
+            let size = be_u32(bytes, section_offset + 4, FORMAT)? as usize;
+            let end = section_offset
+                .checked_add(size)
+                .ok_or_else(|| invalid_offset(section_offset, declared_size))?;
+            if size < 8 || end > declared_size {
+                return Err(invalid_offset(end, declared_size));
+            }
+            if &header[..4] == b"ANK1" {
+                ank1 = Some((section_offset, end));
+            }
+            section_offset = end;
+        }
+        let (base, section_end) = ank1.ok_or_else(|| FormatError::Unsupported {
+            format: FORMAT,
+            message: "missing ANK1 section".to_string(),
+        })?;
+        checked_slice(FORMAT, &bytes[..section_end], base, 0x24)?;
+
+        let attribute = bytes[base + 0x08];
+        let angle_scale = bytes[base + 0x09];
+        let max_frame = be_u16(bytes, base + 0x0A, FORMAT)?;
+        let joint_count = be_u16(bytes, base + 0x0C, FORMAT)? as usize;
+        let scale_count = be_u16(bytes, base + 0x0E, FORMAT)? as usize;
+        let rotation_count = be_u16(bytes, base + 0x10, FORMAT)? as usize;
+        let translation_count = be_u16(bytes, base + 0x12, FORMAT)? as usize;
+        let table_offset = section_relative(bytes, base, section_end, 0x14)?;
+        checked_slice(
+            FORMAT,
+            &bytes[..section_end],
+            table_offset,
+            joint_count
+                .checked_mul(JOINT_TRANSFORM_TABLE_SIZE)
+                .ok_or_else(|| invalid_offset(table_offset, section_end))?,
+        )?;
+        let scales = read_f32_block(bytes, base, section_end, 0x18, scale_count)?;
+        let rotations = read_i16_block(bytes, base, section_end, 0x1C, rotation_count)?;
+        let translations = read_f32_block(bytes, base, section_end, 0x20, translation_count)?;
+        let rotation_multiplier = (1_u32 << angle_scale.min(15)) as f32 * (180.0 / 32768.0);
+
+        let mut joints = Vec::with_capacity(joint_count);
+        for joint in 0..joint_count {
+            let table = read_joint_transform_table(bytes, table_offset, joint)?;
+            joints.push(JointTracks {
+                scale: decode_track_triplet(table.scale, &scales)?,
+                rotation: decode_track_triplet(table.rotation, &rotations)?,
+                translation: decode_track_triplet(table.translation, &translations)?,
+                rotation_multiplier,
+            });
+        }
+
+        Ok(Self {
+            attribute,
+            max_frame,
+            joints,
+            bytes: bytes[..declared_size].to_vec(),
+        })
+    }
+
+    pub fn joint_count(&self) -> usize {
+        self.joints.len()
+    }
+
+    pub fn playback_frame(&self, elapsed_seconds: f32) -> f32 {
+        playback_frame(self.attribute, self.max_frame, elapsed_seconds)
+    }
+
+    pub fn sample_joint(&self, joint: usize, frame: f32) -> Option<J3dJointTransform> {
+        self.joints.get(joint).map(|tracks| tracks.sample(frame))
+    }
+}
+
+impl PreserveBytes for J3dJointAnimation {
+    fn source_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct J3dTexturePatternBinding {
+    pub material_name: String,
+    pub texture_slot: u8,
+    texture_indices: Vec<u16>,
+}
+
+impl J3dTexturePatternBinding {
+    pub fn texture_index(&self, frame: f32) -> Option<usize> {
+        let last = self.texture_indices.len().checked_sub(1)?;
+        let index = if frame.is_finite() {
+            (frame.max(0.0) as usize).min(last)
+        } else {
+            0
+        };
+        Some(self.texture_indices[index] as usize)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct J3dTexturePatternAnimation {
+    pub attribute: u8,
+    pub max_frame: u16,
+    pub bindings: Vec<J3dTexturePatternBinding>,
+    bytes: Vec<u8>,
+}
+
+impl J3dTexturePatternAnimation {
+    pub fn parse(bytes: impl AsRef<[u8]>) -> Result<Self> {
+        let bytes = bytes.as_ref();
+        require_len(FORMAT, bytes, FILE_HEADER_SIZE)?;
+        require_magic(FORMAT, bytes, b"J3D1btp1")?;
+        let declared_size = be_u32(bytes, 0x08, FORMAT)? as usize;
+        if declared_size > bytes.len() || declared_size < FILE_HEADER_SIZE {
+            return Err(invalid_offset(declared_size, bytes.len()));
+        }
+        let section_count = be_u32(bytes, 0x0C, FORMAT)? as usize;
+        let mut section_offset = FILE_HEADER_SIZE;
+        let mut tpt1 = None;
+        for _ in 0..section_count {
+            let header = checked_slice(FORMAT, bytes, section_offset, 8)?;
+            let size = be_u32(bytes, section_offset + 4, FORMAT)? as usize;
+            let end = section_offset
+                .checked_add(size)
+                .ok_or_else(|| invalid_offset(section_offset, declared_size))?;
+            if size < 8 || end > declared_size {
+                return Err(invalid_offset(end, declared_size));
+            }
+            if &header[..4] == b"TPT1" {
+                tpt1 = Some((section_offset, end));
+            }
+            section_offset = end;
+        }
+        let (base, section_end) = tpt1.ok_or_else(|| FormatError::Unsupported {
+            format: FORMAT,
+            message: "missing TPT1 section".to_string(),
+        })?;
+        checked_slice(FORMAT, &bytes[..section_end], base, 0x20)?;
+
+        let attribute = bytes[base + 0x08];
+        let max_frame = be_u16(bytes, base + 0x0A, FORMAT)?;
+        let binding_count = be_u16(bytes, base + 0x0C, FORMAT)? as usize;
+        let texture_index_count = be_u16(bytes, base + 0x0E, FORMAT)? as usize;
+        let table_offset = section_relative(bytes, base, section_end, 0x10)?;
+        checked_slice(
+            FORMAT,
+            &bytes[..section_end],
+            table_offset,
+            binding_count
+                .checked_mul(TEXTURE_PATTERN_TABLE_SIZE)
+                .ok_or_else(|| invalid_offset(table_offset, section_end))?,
+        )?;
+        let values_offset = section_relative(bytes, base, section_end, 0x14)?;
+        let values = read_u16_block_at(bytes, values_offset, section_end, texture_index_count)?;
+        let name_offset = section_relative(bytes, base, section_end, 0x1C)?;
+        let names = read_jut_name_table(bytes, name_offset, section_end)?;
+        if names.len() != binding_count {
+            return Err(FormatError::Unsupported {
+                format: FORMAT,
+                message: format!(
+                    "texture pattern has {binding_count} binding(s) but {} material name(s)",
+                    names.len()
+                ),
+            });
+        }
+
+        let mut bindings = Vec::with_capacity(binding_count);
+        for (index, material_name) in names.into_iter().enumerate() {
+            let table = table_offset + index * TEXTURE_PATTERN_TABLE_SIZE;
+            let frame_count = be_u16(bytes, table, FORMAT)? as usize;
+            let first_value = be_u16(bytes, table + 2, FORMAT)? as usize;
+            let end = first_value
+                .checked_add(frame_count)
+                .ok_or_else(|| invalid_offset(first_value, values.len()))?;
+            if end > values.len() {
+                return Err(invalid_offset(end, values.len()));
+            }
+            bindings.push(J3dTexturePatternBinding {
+                material_name,
+                texture_slot: bytes[table + 4],
+                texture_indices: values[first_value..end].to_vec(),
+            });
+        }
+
+        Ok(Self {
+            attribute,
+            max_frame,
+            bindings,
+            bytes: bytes[..declared_size].to_vec(),
+        })
+    }
+
+    pub fn playback_frame(&self, elapsed_seconds: f32) -> f32 {
+        playback_frame(self.attribute, self.max_frame, elapsed_seconds)
+    }
+}
+
+impl PreserveBytes for J3dTexturePatternAnimation {
+    fn source_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct JointTracks {
+    scale: [KeyTrack; 3],
+    rotation: [KeyTrack; 3],
+    translation: [KeyTrack; 3],
+    rotation_multiplier: f32,
+}
+
+impl JointTracks {
+    fn sample(&self, frame: f32) -> J3dJointTransform {
+        J3dJointTransform {
+            scale: std::array::from_fn(|axis| self.scale[axis].sample_or(frame, 1.0)),
+            rotation_degrees: std::array::from_fn(|axis| {
+                self.rotation[axis].sample_or(frame, 0.0) * self.rotation_multiplier
+            }),
+            translation: std::array::from_fn(|axis| self.translation[axis].sample_or(frame, 0.0)),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct J3dTextureSrt {
@@ -189,40 +440,44 @@ impl J3dTextureSrtAnimation {
     }
 
     pub fn playback_frame(&self, elapsed_seconds: f32) -> f32 {
-        let end = self.max_frame as f32;
-        if !elapsed_seconds.is_finite() || end <= 0.0 {
-            return 0.0;
+        playback_frame(self.attribute, self.max_frame, elapsed_seconds)
+    }
+}
+
+fn playback_frame(attribute: u8, max_frame: u16, elapsed_seconds: f32) -> f32 {
+    let end = max_frame as f32;
+    if !elapsed_seconds.is_finite() || end <= 0.0 {
+        return 0.0;
+    }
+    let frame = elapsed_seconds.max(0.0) * 60.0;
+    match attribute {
+        0 => frame.min((end - 0.001).max(0.0)),
+        1 => {
+            if frame < end {
+                frame
+            } else {
+                0.0
+            }
         }
-        let frame = elapsed_seconds.max(0.0) * 60.0;
-        match self.attribute {
-            0 => frame.min((end - 0.001).max(0.0)),
-            1 => {
-                if frame < end {
-                    frame
-                } else {
-                    0.0
-                }
+        2 => frame.rem_euclid(end),
+        3 => {
+            if frame < end {
+                frame
+            } else if frame < end * 2.0 {
+                end * 2.0 - frame - 0.001
+            } else {
+                0.0
             }
-            2 => frame.rem_euclid(end),
-            3 => {
-                if frame < end {
-                    frame
-                } else if frame < end * 2.0 {
-                    end * 2.0 - frame - 0.001
-                } else {
-                    0.0
-                }
-            }
-            4 => {
-                let phase = frame.rem_euclid(end * 2.0);
-                if phase < end {
-                    phase
-                } else {
-                    end * 2.0 - phase - 0.001
-                }
-            }
-            _ => frame.min((end - 0.001).max(0.0)),
         }
+        4 => {
+            let phase = frame.rem_euclid(end * 2.0);
+            if phase < end {
+                phase
+            } else {
+                end * 2.0 - phase - 0.001
+            }
+        }
+        _ => frame.min((end - 0.001).max(0.0)),
     }
 }
 
@@ -283,6 +538,36 @@ struct TransformTable {
     scale: KeyTable,
     rotation: KeyTable,
     translation: KeyTable,
+}
+
+struct JointTransformTable {
+    scale: [KeyTable; 3],
+    rotation: [KeyTable; 3],
+    translation: [KeyTable; 3],
+}
+
+fn read_joint_transform_table(
+    bytes: &[u8],
+    base: usize,
+    index: usize,
+) -> Result<JointTransformTable> {
+    let offset = base
+        .checked_add(index * JOINT_TRANSFORM_TABLE_SIZE)
+        .ok_or_else(|| invalid_offset(base, bytes.len()))?;
+    let mut scale = [read_key_table(bytes, offset)?; 3];
+    let mut rotation = scale;
+    let mut translation = scale;
+    for axis in 0..3 {
+        let axis_offset = offset + axis * TRANSFORM_TABLE_SIZE;
+        scale[axis] = read_key_table(bytes, axis_offset)?;
+        rotation[axis] = read_key_table(bytes, axis_offset + KEY_TABLE_SIZE)?;
+        translation[axis] = read_key_table(bytes, axis_offset + KEY_TABLE_SIZE * 2)?;
+    }
+    Ok(JointTransformTable {
+        scale,
+        rotation,
+        translation,
+    })
 }
 
 fn read_transform_table(bytes: &[u8], base: usize, index: usize) -> Result<TransformTable> {
@@ -354,6 +639,17 @@ fn decode_track<T: Copy + Into<f32>>(table: KeyTable, data: &[T]) -> Result<KeyT
     Ok(KeyTrack { keys })
 }
 
+fn decode_track_triplet<T: Copy + Into<f32>>(
+    tables: [KeyTable; 3],
+    data: &[T],
+) -> Result<[KeyTrack; 3]> {
+    Ok([
+        decode_track(tables[0], data)?,
+        decode_track(tables[1], data)?,
+        decode_track(tables[2], data)?,
+    ])
+}
+
 fn hermite(frame: f32, left: &KeyFrame, right: &KeyFrame) -> f32 {
     let duration = right.time - left.time;
     if duration <= f32::EPSILON {
@@ -410,6 +706,18 @@ fn read_i16_array(bytes: &[u8], offset: usize, count: usize, limit: usize) -> Re
         .collect()
 }
 
+fn read_u16_block_at(bytes: &[u8], offset: usize, limit: usize, count: usize) -> Result<Vec<u16>> {
+    let length = count
+        .checked_mul(2)
+        .ok_or_else(|| invalid_offset(offset, limit))?;
+    if offset.checked_add(length).is_none_or(|end| end > limit) {
+        return Err(invalid_offset(offset.saturating_add(length), limit));
+    }
+    (0..count)
+        .map(|index| be_u16(bytes, offset + index * 2, FORMAT))
+        .collect()
+}
+
 fn read_i16_block(
     bytes: &[u8],
     base: usize,
@@ -446,6 +754,37 @@ fn invalid_offset(offset: usize, len: usize) -> FormatError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_btp() -> Vec<u8> {
+        const FILE_SIZE: usize = 0x80;
+        const BLOCK: usize = 0x20;
+        let mut bytes = vec![0_u8; FILE_SIZE];
+        bytes[..8].copy_from_slice(b"J3D1btp1");
+        put_u32(&mut bytes, 0x08, FILE_SIZE as u32);
+        put_u32(&mut bytes, 0x0C, 1);
+        bytes[BLOCK..BLOCK + 4].copy_from_slice(b"TPT1");
+        put_u32(&mut bytes, BLOCK + 0x04, (FILE_SIZE - BLOCK) as u32);
+        bytes[BLOCK + 0x08] = 2;
+        put_u16(&mut bytes, BLOCK + 0x0A, 3);
+        put_u16(&mut bytes, BLOCK + 0x0C, 1);
+        put_u16(&mut bytes, BLOCK + 0x0E, 3);
+        for (field, relative) in [(0x10, 0x20), (0x14, 0x28), (0x18, 0x30), (0x1C, 0x38)] {
+            put_u32(&mut bytes, BLOCK + field, relative);
+        }
+        put_u16(&mut bytes, BLOCK + 0x20, 3);
+        put_u16(&mut bytes, BLOCK + 0x22, 0);
+        bytes[BLOCK + 0x24] = 0;
+        for (index, value) in [4_u16, 7, 9].into_iter().enumerate() {
+            put_u16(&mut bytes, BLOCK + 0x28 + index * 2, value);
+        }
+        put_u16(&mut bytes, BLOCK + 0x30, 0);
+        let names = BLOCK + 0x38;
+        put_u16(&mut bytes, names, 1);
+        put_u16(&mut bytes, names + 2, 0xFFFF);
+        put_u16(&mut bytes, names + 6, 0x000C);
+        bytes[names + 0x0C..names + 0x15].copy_from_slice(b"_eye_mat\0");
+        bytes
+    }
 
     fn test_btk() -> Vec<u8> {
         const FILE_SIZE: usize = 0x100;
@@ -499,6 +838,43 @@ mod tests {
         bytes
     }
 
+    fn test_bck() -> Vec<u8> {
+        const FILE_SIZE: usize = 0xC0;
+        const BLOCK: usize = 0x20;
+        let mut bytes = vec![0_u8; FILE_SIZE];
+        bytes[..8].copy_from_slice(b"J3D1bck1");
+        put_u32(&mut bytes, 0x08, FILE_SIZE as u32);
+        put_u32(&mut bytes, 0x0C, 1);
+        bytes[BLOCK..BLOCK + 4].copy_from_slice(b"ANK1");
+        put_u32(&mut bytes, BLOCK + 0x04, (FILE_SIZE - BLOCK) as u32);
+        bytes[BLOCK + 0x08] = 2;
+        bytes[BLOCK + 0x09] = 0;
+        put_u16(&mut bytes, BLOCK + 0x0A, 60);
+        put_u16(&mut bytes, BLOCK + 0x0C, 1);
+        put_u16(&mut bytes, BLOCK + 0x0E, 3);
+        put_u16(&mut bytes, BLOCK + 0x10, 3);
+        put_u16(&mut bytes, BLOCK + 0x12, 3);
+        for (field, relative) in [(0x14, 0x24), (0x18, 0x60), (0x1C, 0x6C), (0x20, 0x74)] {
+            put_u32(&mut bytes, BLOCK + field, relative);
+        }
+        for axis in 0..3 {
+            let table = BLOCK + 0x24 + axis * TRANSFORM_TABLE_SIZE;
+            put_key_table(&mut bytes, table, 1, axis as u16, 0);
+            put_key_table(&mut bytes, table + KEY_TABLE_SIZE, 1, axis as u16, 0);
+            put_key_table(&mut bytes, table + KEY_TABLE_SIZE * 2, 1, axis as u16, 0);
+        }
+        for (axis, value) in [1.0, 2.0, 3.0].into_iter().enumerate() {
+            put_f32(&mut bytes, BLOCK + 0x60 + axis * 4, value);
+        }
+        for (axis, value) in [0_i16, 0x2000, -0x2000].into_iter().enumerate() {
+            put_i16(&mut bytes, BLOCK + 0x6C + axis * 2, value);
+        }
+        for (axis, value) in [10.0, 20.0, 30.0].into_iter().enumerate() {
+            put_f32(&mut bytes, BLOCK + 0x74 + axis * 4, value);
+        }
+        bytes
+    }
+
     fn put_key_table(
         bytes: &mut [u8],
         offset: usize,
@@ -538,6 +914,35 @@ mod tests {
         assert_eq!(animation.bindings[0].material_name, "water");
         assert_eq!(animation.bindings[0].center, [0.5, 0.5, 0.0]);
         assert!((animation.bindings[0].sample(30.0).translation[0] - 0.5).abs() < 0.0001);
+        assert_eq!(animation.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn parses_and_samples_texture_pattern_animation() {
+        let bytes = test_btp();
+        let animation = J3dTexturePatternAnimation::parse(&bytes).unwrap();
+
+        assert_eq!(animation.bindings.len(), 1);
+        assert_eq!(animation.bindings[0].material_name, "_eye_mat");
+        assert_eq!(animation.bindings[0].texture_slot, 0);
+        assert_eq!(animation.bindings[0].texture_index(0.0), Some(4));
+        assert_eq!(animation.bindings[0].texture_index(1.0), Some(7));
+        assert_eq!(animation.bindings[0].texture_index(99.0), Some(9));
+        assert_eq!(animation.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn parses_and_samples_joint_animation() {
+        let bytes = test_bck();
+        let animation = J3dJointAnimation::parse(&bytes).unwrap();
+
+        assert_eq!(animation.max_frame, 60);
+        assert_eq!(animation.joint_count(), 1);
+        assert_eq!(animation.playback_frame(1.25), 15.0);
+        let joint = animation.sample_joint(0, 15.0).unwrap();
+        assert_eq!(joint.scale, [1.0, 2.0, 3.0]);
+        assert_eq!(joint.rotation_degrees, [0.0, 45.0, -45.0]);
+        assert_eq!(joint.translation, [10.0, 20.0, 30.0]);
         assert_eq!(animation.to_bytes(), bytes);
     }
 

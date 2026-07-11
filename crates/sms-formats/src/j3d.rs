@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::binary::{
     be_f32, be_i16, be_u16, be_u32, checked_slice, read_jut_name_table, require_magic,
 };
+use crate::j3d_anim::J3dJointAnimation;
 use crate::{FormatError, PreserveBytes, Result};
 
 const FORMAT: &str = "J3D";
@@ -359,6 +360,8 @@ impl J3dPreviewCombineMode {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct J3dTexturePreview {
+    #[serde(default)]
+    pub name: String,
     pub width: u16,
     pub height: u16,
     pub format: u8,
@@ -534,7 +537,8 @@ struct TevAlphaArgs {
     d: u8,
 }
 
-type Mtx34 = [[f32; 4]; 3];
+pub type J3dMatrix34 = [[f32; 4]; 3];
+type Mtx34 = J3dMatrix34;
 
 #[derive(Debug, Clone, Copy)]
 struct JointPreviewTransform {
@@ -655,6 +659,92 @@ impl J3dFile {
         &self,
         loader_flags: u32,
     ) -> Result<J3dGeometryPreview> {
+        self.geometry_preview_with_pose(loader_flags, None)
+    }
+
+    pub fn geometry_preview_with_joint_animation(
+        &self,
+        loader_flags: u32,
+        animation: &J3dJointAnimation,
+        elapsed_seconds: f32,
+    ) -> Result<J3dGeometryPreview> {
+        let frame = animation.playback_frame(elapsed_seconds);
+        self.geometry_preview_with_pose(loader_flags, Some((animation, frame)))
+    }
+
+    pub fn animated_triangles_with_joint_animation(
+        &self,
+        loader_flags: u32,
+        animation: &J3dJointAnimation,
+        elapsed_seconds: f32,
+    ) -> Result<Vec<J3dTriangle>> {
+        let vertex_preview = self.vertex_preview()?;
+        let vtx1 = self
+            .section("VTX1")
+            .ok_or_else(|| FormatError::Unsupported {
+                format: FORMAT,
+                message: "missing VTX1 section".to_string(),
+            })?;
+        let vtx_offset = vtx1.offset as usize;
+        let attr_formats = self.attribute_formats(
+            vtx_offset + be_u32(&self.bytes, vtx_offset + 0x08, FORMAT)? as usize,
+        )?;
+        let position_format = position_format_from(&attr_formats)?;
+        let vertex_arrays = vertex_arrays(&self.bytes, vtx_offset, &attr_formats);
+        let shp1 = self
+            .section("SHP1")
+            .ok_or_else(|| FormatError::Unsupported {
+                format: FORMAT,
+                message: "missing SHP1 section".to_string(),
+            })?;
+        let frame = animation.playback_frame(elapsed_seconds);
+        let draw_matrices = self.preview_draw_matrices(loader_flags, Some((animation, frame)))?;
+        self.read_shape_triangles(
+            shp1.offset as usize,
+            &vertex_preview.positions,
+            &attr_formats,
+            position_format,
+            vertex_arrays,
+            &[],
+            &[],
+            &[],
+            &[],
+            &draw_matrices,
+        )
+    }
+
+    pub fn joint_names(&self) -> Result<Vec<String>> {
+        let Some(jnt1) = self.section("JNT1") else {
+            return Ok(Vec::new());
+        };
+        let base = jnt1.offset as usize;
+        let name_table_offset = relative_offset(&self.bytes, base, 0x14)?;
+        let section_end = base
+            .checked_add(jnt1.size as usize)
+            .ok_or_else(|| invalid_offset(base, self.bytes.len()))?
+            .min(self.bytes.len());
+        read_jut_name_table(&self.bytes, name_table_offset, section_end)
+    }
+
+    pub fn joint_matrices_with_joint_animation(
+        &self,
+        loader_flags: u32,
+        animation: &J3dJointAnimation,
+        elapsed_seconds: f32,
+    ) -> Result<Vec<J3dMatrix34>> {
+        let frame = animation.playback_frame(elapsed_seconds);
+        self.preview_joint_matrices(loader_flags, Some((animation, frame)))
+    }
+
+    pub fn joint_matrices(&self, loader_flags: u32) -> Result<Vec<J3dMatrix34>> {
+        self.preview_joint_matrices(loader_flags, None)
+    }
+
+    fn geometry_preview_with_pose(
+        &self,
+        loader_flags: u32,
+        animation: Option<(&J3dJointAnimation, f32)>,
+    ) -> Result<J3dGeometryPreview> {
         let vertex_preview = self.vertex_preview()?;
         let vtx1 = self
             .section("VTX1")
@@ -694,7 +784,9 @@ impl J3dFile {
         let material_textures = self
             .material_texture_bindings(&textures, &material_colors)
             .unwrap_or_default();
-        let draw_matrices = self.preview_draw_matrices(loader_flags).unwrap_or_default();
+        let draw_matrices = self
+            .preview_draw_matrices(loader_flags, animation)
+            .unwrap_or_default();
         let triangles = self.read_shape_triangles(
             shp1.offset as usize,
             &vertex_preview.positions,
@@ -860,13 +952,16 @@ impl J3dFile {
             let texture_binding = shape_materials.get(shape_no).and_then(|material| {
                 material.and_then(|index| material_textures.get(index).copied().flatten())
             });
+            let mut matrix_palette = Vec::new();
 
             for group in 0..mtx_group_count {
-                let group_matrices = self.shape_group_draw_matrices(
+                let raw_group_matrices = self.shape_group_draw_matrices(
                     shape_mtx_type,
                     mtx_init_offset + (mtx_init_index + group) * 0x08,
                     mtx_table_offset,
                 )?;
+                let group_matrices =
+                    resolve_shape_matrix_palette(&raw_group_matrices, &mut matrix_palette);
                 let draw_offset = draw_init_offset + (draw_init_index + group) * 0x08;
                 checked_slice(FORMAT, &self.bytes, draw_offset, 0x08)?;
                 let display_list_size = be_u32(&self.bytes, draw_offset, FORMAT)? as usize;
@@ -936,8 +1031,12 @@ impl J3dFile {
         }
     }
 
-    fn preview_draw_matrices(&self, loader_flags: u32) -> Result<Vec<Option<Mtx34>>> {
-        let joint_matrices = self.preview_joint_matrices(loader_flags)?;
+    fn preview_draw_matrices(
+        &self,
+        loader_flags: u32,
+        animation: Option<(&J3dJointAnimation, f32)>,
+    ) -> Result<Vec<Option<Mtx34>>> {
+        let joint_matrices = self.preview_joint_matrices(loader_flags, animation)?;
         let envelope_matrices = self
             .preview_envelope_matrices(&joint_matrices)
             .unwrap_or_default();
@@ -999,7 +1098,11 @@ impl J3dFile {
         Ok(matrices)
     }
 
-    fn preview_joint_matrices(&self, loader_flags: u32) -> Result<Vec<Mtx34>> {
+    fn preview_joint_matrices(
+        &self,
+        loader_flags: u32,
+        animation: Option<(&J3dJointAnimation, f32)>,
+    ) -> Result<Vec<Mtx34>> {
         let Some(jnt1) = self.section("JNT1") else {
             return Ok(vec![identity_mtx34()]);
         };
@@ -1017,6 +1120,17 @@ impl J3dFile {
             let offset = init_offset + init_index * J3D_JOINT_INIT_DATA_SIZE;
             checked_slice(FORMAT, &self.bytes, offset, J3D_JOINT_INIT_DATA_SIZE)?;
             local.push(read_joint_preview_transform(&self.bytes, offset)?);
+        }
+
+        if let Some((animation, frame)) = animation {
+            for (joint, transform) in local.iter_mut().enumerate() {
+                let Some(sample) = animation.sample_joint(joint, frame) else {
+                    continue;
+                };
+                transform.scale = sample.scale;
+                transform.rotation = sample.rotation_degrees.map(degrees_to_j3d_angle);
+                transform.translation = sample.translation;
+            }
         }
 
         let info = self
@@ -1476,27 +1590,33 @@ impl J3dFile {
         let base = tex1.offset as usize;
         let texture_count = be_u16(&self.bytes, base + 0x08, FORMAT)? as usize;
         let texture_offset = relative_offset(&self.bytes, base, 0x0C)?;
+        let texture_names = optional_relative_offset(&self.bytes, base, 0x10)
+            .and_then(|offset| read_jut_name_table(&self.bytes, offset, self.bytes.len()).ok())
+            .unwrap_or_default();
         let mut textures = Vec::with_capacity(texture_count);
 
         for index in 0..texture_count {
             let header_offset = texture_offset + index * 0x20;
             checked_slice(FORMAT, &self.bytes, header_offset, 0x20)?;
-            let texture = decode_timg(&self.bytes, header_offset).unwrap_or(J3dTexturePreview {
-                width: 1,
-                height: 1,
-                format: 0xFF,
-                wrap_s: 0,
-                wrap_t: 0,
-                min_filter: 1,
-                mag_filter: 1,
-                mipmap_count: 1,
-                rgba: vec![255, 255, 255, 255],
-                mips: vec![J3dTextureMipPreview {
+            let mut texture =
+                decode_timg(&self.bytes, header_offset).unwrap_or(J3dTexturePreview {
+                    name: String::new(),
                     width: 1,
                     height: 1,
+                    format: 0xFF,
+                    wrap_s: 0,
+                    wrap_t: 0,
+                    min_filter: 1,
+                    mag_filter: 1,
+                    mipmap_count: 1,
                     rgba: vec![255, 255, 255, 255],
-                }],
-            });
+                    mips: vec![J3dTextureMipPreview {
+                        width: 1,
+                        height: 1,
+                        rgba: vec![255, 255, 255, 255],
+                    }],
+                });
+            texture.name = texture_names.get(index).cloned().unwrap_or_default();
             textures.push(texture);
         }
 
@@ -1797,6 +1917,10 @@ impl J3dFile {
 
         Ok(materials)
     }
+}
+
+pub fn decode_bti_texture(bytes: impl AsRef<[u8]>) -> Result<J3dTexturePreview> {
+    decode_timg(bytes.as_ref(), 0)
 }
 
 fn read_material_color_channel(
@@ -3169,6 +3293,13 @@ fn joint_transform_mtx(transform: JointPreviewTransform) -> Mtx34 {
     mtx
 }
 
+fn degrees_to_j3d_angle(degrees: f32) -> i16 {
+    if !degrees.is_finite() {
+        return 0;
+    }
+    (degrees * (32768.0 / 180.0)).round() as i32 as i16
+}
+
 fn basic_joint_matrices(
     transforms: &[JointPreviewTransform],
     parents: &[Option<usize>],
@@ -3317,6 +3448,18 @@ fn normalize_vec3(vector: [f32; 3]) -> Option<[f32; 3]> {
         vector[1] * inv_len,
         vector[2] * inv_len,
     ])
+}
+
+fn resolve_shape_matrix_palette(raw: &[u16], palette: &mut Vec<u16>) -> Vec<u16> {
+    if palette.len() < raw.len() {
+        palette.resize(raw.len(), 0xFFFF);
+    }
+    for (slot, matrix) in raw.iter().copied().enumerate() {
+        if matrix != 0xFFFF {
+            palette[slot] = matrix;
+        }
+    }
+    palette[..raw.len()].to_vec()
 }
 
 fn transform_position_for_shape_matrix(
@@ -4339,6 +4482,7 @@ fn decode_timg(bytes: &[u8], header_offset: usize) -> Result<J3dTexturePreview> 
         .unwrap_or_else(|| vec![255, 255, 255, 255]);
 
     Ok(J3dTexturePreview {
+        name: String::new(),
         width,
         height,
         format,
@@ -4445,8 +4589,8 @@ fn decode_ia4(bytes: &[u8], offset: usize, width: u16, height: u16, rgba: &mut [
         32,
         |tile, x, y| {
             let packed = tile[y * 8 + x];
-            let intensity = (packed >> 4) * 17;
-            let alpha = (packed & 0x0F) * 17;
+            let alpha = (packed >> 4) * 17;
+            let intensity = (packed & 0x0F) * 17;
             [intensity, intensity, intensity, alpha]
         },
         rgba,
@@ -4464,8 +4608,8 @@ fn decode_ia8(bytes: &[u8], offset: usize, width: u16, height: u16, rgba: &mut [
         32,
         |tile, x, y| {
             let pixel = (y * 4 + x) * 2;
-            let intensity = tile[pixel];
-            let alpha = tile[pixel + 1];
+            let alpha = tile[pixel];
+            let intensity = tile[pixel + 1];
             [intensity, intensity, intensity, alpha]
         },
         rgba,
@@ -4921,6 +5065,19 @@ mod tests {
     }
 
     #[test]
+    fn shape_matrix_palette_inherits_ffff_slots_from_previous_packet() {
+        let mut palette = Vec::new();
+        assert_eq!(
+            resolve_shape_matrix_palette(&[4, 7, 9], &mut palette),
+            [4, 7, 9]
+        );
+        assert_eq!(
+            resolve_shape_matrix_palette(&[0xFFFF, 12, 0xFFFF], &mut palette),
+            [4, 12, 9]
+        );
+    }
+
+    #[test]
     fn extracts_f32_vertex_preview() {
         let mut bytes = vec![0; 0x20];
         bytes[0..4].copy_from_slice(b"J3D2");
@@ -5267,6 +5424,22 @@ mod tests {
         let mut i8_rgba = vec![0; 8 * 4 * 4];
         decode_i8(&i8, 0, 8, 4, &mut i8_rgba).unwrap();
         assert_eq!(&i8_rgba[0..4], &[73, 73, 73, 73]);
+    }
+
+    #[test]
+    fn intensity_alpha_textures_store_alpha_before_intensity() {
+        let mut ia4_rgba = vec![0; 8 * 4 * 4];
+        let mut ia4 = vec![0; 8 * 4];
+        ia4[0] = 0xA3;
+        decode_ia4(&ia4, 0, 8, 4, &mut ia4_rgba).unwrap();
+        assert_eq!(&ia4_rgba[0..4], &[51, 51, 51, 170]);
+
+        let mut ia8_rgba = vec![0; 4 * 4 * 4];
+        let mut ia8 = vec![0; 4 * 4 * 2];
+        ia8[0] = 201;
+        ia8[1] = 42;
+        decode_ia8(&ia8, 0, 4, 4, &mut ia8_rgba).unwrap();
+        assert_eq!(&ia8_rgba[0..4], &[42, 42, 42, 201]);
     }
 
     #[test]

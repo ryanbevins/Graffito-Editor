@@ -554,6 +554,7 @@ fn preview_stats(
             let pixel_count = (texture.rgba.len() / 4).max(1);
             texture_stats.push(serde_json::json!({
                 "index": texture_index,
+                "name": texture.name,
                 "width": texture.width,
                 "height": texture.height,
                 "format": texture.format,

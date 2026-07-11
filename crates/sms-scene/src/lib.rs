@@ -371,6 +371,32 @@ fn load_scene_objects_from_assets(assets: &[StageAsset]) -> Vec<SceneObject> {
                     .raw_params
                     .insert(format!("stream_string_{index}"), value.clone());
             }
+            if let Some(params) = record.npc_params {
+                object.raw_params.insert(
+                    "npc_body_color_index".to_string(),
+                    params.color_indices[0].to_string(),
+                );
+                object.raw_params.insert(
+                    "npc_cloth_color_index".to_string(),
+                    params.color_indices[1].to_string(),
+                );
+                object.raw_params.insert(
+                    "npc_pollution_amount".to_string(),
+                    params.pollution_amount.to_string(),
+                );
+                object
+                    .raw_params
+                    .insert("npc_parts_mask".to_string(), params.parts_mask.to_string());
+                for (index, value) in params.parts_color_indices.into_iter().enumerate() {
+                    object
+                        .raw_params
+                        .insert(format!("npc_parts_color_index_{index}"), value.to_string());
+                }
+                object.raw_params.insert(
+                    "npc_action_flags".to_string(),
+                    params.action_flags.to_string(),
+                );
+            }
 
             if !scene_object_is_preview_helper(&object) {
                 if let Some(model_path) = infer_preview_model_path(&object, &model_index) {
@@ -434,6 +460,20 @@ fn infer_preview_model_path(
     object: &SceneObject,
     model_index: &[(String, String)],
 ) -> Option<String> {
+    if let Some((directory, model_name)) = npc_preview_model_identity(&object.factory_name) {
+        let archive_directory = format!("!/{directory}/");
+        if let Some((path, _)) = model_index.iter().find(|(path, _)| {
+            let lower = path.to_ascii_lowercase();
+            lower.contains(&archive_directory)
+                && lower
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(model_name))
+        }) {
+            return Some(path.clone());
+        }
+    }
+
     let mut keys = Vec::new();
     keys.push(normalize_model_key(&object.factory_name));
     if let Some(class_name) = &object.class_name {
@@ -462,6 +502,35 @@ fn infer_preview_model_path(
     }
 
     None
+}
+
+fn npc_preview_model_identity(factory_name: &str) -> Option<(&'static str, &'static str)> {
+    match factory_name.to_ascii_lowercase().as_str() {
+        "npcmontem" => Some(("montem", "mom_model.bmd")),
+        "npcmontema" => Some(("montema", "moma_model.bmd")),
+        "npcmontemb" => Some(("montemb", "momb_model.bmd")),
+        "npcmontemc" => Some(("montemc", "momc_model.bmd")),
+        "npcmontemd" => Some(("montemd", "momd_model.bmd")),
+        "npcmonteme" => Some(("monteme", "mome_model.bmd")),
+        // These variants deliberately reuse another Monte model in the game.
+        "npcmontemf" => Some(("montem", "mom_model.bmd")),
+        "npcmontemg" => Some(("montemc", "momc_model.bmd")),
+        "npcmontemh" => Some(("montema", "moma_model.bmd")),
+        "npcmontew" => Some(("montew", "mow_model.bmd")),
+        "npcmontewa" => Some(("montewa", "mowa_model.bmd")),
+        "npcmontewb" => Some(("montewb", "mowb_model.bmd")),
+        "npcmontewc" => Some(("montew", "mow_model.bmd")),
+        "npcmarem" | "npcmarema" | "npcmaremb" | "npcmaremc" | "npcmaremd" => {
+            Some(("marem", "marem.bmd"))
+        }
+        "npcmarew" | "npcmarewa" | "npcmarewb" => Some(("marew", "marew.bmd")),
+        "npckinopio" => Some(("kinopio", "kinopio_body.bmd")),
+        "npckinojii" => Some(("kinojii", "kinoji_body.bmd")),
+        "npcpeach" => Some(("peach", "peach_model.bmd")),
+        "npcraccoondog" => Some(("raccoondog", "tanuki.bmd")),
+        "npcboard" => Some(("boardnpc", "boardnpc.bmd")),
+        _ => None,
+    }
 }
 
 fn exact_model_key_match(key: &str, model_index: &[(String, String)]) -> Option<String> {
@@ -582,5 +651,44 @@ mod tests {
         assert!(doc
             .changed_files
             .contains_key(&PathBuf::from("editor/stages/dolpic.scene.json")));
+    }
+
+    #[test]
+    fn resolves_npc_models_from_decomp_manager_resource_names() {
+        let models = vec![
+            (
+                "stage.szs!/montema/moma_model.bmd".to_string(),
+                "omamodel".to_string(),
+            ),
+            (
+                "stage.szs!/kinopio/kinopio_body.bmd".to_string(),
+                "kinopiobody".to_string(),
+            ),
+        ];
+        let monte = SceneObject::new("monte", "NPCMonteMA");
+        let kinopio = SceneObject::new("kinopio", "NPCKinopio");
+
+        assert_eq!(
+            infer_preview_model_path(&monte, &models).as_deref(),
+            Some("stage.szs!/montema/moma_model.bmd")
+        );
+        assert_eq!(
+            infer_preview_model_path(&kinopio, &models).as_deref(),
+            Some("stage.szs!/kinopio/kinopio_body.bmd")
+        );
+    }
+
+    #[test]
+    fn special_monte_variants_reuse_the_game_model_directory() {
+        let models = vec![(
+            "stage.szs!/montema/moma_model.bmd".to_string(),
+            "omamodel".to_string(),
+        )];
+        let object = SceneObject::new("map-shop", "NPCMonteMH");
+
+        assert_eq!(
+            infer_preview_model_path(&object, &models).as_deref(),
+            Some("stage.szs!/montema/moma_model.bmd")
+        );
     }
 }
