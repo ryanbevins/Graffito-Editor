@@ -497,13 +497,32 @@ impl SmsEditorApp {
                             .map(|normals| transform_preview_normals(normals, instance.transform));
                     }
                     for accessory in &instance.accessories {
-                        let Some(joint_matrix) = joint_matrices.get(accessory.joint_index).copied()
-                        else {
-                            continue;
+                        let joint_matrix = match accessory.joint_index {
+                            Some(index) => {
+                                let Some(matrix) = joint_matrices.get(index).copied() else {
+                                    continue;
+                                };
+                                matrix
+                            }
+                            None => j3d_identity_matrix(),
                         };
+                        let posed_triangles =
+                            accessory.joint_animation.as_ref().and_then(|animation| {
+                                accessory
+                                    .file
+                                    .animated_triangles_with_joint_animation(
+                                        accessory.loader_flags,
+                                        animation.as_ref(),
+                                        elapsed_seconds,
+                                    )
+                                    .ok()
+                            });
+                        let local_triangles = posed_triangles
+                            .as_deref()
+                            .unwrap_or(accessory.local_triangles.as_slice());
                         for (triangle, local) in triangles[accessory.triangle_range.clone()]
                             .iter_mut()
-                            .zip(accessory.local_triangles.iter())
+                            .zip(local_triangles.iter())
                         {
                             triangle.vertices = transform_preview_vertices(
                                 local

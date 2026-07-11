@@ -543,12 +543,12 @@ pub(super) fn is_npc_eye_material_name(name: &str) -> bool {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct MonteAccessorySpec {
-    pub(super) joint_name: &'static str,
+pub(super) struct NpcAccessorySpec {
+    pub(super) joint_name: Option<&'static str>,
     pub(super) asset_suffix: &'static str,
 }
 
-pub(super) fn monte_accessory_specs(object: &SceneObject) -> Vec<MonteAccessorySpec> {
+pub(super) fn npc_accessory_specs(object: &SceneObject) -> Vec<NpcAccessorySpec> {
     let Some(mask) = object
         .raw_params
         .get("npc_parts_mask")
@@ -561,47 +561,100 @@ pub(super) fn monte_accessory_specs(object: &SceneObject) -> Vec<MonteAccessoryS
     let mut available = Vec::new();
     if factory.starts_with("npcmontem") {
         available.extend_from_slice(&[
-            (0, "kubi", "/montemcommon/hata_model.bmd"),
-            (1, "kubi", "/montemcommon/higea_model.bmd"),
-            (2, "kubi", "/montemcommon/glassesa_model.bmd"),
-            (3, "kubi", "/montemcommon/glassesb_model.bmd"),
-            (4, "kubi", "/montemcommon/hatb_model.bmd"),
-            (5, "kubi", "/montemcommon/hate_model.bmd"),
-            (6, "kubi", "/montemcommon/hatd_model.bmd"),
-            (7, "kubi", "/montemcommon/hatf_model.bmd"),
-            (8, "kubi", "/montemcommon/hatg_model.bmd"),
-            (9, "body_jnt", "/montemcommon/eria_model.bmd"),
-            (10, "body_jnt", "/montemcommon/tieb_model.bmd"),
+            (0, Some("kubi"), "/montemcommon/hata_model.bmd"),
+            (1, Some("kubi"), "/montemcommon/higea_model.bmd"),
+            (2, Some("kubi"), "/montemcommon/glassesa_model.bmd"),
+            (3, Some("kubi"), "/montemcommon/glassesb_model.bmd"),
+            (4, Some("kubi"), "/montemcommon/hatb_model.bmd"),
+            (5, Some("kubi"), "/montemcommon/hate_model.bmd"),
+            (6, Some("kubi"), "/montemcommon/hatd_model.bmd"),
+            (7, Some("kubi"), "/montemcommon/hatf_model.bmd"),
+            (8, Some("kubi"), "/montemcommon/hatg_model.bmd"),
+            (9, Some("body_jnt"), "/montemcommon/eria_model.bmd"),
+            (10, Some("body_jnt"), "/montemcommon/tieb_model.bmd"),
         ]);
         available.push(if factory == "npcmontemf" {
-            (11, "body_jnt", "/tube_model.bmd")
+            (11, Some("body_jnt"), "/tube_model.bmd")
         } else if factory == "npcmontemg" {
-            (11, "handR_jnt", "/mop_model.bmd")
+            (11, Some("handR_jnt"), "/mop_model.bmd")
         } else if factory == "npcmontemh" {
-            (11, "body_jnt", "/uklele_model.bmd")
+            (11, Some("body_jnt"), "/uklele_model.bmd")
         } else {
-            (11, "body_jnt", "/montemcommon/nimotsu_model.bmd")
+            (11, Some("body_jnt"), "/montemcommon/nimotsu_model.bmd")
         });
     } else if factory.starts_with("npcmontew") {
         available.extend_from_slice(&[
-            (0, "yashi_jnt", "/montewcommon/flower_model.bmd"),
-            (1, "kubi", "/montewcommon/hwa_model.bmd"),
-            (2, "kubi", "/montewcommon/gwb_model.bmd"),
-            (3, "handR_jnt", "/montewcommon/arrowr_model.bmd"),
-            (4, "handR_jnt", "/montewcommon/arrowl_model.bmd"),
+            (0, Some("yashi_jnt"), "/montewcommon/flower_model.bmd"),
+            (1, Some("kubi"), "/montewcommon/hwa_model.bmd"),
+            (2, Some("kubi"), "/montewcommon/gwb_model.bmd"),
+            (3, Some("handR_jnt"), "/montewcommon/arrowr_model.bmd"),
+            (4, Some("handR_jnt"), "/montewcommon/arrowl_model.bmd"),
         ]);
         if factory == "npcmontewc" {
             available.extend_from_slice(&[
-                (5, "kubi", "/hwc_model.bmd"),
-                (6, "handR_jnt", "/udewar_model.bmd"),
-                (7, "handL_jnt", "/udewal_model.bmd"),
+                (5, Some("kubi"), "/hwc_model.bmd"),
+                (6, Some("handR_jnt"), "/udewar_model.bmd"),
+                (7, Some("handL_jnt"), "/udewal_model.bmd"),
             ]);
         }
+    } else if factory.starts_with("npcmarem") {
+        available.extend_from_slice(&[
+            (0, Some("kubi"), "/maremhat_a.bmd"),
+            (1, Some("kubi"), "/maremhat_b.bmd"),
+            (3, Some("kubi"), "/maremhat_e.bmd"),
+            (4, Some("koshi"), "/maremmakigai_a.bmd"),
+            (5, Some("koshi"), "/maremmakigai_b.bmd"),
+            (6, Some("kubi"), "/marem_grass.bmd"),
+            (7, Some("koshi"), "/marembivalve_b.bmd"),
+        ]);
+        if factory == "npcmaremb" {
+            available.extend_from_slice(&[
+                (8, Some("kubi"), "/maremb_set.bmd"),
+                (9, None, "/marembturizao.bmd"),
+            ]);
+        } else if factory == "npcmaremc" {
+            available.extend_from_slice(&[
+                (8, Some("kubi"), "/maremchat_f.bmd"),
+                (9, Some("kubi"), "/maremcagohige.bmd"),
+                (10, Some("kubi"), "/maremckuchihige.bmd"),
+            ]);
+        } else if factory == "npcmaremd" {
+            available.push((8, Some("migite"), "/maremdhoragai_a.bmd"));
+        }
+    } else if factory.starts_with("npcmarew") {
+        available.extend_from_slice(&[
+            (0, Some("kubi"), "/marewpearl_a.bmd"),
+            (1, Some("kubi"), "/marewhatw_a.bmd"),
+            (4, Some("koshi"), "/marewkai_a.bmd"),
+            (5, Some("koshi"), "/marewkai_b.bmd"),
+            (8, Some("koshi"), "/marewbivalvew_a.bmd"),
+            (9, Some("kubi"), "/marewhatw_d.bmd"),
+        ]);
+        if factory == "npcmarewb" {
+            available.push((10, None, "/marewbbaby.bmd"));
+        }
+    } else if factory == "npckinopio" {
+        available.push((0, Some("kubi"), "/kinopio_sunmegane.bmd"));
+    } else if factory == "npckinojii" {
+        available.push((0, Some("jnt_rfinger_1"), "/kinoji_stick.bmd"));
+    } else if factory == "npcpeach" {
+        // TNpcParts::partsPerform hides the parasol and alternate hands in
+        // Peach's default state, while her normal or ponytail hair remains
+        // attached to the neck joint. Keep the resource-mask bit positions in
+        // lockstep with sPeach_InitData in NpcInitData.cpp.
+        available.extend_from_slice(&[
+            (0, Some("kubi"), "/peach/peach_hair_normal.bmd"),
+            (1, Some("jnt_hand_L"), "/peach/peach_hand1_l.bmd"),
+            (2, Some("jnt_hand_R"), "/peach/peach_hand1_r.bmd"),
+            (3, Some("kubi"), "/peach/peach_hair_ponytail.bmd"),
+        ]);
+    } else if factory == "npcraccoondog" {
+        available.push((0, Some("ukiwa_null"), "/ukiwa.bmd"));
     }
     available
         .into_iter()
         .filter(|(bit, _, _)| mask & (1 << bit) != 0)
-        .map(|(_, joint_name, asset_suffix)| MonteAccessorySpec {
+        .map(|(_, joint_name, asset_suffix)| NpcAccessorySpec {
             joint_name,
             asset_suffix,
         })
@@ -623,6 +676,27 @@ pub(super) fn find_stage_asset_by_suffix<'a>(
                 .to_ascii_lowercase()
                 .ends_with(&suffix)
     })
+}
+
+pub(super) fn accessory_joint_animation(
+    document: &StageDocument,
+    asset_suffix: &str,
+) -> Option<J3dJointAnimation> {
+    let animation_suffix = accessory_joint_animation_suffix(asset_suffix)?;
+    let asset = find_stage_asset_by_suffix(document, StageAssetKind::Animation, animation_suffix)?;
+    let bytes = read_stage_asset_bytes(&asset.path).ok()?;
+    J3dJointAnimation::parse(bytes).ok()
+}
+
+pub(super) fn accessory_joint_animation_suffix(asset_suffix: &str) -> Option<&'static str> {
+    let normalized = asset_suffix.to_ascii_lowercase();
+    if normalized.ends_with("/peach/peach_hair_normal.bmd") {
+        Some("/peach/peach_hair_normal_wait.bck")
+    } else if normalized.ends_with("/peach/peach_hair_ponytail.bmd") {
+        Some("/peach/peach_hair_ponytail_wait.bck")
+    } else {
+        None
+    }
 }
 
 pub(super) fn push_accessory_instance_materials(

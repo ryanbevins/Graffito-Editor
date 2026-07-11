@@ -128,12 +128,93 @@ fn monte_parts_mask_selects_retail_joint_attachments() {
     monte
         .raw_params
         .insert("npc_parts_mask".to_string(), "7".to_string());
-    let parts = monte_accessory_specs(&monte);
+    let parts = npc_accessory_specs(&monte);
 
     assert_eq!(parts.len(), 3);
-    assert_eq!(parts[0].joint_name, "kubi");
+    assert_eq!(parts[0].joint_name, Some("kubi"));
     assert_eq!(parts[0].asset_suffix, "/montemcommon/hata_model.bmd");
     assert_eq!(parts[2].asset_suffix, "/montemcommon/glassesa_model.bmd");
+}
+
+#[test]
+fn peach_parts_mask_attaches_default_visible_ponytail() {
+    let mut peach = SceneObject::new("peach", "NPCPeach");
+    peach
+        .raw_params
+        .insert("npc_parts_mask".to_string(), "24".to_string());
+    let parts = npc_accessory_specs(&peach);
+
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].joint_name, Some("kubi"));
+    assert_eq!(parts[0].asset_suffix, "/peach/peach_hair_ponytail.bmd");
+}
+
+#[test]
+fn peach_hair_parts_use_their_retail_wait_animations() {
+    assert_eq!(
+        accessory_joint_animation_suffix("/peach/peach_hair_normal.bmd"),
+        Some("/peach/peach_hair_normal_wait.bck")
+    );
+    assert_eq!(
+        accessory_joint_animation_suffix("/peach/peach_hair_ponytail.bmd"),
+        Some("/peach/peach_hair_ponytail_wait.bck")
+    );
+    assert_eq!(
+        accessory_joint_animation_suffix("/montemcommon/hata_model.bmd"),
+        None
+    );
+}
+
+#[test]
+fn toadsworth_parts_mask_attaches_cane_to_retail_finger_joint() {
+    let mut kinojii = SceneObject::new("kinojii", "NPCKinojii");
+    kinojii
+        .raw_params
+        .insert("npc_parts_mask".to_string(), "1".to_string());
+    let parts = npc_accessory_specs(&kinojii);
+
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].joint_name, Some("jnt_rfinger_1"));
+    assert_eq!(parts[0].asset_suffix, "/kinoji_stick.bmd");
+}
+
+#[test]
+fn npc_parts_tables_cover_every_retail_family_with_parts() {
+    let cases = [
+        ("NPCMareM", 7),
+        ("NPCMareMB", 9),
+        ("NPCMareMC", 10),
+        ("NPCMareMD", 8),
+        ("NPCMareW", 6),
+        ("NPCMareWB", 7),
+        ("NPCKinopio", 1),
+        ("NPCKinojii", 1),
+        ("NPCPeach", 4),
+        ("NPCRaccoonDog", 1),
+    ];
+    for (factory, expected_count) in cases {
+        let mut object = SceneObject::new(factory, factory);
+        object
+            .raw_params
+            .insert("npc_parts_mask".to_string(), "-1".to_string());
+        assert_eq!(
+            npc_accessory_specs(&object).len(),
+            expected_count,
+            "{factory} parts table"
+        );
+    }
+}
+
+#[test]
+fn root_attached_noki_parts_do_not_require_a_body_joint() {
+    let mut fisherman = SceneObject::new("fisherman", "NPCMareMB");
+    fisherman
+        .raw_params
+        .insert("npc_parts_mask".to_string(), (1 << 9).to_string());
+    let parts = npc_accessory_specs(&fisherman);
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].joint_name, None);
+    assert_eq!(parts[0].asset_suffix, "/marembturizao.bmd");
 }
 
 #[test]

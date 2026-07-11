@@ -158,6 +158,9 @@ pub(super) struct CachedObjectModelPreview {
 
 #[derive(Clone)]
 pub(super) struct CachedAccessoryModelPreview {
+    pub(super) file: Arc<J3dFile>,
+    pub(super) joint_animation: Option<Arc<J3dJointAnimation>>,
+    pub(super) loader_flags: u32,
     pub(super) preview: J3dGeometryPreview,
     pub(super) local_triangles: Arc<Vec<J3dTriangle>>,
     pub(super) texture_base: usize,
@@ -184,7 +187,10 @@ pub(super) struct AnimatedModelInstance {
 
 #[derive(Debug, Clone)]
 pub(super) struct AnimatedAccessoryInstance {
-    pub(super) joint_index: usize,
+    pub(super) joint_index: Option<usize>,
+    pub(super) file: Arc<J3dFile>,
+    pub(super) joint_animation: Option<Arc<J3dJointAnimation>>,
+    pub(super) loader_flags: u32,
     pub(super) local_triangles: Arc<Vec<J3dTriangle>>,
     pub(super) triangle_range: std::ops::Range<usize>,
 }

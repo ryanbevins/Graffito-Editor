@@ -1004,16 +1004,28 @@ impl SmsEditorApp {
                     },
                 )
                 .unwrap_or_default();
-            for spec in monte_accessory_specs(object) {
-                let Some(joint_index) = cached
-                    .joint_names
-                    .iter()
-                    .position(|name| name.eq_ignore_ascii_case(spec.joint_name))
-                else {
-                    continue;
+            for spec in npc_accessory_specs(object) {
+                let joint_index = match spec.joint_name {
+                    Some(joint_name) => {
+                        let Some(index) = cached
+                            .joint_names
+                            .iter()
+                            .position(|name| name.eq_ignore_ascii_case(joint_name))
+                        else {
+                            continue;
+                        };
+                        Some(index)
+                    }
+                    None => None,
                 };
-                let Some(joint_matrix) = joint_matrices.get(joint_index).copied() else {
-                    continue;
+                let joint_matrix = match joint_index {
+                    Some(index) => {
+                        let Some(matrix) = joint_matrices.get(index).copied() else {
+                            continue;
+                        };
+                        matrix
+                    }
+                    None => j3d_identity_matrix(),
                 };
                 if !accessory_model_cache.contains_key(spec.asset_suffix) {
                     let Some(asset) = find_stage_asset_by_suffix(
@@ -1029,9 +1041,23 @@ impl SmsEditorApp {
                     let Ok(file) = J3dFile::parse(&bytes) else {
                         continue;
                     };
-                    let Ok(preview) = file.geometry_preview_with_loader_flags(0x1021_0000) else {
+                    let loader_flags = 0x1021_0000;
+                    let joint_animation =
+                        accessory_joint_animation(document, spec.asset_suffix).map(Arc::new);
+                    let preview_result = joint_animation.as_ref().map_or_else(
+                        || file.geometry_preview_with_loader_flags(loader_flags),
+                        |animation| {
+                            file.geometry_preview_with_joint_animation(
+                                loader_flags,
+                                animation.as_ref(),
+                                0.0,
+                            )
+                        },
+                    );
+                    let Ok(preview) = preview_result else {
                         continue;
                     };
+                    let file = Arc::new(file);
                     let local_triangles = Arc::new(preview.triangles.clone());
                     let texture_base = push_preview_textures(&mut textures, &preview);
                     let material_base =
@@ -1039,6 +1065,9 @@ impl SmsEditorApp {
                     accessory_model_cache.insert(
                         spec.asset_suffix.to_string(),
                         CachedAccessoryModelPreview {
+                            file,
+                            joint_animation,
+                            loader_flags,
                             preview,
                             local_triangles,
                             texture_base,
@@ -1081,6 +1110,9 @@ impl SmsEditorApp {
                 );
                 accessories.push(AnimatedAccessoryInstance {
                     joint_index,
+                    file: accessory.file.clone(),
+                    joint_animation: accessory.joint_animation.clone(),
+                    loader_flags: accessory.loader_flags,
                     local_triangles: accessory.local_triangles.clone(),
                     triangle_range: accessory_triangle_start..triangles.len(),
                 });
@@ -1338,6 +1370,14 @@ fn push_attached_preview_triangles(
             z_mode: triangle.z_mode,
         });
     }
+}
+
+fn j3d_identity_matrix() -> J3dMatrix34 {
+    [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ]
 }
 
 fn push_npc_circle_shadow(
