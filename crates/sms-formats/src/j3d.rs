@@ -155,6 +155,22 @@ pub struct J3dTriangle {
     pub blend_mode: Option<J3dBlendMode>,
     pub z_mode: Option<J3dZMode>,
     pub z_comp_loc: Option<u8>,
+    pub billboard: Option<J3dBillboard>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum J3dBillboardMode {
+    Full,
+    YAxis,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct J3dBillboard {
+    pub mode: J3dBillboardMode,
+    pub center: [f32; 3],
+    pub axes: [[f32; 3]; 3],
+    pub offsets: [[f32; 3]; 3],
+    pub normals: Option<[[f32; 3]; 3]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -387,7 +403,13 @@ pub struct J3dTextureMipPreview {
 pub struct J3dMaterialDiagnostic {
     pub material_index: usize,
     pub material_id: usize,
+    pub name: String,
+    pub mode: u8,
+    pub color_channel_count: u8,
     pub color: [u8; 4],
+    pub material_colors: [[u8; 4]; 2],
+    pub ambient_colors: [[u8; 4]; 2],
+    pub color_channels: [J3dColorChannel; 4],
     pub cull_mode: Option<u8>,
     pub alpha_compare: Option<J3dAlphaCompare>,
     pub blend_mode: Option<J3dBlendMode>,
@@ -1136,6 +1158,25 @@ impl J3dFile {
                     triangle.material_index = material_index;
                     triangle.shape_index = shape_no;
                     triangle.packet_index = packet_index;
+                }
+                if matches!(shape_mtx_type, 0x01 | 0x02) {
+                    let draw_matrix = group_matrices
+                        .first()
+                        .copied()
+                        .filter(|index| *index != 0xFFFF)
+                        .and_then(|index| draw_matrices.get(index as usize))
+                        .copied()
+                        .flatten();
+                    if let Some(draw_matrix) = draw_matrix {
+                        for triangle in &mut shape_triangles {
+                            triangle.billboard = billboard_for_triangle(
+                                triangle.vertices,
+                                triangle.normals,
+                                draw_matrix,
+                                shape_mtx_type,
+                            );
+                        }
+                    }
                 }
                 triangles.append(&mut shape_triangles);
                 packet_index += 1;
@@ -2027,6 +2068,7 @@ impl J3dFile {
         let material_render_states = self.material_render_states().unwrap_or_default();
         let base = mat3.offset as usize;
         let material_count = be_u16(&self.bytes, base + 0x08, FORMAT)? as usize;
+        let material_programs = self.material_programs().unwrap_or_default();
         let init_offset = relative_offset(&self.bytes, base, 0x0C)?;
         let material_id_offset = relative_offset(&self.bytes, base, 0x10)?;
         let tex_no_offset = relative_offset(&self.bytes, base, 0x48).ok();
@@ -2108,10 +2150,30 @@ impl J3dFile {
             materials.push(J3dMaterialDiagnostic {
                 material_index: index,
                 material_id,
+                name: material_programs
+                    .get(index)
+                    .map_or_else(String::new, |material| material.name.clone()),
+                mode: material_programs
+                    .get(index)
+                    .map_or(0, |material| material.mode),
+                color_channel_count: material_programs
+                    .get(index)
+                    .map_or(0, |material| material.color_channel_count),
                 color: material_colors
                     .get(index)
                     .copied()
                     .unwrap_or([255, 255, 255, 255]),
+                material_colors: material_programs
+                    .get(index)
+                    .map_or([[255; 4]; 2], |material| material.material_colors),
+                ambient_colors: material_programs
+                    .get(index)
+                    .map_or([[50; 4]; 2], |material| material.ambient_colors),
+                color_channels: material_programs
+                    .get(index)
+                    .map_or([J3dColorChannel::default(); 4], |material| {
+                        material.color_channels
+                    }),
                 cull_mode: render_state.cull_mode,
                 alpha_compare: render_state.alpha_compare,
                 blend_mode: render_state.blend_mode,
@@ -3694,6 +3756,45 @@ fn normalize_vec3(vector: [f32; 3]) -> Option<[f32; 3]> {
     ])
 }
 
+fn billboard_for_triangle(
+    vertices: [[f32; 3]; 3],
+    normals: Option<[[f32; 3]; 3]>,
+    matrix: Mtx34,
+    shape_mtx_type: u8,
+) -> Option<J3dBillboard> {
+    let center = [matrix[0][3], matrix[1][3], matrix[2][3]];
+    let axes = [
+        normalize_vec3([matrix[0][0], matrix[1][0], matrix[2][0]])?,
+        normalize_vec3([matrix[0][1], matrix[1][1], matrix[2][1]])?,
+        normalize_vec3([matrix[0][2], matrix[1][2], matrix[2][2]])?,
+    ];
+    let offsets = vertices.map(|vertex| {
+        let relative = [
+            vertex[0] - center[0],
+            vertex[1] - center[1],
+            vertex[2] - center[2],
+        ];
+        axes.map(|axis| dot_vec3(relative, axis))
+    });
+    let normals =
+        normals.map(|normals| normals.map(|normal| axes.map(|axis| dot_vec3(normal, axis))));
+    Some(J3dBillboard {
+        mode: if shape_mtx_type == 0x02 {
+            J3dBillboardMode::YAxis
+        } else {
+            J3dBillboardMode::Full
+        },
+        center,
+        axes,
+        offsets,
+        normals,
+    })
+}
+
+fn dot_vec3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
 fn resolve_shape_matrix_palette(raw: &[u16], palette: &mut Vec<u16>) -> Vec<u16> {
     if palette.len() < raw.len() {
         palette.resize(raw.len(), 0xFFFF);
@@ -4772,6 +4873,7 @@ fn push_triangle(
         blend_mode: render_state.blend_mode,
         z_mode: render_state.z_mode,
         z_comp_loc: render_state.z_comp_loc,
+        billboard: None,
     });
 }
 

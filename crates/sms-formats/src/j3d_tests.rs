@@ -99,6 +99,35 @@ fn shape_matrix_palette_inherits_ffff_slots_from_previous_packet() {
 }
 
 #[test]
+fn billboard_metadata_preserves_joint_center_and_scaled_local_offsets() {
+    let matrix = [
+        [0.0, 0.0, 4.0, 10.0],
+        [0.0, 3.0, 0.0, 20.0],
+        [-2.0, 0.0, 0.0, 30.0],
+    ];
+    let vertices = [[10.0, 20.0, 30.0], [10.0, 23.0, 28.0], [14.0, 20.0, 30.0]];
+    let billboard = billboard_for_triangle(vertices, None, matrix, 1).unwrap();
+
+    assert_eq!(billboard.mode, J3dBillboardMode::Full);
+    assert_eq!(billboard.center, [10.0, 20.0, 30.0]);
+    assert_eq!(billboard.offsets[0], [0.0, 0.0, 0.0]);
+    assert_eq!(billboard.offsets[1], [2.0, 3.0, 0.0]);
+    assert_eq!(billboard.offsets[2], [0.0, 0.0, 4.0]);
+}
+
+#[test]
+fn shape_type_two_is_y_axis_billboard() {
+    let identity = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ];
+    let billboard = billboard_for_triangle([[0.0; 3]; 3], None, identity, 2).unwrap();
+
+    assert_eq!(billboard.mode, J3dBillboardMode::YAxis);
+}
+
+#[test]
 fn extracts_f32_vertex_preview() {
     let mut bytes = vec![0; 0x20];
     bytes[0..4].copy_from_slice(b"J3D2");

@@ -19,6 +19,21 @@ pub struct JDramaObjectRecord {
     pub stream_strings: Vec<String>,
     pub npc_params: Option<JDramaNpcParams>,
     pub map_event_sink: Option<JDramaMapEventSinkParams>,
+    pub light: Option<JDramaLight>,
+    pub ambient: Option<JDramaAmbient>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JDramaLight {
+    pub name: Option<String>,
+    pub position: [f32; 3],
+    pub color: [u8; 4],
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JDramaAmbient {
+    pub name: Option<String>,
+    pub color: [u8; 4],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +105,13 @@ fn parse_record_at(
     let npc_params =
         transform.and_then(|_| read_npc_params(bytes, after_name + 36, end, &type_name));
     let map_event_sink = read_map_event_sink_params(bytes, after_name, end, &type_name);
+    let short_type = type_name.rsplit("::").next().unwrap_or(&type_name);
+    let light = (short_type == "Light")
+        .then(|| read_light(bytes, after_name, end, object_name.clone()))
+        .flatten();
+    let ambient = (short_type == "AmbColor")
+        .then(|| read_ambient(bytes, after_name, end, object_name.clone()))
+        .flatten();
 
     records.push(JDramaObjectRecord {
         offset,
@@ -100,6 +122,8 @@ fn parse_record_at(
         stream_strings,
         npc_params,
         map_event_sink,
+        light,
+        ambient,
     });
 
     let mut scan = after_type;
@@ -113,6 +137,36 @@ fn parse_record_at(
     }
 
     Ok(size)
+}
+
+fn read_light(bytes: &[u8], start: usize, end: usize, name: Option<String>) -> Option<JDramaLight> {
+    if start.checked_add(16)? > end {
+        return None;
+    }
+    Some(JDramaLight {
+        name,
+        position: [
+            be_f32(bytes, start, FORMAT).ok()?,
+            be_f32(bytes, start + 4, FORMAT).ok()?,
+            be_f32(bytes, start + 8, FORMAT).ok()?,
+        ],
+        color: bytes[start + 12..start + 16].try_into().ok()?,
+    })
+}
+
+fn read_ambient(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    name: Option<String>,
+) -> Option<JDramaAmbient> {
+    if start.checked_add(4)? > end {
+        return None;
+    }
+    Some(JDramaAmbient {
+        name,
+        color: bytes[start..start + 4].try_into().ok()?,
+    })
 }
 
 fn read_map_event_sink_params(
@@ -346,6 +400,33 @@ mod tests {
             scan_ascii_stream_strings(&bytes, 0, bytes.len()),
             ["NozzleBox", "rocket_nozzle_item"]
         );
+    }
+
+    #[test]
+    fn reads_external_jdrama_light_and_ambient_state() {
+        let mut light_bytes = Vec::new();
+        for value in [200_000.0f32, 500_000.0, 200_000.0] {
+            light_bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        light_bytes.extend_from_slice(&[210, 150, 230, 255]);
+        let light = read_light(
+            &light_bytes,
+            0,
+            light_bytes.len(),
+            Some("object sun".to_string()),
+        )
+        .unwrap();
+        assert_eq!(light.position, [200_000.0, 500_000.0, 200_000.0]);
+        assert_eq!(light.color, [210, 150, 230, 255]);
+
+        let ambient = read_ambient(
+            &[95, 80, 115, 255],
+            0,
+            4,
+            Some("object ambient".to_string()),
+        )
+        .unwrap();
+        assert_eq!(ambient.color, [95, 80, 115, 255]);
     }
 
     #[test]

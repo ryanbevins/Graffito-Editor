@@ -55,6 +55,10 @@ struct VertexIn {
     // 3 = camera-facing JPA billboard, 4 = billboarded JPA EFB distortion;
     // normal.xy is half-size and normal.z rotation for both.
     @location(12) coordinate_space: u32,
+    // xyz = joint center, w = 0 none / 1 full / 2 Y-axis billboard.
+    @location(13) billboard_center_mode: vec4<f32>,
+    @location(14) billboard_offset: vec3<f32>,
+    @location(15) billboard_axis_y: vec3<f32>,
 };
 
 struct VertexOut {
@@ -169,6 +173,7 @@ fn compute_color_channel(
     let attenuation_function = (packed >> 8u) & 0xffu;
     let light_mask = (packed >> 16u) & 0xffu;
     let light_position = vec3<f32>(200000.0, 500000.0, 200000.0);
+    let light_color = vec4<f32>(1.0);
     let light_direction = normalize(light_position - position);
     let normalized_normal = normalize(normal);
     if (attenuation_function == 0u) {
@@ -180,9 +185,9 @@ fn compute_color_channel(
         let denominator = max(25.0 - 24.0 * cosine_squared, 0.000001);
         let facing_light = dot(normalized_normal, light_direction) >= 0.0;
         let specular = select(0.0, cosine_squared / denominator, facing_light);
-        let enabled_specular = select(0.0, specular, (light_mask & 0x04u) != 0u);
+        let enabled_specular = select(0.0, specular, (light_mask & 0x01u) != 0u);
         return clamp(
-            mat * (ambient + vec4<f32>(vec3<f32>(enabled_specular), enabled_specular)),
+            mat * (ambient + light_color * enabled_specular),
             vec4<f32>(0.0),
             vec4<f32>(1.0),
         );
@@ -195,7 +200,8 @@ fn compute_color_channel(
     } else if (diffuse_function == 2u) {
         diffuse = max(n_dot_l, 0.0);
     }
-    return clamp(mat * (ambient + vec4<f32>(vec3<f32>(diffuse), diffuse)), vec4<f32>(0.0), vec4<f32>(1.0));
+    let enabled_diffuse = select(0.0, diffuse, (light_mask & 0x01u) != 0u);
+    return clamp(mat * (ambient + light_color * enabled_diffuse), vec4<f32>(0.0), vec4<f32>(1.0));
 }
 
 @vertex
@@ -218,21 +224,91 @@ fn vs_main(input: VertexIn) -> VertexOut {
         dot(input.normal, camera.up.xyz),
         dot(input.normal, camera.forward.xyz),
     ));
-    if (input.coordinate_space == 2u) {
+    let billboard_mode = u32(round(input.billboard_center_mode.w));
+    if (billboard_mode != 0u && input.coordinate_space != 3u && input.coordinate_space != 4u) {
+        // J3DModel::calcBBoard runs after the model matrix is concatenated with
+        // the view matrix. A full billboard replaces that view-space 3x3 with
+        // its axis scales; a Y billboard retains the model's Y axis and builds
+        // the other axes from camera-right. The offsets were extracted from
+        // the original rigid joint matrix on the CPU.
+        let center_rel = input.billboard_center_mode.xyz - camera.camera_position.xyz;
+        let center_view = vec3<f32>(
+            dot(center_rel, camera.right.xyz),
+            dot(center_rel, camera.up.xyz),
+            dot(center_rel, camera.forward.xyz),
+        );
+        if (billboard_mode == 1u) {
+            // GX view space looks down -Z while the editor's depth convention
+            // is +Z forward. Billboard-local depth must cross that boundary
+            // too; otherwise front-facing glow shells sit behind their model.
+            view_position = center_view + vec3<f32>(
+                input.billboard_offset.xy,
+                -input.billboard_offset.z,
+            );
+            view_normal = normalize(vec3<f32>(input.normal.xy, -input.normal.z));
+        } else {
+            let axis_y_view = normalize(vec3<f32>(
+                dot(input.billboard_axis_y, camera.right.xyz),
+                dot(input.billboard_axis_y, camera.up.xyz),
+                dot(input.billboard_axis_y, camera.forward.xyz),
+            ));
+            let axis_x_view = vec3<f32>(1.0, 0.0, 0.0);
+            let axis_z_view = -normalize(cross(axis_x_view, axis_y_view));
+            view_position = center_view
+                + axis_x_view * input.billboard_offset.x
+                + axis_y_view * input.billboard_offset.y
+                + axis_z_view * input.billboard_offset.z;
+            view_normal = normalize(
+                axis_x_view * input.normal.x
+                    + axis_y_view * input.normal.y
+                    + axis_z_view * input.normal.z,
+            );
+        }
+    } else if (input.coordinate_space == 2u) {
         // TShimmer cancels the camera view matrix before drawing its -Z-facing
         // quad, so its model coordinates arrive in GX view space.
         view_position = vec3<f32>(input.position.xy, -input.position.z);
         view_normal = normalize(vec3<f32>(input.normal.xy, -input.normal.z));
     } else if (input.coordinate_space == 3u || input.coordinate_space == 4u) {
-        let corner = input.uv0 * 2.0 - vec2<f32>(1.0);
-        let angle = input.normal.z * 3.14159265359;
-        let rotated = vec2<f32>(
-            corner.x * cos(angle) - corner.y * sin(angle),
-            corner.x * sin(angle) + corner.y * cos(angle),
+        // JPADraw assigns V=0 to positive local Y. ESP1 pivots use 1 as the
+        // center, with 0 and 2 anchoring the corresponding sprite edge.
+        let pivot = input.billboard_center_mode.xy;
+        let corner = vec2<f32>(
+            input.uv1.x * 2.0 - 1.0 + (1.0 - pivot.x),
+            1.0 - input.uv1.y * 2.0 + (pivot.y - 1.0),
         );
-        let billboard_offset = rotated * input.normal.xy;
-        view_position.x = view_position.x + billboard_offset.x;
-        view_position.y = view_position.y + billboard_offset.y;
+        let angle = input.normal.z * 3.14159265359;
+        let particle_type = billboard_mode;
+        if ((particle_type == 3u || particle_type == 4u)
+            && dot(input.billboard_axis_y, input.billboard_axis_y) > 0.000001) {
+            // JPA directional shapes are real 3D quads. Their Y axis follows
+            // the selected particle vector; rotation type Y spins only the
+            // narrow axis around that vector. Treating the angle as a 2D
+            // billboard rotation turns radial rays into vertical columns.
+            let direction = normalize(input.billboard_axis_y);
+            var side = cross(vec3<f32>(0.0, 1.0, 0.0), direction);
+            if (dot(side, side) <= 0.000001) {
+                side = cross(vec3<f32>(1.0, 0.0, 0.0), direction);
+            }
+            side = normalize(side);
+            let across = normalize(cross(direction, side));
+            let rotated_across = across * cos(angle) + side * sin(angle);
+            let world_offset = rotated_across * (corner.x * input.normal.x)
+                + direction * (corner.y * input.normal.y);
+            view_position += vec3<f32>(
+                dot(world_offset, camera.right.xyz),
+                dot(world_offset, camera.up.xyz),
+                dot(world_offset, camera.forward.xyz),
+            );
+        } else if (particle_type != 255u) {
+            let rotated = vec2<f32>(
+                corner.x * cos(angle) - corner.y * sin(angle),
+                corner.x * sin(angle) + corner.y * cos(angle),
+            );
+            let billboard_offset = rotated * input.normal.xy;
+            view_position.x = view_position.x + billboard_offset.x;
+            view_position.y = view_position.y + billboard_offset.y;
+        }
         view_normal = vec3<f32>(0.0, 0.0, -1.0);
     }
     let depth = view_position.z;
@@ -241,6 +317,13 @@ fn vs_main(input: VertexIn) -> VertexOut {
     let depth_range = max(camera.clip.y - camera.clip.x, 1.0);
     let clip_z = (camera.clip.y / depth_range) * depth
         - (camera.clip.y * camera.clip.x / depth_range);
+
+    let rgb0 = compute_color_channel(0u, 0u, input.color0, input.normal, input.position);
+    let alpha0 = compute_color_channel(1u, 0u, input.color0, input.normal, input.position);
+    let rgb1 = compute_color_channel(2u, 1u, input.color1, input.normal, input.position);
+    let alpha1 = compute_color_channel(3u, 1u, input.color1, input.normal, input.position);
+    let channel0 = vec4<f32>(rgb0.rgb, alpha0.a);
+    let channel1 = vec4<f32>(rgb1.rgb, alpha1.a);
 
     var coords: array<vec3<f32>, 8>;
     for (var i = 0u; i < 8u; i = i + 1u) {
@@ -268,9 +351,9 @@ fn vs_main(input: VertexIn) -> VertexOut {
             let prior = coords[source - 12u];
             source_value = vec4<f32>(prior, 1.0);
         } else if (source == 19u) {
-            source_value = vec4<f32>(input.color0.rg, 0.0, 1.0);
+            source_value = vec4<f32>(channel0.rg, 0.0, 1.0);
         } else if (source == 20u) {
-            source_value = vec4<f32>(input.color1.rg, 0.0, 1.0);
+            source_value = vec4<f32>(channel1.rg, 0.0, 1.0);
         }
 
         let matrix_plus_one = config.z;
@@ -294,8 +377,8 @@ fn vs_main(input: VertexIn) -> VertexOut {
             }
             if (mode == 6u || mode == 10u) {
                 source_value = vec4<f32>(
-                    0.5 * source_value.x + 0.5 * source_value.w,
-                    -0.5 * source_value.y + 0.5 * source_value.w,
+                    0.5 * source_value.x + 0.5,
+                    -0.5 * source_value.y + 0.5,
                     source_value.z,
                     1.0,
                 );
@@ -323,15 +406,10 @@ fn vs_main(input: VertexIn) -> VertexOut {
         }
     }
 
-    let rgb0 = compute_color_channel(0u, 0u, input.color0, input.normal, input.position);
-    let alpha0 = compute_color_channel(1u, 0u, input.color0, input.normal, input.position);
-    let rgb1 = compute_color_channel(2u, 1u, input.color1, input.normal, input.position);
-    let alpha1 = compute_color_channel(3u, 1u, input.color1, input.normal, input.position);
-
     var out: VertexOut;
     out.position = vec4<f32>(clip_x, clip_y, clip_z, depth);
-    out.color0 = vec4<f32>(rgb0.rgb, alpha0.a);
-    out.color1 = vec4<f32>(rgb1.rgb, alpha1.a);
+    out.color0 = channel0;
+    out.color1 = channel1;
     out.uv0 = generated_uv(coords, 0u);
     out.uv1 = generated_uv(coords, 1u);
     out.uv2 = generated_uv(coords, 2u);
@@ -753,6 +831,9 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     var previous = vec4<f32>(0.0);
     var reg0 = material.tev_colors[0];
     var reg1 = material.tev_colors[1];
+    if (material.fog_meta.w == 1u) {
+        reg1 = input.color1;
+    }
     var reg2 = material.tev_colors[2];
 
     for (var stage_index = 0u; stage_index < 16u; stage_index = stage_index + 1u) {

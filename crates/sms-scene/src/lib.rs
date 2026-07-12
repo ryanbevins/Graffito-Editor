@@ -6,8 +6,8 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sms_formats::{
-    parse_jdrama_object_records, read_stage_asset_bytes, scan_stage_assets, SourceLocation,
-    StageAsset, StageAssetKind,
+    parse_jdrama_object_records, read_stage_asset_bytes, scan_stage_assets, JDramaAmbient,
+    JDramaLight, SourceLocation, StageAsset, StageAssetKind,
 };
 use sms_schema::ObjectRegistry;
 use thiserror::Error;
@@ -68,6 +68,53 @@ pub struct StageDocument {
     pub changed_files: BTreeMap<PathBuf, Vec<u8>>,
     pub registry: Option<ObjectRegistry>,
     pub load_issues: Vec<ValidationIssue>,
+    #[serde(default)]
+    pub lighting: StageLighting,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StageLighting {
+    pub lights: Vec<JDramaLight>,
+    pub ambients: Vec<JDramaAmbient>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StageObjectLighting {
+    pub position: [f32; 3],
+    pub color: [u8; 4],
+    pub ambient: [u8; 4],
+}
+
+impl StageLighting {
+    pub fn object_lighting(&self) -> Option<StageObjectLighting> {
+        let object_primary = |name: &str| {
+            name.contains("オブジェクト")
+                && name.contains("太陽")
+                && !name.contains("サブ")
+                && !name.contains("スペキュラ")
+        };
+        let light = self
+            .lights
+            .iter()
+            .find(|light| light.name.as_deref().is_some_and(object_primary))
+            .or_else(|| self.lights.get(5))?;
+        let ambient = self
+            .ambients
+            .iter()
+            .find(|ambient| {
+                ambient.name.as_deref().is_some_and(|name| {
+                    name.contains("オブジェクト")
+                        && name.contains("アンビエント")
+                        && !name.contains("サブ")
+                })
+            })
+            .or_else(|| self.ambients.get(2))?;
+        Some(StageObjectLighting {
+            position: light.position,
+            color: light.color,
+            ambient: ambient.color,
+        })
+    }
 }
 
 impl StageDocument {
@@ -79,7 +126,7 @@ impl StageDocument {
 
         let stage_id = stage_id.into();
         let assets = scan_stage_assets(&base_root, &stage_id)?;
-        let (objects, load_issues) = load_scene_objects_from_assets(&assets);
+        let (objects, load_issues, lighting) = load_scene_objects_from_assets(&assets);
         Ok(Self {
             stage_id,
             base_root,
@@ -88,6 +135,7 @@ impl StageDocument {
             changed_files: BTreeMap::new(),
             registry: None,
             load_issues,
+            lighting,
         })
     }
 
@@ -490,9 +538,10 @@ fn path_is_same_or_child(path: &str, parent: &str) -> bool {
 
 fn load_scene_objects_from_assets(
     assets: &[StageAsset],
-) -> (Vec<SceneObject>, Vec<ValidationIssue>) {
+) -> (Vec<SceneObject>, Vec<ValidationIssue>, StageLighting) {
     let mut objects = Vec::new();
     let mut issues = Vec::new();
+    let mut lighting = StageLighting::default();
     let model_index = stage_model_index(assets);
     let mut placement_files = 0usize;
 
@@ -528,6 +577,12 @@ fn load_scene_objects_from_assets(
         };
 
         for record in records {
+            if let Some(light) = record.light.clone() {
+                lighting.lights.push(light);
+            }
+            if let Some(ambient) = record.ambient.clone() {
+                lighting.ambients.push(ambient);
+            }
             let Some(transform) = record.transform else {
                 continue;
             };
@@ -603,7 +658,7 @@ fn load_scene_objects_from_assets(
         ));
     }
 
-    (objects, issues)
+    (objects, issues, lighting)
 }
 
 fn stage_model_index(assets: &[StageAsset]) -> Vec<(String, String)> {
@@ -801,6 +856,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn selects_primary_object_light_and_ambient_by_runtime_names() {
+        let lighting = StageLighting {
+            lights: vec![JDramaLight {
+                name: Some("太陽（オブジェクト）".to_string()),
+                position: [1.0, 2.0, 3.0],
+                color: [4, 5, 6, 255],
+            }],
+            ambients: vec![JDramaAmbient {
+                name: Some("太陽アンビエント（オブジェクト）".to_string()),
+                color: [7, 8, 9, 255],
+            }],
+        };
+        assert_eq!(
+            lighting.object_lighting(),
+            Some(StageObjectLighting {
+                position: [1.0, 2.0, 3.0],
+                color: [4, 5, 6, 255],
+                ambient: [7, 8, 9, 255],
+            })
+        );
+    }
+
+    #[test]
     fn detects_invalid_transform() {
         let mut doc = StageDocument {
             stage_id: "dolpic".to_string(),
@@ -810,6 +888,7 @@ mod tests {
             changed_files: BTreeMap::new(),
             registry: None,
             load_issues: Vec::new(),
+            lighting: StageLighting::default(),
         };
         let mut object = SceneObject::new("obj-1", "coin");
         object.transform.translation[0] = f32::NAN;
@@ -829,6 +908,7 @@ mod tests {
             changed_files: BTreeMap::new(),
             registry: None,
             load_issues: Vec::new(),
+            lighting: StageLighting::default(),
         };
 
         doc.queue_editor_overlay_change().unwrap();
@@ -935,6 +1015,7 @@ mod tests {
             changed_files: BTreeMap::new(),
             registry: None,
             load_issues: Vec::new(),
+            lighting: StageLighting::default(),
         }
     }
 

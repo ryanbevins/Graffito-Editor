@@ -406,6 +406,24 @@ impl SmsEditorApp {
                 instance.transform = new_preview_transform;
             }
         }
+        for model in &mut preview.rotating_models {
+            if let Some(instance) = model
+                .instances
+                .iter_mut()
+                .find(|instance| instance.model_index == model_index)
+            {
+                instance.transform = new_preview_transform;
+            }
+        }
+        for particles in &mut preview.actor_particles {
+            if particles.model_index == Some(model_index) {
+                particles.origin_offset = retransform_preview_point(
+                    particles.origin_offset,
+                    old_preview_transform,
+                    new_preview_transform,
+                );
+            }
+        }
 
         let mut changed = false;
         for point in &mut preview.points {
@@ -423,15 +441,31 @@ impl SmsEditorApp {
                 triangle.vertices = triangle.vertices.map(|vertex| {
                     retransform_preview_point(vertex, old_preview_transform, new_preview_transform)
                 });
-                triangle.normals = triangle.normals.map(|normals| {
-                    normals.map(|normal| {
-                        retransform_preview_normal(
-                            normal,
-                            old_preview_transform,
-                            new_preview_transform,
-                        )
+                let normals = if matches!(
+                    triangle.render_layer,
+                    PreviewRenderLayer::Particle | PreviewRenderLayer::ParticleDistortion
+                ) {
+                    triangle.normals
+                } else {
+                    triangle.normals.map(|normals| {
+                        normals.map(|normal| {
+                            retransform_preview_normal(
+                                normal,
+                                old_preview_transform,
+                                new_preview_transform,
+                            )
+                        })
                     })
+                };
+                triangle.billboard = triangle.billboard.and_then(|billboard| {
+                    retransform_j3d_billboard(
+                        billboard,
+                        old_preview_transform,
+                        new_preview_transform,
+                        normals,
+                    )
                 });
+                triangle.normals = normals;
                 changed = true;
             }
         }

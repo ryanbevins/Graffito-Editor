@@ -26,6 +26,10 @@ pub struct ObjectRegistry {
     pub objects: Vec<ObjectDefinition>,
     pub params: Vec<ParamDefinition>,
     pub asset_hints: Vec<AssetHint>,
+    #[serde(default)]
+    pub particle_resources: Vec<ParticleResourceDefinition>,
+    #[serde(default)]
+    pub actor_particle_bindings: Vec<ActorParticleBinding>,
 }
 
 impl ObjectRegistry {
@@ -106,6 +110,27 @@ pub struct AssetHint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParticleResourceDefinition {
+    pub effect_id: u16,
+    pub path: String,
+    pub source_file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorParticleBinding {
+    pub class_name: String,
+    pub effect_id: u16,
+    pub target: ParticleBindingTarget,
+    pub source_file: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParticleBindingTarget {
+    ActorOrigin,
+    ModelJoint(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SchemaSource {
     MarNameRefGen,
     MapObjManager,
@@ -146,6 +171,7 @@ impl SchemaGenerator {
         self.scan_mar_name_ref_gen(&mut registry)?;
         self.scan_map_obj_manager(&mut registry)?;
         self.scan_params_and_assets(&mut registry)?;
+        self.scan_particle_bindings(&mut registry)?;
         dedup_registry(&mut registry);
         Ok(registry)
     }
@@ -214,6 +240,161 @@ impl SchemaGenerator {
 
         Ok(())
     }
+
+    fn scan_particle_bindings(&self, registry: &mut ObjectRegistry) -> Result<()> {
+        for entry in WalkDir::new(self.repo_root.join("src"))
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+        {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("cpp") {
+                continue;
+            }
+            let text = fs::read_to_string(path)?;
+            let source_file = normalize_source_path(&self.repo_root, path);
+            extract_particle_resources(&text, &source_file, registry);
+            extract_calc_particle_bindings(&text, &source_file, registry);
+        }
+        Ok(())
+    }
+}
+
+fn extract_particle_resources(text: &str, source_file: &str, registry: &mut ObjectRegistry) {
+    let load_re = Regex::new(
+        r#"(?:gpResourceManager|[A-Za-z_][A-Za-z0-9_]*ResourceManager)\s*->\s*load\s*\(\s*\"([^\"]+\.jpa)\"\s*,\s*(0[xX][0-9A-Fa-f]+|[0-9]+)"#,
+    )
+    .expect("valid particle resource regex");
+    for captures in load_re.captures_iter(text) {
+        let Some(effect_id) = parse_cpp_u16(&captures[2]) else {
+            continue;
+        };
+        registry
+            .particle_resources
+            .push(ParticleResourceDefinition {
+                effect_id,
+                path: captures[1].to_string(),
+                source_file: source_file.to_string(),
+            });
+    }
+}
+
+fn extract_calc_particle_bindings(text: &str, source_file: &str, registry: &mut ObjectRegistry) {
+    let calc_re = Regex::new(r"([A-Za-z_][A-Za-z0-9_:]*)::calc\s*\([^)]*\)\s*(?:const\s*)?\{")
+        .expect("valid calc method regex");
+    let matrix_re = Regex::new(
+        r"(?:MtxPtr|Mtx\s*\*)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[^;]*mNodeMatrices\s*\[\s*([0-9]+)\s*\]",
+    )
+    .expect("valid particle matrix regex");
+    let emit_re = Regex::new(
+        r"emitAndBind(ToPosPtr|ToMtxPtr|ToSRTMtxPtr|ToMtx)\s*\(\s*(0[xX][0-9A-Fa-f]+|[0-9]+)\s*,\s*([^,\n]+)",
+    )
+    .expect("valid actor particle emission regex");
+    let direct_joint_re =
+        Regex::new(r"mNodeMatrices\s*\[\s*([0-9]+)\s*\]").expect("valid direct joint regex");
+
+    for captures in calc_re.captures_iter(text) {
+        let Some(whole_match) = captures.get(0) else {
+            continue;
+        };
+        let Some(body) = braced_body(text, whole_match.end() - 1) else {
+            continue;
+        };
+        let matrix_joints = matrix_re
+            .captures_iter(body)
+            .filter_map(|captures| {
+                Some((captures[1].to_string(), captures[2].parse::<usize>().ok()?))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for emission in emit_re.captures_iter(body) {
+            let Some(effect_id) = parse_cpp_u16(&emission[2]) else {
+                continue;
+            };
+            let target = if &emission[1] == "ToPosPtr" {
+                Some(ParticleBindingTarget::ActorOrigin)
+            } else {
+                let argument = emission[3].trim();
+                matrix_joints
+                    .get(argument)
+                    .copied()
+                    .map(ParticleBindingTarget::ModelJoint)
+                    .or_else(|| {
+                        direct_joint_re
+                            .captures(argument)
+                            .and_then(|captures| captures[1].parse::<usize>().ok())
+                            .map(ParticleBindingTarget::ModelJoint)
+                    })
+            };
+            let Some(target) = target else {
+                continue;
+            };
+            registry.actor_particle_bindings.push(ActorParticleBinding {
+                class_name: captures[1].to_string(),
+                effect_id,
+                target,
+                source_file: source_file.to_string(),
+            });
+        }
+    }
+}
+
+fn parse_cpp_u16(value: &str) -> Option<u16> {
+    let value = value.trim();
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u16::from_str_radix(hex, 16).ok()
+    } else {
+        value.parse().ok()
+    }
+}
+
+fn braced_body(text: &str, open_brace: usize) -> Option<&str> {
+    let bytes = text.as_bytes();
+    if bytes.get(open_brace).copied() != Some(b'{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut index = open_brace;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return text.get(open_brace + 1..index);
+                }
+            }
+            b'"' | b'\'' => {
+                let quote = bytes[index];
+                index += 1;
+                while index < bytes.len() && bytes[index] != quote {
+                    if bytes[index] == b'\\' {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1).copied() == Some(b'/') => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1).copied() == Some(b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index += 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
 }
 
 fn extract_string_factory_returns(
@@ -325,6 +506,22 @@ fn dedup_registry(registry: &mut ObjectRegistry) {
             .then_with(|| a.source_file.cmp(&b.source_file))
     });
     registry.asset_hints.dedup();
+
+    registry.particle_resources.sort_by(|a, b| {
+        a.effect_id
+            .cmp(&b.effect_id)
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.source_file.cmp(&b.source_file))
+    });
+    registry.particle_resources.dedup();
+
+    registry.actor_particle_bindings.sort_by(|a, b| {
+        a.class_name
+            .cmp(&b.class_name)
+            .then_with(|| a.effect_id.cmp(&b.effect_id))
+            .then_with(|| a.source_file.cmp(&b.source_file))
+    });
+    registry.actor_particle_bindings.dedup();
 }
 
 fn read_required(path: &Path) -> Result<String> {
@@ -370,6 +567,45 @@ mod tests {
         extract_string_factory_returns(text, "MapObj", SchemaSource::MapObjManager, &mut registry);
         assert_eq!(registry.objects[0].factory_name, "coin");
         assert_eq!(registry.objects[0].class_name, "Unknown");
+    }
+
+    #[test]
+    fn discovers_particle_resources_and_calc_joint_bindings() {
+        let resources = r#"
+            gpResourceManager->load("ms_glow.jpa", 7);
+        "#;
+        let actor = r#"
+            void TExample::calc()
+            {
+                MtxPtr effectMtx = mMActor->getModel()->mNodeMatrices[2];
+                gpMarioParticleManager->emitAndBindToMtxPtr(7, effectMtx, 1, this);
+            }
+        "#;
+        let mut registry = ObjectRegistry::default();
+        extract_particle_resources(resources, "src/System/Resources.cpp", &mut registry);
+        extract_calc_particle_bindings(actor, "src/MoveBG/Example.cpp", &mut registry);
+
+        assert_eq!(registry.particle_resources[0].effect_id, 7);
+        assert_eq!(registry.particle_resources[0].path, "ms_glow.jpa");
+        assert_eq!(registry.actor_particle_bindings[0].class_name, "TExample");
+        assert_eq!(
+            registry.actor_particle_bindings[0].target,
+            ParticleBindingTarget::ModelJoint(2)
+        );
+    }
+
+    #[test]
+    fn ignores_transient_particle_emissions_outside_calc() {
+        let actor = r#"
+            void TExample::explode()
+            {
+                gpMarioParticleManager->emitAndBindToPosPtr(0x80, &mPosition, 1, this);
+            }
+        "#;
+        let mut registry = ObjectRegistry::default();
+        extract_calc_particle_bindings(actor, "src/MoveBG/Example.cpp", &mut registry);
+
+        assert!(registry.actor_particle_bindings.is_empty());
     }
 
     #[test]

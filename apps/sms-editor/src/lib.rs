@@ -10,18 +10,19 @@ use std::time::Instant;
 
 use eframe::egui;
 use sms_formats::{
-    decode_bti_texture, discover_scene_archives, parse_jdrama_object_records,
-    read_stage_asset_bytes, J3dAlphaCompare, J3dBlendMode, J3dFile, J3dGeometryPreview,
-    J3dJointAnimation, J3dJointTransformOverride, J3dMaterial, J3dMatrix34, J3dPreviewCombineMode,
-    J3dTexturePatternAnimation, J3dTextureSrtAnimation, J3dTriangle, J3dZMode, JpaEffect,
-    SceneArchiveInfo, StageAsset, StageAssetKind, SMS_ANIMATION_FRAMES_PER_SECOND,
-    SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS, SMS_MAP_MODEL_LOAD_FLAGS, SMS_POLLUTION_MODEL_LOAD_FLAGS,
+    decode_bti_texture, discover_scene_archives, mount_scene_archive, parse_jdrama_object_records,
+    read_stage_asset_bytes, J3dAlphaCompare, J3dBillboard, J3dBlendMode, J3dFile,
+    J3dGeometryPreview, J3dJointAnimation, J3dJointTransformOverride, J3dMaterial, J3dMatrix34,
+    J3dPreviewCombineMode, J3dTexturePatternAnimation, J3dTextureSrtAnimation, J3dTriangle,
+    J3dZMode, JpaEffect, SceneArchiveInfo, StageAsset, StageAssetKind,
+    SMS_ANIMATION_FRAMES_PER_SECOND, SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS, SMS_MAP_MODEL_LOAD_FLAGS,
+    SMS_POLLUTION_MODEL_LOAD_FLAGS,
 };
 use sms_render::{RenderScene, RendererConfig, ViewportRenderer};
 use sms_scene::{
     AssetRef, AssetRole, SceneObject, StageDocument, Transform, ValidationIssue, ValidationSeverity,
 };
-use sms_schema::{ObjectDefinition, ObjectRegistry, SchemaGenerator};
+use sms_schema::{ObjectDefinition, ObjectRegistry, ParticleBindingTarget, SchemaGenerator};
 
 mod camera;
 mod document_commands;
@@ -575,7 +576,7 @@ impl SmsEditorApp {
         ));
         if let Some(preview) = &preview {
             self.log.push(format!(
-                "Viewport preview loaded {} model(s), {} sampled point(s), {} triangle(s), {} texture(s), {} BTK material animation(s), {} BCK skeletal animation(s), {} procedural map-joint transformation(s), {} level-change JPA effect(s), {} source vertex/vertices.",
+                "Viewport preview loaded {} model(s), {} sampled point(s), {} triangle(s), {} texture(s), {} BTK material animation(s), {} BCK skeletal animation(s), {} procedural map-joint transformation(s), {} level-change JPA effect(s), {} actor-bound JPA effect(s), {} source vertex/vertices.",
                 preview.loaded_models,
                 preview.points.len(),
                 preview.triangles.len(),
@@ -588,6 +589,7 @@ impl SmsEditorApp {
                     .map(|model| model.targets.len())
                     .sum::<usize>(),
                 preview.level_transform_particles.len(),
+                preview.actor_particles.len(),
                 preview.source_vertices
             ));
         } else if !scene.model_paths.is_empty() {
@@ -667,6 +669,8 @@ impl SmsEditorApp {
         let mut material_animation_bindings = Vec::new();
         let mut level_transform_models = Vec::new();
         let mut level_transform_particles = Vec::new();
+        let mut actor_particles = Vec::new();
+        let actor_particle_effects = load_actor_particle_effects(document);
         let mut next_packet_index = 0usize;
         let mut bounds_min = [f32::INFINITY; 3];
         let mut bounds_max = [f32::NEG_INFINITY; 3];
@@ -801,6 +805,12 @@ impl SmsEditorApp {
                                 alpha_compare: triangle.alpha_compare,
                                 blend_mode: triangle.blend_mode,
                                 z_mode: triangle.z_mode,
+                                billboard: triangle.billboard,
+                                particle_type: None,
+                                particle_pivot: None,
+                                particle_direction: None,
+                                particle_color_mode: None,
+                                particle_environment_color: None,
                             });
                         }
                     }
@@ -1022,6 +1032,20 @@ impl SmsEditorApp {
                         alpha_compare: triangle.alpha_compare,
                         blend_mode: triangle.blend_mode,
                         z_mode: triangle.z_mode,
+                        billboard: triangle.billboard.and_then(|billboard| {
+                            transform_j3d_billboard(
+                                billboard,
+                                object_preview_transform,
+                                triangle.normals.map(|normals| {
+                                    transform_preview_normals(normals, object_preview_transform)
+                                }),
+                            )
+                        }),
+                        particle_type: None,
+                        particle_pivot: None,
+                        particle_direction: None,
+                        particle_color_mode: None,
+                        particle_environment_color: None,
                     });
                 }
             }
@@ -1041,6 +1065,18 @@ impl SmsEditorApp {
                     },
                 )
                 .unwrap_or_default();
+            push_actor_particle_previews(
+                document,
+                object,
+                &actor_particle_effects,
+                &joint_matrices,
+                object_preview_transform,
+                model_index,
+                &mut textures,
+                &mut triangles,
+                &mut next_packet_index,
+                &mut actor_particles,
+            );
             for spec in npc_accessory_specs(object) {
                 let joint_index = match spec.joint_name {
                     Some(joint_name) => {
@@ -1170,12 +1206,36 @@ impl SmsEditorApp {
                 point_stride,
                 triangle_range: triangle_start..body_triangle_end,
                 accessories,
+                // TShine::control advances the normal live state by unk16C,
+                // whose constructor default is 2 degrees per retail frame.
+                runtime_yaw_degrees_per_frame: if object.factory_name.eq_ignore_ascii_case("shine")
+                {
+                    2.0
+                } else {
+                    0.0
+                },
             };
             if let Some(cached) = object_model_cache.get_mut(&model_cache_key) {
                 cached.instances.push(instance);
             }
         }
 
+        let rotating_models = object_model_cache
+            .values()
+            .filter_map(|cached| {
+                let instances = cached
+                    .instances
+                    .iter()
+                    .filter(|instance| instance.runtime_yaw_degrees_per_frame != 0.0)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!instances.is_empty()).then(|| RuntimeRotatingModelPreview {
+                    positions: Arc::new(cached.preview.positions.clone()),
+                    triangles: Arc::new(cached.preview.triangles.clone()),
+                    instances,
+                })
+            })
+            .collect::<Vec<_>>();
         let animated_models: Vec<AnimatedModelPreview> = object_model_cache
             .into_values()
             .filter_map(|cached| {
@@ -1204,7 +1264,7 @@ impl SmsEditorApp {
             level_transform_particle_end_frames(&level_transform_particles)
                 .max(level_transform_duration_frames);
 
-        if points.len() > POINT_BUDGET && animated_models.is_empty() {
+        if points.len() > POINT_BUDGET && animated_models.is_empty() && rotating_models.is_empty() {
             let stride = (points.len() / POINT_BUDGET).max(1);
             points = points
                 .into_iter()
@@ -1255,8 +1315,10 @@ impl SmsEditorApp {
             source_textures,
             object_model_indices,
             animated_models,
+            rotating_models,
             level_transform_models,
             level_transform_particles,
+            actor_particles,
             level_transform_duration_frames,
             level_transform_particle_end_frames,
         })
@@ -1426,6 +1488,23 @@ fn push_attached_preview_triangles(
             alpha_compare: triangle.alpha_compare,
             blend_mode: triangle.blend_mode,
             z_mode: triangle.z_mode,
+            billboard: triangle.billboard.and_then(|billboard| {
+                let joint_normals = triangle.normals.map(|normals| {
+                    normals.map(|normal| transform_j3d_matrix_normal(joint_matrix, normal))
+                });
+                let billboard =
+                    transform_j3d_billboard_matrix(billboard, joint_matrix, joint_normals)?;
+                transform_j3d_billboard(
+                    billboard,
+                    transform,
+                    joint_normals.map(|normals| transform_preview_normals(normals, transform)),
+                )
+            }),
+            particle_type: None,
+            particle_pivot: None,
+            particle_direction: None,
+            particle_color_mode: None,
+            particle_environment_color: None,
         });
     }
 }
@@ -1496,6 +1575,12 @@ fn push_npc_circle_shadow(
                 func: 3,
                 update_enable: 0,
             }),
+            billboard: None,
+            particle_type: None,
+            particle_pivot: None,
+            particle_direction: None,
+            particle_color_mode: None,
+            particle_environment_color: None,
         });
     }
 }

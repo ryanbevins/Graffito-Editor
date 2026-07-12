@@ -387,7 +387,10 @@ impl SmsEditorApp {
 
         if has_triangles {
             if self.model_preview.as_ref().is_some_and(|preview| {
-                !preview.texture_srt_animations.is_empty() || !preview.animated_models.is_empty()
+                !preview.texture_srt_animations.is_empty()
+                    || !preview.animated_models.is_empty()
+                    || !preview.rotating_models.is_empty()
+                    || !preview.actor_particles.is_empty()
             }) {
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
             }
@@ -549,7 +552,11 @@ impl SmsEditorApp {
         let Some(preview) = self.model_preview.as_mut() else {
             return;
         };
-        if preview.animated_models.is_empty() && preview.texture_pattern_animations.is_empty() {
+        if preview.animated_models.is_empty()
+            && preview.rotating_models.is_empty()
+            && preview.actor_particles.is_empty()
+            && preview.texture_pattern_animations.is_empty()
+        {
             return;
         }
         self.last_skeletal_animation_tick = tick;
@@ -558,6 +565,8 @@ impl SmsEditorApp {
         {
             let ModelPreview {
                 animated_models,
+                rotating_models,
+                actor_particles,
                 texture_pattern_animations,
                 materials,
                 points,
@@ -601,6 +610,15 @@ impl SmsEditorApp {
                         triangle.normals = posed
                             .normals
                             .map(|normals| transform_preview_normals(normals, instance.transform));
+                        triangle.billboard = posed.billboard.and_then(|billboard| {
+                            transform_j3d_billboard(
+                                billboard,
+                                instance.transform,
+                                posed.normals.map(|normals| {
+                                    transform_preview_normals(normals, instance.transform)
+                                }),
+                            )
+                        });
                     }
                     for accessory in &instance.accessories {
                         let joint_matrix = match accessory.joint_index {
@@ -644,10 +662,70 @@ impl SmsEditorApp {
                                     instance.transform,
                                 )
                             });
+                            triangle.billboard = local.billboard.and_then(|billboard| {
+                                let joint_normals = local.normals.map(|normals| {
+                                    normals.map(|normal| {
+                                        transform_j3d_matrix_normal(joint_matrix, normal)
+                                    })
+                                });
+                                let billboard = transform_j3d_billboard_matrix(
+                                    billboard,
+                                    joint_matrix,
+                                    joint_normals,
+                                )?;
+                                transform_j3d_billboard(
+                                    billboard,
+                                    instance.transform,
+                                    joint_normals.map(|normals| {
+                                        transform_preview_normals(normals, instance.transform)
+                                    }),
+                                )
+                            });
                         }
                     }
                 }
             }
+            for source in rotating_models {
+                for instance in &source.instances {
+                    let mut transform = instance.transform;
+                    transform.rotation_degrees[1] += elapsed_seconds
+                        * SMS_ANIMATION_FRAMES_PER_SECOND
+                        * instance.runtime_yaw_degrees_per_frame;
+                    for (point, position) in points[instance.point_range.clone()]
+                        .iter_mut()
+                        .zip(source.positions.iter().step_by(instance.point_stride))
+                    {
+                        point.position = transform_preview_point(*position, transform);
+                    }
+                    for (triangle, local) in
+                        triangles[instance.triangle_range.clone()].iter_mut().zip(
+                            source
+                                .triangles
+                                .iter()
+                                .filter(|triangle| triangle_vertices_are_finite(triangle.vertices)),
+                        )
+                    {
+                        triangle.vertices = transform_preview_vertices(local.vertices, transform);
+                        triangle.normals = local
+                            .normals
+                            .map(|normals| transform_preview_normals(normals, transform));
+                        triangle.billboard = local.billboard.and_then(|billboard| {
+                            transform_j3d_billboard(
+                                billboard,
+                                transform,
+                                local
+                                    .normals
+                                    .map(|normals| transform_preview_normals(normals, transform)),
+                            )
+                        });
+                    }
+                }
+            }
+            apply_level_transform_particles(
+                actor_particles,
+                elapsed_seconds * SMS_ANIMATION_FRAMES_PER_SECOND,
+                triangles,
+            );
             for pattern in texture_pattern_animations {
                 let frame = pattern
                     .animation
@@ -682,6 +760,18 @@ impl SmsEditorApp {
                         )
                     })
                 })
+                .chain(preview.rotating_models.iter().flat_map(|model| {
+                    model
+                        .instances
+                        .iter()
+                        .map(|instance| instance.triangle_range.clone())
+                }))
+                .chain(
+                    preview
+                        .actor_particles
+                        .iter()
+                        .map(|particles| particles.triangle_range.clone()),
+                )
                 .collect::<Vec<_>>();
             gpu_viewport.update_geometry(preview, &triangle_ranges);
             if !dirty_materials.is_empty() {
@@ -827,10 +917,16 @@ impl SmsEditorApp {
         size: [usize; 2],
         triangle: &'a PreviewTriangle,
     ) -> Option<ProjectedPreviewTriangle<'a>> {
-        let vertices = preview_triangle_world_vertices(
-            triangle.vertices,
-            triangle.render_layer,
-            self.camera_frame().position,
+        let camera = self.camera_frame();
+        let vertices = triangle.billboard.map_or_else(
+            || {
+                preview_triangle_world_vertices(
+                    triangle.vertices,
+                    triangle.render_layer,
+                    camera.position,
+                )
+            },
+            |billboard| j3d_billboard_world_vertices(billboard, camera),
         );
         let screen = project_triangle_to_framebuffer(self, rect, size, vertices)?;
         if !projected_triangle_overlaps_frame(screen, size) {

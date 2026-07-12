@@ -61,6 +61,145 @@ pub(super) fn transform_preview_point(mut point: [f32; 3], transform: Transform)
     ]
 }
 
+pub(super) fn transform_j3d_billboard(
+    billboard: J3dBillboard,
+    transform: Transform,
+    transformed_normals: Option<[[f32; 3]; 3]>,
+) -> Option<J3dBillboard> {
+    rebase_j3d_billboard(
+        billboard,
+        transform_preview_point(billboard.center, transform),
+        billboard
+            .axes
+            .map(|axis| transform_preview_vector(axis, transform)),
+        transformed_normals,
+    )
+}
+
+pub(super) fn retransform_j3d_billboard(
+    billboard: J3dBillboard,
+    old_transform: Transform,
+    new_transform: Transform,
+    transformed_normals: Option<[[f32; 3]; 3]>,
+) -> Option<J3dBillboard> {
+    rebase_j3d_billboard(
+        billboard,
+        retransform_preview_point(billboard.center, old_transform, new_transform),
+        billboard.axes.map(|axis| {
+            transform_preview_vector(
+                inverse_transform_preview_vector(axis, old_transform),
+                new_transform,
+            )
+        }),
+        transformed_normals,
+    )
+}
+
+pub(super) fn transform_j3d_billboard_matrix(
+    billboard: J3dBillboard,
+    matrix: J3dMatrix34,
+    transformed_normals: Option<[[f32; 3]; 3]>,
+) -> Option<J3dBillboard> {
+    rebase_j3d_billboard(
+        billboard,
+        transform_j3d_matrix_point(matrix, billboard.center),
+        billboard
+            .axes
+            .map(|axis| transform_j3d_matrix_vector(matrix, axis)),
+        transformed_normals,
+    )
+}
+
+pub(super) fn j3d_billboard_world_vertices(
+    billboard: J3dBillboard,
+    camera: CameraFrame,
+) -> [[f32; 3]; 3] {
+    let axes = match billboard.mode {
+        sms_formats::J3dBillboardMode::Full => [
+            camera.right,
+            camera.up,
+            camera.forward.map(|component| -component),
+        ],
+        sms_formats::J3dBillboardMode::YAxis => {
+            let axis_y = vec3_normalize(billboard.axes[1]);
+            let axis_z =
+                vec3_normalize(vec3_cross(camera.right, axis_y)).map(|component| -component);
+            [camera.right, axis_y, axis_z]
+        }
+    };
+    billboard.offsets.map(|offset| {
+        let mut vertex = billboard.center;
+        for axis in 0..3 {
+            for component in 0..3 {
+                vertex[component] += axes[axis][component] * offset[axis];
+            }
+        }
+        vertex
+    })
+}
+
+fn rebase_j3d_billboard(
+    mut billboard: J3dBillboard,
+    center: [f32; 3],
+    axis_vectors: [[f32; 3]; 3],
+    transformed_normals: Option<[[f32; 3]; 3]>,
+) -> Option<J3dBillboard> {
+    let axis_lengths = axis_vectors.map(vec3_length);
+    if axis_lengths
+        .iter()
+        .any(|length| !length.is_finite() || *length <= 0.00001)
+    {
+        return None;
+    }
+    billboard.center = center;
+    billboard.axes = std::array::from_fn(|index| {
+        let length = axis_lengths[index];
+        axis_vectors[index].map(|component| component / length)
+    });
+    billboard.offsets = billboard
+        .offsets
+        .map(|offset| std::array::from_fn(|index| offset[index] * axis_lengths[index]));
+    billboard.normals = transformed_normals
+        .map(|normals| normals.map(|normal| billboard.axes.map(|axis| vec3_dot(normal, axis))));
+    Some(billboard)
+}
+
+pub(super) fn transform_preview_vector(mut vector: [f32; 3], transform: Transform) -> [f32; 3] {
+    vector[0] *= transform.scale[0];
+    vector[1] *= transform.scale[1];
+    vector[2] *= transform.scale[2];
+    vector = rotate_x_degrees(vector, transform.rotation_degrees[0]);
+    vector = rotate_y_degrees(vector, transform.rotation_degrees[1]);
+    rotate_z_degrees(vector, transform.rotation_degrees[2])
+}
+
+fn inverse_transform_preview_vector(mut vector: [f32; 3], transform: Transform) -> [f32; 3] {
+    vector = rotate_z_degrees(vector, -transform.rotation_degrees[2]);
+    vector = rotate_y_degrees(vector, -transform.rotation_degrees[1]);
+    vector = rotate_x_degrees(vector, -transform.rotation_degrees[0]);
+    [
+        vector[0] / transform.scale[0],
+        vector[1] / transform.scale[1],
+        vector[2] / transform.scale[2],
+    ]
+}
+
+pub(super) fn transform_j3d_matrix_vector(matrix: J3dMatrix34, vector: [f32; 3]) -> [f32; 3] {
+    [
+        matrix[0][0] * vector[0] + matrix[0][1] * vector[1] + matrix[0][2] * vector[2],
+        matrix[1][0] * vector[0] + matrix[1][1] * vector[1] + matrix[1][2] * vector[2],
+        matrix[2][0] * vector[0] + matrix[2][1] * vector[1] + matrix[2][2] * vector[2],
+    ]
+}
+
+fn vec3_length(vector: [f32; 3]) -> f32 {
+    vec3_dot(vector, vector).sqrt()
+}
+
+fn vec3_dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
 pub(super) fn retransform_preview_point(
     point: [f32; 3],
     old_transform: Transform,

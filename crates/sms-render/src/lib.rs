@@ -175,6 +175,7 @@ mod tests {
             changed_files: BTreeMap::new(),
             registry: None,
             load_issues: Vec::new(),
+            lighting: Default::default(),
         };
         let scene = RenderScene::from_document(&document);
         let renderer = ViewportRenderer::new(RendererConfig::default());

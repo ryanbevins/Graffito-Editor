@@ -21,8 +21,10 @@ pub(super) struct ModelPreview {
     pub(super) source_textures: usize,
     pub(super) object_model_indices: BTreeMap<String, usize>,
     pub(super) animated_models: Vec<AnimatedModelPreview>,
+    pub(super) rotating_models: Vec<RuntimeRotatingModelPreview>,
     pub(super) level_transform_models: Vec<LevelTransformModelPreview>,
     pub(super) level_transform_particles: Vec<LevelTransformParticlePreview>,
+    pub(super) actor_particles: Vec<LevelTransformParticlePreview>,
     pub(super) level_transform_duration_frames: f32,
     pub(super) level_transform_particle_end_frames: f32,
 }
@@ -83,6 +85,7 @@ pub(super) struct LevelTransformParticlePreview {
     pub(super) origin_offset: [f32; 3],
     pub(super) triangle_range: std::ops::Range<usize>,
     pub(super) particle_capacity: usize,
+    pub(super) model_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +121,12 @@ pub(super) struct PreviewTriangle {
     pub(super) alpha_compare: Option<J3dAlphaCompare>,
     pub(super) blend_mode: Option<J3dBlendMode>,
     pub(super) z_mode: Option<J3dZMode>,
+    pub(super) billboard: Option<J3dBillboard>,
+    pub(super) particle_type: Option<u8>,
+    pub(super) particle_pivot: Option<[f32; 2]>,
+    pub(super) particle_direction: Option<[f32; 3]>,
+    pub(super) particle_color_mode: Option<u8>,
+    pub(super) particle_environment_color: Option<[u8; 4]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,6 +210,13 @@ pub(super) struct AnimatedModelPreview {
 }
 
 #[derive(Clone)]
+pub(super) struct RuntimeRotatingModelPreview {
+    pub(super) positions: Arc<Vec<[f32; 3]>>,
+    pub(super) triangles: Arc<Vec<J3dTriangle>>,
+    pub(super) instances: Vec<AnimatedModelInstance>,
+}
+
+#[derive(Clone)]
 pub(super) struct LevelTransformModelPreview {
     pub(super) file: J3dFile,
     pub(super) loader_flags: u32,
@@ -233,6 +249,7 @@ pub(super) struct AnimatedModelInstance {
     pub(super) point_stride: usize,
     pub(super) triangle_range: std::ops::Range<usize>,
     pub(super) accessories: Vec<AnimatedAccessoryInstance>,
+    pub(super) runtime_yaw_degrees_per_frame: f32,
 }
 
 #[derive(Debug, Clone)]

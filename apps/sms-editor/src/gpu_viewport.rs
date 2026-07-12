@@ -7,8 +7,8 @@ use eframe::egui;
 use eframe::egui_wgpu::{Callback, CallbackResources, CallbackTrait, ScreenDescriptor};
 use eframe::wgpu::{self, util::DeviceExt};
 use sms_formats::{
-    J3dAlphaCompare, J3dBlendMode, J3dMaterial, J3dTevStage, J3dTexMatrix, J3dTextureSrtAnimation,
-    J3dZMode,
+    J3dAlphaCompare, J3dBillboardMode, J3dBlendMode, J3dMaterial, J3dTevStage, J3dTexMatrix,
+    J3dTextureSrtAnimation, J3dZMode,
 };
 
 use super::{
@@ -223,7 +223,7 @@ impl GpuSceneData {
             .iter()
             .map(|material| GpuMaterialData::from_j3d(material, preview))
             .collect::<Vec<_>>();
-        let mut fallback_materials = BTreeMap::<(usize, usize, u8), usize>::new();
+        let mut fallback_materials = BTreeMap::<(usize, usize, u8, u8, u32), usize>::new();
         let mut batch_map = BTreeMap::<(usize, usize, GpuPipelineKey), usize>::new();
         let mut batches = Vec::<GpuBatchData>::new();
         let mut triangle_vertices = vec![None; preview.triangles.len()];
@@ -236,8 +236,19 @@ impl GpuSceneData {
                     let texture = triangle.texture_index.unwrap_or(usize::MAX);
                     let mask = triangle.mask_texture_index.unwrap_or(usize::MAX);
                     let layer = render_layer_id(triangle.render_layer);
+                    let particle_color_mode = triangle.particle_color_mode.unwrap_or(u8::MAX);
+                    let particle_environment_color = triangle
+                        .particle_environment_color
+                        .map(u32::from_be_bytes)
+                        .unwrap_or(0);
                     *fallback_materials
-                        .entry((texture, mask, layer))
+                        .entry((
+                            texture,
+                            mask,
+                            layer,
+                            particle_color_mode,
+                            particle_environment_color,
+                        ))
                         .or_insert_with(|| {
                             let index = materials.len();
                             materials.push(GpuMaterialData::fallback(triangle, preview));
@@ -272,8 +283,10 @@ impl GpuSceneData {
             let legacy_colors = legacy_vertex_colors(triangle, face_normal);
             for vertex_index in 0..3 {
                 let normal = triangle
-                    .normals
+                    .billboard
+                    .and_then(|billboard| billboard.normals)
                     .map(|normals| normals[vertex_index])
+                    .or_else(|| triangle.normals.map(|normals| normals[vertex_index]))
                     .unwrap_or(face_normal);
                 let color0 = triangle.color_channels[0]
                     .map(|colors| color_u8_to_f32(colors[vertex_index]))
@@ -311,6 +324,33 @@ impl GpuSceneData {
                     uv6: tex_coords[6],
                     uv7: tex_coords[7],
                     coordinate_space: coordinate_space_for_render_layer(triangle.render_layer),
+                    billboard_center_mode: triangle
+                        .billboard
+                        .map(|billboard| {
+                            [
+                                billboard.center[0],
+                                billboard.center[1],
+                                billboard.center[2],
+                                match billboard.mode {
+                                    J3dBillboardMode::Full => 1.0,
+                                    J3dBillboardMode::YAxis => 2.0,
+                                },
+                            ]
+                        })
+                        .unwrap_or([
+                            triangle.particle_pivot.map_or(0.0, |pivot| pivot[0]),
+                            triangle.particle_pivot.map_or(0.0, |pivot| pivot[1]),
+                            0.0,
+                            triangle.particle_type.map_or(0.0, f32::from),
+                        ]),
+                    billboard_offset: triangle
+                        .billboard
+                        .map(|billboard| billboard.offsets[vertex_index])
+                        .unwrap_or([0.0; 3]),
+                    billboard_axis_y: triangle
+                        .particle_direction
+                        .or_else(|| triangle.billboard.map(|billboard| billboard.axes[1]))
+                        .unwrap_or([0.0, 1.0, 0.0]),
                 });
             }
             batch.indices.extend_from_slice(&[base, base + 1, base + 2]);
@@ -364,9 +404,38 @@ impl GpuSceneData {
                 };
                 vertex.position = triangle.vertices[vertex_index];
                 vertex.normal = triangle
-                    .normals
+                    .billboard
+                    .and_then(|billboard| billboard.normals)
                     .map(|normals| normals[vertex_index])
+                    .or_else(|| triangle.normals.map(|normals| normals[vertex_index]))
                     .unwrap_or(face_normal);
+                vertex.billboard_center_mode = triangle
+                    .billboard
+                    .map(|billboard| {
+                        [
+                            billboard.center[0],
+                            billboard.center[1],
+                            billboard.center[2],
+                            match billboard.mode {
+                                J3dBillboardMode::Full => 1.0,
+                                J3dBillboardMode::YAxis => 2.0,
+                            },
+                        ]
+                    })
+                    .unwrap_or([
+                        triangle.particle_pivot.map_or(0.0, |pivot| pivot[0]),
+                        triangle.particle_pivot.map_or(0.0, |pivot| pivot[1]),
+                        0.0,
+                        triangle.particle_type.map_or(0.0, f32::from),
+                    ]);
+                vertex.billboard_offset = triangle
+                    .billboard
+                    .map(|billboard| billboard.offsets[vertex_index])
+                    .unwrap_or([0.0; 3]);
+                vertex.billboard_axis_y = triangle
+                    .particle_direction
+                    .or_else(|| triangle.billboard.map(|billboard| billboard.axes[1]))
+                    .unwrap_or([0.0, 1.0, 0.0]);
                 let colors = legacy_vertex_colors(triangle, face_normal);
                 vertex.color0 = triangle.color_channels[0]
                     .map(|channels| color_u8_to_f32(channels[vertex_index]))
@@ -379,6 +448,25 @@ impl GpuSceneData {
                 vertex.color1 = triangle.color_channels[1]
                     .map(|channels| color_u8_to_f32(channels[vertex_index]))
                     .unwrap_or([1.0; 4]);
+                let tex_coords: [[f32; 2]; TEXTURE_SLOT_COUNT] = std::array::from_fn(|slot| {
+                    triangle.tex_coord_sets[slot]
+                        .map(|coords| coords[vertex_index])
+                        .or_else(|| {
+                            (slot == 0)
+                                .then_some(triangle.tex_coords)
+                                .flatten()
+                                .map(|coords| coords[vertex_index])
+                        })
+                        .unwrap_or([0.0; 2])
+                });
+                vertex.uv0 = tex_coords[0];
+                vertex.uv1 = tex_coords[1];
+                vertex.uv2 = tex_coords[2];
+                vertex.uv3 = tex_coords[3];
+                vertex.uv4 = tex_coords[4];
+                vertex.uv5 = tex_coords[5];
+                vertex.uv6 = tex_coords[6];
+                vertex.uv7 = tex_coords[7];
             }
             dirty_batches.insert(location.batch_index);
         }
@@ -597,6 +685,21 @@ impl GpuMaterialData {
 
     fn fallback(triangle: &PreviewTriangle, preview: &ModelPreview) -> Self {
         let mut uniform = GpuMaterialUniform::fallback(triangle.texture_index.is_some());
+        if let Some(mode) = triangle.particle_color_mode {
+            uniform.fog_meta[3] = 1;
+            uniform.tev_color_args[0] = match mode {
+                0 => [15, 8, 12, 15],
+                1 => [15, 10, 8, 15],
+                2 => [10, 12, 8, 15],
+                3 => [4, 10, 8, 15],
+                4 => [15, 8, 10, 4],
+                5 => [15, 15, 15, 10],
+                _ => [15, 10, 8, 15],
+            };
+            if let Some(environment) = triangle.particle_environment_color {
+                uniform.tev_colors[1] = color_u8_to_f32(environment);
+            }
+        }
         if let Some(compare) = triangle.alpha_compare {
             uniform.set_alpha_compare(compare);
         }
@@ -1133,10 +1236,13 @@ struct GpuVertex {
     uv6: [f32; 2],
     uv7: [f32; 2],
     coordinate_space: u32,
+    billboard_center_mode: [f32; 4],
+    billboard_offset: [f32; 3],
+    billboard_axis_y: [f32; 3],
 }
 
 impl GpuVertex {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 13] = wgpu::vertex_attr_array![
+    const ATTRIBUTES: [wgpu::VertexAttribute; 16] = wgpu::vertex_attr_array![
         0 => Float32x3,
         1 => Float32x3,
         2 => Float32x4,
@@ -1149,7 +1255,10 @@ impl GpuVertex {
         9 => Float32x2,
         10 => Float32x2,
         11 => Float32x2,
-        12 => Uint32
+        12 => Uint32,
+        13 => Float32x4,
+        14 => Float32x3,
+        15 => Float32x3
     ];
 
     fn layout() -> wgpu::VertexBufferLayout<'static> {

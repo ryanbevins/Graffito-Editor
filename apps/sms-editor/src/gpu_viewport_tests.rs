@@ -1,4 +1,9 @@
 use super::*;
+
+#[test]
+fn j3d_vertex_layout_fits_webgpu_minimum_attribute_limit() {
+    assert!(GpuVertex::ATTRIBUTES.len() <= 16);
+}
 use crate::{PreviewPoint, PreviewRenderLayer};
 use sms_formats::{
     J3dColorChannel, J3dIndirectMaterial, J3dPreviewCombineMode, J3dTevOrder, J3dTexGen,
@@ -20,6 +25,13 @@ fn j3d_shader_parses_and_validates() {
     )
     .validate(&module)
     .expect("J3D WGSL validates");
+}
+
+#[test]
+fn color_texgen_uses_post_lighting_gx_channel_values() {
+    assert!(J3D_SHADER.contains("source_value = vec4<f32>(channel0.rg, 0.0, 1.0)"));
+    assert!(J3D_SHADER.contains("source_value = vec4<f32>(channel1.rg, 0.0, 1.0)"));
+    assert!(!J3D_SHADER.contains("source_value = vec4<f32>(input.color0.rg, 0.0, 1.0)"));
 }
 
 #[test]
@@ -67,6 +79,28 @@ fn geometry_updates_touch_only_requested_triangle_batches() {
     );
 }
 
+#[test]
+fn geometry_updates_keep_dynamic_particle_shape_metadata() {
+    let mut preview = geometry_update_preview();
+    preview.triangles[1].particle_type = Some(3);
+    preview.triangles[1].particle_pivot = Some([1.0, 2.0]);
+    preview.triangles[1].particle_direction = Some([4.0, 5.0, 6.0]);
+    preview.triangles[1].tex_coords = Some([[0.0, 0.1], [1.0, 0.1], [1.0, 0.2]]);
+    let mut scene = GpuSceneData::from_preview(&preview);
+
+    preview.triangles[1].particle_direction = Some([7.0, 8.0, 9.0]);
+    preview.triangles[1].tex_coords = Some([[0.0, 0.7], [1.0, 0.7], [1.0, 0.8]]);
+    let particle_range = 1..2;
+    scene.update_geometry(&preview, std::slice::from_ref(&particle_range));
+
+    let location = scene.triangle_vertices[1].unwrap();
+    let vertex = scene.batches[location.batch_index].vertices[location.vertex_offset];
+    assert_eq!(vertex.billboard_center_mode[3], 3.0);
+    assert_eq!(&vertex.billboard_center_mode[..2], &[1.0, 2.0]);
+    assert_eq!(vertex.billboard_axis_y, [7.0, 8.0, 9.0]);
+    assert_eq!(vertex.uv0, [0.0, 0.7]);
+}
+
 fn geometry_update_preview() -> ModelPreview {
     let triangle = |packet_index, x| PreviewTriangle {
         vertices: [[x, 0.0, 0.0], [x + 1.0, 0.0, 0.0], [x, 1.0, 0.0]],
@@ -88,6 +122,12 @@ fn geometry_update_preview() -> ModelPreview {
         alpha_compare: None,
         blend_mode: None,
         z_mode: None,
+        billboard: None,
+        particle_type: None,
+        particle_pivot: None,
+        particle_direction: None,
+        particle_color_mode: None,
+        particle_environment_color: None,
     };
     ModelPreview {
         points: Vec::<PreviewPoint>::new(),
@@ -109,8 +149,10 @@ fn geometry_update_preview() -> ModelPreview {
         source_textures: 0,
         object_model_indices: BTreeMap::new(),
         animated_models: Vec::new(),
+        rotating_models: Vec::new(),
         level_transform_models: Vec::new(),
         level_transform_particles: Vec::new(),
+        actor_particles: Vec::new(),
         level_transform_duration_frames: 600.0,
         level_transform_particle_end_frames: 600.0,
     }

@@ -9,6 +9,27 @@ fn assert_vec3_close(actual: [f32; 3], expected: [f32; 3]) {
     }
 }
 
+#[test]
+fn full_billboard_local_positive_z_moves_toward_the_camera() {
+    let billboard = J3dBillboard {
+        mode: sms_formats::J3dBillboardMode::Full,
+        center: [0.0, 0.0, 100.0],
+        axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        offsets: [[0.0, 0.0, 10.0]; 3],
+        normals: None,
+    };
+    let vertices = j3d_billboard_world_vertices(
+        billboard,
+        CameraFrame {
+            position: [0.0; 3],
+            right: [1.0, 0.0, 0.0],
+            up: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        },
+    );
+    assert_eq!(vertices[0], [0.0, 0.0, 90.0]);
+}
+
 fn camera_app() -> SmsEditorApp {
     let mut app = SmsEditorApp::default();
     {
@@ -512,8 +533,10 @@ fn preview_for_texture_alpha(has_alpha: bool, has_translucent_alpha: bool) -> Mo
         source_textures: 1,
         object_model_indices: BTreeMap::new(),
         animated_models: Vec::new(),
+        rotating_models: Vec::new(),
         level_transform_models: Vec::new(),
         level_transform_particles: Vec::new(),
+        actor_particles: Vec::new(),
         level_transform_duration_frames: 600.0,
         level_transform_particle_end_frames: 600.0,
     }
@@ -549,6 +572,12 @@ fn textured_blended_triangle() -> PreviewTriangle {
             logic_op: 0,
         }),
         z_mode: None,
+        billboard: None,
+        particle_type: None,
+        particle_pivot: None,
+        particle_direction: None,
+        particle_color_mode: None,
+        particle_environment_color: None,
     }
 }
 
@@ -1188,6 +1217,29 @@ fn transform_preview_normal_ignores_translation_and_normalizes() {
 }
 
 #[test]
+fn billboard_transform_tracks_instance_center_rotation_and_scale() {
+    let billboard = J3dBillboard {
+        mode: sms_formats::J3dBillboardMode::Full,
+        center: [1.0, 2.0, 3.0],
+        axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        offsets: [[2.0, 3.0, 4.0]; 3],
+        normals: None,
+    };
+    let transform = Transform {
+        translation: [10.0, 20.0, 30.0],
+        rotation_degrees: [0.0, 90.0, 0.0],
+        scale: [2.0, 3.0, 4.0],
+    };
+    let transformed = transform_j3d_billboard(billboard, transform, None).unwrap();
+
+    assert_vec3_close(transformed.center, [22.0, 26.0, 28.0]);
+    assert_vec3_close(transformed.offsets[0], [4.0, 9.0, 16.0]);
+    assert_vec3_close(transformed.axes[0], [0.0, 0.0, -1.0]);
+    assert_vec3_close(transformed.axes[1], [0.0, 1.0, 0.0]);
+    assert_vec3_close(transformed.axes[2], [1.0, 0.0, 0.0]);
+}
+
+#[test]
 fn updating_object_transform_moves_cached_preview_mesh() {
     let old_transform = Transform::default();
     let new_transform = Transform {
@@ -1222,6 +1274,12 @@ fn updating_object_transform_moves_cached_preview_mesh() {
                 alpha_compare: None,
                 blend_mode: None,
                 z_mode: None,
+                billboard: None,
+                particle_type: None,
+                particle_pivot: None,
+                particle_direction: None,
+                particle_color_mode: None,
+                particle_environment_color: None,
             }],
             textures: Vec::new(),
             materials: Vec::new(),
@@ -1240,8 +1298,10 @@ fn updating_object_transform_moves_cached_preview_mesh() {
             source_textures: 0,
             object_model_indices,
             animated_models: Vec::new(),
+            rotating_models: Vec::new(),
             level_transform_models: Vec::new(),
             level_transform_particles: Vec::new(),
+            actor_particles: Vec::new(),
             level_transform_duration_frames: 600.0,
             level_transform_particle_end_frames: 600.0,
         }),
@@ -1304,5 +1364,6 @@ fn test_document(objects: Vec<SceneObject>) -> StageDocument {
         changed_files: BTreeMap::new(),
         registry: None,
         load_issues: Vec::new(),
+        lighting: Default::default(),
     }
 }

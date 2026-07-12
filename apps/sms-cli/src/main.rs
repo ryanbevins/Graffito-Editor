@@ -454,11 +454,17 @@ fn preview_stats(
         let mut combine_modes = std::collections::BTreeMap::<String, usize>::new();
         let mut material_colors = std::collections::BTreeMap::<String, usize>::new();
         let mut used_texture_formats = std::collections::BTreeMap::<u8, usize>::new();
+        let mut billboard_modes = std::collections::BTreeMap::<String, usize>::new();
         let mut texture_triangle_stats =
             std::collections::BTreeMap::<usize, TextureTriangleStats>::new();
         let mut triangle_group_stats =
             std::collections::BTreeMap::<String, TextureTriangleStats>::new();
         for triangle in &preview.triangles {
+            if let Some(billboard) = triangle.billboard {
+                *billboard_modes
+                    .entry(format!("{:?}", billboard.mode))
+                    .or_default() += 1;
+            }
             *combine_modes
                 .entry(format!("{:?}", triangle.combine_mode))
                 .or_default() += 1;
@@ -601,6 +607,7 @@ fn preview_stats(
             "used_texture_formats": used_texture_formats,
             "combine_modes": combine_modes,
             "material_colors": material_colors,
+            "billboard_modes": billboard_modes,
             "uv_min": uv_min,
             "uv_max": uv_max,
             "bounds_min": preview.bounds_min,
