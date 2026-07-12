@@ -789,6 +789,44 @@ fn pollution_bitmap_replaces_the_embedded_authoring_mask_top_down() {
 }
 
 #[test]
+fn pollution_bitmap_replaces_every_material_alias_of_the_dynamic_texture() {
+    fn texture(name: &str, width: u16, height: u16, value: u8) -> sms_formats::J3dTexturePreview {
+        sms_formats::J3dTexturePreview {
+            name: name.to_string(),
+            width,
+            height,
+            format: 1,
+            wrap_s: 0,
+            wrap_t: 0,
+            min_filter: 0,
+            mag_filter: 0,
+            mipmap_count: 2,
+            rgba: vec![value; width as usize * height as usize * 4],
+            mips: vec![],
+        }
+    }
+
+    let mut textures = vec![
+        texture("DummyPollution256x256_I8", 2, 2, 1),
+        texture("TestChoco2", 2, 2, 2),
+        texture("DummyPollution256x256_I8", 2, 2, 3),
+        texture("DummyPollution256x256_I8", 1, 1, 4),
+    ];
+    let runtime_mask = vec![9; 2 * 2 * 4];
+
+    replace_pollution_mask_texture_aliases(&mut textures, 2, 2, &runtime_mask);
+
+    assert_eq!(textures[0].rgba, runtime_mask);
+    assert_eq!(textures[2].rgba, runtime_mask);
+    assert_eq!(textures[0].mipmap_count, 1);
+    assert_eq!(textures[2].mipmap_count, 1);
+    assert!(textures[0].mips.is_empty());
+    assert!(textures[2].mips.is_empty());
+    assert_eq!(textures[1].rgba, vec![2; 2 * 2 * 4]);
+    assert_eq!(textures[3].rgba, vec![4; 4]);
+}
+
+#[test]
 fn pollution_bitmap_rejects_non_i8_or_truncated_inputs() {
     assert_eq!(decode_pollution_bitmap_mask(b"not a bitmap"), None);
 

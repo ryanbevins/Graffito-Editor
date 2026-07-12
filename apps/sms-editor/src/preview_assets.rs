@@ -24,22 +24,42 @@ pub(super) fn apply_pollution_bitmap_mask(
     }) else {
         return;
     };
-    let Some(texture) = preview.textures.first_mut() else {
-        return;
-    };
     let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
         return;
     };
     let Some((width, height, rgba)) = decode_pollution_bitmap_mask(&bytes) else {
         return;
     };
-    if texture.width != width || texture.height != height {
+
+    replace_pollution_mask_texture_aliases(&mut preview.textures, width, height, &rgba);
+}
+
+pub(super) fn replace_pollution_mask_texture_aliases(
+    textures: &mut [sms_formats::J3dTexturePreview],
+    width: u16,
+    height: u16,
+    rgba: &[u8],
+) {
+    let Some(dynamic_texture) = textures.first() else {
+        return;
+    };
+    if dynamic_texture.width != width || dynamic_texture.height != height {
         return;
     }
 
-    texture.rgba = rgba;
-    texture.mips.clear();
-    texture.mipmap_count = 1;
+    // TPollutionLayer writes the live mask through the model's first ResTIMG.
+    // Some retail pollution models repeat that same named texture resource for
+    // multiple materials. J3D shares the underlying image data, but the preview
+    // decoder owns one RGBA buffer per TEX1 entry, so update every alias here.
+    let dynamic_texture_name = dynamic_texture.name.clone();
+    for texture in textures.iter_mut().filter(|texture| {
+        texture.name == dynamic_texture_name && texture.width == width && texture.height == height
+    }) {
+        texture.rgba.clear();
+        texture.rgba.extend_from_slice(rgba);
+        texture.mips.clear();
+        texture.mipmap_count = 1;
+    }
 }
 
 pub(super) fn decode_pollution_bitmap_mask(bytes: &[u8]) -> Option<(u16, u16, Vec<u8>)> {
