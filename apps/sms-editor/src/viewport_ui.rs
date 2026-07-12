@@ -721,7 +721,7 @@ impl SmsEditorApp {
                     }
                 }
             }
-            apply_level_transform_particles(
+            apply_actor_particles(
                 actor_particles,
                 elapsed_seconds * SMS_ANIMATION_FRAMES_PER_SECOND,
                 triangles,

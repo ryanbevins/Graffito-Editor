@@ -82,13 +82,14 @@ impl ModelPreview {
 pub(super) struct LevelTransformParticlePreview {
     pub(super) effect: JpaEffect,
     pub(super) kind: JpaParticleKind,
+    pub(super) shared_simulation_id: Option<u16>,
     pub(super) origin_offset: [f32; 3],
     pub(super) triangle_range: std::ops::Range<usize>,
     pub(super) particle_capacity: usize,
     pub(super) model_index: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum JpaParticleKind {
     Parent,
     Child,

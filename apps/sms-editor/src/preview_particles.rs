@@ -1,6 +1,6 @@
 use super::*;
 
-const PARTICLE_CAPACITY: usize = 512;
+const MAX_PARTICLE_CAPACITY: usize = 512;
 const DEFAULT_TRANSFORM_FRAMES: f32 = 600.0;
 const JPA_VOLUME_CUBE: u8 = 0;
 const JPA_VOLUME_SPHERE: u8 = 1;
@@ -260,6 +260,7 @@ pub(super) fn push_actor_particle_previews(
         let preview_start = previews.len();
         append_particle_preview(
             effect.clone(),
+            Some(binding.effect_id),
             origin,
             textures,
             triangles,
@@ -336,6 +337,7 @@ pub(super) fn push_level_transform_particle_previews(
         for effect in effects {
             append_particle_preview(
                 effect.clone(),
+                None,
                 target_center,
                 textures,
                 triangles,
@@ -394,6 +396,7 @@ fn level_transform_target_centers(model: &LevelTransformModelPreview) -> Vec<[f3
 
 fn append_particle_preview(
     effect: JpaEffect,
+    shared_simulation_id: Option<u16>,
     target_center: [f32; 3],
     textures: &mut Vec<PreviewTexture>,
     triangles: &mut Vec<PreviewTriangle>,
@@ -419,6 +422,7 @@ fn append_particle_preview(
         append_particle_shape_preview(
             effect.clone(),
             JpaParticleKind::Parent,
+            shared_simulation_id,
             origin_offset,
             source_texture_index,
             effect.uses_screen_texture,
@@ -432,6 +436,7 @@ fn append_particle_preview(
         append_particle_shape_preview(
             effect,
             JpaParticleKind::Child,
+            shared_simulation_id,
             origin_offset,
             usize::from(child.texture_index),
             false,
@@ -443,10 +448,86 @@ fn append_particle_preview(
     }
 }
 
+fn particle_capacity(effect: &JpaEffect, kind: JpaParticleKind) -> usize {
+    let emitter = effect.emitter;
+    let maximum_spawn_rate = maximum_keyframed_value(effect, 0, emitter.spawn_rate)
+        * (1.0 + emitter.spawn_rate_variance.abs());
+    let maximum_lifetime = maximum_keyframed_value(effect, 4, f32::from(emitter.base_lifetime))
+        * (1.0 + (-emitter.lifetime_random_scale).max(0.0));
+    let interval = usize::from(emitter.emit_interval) + 1;
+    let parent_capacity = particle_birth_capacity(maximum_spawn_rate, maximum_lifetime, interval);
+
+    let capacity = match kind {
+        JpaParticleKind::Parent => parent_capacity,
+        JpaParticleKind::Child => {
+            let Some(child) = effect.child_shape else {
+                return 1;
+            };
+            let child_lifetime = f32::from(child.lifetime.max(1));
+            let contributing_parents = particle_birth_capacity(
+                maximum_spawn_rate,
+                maximum_lifetime + child_lifetime,
+                interval,
+            );
+            let child_interval = usize::from(child.spawn_step) + 1;
+            let births_per_parent =
+                (((maximum_lifetime.min(child_lifetime) / child_interval as f32).ceil() as usize)
+                    + 1)
+                .saturating_mul(usize::try_from(child.spawn_count.max(0)).unwrap_or(0));
+            contributing_parents.saturating_mul(births_per_parent)
+        }
+    };
+    let stripe_multiplier = match kind {
+        JpaParticleKind::Parent if effect.base_shape.particle_type == 6 => 2,
+        JpaParticleKind::Child
+            if effect
+                .child_shape
+                .is_some_and(|child| child.particle_type == 6) =>
+        {
+            2
+        }
+        _ => 1,
+    };
+    capacity
+        .saturating_mul(stripe_multiplier)
+        .clamp(1, MAX_PARTICLE_CAPACITY)
+}
+
+fn particle_birth_capacity(maximum_spawn_rate: f32, lifetime: f32, interval: usize) -> usize {
+    if maximum_spawn_rate <= 0.0 || lifetime <= 0.0 {
+        return 1;
+    }
+    let births_per_event = maximum_spawn_rate.ceil().max(1.0) as usize;
+    let concurrent_events = (lifetime / interval.max(1) as f32).ceil() as usize + 1;
+    births_per_event.saturating_mul(concurrent_events)
+}
+
+fn maximum_keyframed_value(effect: &JpaEffect, parameter_index: u8, fallback: f32) -> f32 {
+    let Some(curve) = effect
+        .keyframes
+        .iter()
+        .find(|curve| curve.parameter_index == parameter_index)
+    else {
+        return fallback.max(0.0);
+    };
+    let endpoint_maximum = curve.keys.iter().map(|key| key[1]).fold(0.0f32, f32::max);
+    curve
+        .keys
+        .windows(2)
+        .fold(endpoint_maximum, |maximum, pair| {
+            let span = (pair[1][0] - pair[0][0]).abs();
+            // Hermite tangent basis functions stay within roughly +/-0.148.
+            // Using 0.15 gives a conservative bound without sampling a timeline.
+            let tangent_overshoot = 0.15 * span * (pair[0][3].abs() + pair[1][2].abs());
+            maximum.max(pair[0][1].max(pair[1][1]) + tangent_overshoot)
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn append_particle_shape_preview(
     effect: JpaEffect,
     kind: JpaParticleKind,
+    shared_simulation_id: Option<u16>,
     origin_offset: [f32; 3],
     source_texture_index: usize,
     screen_distortion: bool,
@@ -478,7 +559,8 @@ fn append_particle_shape_preview(
     let triangle_start = triangles.len();
     let packet_index = *next_packet_index;
     *next_packet_index += 1;
-    for _ in 0..PARTICLE_CAPACITY {
+    let particle_capacity = particle_capacity(&effect, kind);
+    for _ in 0..particle_capacity {
         push_particle_slot(
             triangles,
             packet_index,
@@ -492,8 +574,9 @@ fn append_particle_shape_preview(
         origin_offset,
         effect,
         kind,
+        shared_simulation_id,
         triangle_range: triangle_start..triangles.len(),
-        particle_capacity: PARTICLE_CAPACITY,
+        particle_capacity,
         model_index: None,
     });
 }
@@ -581,44 +664,84 @@ pub(super) fn apply_level_transform_particles(
     triangles: &mut [PreviewTriangle],
 ) {
     for preview in previews {
-        let mut samples = match preview.kind {
-            JpaParticleKind::Parent => sample_particles(
-                &preview.effect,
-                preview.origin_offset,
-                retail_frame,
-                preview.particle_capacity,
-            ),
-            JpaParticleKind::Child => sample_child_particles(
-                &preview.effect,
-                preview.origin_offset,
-                retail_frame,
-                preview.particle_capacity,
-            ),
+        let samples = sample_particle_preview(preview, preview.origin_offset, retail_frame);
+        apply_particle_samples(preview, &samples, [0.0; 3], triangles);
+    }
+}
+
+/// Actor-bound emitters with the same retail effect ID are deterministic and
+/// phase-aligned. Simulate each effect once, then translate that exact result
+/// to every actor instead of replaying its full history for every instance.
+pub(super) fn apply_actor_particles(
+    previews: &[LevelTransformParticlePreview],
+    retail_frame: f32,
+    triangles: &mut [PreviewTriangle],
+) {
+    let mut shared_samples = BTreeMap::<(u16, JpaParticleKind), Vec<SampledParticle>>::new();
+    for preview in previews {
+        let Some(effect_id) = preview.shared_simulation_id else {
+            let samples = sample_particle_preview(preview, preview.origin_offset, retail_frame);
+            apply_particle_samples(preview, &samples, [0.0; 3], triangles);
+            continue;
         };
-        let particle_type = match preview.kind {
-            JpaParticleKind::Parent => preview.effect.base_shape.particle_type,
-            JpaParticleKind::Child => preview
-                .effect
-                .child_shape
-                .map_or(preview.effect.base_shape.particle_type, |child| {
-                    child.particle_type
-                }),
-        };
-        if matches!(particle_type, 5 | 6) {
-            samples = stripe_particle_segments(
-                &samples,
-                particle_type == 6,
-                preview.effect.base_shape.flags & 1 != 0,
-                preview.particle_capacity,
-            );
-        }
-        let slots = triangles[preview.triangle_range.clone()].chunks_exact_mut(2);
-        for (index, slot) in slots.enumerate() {
-            if let Some(sample) = samples.get(index).copied() {
-                update_particle_slot(slot, sample);
-            } else {
-                hide_particle_slot(slot);
-            }
+        let samples = shared_samples
+            .entry((effect_id, preview.kind))
+            .or_insert_with(|| sample_particle_preview(preview, [0.0; 3], retail_frame));
+        apply_particle_samples(preview, samples, preview.origin_offset, triangles);
+    }
+}
+
+fn sample_particle_preview(
+    preview: &LevelTransformParticlePreview,
+    origin_offset: [f32; 3],
+    retail_frame: f32,
+) -> Vec<SampledParticle> {
+    let mut samples = match preview.kind {
+        JpaParticleKind::Parent => sample_particles(
+            &preview.effect,
+            origin_offset,
+            retail_frame,
+            preview.particle_capacity,
+        ),
+        JpaParticleKind::Child => sample_child_particles(
+            &preview.effect,
+            origin_offset,
+            retail_frame,
+            preview.particle_capacity,
+        ),
+    };
+    let particle_type = match preview.kind {
+        JpaParticleKind::Parent => preview.effect.base_shape.particle_type,
+        JpaParticleKind::Child => preview
+            .effect
+            .child_shape
+            .map_or(preview.effect.base_shape.particle_type, |child| {
+                child.particle_type
+            }),
+    };
+    if matches!(particle_type, 5 | 6) {
+        samples = stripe_particle_segments(
+            &samples,
+            particle_type == 6,
+            preview.effect.base_shape.flags & 1 != 0,
+            preview.particle_capacity,
+        );
+    }
+    samples
+}
+
+fn apply_particle_samples(
+    preview: &LevelTransformParticlePreview,
+    samples: &[SampledParticle],
+    translation: [f32; 3],
+    triangles: &mut [PreviewTriangle],
+) {
+    let slots = triangles[preview.triangle_range.clone()].chunks_exact_mut(2);
+    for (index, slot) in slots.enumerate() {
+        if let Some(sample) = samples.get(index).copied() {
+            update_particle_slot(slot, sample, translation);
+        } else {
+            hide_particle_slot(slot);
         }
     }
 }
@@ -1411,7 +1534,12 @@ fn push_particle_slot(
     ));
 }
 
-fn update_particle_slot(slot: &mut [PreviewTriangle], sample: SampledParticle) {
+fn update_particle_slot(
+    slot: &mut [PreviewTriangle],
+    sample: SampledParticle,
+    translation: [f32; 3],
+) {
+    let sample = translated_particle_sample(sample, translation);
     if let (Some(vertices), Some(uvs)) = (sample.quad_vertices, sample.quad_uvs) {
         if let [first, second] = slot {
             first.vertices = [vertices[0], vertices[1], vertices[3]];
@@ -1430,6 +1558,19 @@ fn update_particle_slot(slot: &mut [PreviewTriangle], sample: SampledParticle) {
         triangle.particle_type = Some(sample.particle_type);
         triangle.particle_direction = Some(sample.direction);
     }
+}
+
+fn translated_particle_sample(
+    mut sample: SampledParticle,
+    translation: [f32; 3],
+) -> SampledParticle {
+    sample.position = std::array::from_fn(|axis| sample.position[axis] + translation[axis]);
+    if let Some(vertices) = &mut sample.quad_vertices {
+        for vertex in vertices {
+            *vertex = std::array::from_fn(|axis| vertex[axis] + translation[axis]);
+        }
+    }
+    sample
 }
 
 fn hide_particle_slot(slot: &mut [PreviewTriangle]) {
@@ -1495,6 +1636,37 @@ mod tests {
     fn deterministic_random_stays_normalized() {
         assert_eq!(random01(42), random01(42));
         assert!((0.0..=1.0).contains(&random01(42)));
+    }
+
+    #[test]
+    fn sparse_emitters_allocate_only_the_slots_they_can_reach() {
+        assert_eq!(particle_birth_capacity(0.15, 30.0, 1), 31);
+        assert_eq!(particle_birth_capacity(2.0, 10.0, 2), 12);
+        assert_eq!(particle_birth_capacity(0.0, 30.0, 1), 1);
+    }
+
+    #[test]
+    fn shared_actor_samples_translate_points_and_stripe_geometry_equally() {
+        let sample = SampledParticle {
+            position: [1.0, 2.0, 3.0],
+            half_size: [1.0; 2],
+            rotation: 0.0,
+            color: [255; 4],
+            environment_color: [255; 4],
+            particle_type: 6,
+            direction: [0.0, 1.0, 0.0],
+            velocity: [0.0; 3],
+            trail_id: 0,
+            quad_vertices: Some([[1.0, 2.0, 3.0]; 4]),
+            quad_uvs: Some([[0.0; 2]; 4]),
+        };
+        let translated = translated_particle_sample(sample, [10.0, 20.0, 30.0]);
+        assert_eq!(translated.position, [11.0, 22.0, 33.0]);
+        assert!(translated
+            .quad_vertices
+            .unwrap()
+            .iter()
+            .all(|vertex| *vertex == [11.0, 22.0, 33.0]));
     }
 
     #[test]
