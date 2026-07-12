@@ -10,6 +10,14 @@ fn runtime_joint_children_reverse_inf1_sibling_order() {
 }
 
 #[test]
+fn map_buildings_use_the_first_runtime_root_child() {
+    let parents = [None, Some(0), Some(0), Some(2), Some(2)];
+
+    assert_eq!(map_building_joint_from_parents(&parents, 0), Some(4));
+    assert_eq!(map_building_joint_from_parents(&parents, 1), Some(3));
+}
+
+#[test]
 fn joint_subtree_membership_follows_parent_chain() {
     let parents = [None, Some(0), Some(1), Some(1), Some(3)];
 

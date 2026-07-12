@@ -110,6 +110,7 @@ pub(super) fn level_transform_targets(
                             "mapeventsinkbianco" if event_index == 0 => 1700.0,
                             "mapeventsinkbianco" => 1500.0,
                             "mapeventsirenasink" => 3500.0,
+                            "airporteventsink" => 200.0,
                             _ if bounds_depth.is_finite() && bounds_depth > 0.0 => bounds_depth,
                             _ => 1000.0,
                         };

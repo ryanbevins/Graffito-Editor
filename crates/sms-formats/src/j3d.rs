@@ -817,11 +817,7 @@ impl J3dFile {
         };
         let joint_count = be_u16(&self.bytes, jnt1.offset as usize + 0x08, FORMAT)? as usize;
         let parents = self.joint_parent_indices(joint_count)?;
-        let root = parents.iter().position(Option::is_none);
-        let first_child =
-            root.and_then(|root| parents.iter().position(|parent| *parent == Some(root)));
-        Ok(first_child
-            .and_then(|parent| runtime_child_joint_index(&parents, parent, building_index)))
+        Ok(map_building_joint_from_parents(&parents, building_index))
     }
 
     pub fn runtime_joint_child_index(
@@ -2144,6 +2140,15 @@ fn runtime_child_joint_index(
         .filter_map(|(joint, joint_parent)| (*joint_parent == Some(parent)).then_some(joint))
         .rev()
         .nth(child_index)
+}
+
+fn map_building_joint_from_parents(
+    parents: &[Option<usize>],
+    building_index: usize,
+) -> Option<usize> {
+    let root = parents.iter().position(Option::is_none)?;
+    let building_parent = runtime_child_joint_index(parents, root, 0)?;
+    runtime_child_joint_index(parents, building_parent, building_index)
 }
 
 fn joint_is_in_subtree(mut joint: usize, subtree_root: usize, parents: &[Option<usize>]) -> bool {
