@@ -6,8 +6,9 @@ pub(super) fn push_object_preview_materials(
     object: &SceneObject,
 ) -> usize {
     let nozzle_tev_reg1 = nozzle_box_tev_reg1_color(object);
-    let has_npc_colors =
-        monte_material_colors(object).is_some() || npc_pollution_k_color(object).is_some();
+    let has_npc_colors = monte_material_colors(object).is_some()
+        || mare_body_color(object).is_some()
+        || npc_pollution_k_color(object).is_some();
     if nozzle_tev_reg1.is_none() && !has_npc_colors {
         return cached.material_base;
     }
@@ -25,13 +26,35 @@ pub(super) fn push_object_preview_materials(
             }
         }
         apply_monte_material_color(&mut material, object);
+        apply_mare_material_color(&mut material, object);
         materials.push(material);
     }
     material_base
 }
 
+pub(super) fn apply_mare_material_color(material: &mut J3dMaterial, object: &SceneObject) {
+    if material.name.eq_ignore_ascii_case("_body") {
+        if let Some(color) = mare_body_color(object) {
+            material.tev_colors[0] = color;
+        }
+    }
+}
+
+pub(super) fn mare_body_color(object: &SceneObject) -> Option<[i16; 4]> {
+    let factory = object.factory_name.to_ascii_lowercase();
+    let colors = if factory.starts_with("npcmarem") {
+        &MARE_M_BODY_COLORS
+    } else if factory.starts_with("npcmarew") {
+        &MARE_W_BODY_COLORS
+    } else {
+        return None;
+    };
+    let body_index = npc_color_index(object, "npc_body_color_index")?;
+    colors.get(body_index).copied()
+}
+
 pub(super) fn npc_pollution_k_color(object: &SceneObject) -> Option<[u8; 4]> {
-    if !object.factory_name.to_ascii_lowercase().starts_with("npc") {
+    if !npc_has_initial_pollution_color(object) {
         return None;
     }
     let amount = object
@@ -41,6 +64,14 @@ pub(super) fn npc_pollution_k_color(object: &SceneObject) -> Option<[u8; 4]> {
         .ok()?
         .clamp(0, 255) as u8;
     Some([255, 255, 255, amount])
+}
+
+pub(super) fn npc_has_initial_pollution_color(object: &SceneObject) -> bool {
+    let factory = object.factory_name.to_ascii_lowercase();
+    // TBaseNPC::getPtrInitPollutionColor is intentionally broader than
+    // isPollutionNpc: normal and special Monte/Mare actors still install K0,
+    // usually with alpha zero, so the authored dirty-layer default is hidden.
+    factory.starts_with("npcmonte") || factory.starts_with("npcmare") || factory == "npckinopio"
 }
 
 #[derive(Clone, Copy)]
@@ -260,6 +291,25 @@ const MONTE_WB_CLOTH_REG2: [[i16; 4]; 9] = [
     [200, 100, 0, 255],
     [0, 100, 150, 255],
     [255, 200, 100, 255],
+];
+
+// NpcInitData.cpp: sMareM_BodyColor and sMareW_BodyColor. The instance color is
+// installed into TEV register 0 by SMS_InitChangeNpcColor.
+const MARE_M_BODY_COLORS: [[i16; 4]; 6] = [
+    [370, 290, 170, 255],
+    [350, 340, 120, 255],
+    [260, 180, 100, 255],
+    [300, 150, 130, 255],
+    [300, 200, 60, 255],
+    [240, 160, 230, 255],
+];
+const MARE_W_BODY_COLORS: [[i16; 4]; 6] = [
+    [410, 255, 280, 255],
+    [430, 330, 150, 255],
+    [440, 330, 255, 255],
+    [300, 200, 130, 255],
+    [300, 190, 220, 255],
+    [400, 250, 90, 255],
 ];
 
 pub(super) fn nozzle_box_tev_reg1_color(object: &SceneObject) -> Option<[i16; 4]> {

@@ -791,6 +791,10 @@ impl SmsEditorApp {
         let frame = self.camera_frame();
         let focal = perspective_focal_length(rect, self.viewport_zoom);
         let far = preview.far_clip(self.renderer.camera().distance);
+        let lighting = self
+            .document
+            .as_ref()
+            .and_then(|document| document.lighting.object_lighting());
         Some(gpu_viewport::GpuViewportFrame {
             camera_position: frame.position,
             right: frame.right,
@@ -802,6 +806,13 @@ impl SmsEditorApp {
             near: VIEWPORT_NEAR_CLIP,
             far,
             animation_seconds: self.animation_started_at.elapsed().as_secs_f32(),
+            light_position: lighting
+                .map(|lighting| lighting.position)
+                .unwrap_or([200_000.0, 500_000.0, 200_000.0]),
+            light_color: lighting
+                .map(|lighting| gpu_viewport::color_u8_to_f32(lighting.color))
+                .unwrap_or([1.0; 4]),
+            ambient_color: lighting.map(|lighting| gpu_viewport::color_u8_to_f32(lighting.ambient)),
         })
     }
 

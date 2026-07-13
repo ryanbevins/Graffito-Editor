@@ -500,6 +500,9 @@ impl SmsEditorApp {
                                 self.issues = document.validate();
                             }
                             self.registry = Some(registry);
+                            if self.document.is_some() {
+                                self.rebuild_model_preview_from_document();
+                            }
                         }
                         Err(err) => self.log.push(format!("Schema generation failed: {err}")),
                     },
@@ -867,7 +870,8 @@ impl SmsEditorApp {
             }
         }
 
-        let mut object_model_cache = BTreeMap::<(String, u32), CachedObjectModelPreview>::new();
+        let mut object_model_cache =
+            BTreeMap::<(String, u32, String), CachedObjectModelPreview>::new();
         let mut accessory_model_cache = BTreeMap::<String, CachedAccessoryModelPreview>::new();
         for object in &document.objects {
             let Some(model_path) = object_preview_model_path(object, &world_model_paths) else {
@@ -881,7 +885,16 @@ impl SmsEditorApp {
             } else {
                 reset_fruit_preview_transform(object, object.transform)
             };
-            let model_cache_key = (model_path.clone(), loader_flags);
+            let animation_profile = std::iter::once(object.factory_name.to_ascii_lowercase())
+                .chain(
+                    npc_accessory_specs(document, object)
+                        .into_iter()
+                        .filter(|part| part.joint_name.is_none())
+                        .map(|part| part.asset_suffix.to_ascii_lowercase()),
+                )
+                .collect::<Vec<_>>()
+                .join("|");
+            let model_cache_key = (model_path.clone(), loader_flags, animation_profile);
 
             if !object_model_cache.contains_key(&model_cache_key) {
                 let Ok(bytes) = read_stage_asset_bytes(&model_path) else {
@@ -1077,8 +1090,8 @@ impl SmsEditorApp {
                 &mut next_packet_index,
                 &mut actor_particles,
             );
-            for spec in npc_accessory_specs(object) {
-                let joint_index = match spec.joint_name {
+            for spec in npc_accessory_specs(document, object) {
+                let joint_index = match spec.joint_name.as_deref() {
                     Some(joint_name) => {
                         let Some(index) = cached
                             .joint_names
@@ -1100,14 +1113,14 @@ impl SmsEditorApp {
                     }
                     None => j3d_identity_matrix(),
                 };
-                if !accessory_model_cache.contains_key(spec.asset_suffix) {
-                    let Some(asset) = find_stage_asset_by_suffix(
-                        document,
-                        StageAssetKind::Model,
-                        spec.asset_suffix,
-                    ) else {
-                        continue;
-                    };
+                let Some(asset) =
+                    find_stage_asset_by_suffix(document, StageAssetKind::Model, &spec.asset_suffix)
+                else {
+                    continue;
+                };
+                let asset_path = asset.path.to_string_lossy().replace('\\', "/");
+                let accessory_cache_key = normalized_preview_asset_path(&asset_path);
+                if !accessory_model_cache.contains_key(&accessory_cache_key) {
                     let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
                         continue;
                     };
@@ -1116,7 +1129,7 @@ impl SmsEditorApp {
                     };
                     let loader_flags = 0x1021_0000;
                     let joint_animation =
-                        accessory_joint_animation(document, spec.asset_suffix).map(Arc::new);
+                        accessory_joint_animation(document, &asset_path).map(Arc::new);
                     let preview_result = joint_animation.as_ref().map_or_else(
                         || file.geometry_preview_with_loader_flags(loader_flags),
                         |animation| {
@@ -1127,16 +1140,21 @@ impl SmsEditorApp {
                             )
                         },
                     );
-                    let Ok(preview) = preview_result else {
+                    let Ok(mut preview) = preview_result else {
                         continue;
                     };
+                    // Parts are ordinary J3D models. Give them the same BMT
+                    // resolution as bodies and map objects so dummy textures
+                    // (including custom-model placeholders) resolve by asset
+                    // names instead of accessory-specific exceptions.
+                    apply_model_material_table(document, &asset_path, loader_flags, &mut preview);
                     let file = Arc::new(file);
                     let local_triangles = Arc::new(preview.triangles.clone());
                     let texture_base = push_preview_textures(&mut textures, &preview);
                     let material_base =
                         push_preview_materials(&mut materials, &preview, texture_base);
                     accessory_model_cache.insert(
-                        spec.asset_suffix.to_string(),
+                        accessory_cache_key.clone(),
                         CachedAccessoryModelPreview {
                             file,
                             joint_animation,
@@ -1148,7 +1166,7 @@ impl SmsEditorApp {
                         },
                     );
                 }
-                let Some(accessory) = accessory_model_cache.get(spec.asset_suffix) else {
+                let Some(accessory) = accessory_model_cache.get(&accessory_cache_key) else {
                     continue;
                 };
                 source_vertices += accessory.preview.positions.len();
@@ -1164,12 +1182,8 @@ impl SmsEditorApp {
                     .map(|index| index + 1)
                     .unwrap_or(1);
                 let accessory_triangle_start = triangles.len();
-                let accessory_material_base = push_accessory_instance_materials(
-                    &mut materials,
-                    accessory,
-                    object,
-                    spec.asset_suffix,
-                );
+                let accessory_material_base =
+                    push_accessory_instance_materials(&mut materials, accessory, object, &spec);
                 push_attached_preview_triangles(
                     &mut triangles,
                     accessory,
@@ -1633,14 +1647,6 @@ fn material_table_candidates_for_model(model_path: &str) -> Vec<String> {
         }
     }
 
-    // TMareBaseManager loads its shared table from mareCommon rather than the
-    // model's actor directory. The pollution variant is a runtime state change;
-    // the normal table is the correct static editor preview.
-    if matches!(model_key.as_str(), "marem" | "marew") {
-        if let Some((archive, _)) = normalized.split_once("!/") {
-            candidates.push(format!("{archive}!/marecommon/mare.bmt"));
-        }
-    }
     candidates
 }
 
@@ -2274,6 +2280,9 @@ fn actor_model_loader_flags(object: &SceneObject) -> Option<u32> {
         "npcmontemb" | "npcmontemd" | "npcmontemf" | "npcmontemg" | "npcmontemh" | "npcmontewb"
         | "npcmontewc" => 0x1021_0000,
         "npcmonteme" => 0x1001_0000,
+        // TMareMBaseManager/TMareWBaseManager::createModelData use these flags
+        // for the shared Mare body models and their material programs.
+        name if name.starts_with("npcmarem") || name.starts_with("npcmarew") => 0x1030_0000,
         _ => return None,
     })
 }
@@ -2521,6 +2530,9 @@ fn sanitize_id(value: &str) -> String {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod noki_render_test;
 
 #[cfg(test)]
 mod tests;

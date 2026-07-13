@@ -3095,6 +3095,7 @@ dependencies = [
  "eframe",
  "egui",
  "naga",
+ "pollster",
  "sms-formats",
  "sms-render",
  "sms-scene",

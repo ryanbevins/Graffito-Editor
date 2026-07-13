@@ -30,6 +30,8 @@ pub struct ObjectRegistry {
     pub particle_resources: Vec<ParticleResourceDefinition>,
     #[serde(default)]
     pub actor_particle_bindings: Vec<ActorParticleBinding>,
+    #[serde(default)]
+    pub npc_actors: Vec<NpcActorDefinition>,
 }
 
 impl ObjectRegistry {
@@ -37,6 +39,20 @@ impl ObjectRegistry {
         self.objects
             .iter()
             .find(|object| object.factory_name == factory_name)
+    }
+
+    pub fn find_npc_actor(&self, factory_name: &str) -> Option<&NpcActorDefinition> {
+        let actor_key = factory_name
+            .strip_prefix("NPC")
+            .or_else(|| factory_name.strip_prefix("npc"))?;
+        self.npc_actors
+            .iter()
+            .filter(|definition| {
+                actor_key
+                    .to_ascii_lowercase()
+                    .starts_with(&definition.actor_key.to_ascii_lowercase())
+            })
+            .max_by_key(|definition| definition.actor_key.len())
     }
 
     pub fn apply_overlay(&mut self, overlay: SchemaOverlay) {
@@ -124,6 +140,37 @@ pub struct ActorParticleBinding {
     pub source_file: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NpcActorDefinition {
+    pub actor_key: String,
+    pub source_file: String,
+    pub parts: Vec<NpcPartDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NpcPartDefinition {
+    pub bit_index: u8,
+    pub color_index_channel: u8,
+    pub models: Vec<NpcPartModelDefinition>,
+    pub color_changes: Vec<NpcColorChangeDefinition>,
+    pub uses_pollution: bool,
+    pub uses_shared_materials: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NpcPartModelDefinition {
+    pub joint_name: Option<String>,
+    pub model_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NpcColorChangeDefinition {
+    pub mode: u8,
+    pub material_name: String,
+    pub colors0: Vec<[i16; 4]>,
+    pub colors1: Vec<[i16; 4]>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParticleBindingTarget {
     ActorOrigin,
@@ -172,6 +219,7 @@ impl SchemaGenerator {
         self.scan_map_obj_manager(&mut registry)?;
         self.scan_params_and_assets(&mut registry)?;
         self.scan_particle_bindings(&mut registry)?;
+        self.scan_npc_init_data(&mut registry)?;
         dedup_registry(&mut registry);
         Ok(registry)
     }
@@ -257,6 +305,279 @@ impl SchemaGenerator {
             extract_calc_particle_bindings(&text, &source_file, registry);
         }
         Ok(())
+    }
+
+    fn scan_npc_init_data(&self, registry: &mut ObjectRegistry) -> Result<()> {
+        let path = self.repo_root.join("src/NPC/NpcInitData.cpp");
+        let text = read_required(&path)?;
+        let source_file = normalize_source_path(&self.repo_root, &path);
+        registry.npc_actors = extract_npc_actor_definitions(&text, &source_file);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct ParsedNpcModelData {
+    joints: [Option<String>; 2],
+    model_names: Vec<String>,
+    color_changes: Vec<NpcColorChangeDefinition>,
+    color_index_channel: u8,
+    uses_pollution: bool,
+    uses_shared_materials: bool,
+}
+
+fn extract_npc_actor_definitions(text: &str, source_file: &str) -> Vec<NpcActorDefinition> {
+    let color_arrays = extract_npc_color_arrays(text);
+    let color_changes = extract_npc_color_changes(text, &color_arrays);
+    let model_data = extract_npc_model_data(text, &color_changes);
+    let initializer_re =
+        Regex::new(r"static\s+const\s+TNpcInitInfo\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{")
+            .expect("valid NPC initializer regex");
+    let reference_re =
+        Regex::new(r"&([A-Za-z_][A-Za-z0-9_]*)|nullptr").expect("valid NPC model reference regex");
+    let mut actors = Vec::new();
+
+    for captures in initializer_re.captures_iter(text) {
+        let Some(whole_match) = captures.get(0) else {
+            continue;
+        };
+        let Some(body) = braced_body(text, whole_match.end() - 1) else {
+            continue;
+        };
+        let fields = split_cpp_initializer_fields(body);
+        let Some(parts_field) = fields.get(1) else {
+            continue;
+        };
+        let actor_key = captures[1]
+            .strip_prefix('s')
+            .and_then(|name| name.strip_suffix("_InitData"))
+            .unwrap_or(&captures[1])
+            .to_string();
+        let mut parts = Vec::new();
+        for (bit_index, reference) in reference_re.captures_iter(parts_field).enumerate() {
+            let Some(name) = reference.get(1).map(|capture| capture.as_str()) else {
+                continue;
+            };
+            let Some(model) = model_data.get(name) else {
+                continue;
+            };
+            let models = model
+                .model_names
+                .iter()
+                .enumerate()
+                .map(|(index, model_name)| NpcPartModelDefinition {
+                    joint_name: model.joints.get(index).cloned().flatten(),
+                    model_name: model_name.clone(),
+                })
+                .collect();
+            parts.push(NpcPartDefinition {
+                bit_index: bit_index as u8,
+                color_index_channel: model.color_index_channel,
+                models,
+                color_changes: model.color_changes.clone(),
+                uses_pollution: model.uses_pollution,
+                uses_shared_materials: model.uses_shared_materials,
+            });
+        }
+        actors.push(NpcActorDefinition {
+            actor_key,
+            source_file: source_file.to_string(),
+            parts,
+        });
+    }
+    actors
+}
+
+fn extract_npc_color_arrays(text: &str) -> BTreeMap<String, Vec<[i16; 4]>> {
+    let initializer_re =
+        Regex::new(r"static\s+const\s+GXColorS10\s+([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*\]\s*=\s*\{")
+            .expect("valid NPC color array regex");
+    let color_re =
+        Regex::new(r"\{\s*(-?[0-9]+)\s*,\s*(-?[0-9]+)\s*,\s*(-?[0-9]+)\s*,\s*(-?[0-9]+)\s*\}")
+            .expect("valid NPC color regex");
+    let mut arrays = BTreeMap::new();
+    for captures in initializer_re.captures_iter(text) {
+        let Some(whole_match) = captures.get(0) else {
+            continue;
+        };
+        let Some(body) = braced_body(text, whole_match.end() - 1) else {
+            continue;
+        };
+        let colors = color_re
+            .captures_iter(body)
+            .filter_map(|color| {
+                Some([
+                    color[1].parse().ok()?,
+                    color[2].parse().ok()?,
+                    color[3].parse().ok()?,
+                    color[4].parse().ok()?,
+                ])
+            })
+            .collect::<Vec<_>>();
+        arrays.insert(captures[1].to_string(), colors);
+    }
+    arrays
+}
+
+fn extract_npc_color_changes(
+    text: &str,
+    arrays: &BTreeMap<String, Vec<[i16; 4]>>,
+) -> BTreeMap<String, NpcColorChangeDefinition> {
+    let initializer_re =
+        Regex::new(r"static\s+const\s+TColorChangeInfo\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{")
+            .expect("valid NPC color-change regex");
+    let mut changes = BTreeMap::new();
+    for captures in initializer_re.captures_iter(text) {
+        let Some(whole_match) = captures.get(0) else {
+            continue;
+        };
+        let Some(body) = braced_body(text, whole_match.end() - 1) else {
+            continue;
+        };
+        let fields = split_cpp_initializer_fields(body);
+        if fields.len() < 4 {
+            continue;
+        }
+        let Some(mode) = parse_cpp_u32(fields[0]).and_then(|value| u8::try_from(value).ok()) else {
+            continue;
+        };
+        let Some(material_name) = parse_cpp_string(fields[1]) else {
+            continue;
+        };
+        let colors_for = |field: &str| {
+            cpp_identifier(field)
+                .and_then(|name| arrays.get(name))
+                .cloned()
+                .unwrap_or_default()
+        };
+        changes.insert(
+            captures[1].to_string(),
+            NpcColorChangeDefinition {
+                mode,
+                material_name,
+                colors0: colors_for(fields[2]),
+                colors1: colors_for(fields[3]),
+            },
+        );
+    }
+    changes
+}
+
+fn extract_npc_model_data(
+    text: &str,
+    color_changes: &BTreeMap<String, NpcColorChangeDefinition>,
+) -> BTreeMap<String, ParsedNpcModelData> {
+    let initializer_re =
+        Regex::new(r"static\s+(?:const\s+)?TNpcModelData\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{")
+            .expect("valid NPC model-data regex");
+    let string_re = Regex::new(r#""([^"]+)""#).expect("valid C++ string regex");
+    let reference_re = Regex::new(r"&([A-Za-z_][A-Za-z0-9_]*)").expect("valid C++ reference regex");
+    let mut models = BTreeMap::new();
+    for captures in initializer_re.captures_iter(text) {
+        let Some(whole_match) = captures.get(0) else {
+            continue;
+        };
+        let Some(body) = braced_body(text, whole_match.end() - 1) else {
+            continue;
+        };
+        let fields = split_cpp_initializer_fields(body);
+        if fields.len() < 7 {
+            continue;
+        }
+        let model_names = string_re
+            .captures_iter(fields[2])
+            .map(|model| model[1].to_string())
+            .collect::<Vec<_>>();
+        if model_names.is_empty() {
+            continue;
+        }
+        let parsed_changes = reference_re
+            .captures_iter(fields[3])
+            .filter_map(|reference| color_changes.get(&reference[1]).cloned())
+            .collect::<Vec<_>>();
+        let Some(color_index_channel) =
+            parse_cpp_u32(fields[4]).and_then(|value| u8::try_from(value).ok())
+        else {
+            continue;
+        };
+        models.insert(
+            captures[1].to_string(),
+            ParsedNpcModelData {
+                joints: [parse_npc_joint(fields[0]), parse_npc_joint(fields[1])],
+                model_names,
+                color_changes: parsed_changes,
+                color_index_channel,
+                uses_pollution: parse_cpp_u32(fields[5]).is_some_and(|value| value != 0),
+                uses_shared_materials: parse_cpp_u32(fields[6]).is_some_and(|value| value != 0),
+            },
+        );
+    }
+    models
+}
+
+fn parse_npc_joint(field: &str) -> Option<String> {
+    if field.contains("cNpcPartsNameRootJoint") || field.trim() == "0" || field.trim() == "nullptr"
+    {
+        return None;
+    }
+    parse_cpp_string(field)
+}
+
+fn parse_cpp_string(field: &str) -> Option<String> {
+    let start = field.find('"')? + 1;
+    let end = field[start..].find('"')? + start;
+    Some(field[start..end].to_string())
+}
+
+fn cpp_identifier(field: &str) -> Option<&str> {
+    let field = field.trim().trim_start_matches('&').trim();
+    (!field.is_empty() && field != "nullptr" && field != "0").then_some(field)
+}
+
+fn split_cpp_initializer_fields(body: &str) -> Vec<&str> {
+    let bytes = body.as_bytes();
+    let mut fields = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' | b'(' | b'[' => depth += 1,
+            b'}' | b')' | b']' => depth = depth.saturating_sub(1),
+            b'"' | b'\'' => {
+                let quote = bytes[index];
+                index += 1;
+                while index < bytes.len() && bytes[index] != quote {
+                    if bytes[index] == b'\\' {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+            }
+            b',' if depth == 0 => {
+                fields.push(body[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    let tail = body[start..].trim();
+    if !tail.is_empty() {
+        fields.push(tail);
+    }
+    fields
+}
+
+fn parse_cpp_u32(value: &str) -> Option<u32> {
+    let value = value.trim();
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        value.parse().ok()
     }
 }
 
@@ -522,6 +843,13 @@ fn dedup_registry(registry: &mut ObjectRegistry) {
             .then_with(|| a.source_file.cmp(&b.source_file))
     });
     registry.actor_particle_bindings.dedup();
+
+    registry
+        .npc_actors
+        .sort_by(|a, b| a.actor_key.cmp(&b.actor_key));
+    registry
+        .npc_actors
+        .dedup_by(|a, b| a.actor_key == b.actor_key);
 }
 
 fn read_required(path: &Path) -> Result<String> {
@@ -606,6 +934,74 @@ mod tests {
         extract_calc_particle_bindings(actor, "src/MoveBG/Example.cpp", &mut registry);
 
         assert!(registry.actor_particle_bindings.is_empty());
+    }
+
+    #[test]
+    fn extracts_npc_parts_and_palettes_from_initializers() {
+        let text = r#"
+            static const GXColorS10 sHatColors0[] = {
+                { 10, 20, 30, 255 }, { -40, 50, 60, 255 },
+            };
+            static const GXColorS10 sHatColors1[] = {
+                { 70, 80, 90, 255 }, { 100, 110, 120, 255 },
+            };
+            static const TColorChangeInfo sHatChange = {
+                0x00000002, "_hat", sHatColors0, sHatColors1
+            };
+            static const TNpcModelData sHatData = {
+                "kubi", 0, { "customHat.bmd" }, { { &sHatChange, 0 } }, 1, 1, 1,
+            };
+            static TNpcModelData sRodData = {
+                cNpcPartsNameRootJoint, 0, { "customRod.bmd" }, {}, 0, 0, 0,
+            };
+            static const TNpcInitInfo sMareM_InitData = {
+                nullptr, { &sHatData, nullptr, &sRodData }, {}, 1.0f, 2.0f, 3.0f, 4.0f,
+            };
+        "#;
+        let actors = extract_npc_actor_definitions(text, "src/NPC/NpcInitData.cpp");
+        let actor = &actors[0];
+        assert_eq!(actor.actor_key, "MareM");
+        assert_eq!(actor.parts.len(), 2);
+        assert_eq!(actor.parts[0].bit_index, 0);
+        assert_eq!(actor.parts[0].color_index_channel, 1);
+        assert_eq!(actor.parts[0].models[0].joint_name.as_deref(), Some("kubi"));
+        assert_eq!(actor.parts[0].models[0].model_name, "customHat.bmd");
+        assert_eq!(actor.parts[0].color_changes[0].mode, 2);
+        assert_eq!(
+            actor.parts[0].color_changes[0].colors0[1],
+            [-40, 50, 60, 255]
+        );
+        assert!(actor.parts[0].uses_pollution);
+        assert!(actor.parts[0].uses_shared_materials);
+        assert_eq!(actor.parts[1].bit_index, 2);
+        assert_eq!(actor.parts[1].models[0].joint_name, None);
+    }
+
+    #[test]
+    fn npc_schema_lookup_prefers_the_longest_actor_key() {
+        let registry = ObjectRegistry {
+            npc_actors: vec![
+                NpcActorDefinition {
+                    actor_key: "MareM".to_string(),
+                    source_file: String::new(),
+                    parts: Vec::new(),
+                },
+                NpcActorDefinition {
+                    actor_key: "MareMB".to_string(),
+                    source_file: String::new(),
+                    parts: Vec::new(),
+                },
+            ],
+            ..ObjectRegistry::default()
+        };
+        assert_eq!(
+            registry.find_npc_actor("NPCMareMA").unwrap().actor_key,
+            "MareM"
+        );
+        assert_eq!(
+            registry.find_npc_actor("NPCMareMB").unwrap().actor_key,
+            "MareMB"
+        );
     }
 
     #[test]

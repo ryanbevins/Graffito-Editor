@@ -82,6 +82,24 @@ fn monte_material_colors_follow_retail_instance_indices() {
 }
 
 #[test]
+fn mare_body_colors_follow_retail_instance_indices() {
+    let mut male = SceneObject::new("mare-m", "NPCMareMB");
+    male.raw_params
+        .insert("npc_body_color_index".to_string(), "4".to_string());
+    let mut female = SceneObject::new("mare-w", "NPCMareWB");
+    female
+        .raw_params
+        .insert("npc_body_color_index".to_string(), "2".to_string());
+
+    assert_eq!(mare_body_color(&male), Some([300, 200, 60, 255]));
+    assert_eq!(mare_body_color(&female), Some([440, 330, 255, 255]));
+    assert_eq!(
+        mare_body_color(&SceneObject::new("monte", "NPCMonteM")),
+        None
+    );
+}
+
+#[test]
 fn npc_pollution_uses_white_k_color_with_amount_as_alpha() {
     let mut monte = SceneObject::new("monte", "NPCMonteMA");
     monte
@@ -92,6 +110,11 @@ fn npc_pollution_uses_white_k_color_with_amount_as_alpha() {
         .insert("npc_parts_color_index_0".to_string(), "2".to_string());
 
     assert_eq!(npc_pollution_k_color(&monte), Some([255, 255, 255, 37]));
+    let mut maremb = SceneObject::new("fisher", "NPCMareMB");
+    maremb
+        .raw_params
+        .insert("npc_pollution_amount".to_string(), "0".to_string());
+    assert_eq!(npc_pollution_k_color(&maremb), Some([255, 255, 255, 0]));
 }
 
 #[test]
@@ -130,10 +153,7 @@ fn material_table_candidates_include_base_actor_table() {
     );
     assert_eq!(
         material_table_candidates_for_model("C:/game/mare0.szs!/marem/marem.bmd"),
-        [
-            "c:/game/mare0.szs!/marem/marem.bmt",
-            "c:/game/mare0.szs!/marecommon/mare.bmt",
-        ]
+        ["c:/game/mare0.szs!/marem/marem.bmt"]
     );
 }
 
@@ -188,6 +208,32 @@ fn dummy_texture_names_resolve_shared_material_tables() {
 }
 
 #[test]
+fn accessory_dummy_texture_resolves_archive_shared_material_table() {
+    let textures = [sms_formats::J3dTexturePreview {
+        name: "J_mare_dammy".to_string(),
+        width: 8,
+        height: 8,
+        format: 0,
+        wrap_s: 0,
+        wrap_t: 0,
+        min_filter: 1,
+        mag_filter: 1,
+        mipmap_count: 1,
+        rgba: vec![255; 8 * 8 * 4],
+        mips: Vec::new(),
+    }];
+
+    assert_eq!(
+        material_table_asset_score(
+            "stage.szs!/maremb/maremb_set.bmd",
+            &textures,
+            "stage.szs!/marecommon/mare.bmt",
+        ),
+        Some((2, "mare".len()))
+    );
+}
+
+#[test]
 fn normalized_dummy_names_resolve_differently_separated_model_names() {
     let textures = [sms_formats::J3dTexturePreview {
         name: "nozzleItem_dummy".to_string(),
@@ -219,6 +265,7 @@ fn npc_starting_animation_uses_family_wait_resource() {
     assert_eq!(
         starting_joint_animation_candidates(&monte, "C:/game/dolpic0.szs!/montema/moma_model.bmd"),
         [
+            "C:/game/dolpic0.szs!/montema/montema_wait.bck",
             "C:/game/dolpic0.szs!/montemcommon/mom_wait.bck",
             "C:/game/dolpic0.szs!/montem/mom_wait.bck",
         ]
@@ -227,7 +274,10 @@ fn npc_starting_animation_uses_family_wait_resource() {
     let mare = SceneObject::new("mare", "NPCMareMB");
     assert_eq!(
         starting_joint_animation_candidates(&mare, "C:/game/mare0.szs!/marem/marem.bmd"),
-        ["C:/game/mare0.szs!/marem/marem_wait.bck"]
+        [
+            "C:/game/mare0.szs!/maremb/maremb_wait.bck",
+            "C:/game/mare0.szs!/marem/marem_wait.bck",
+        ]
     );
 }
 
@@ -320,98 +370,59 @@ fn npc_eye_material_names_are_treated_as_two_sided_decals() {
 }
 
 #[test]
-fn monte_parts_mask_selects_retail_joint_attachments() {
-    let mut monte = SceneObject::new("monte", "NPCMonteMA");
-    monte
-        .raw_params
-        .insert("npc_parts_mask".to_string(), "7".to_string());
-    let parts = npc_accessory_specs(&monte);
-
-    assert_eq!(parts.len(), 3);
-    assert_eq!(parts[0].joint_name, Some("kubi"));
-    assert_eq!(parts[0].asset_suffix, "/montemcommon/hata_model.bmd");
-    assert_eq!(parts[2].asset_suffix, "/montemcommon/glassesa_model.bmd");
-}
-
-#[test]
-fn peach_parts_mask_attaches_default_visible_ponytail() {
-    let mut peach = SceneObject::new("peach", "NPCPeach");
-    peach
-        .raw_params
-        .insert("npc_parts_mask".to_string(), "24".to_string());
-    let parts = npc_accessory_specs(&peach);
+fn npc_parts_mask_uses_decomp_schema_metadata() {
+    let mut document = test_document(Vec::new());
+    document.registry = Some(ObjectRegistry {
+        npc_actors: vec![sms_schema::NpcActorDefinition {
+            actor_key: "MareM".to_string(),
+            source_file: "src/NPC/NpcInitData.cpp".to_string(),
+            parts: vec![sms_schema::NpcPartDefinition {
+                bit_index: 0,
+                color_index_channel: 0,
+                models: vec![sms_schema::NpcPartModelDefinition {
+                    joint_name: Some("kubi".to_string()),
+                    model_name: "custom_hat.bmd".to_string(),
+                }],
+                color_changes: vec![sms_schema::NpcColorChangeDefinition {
+                    mode: 2,
+                    material_name: "_hat".to_string(),
+                    colors0: vec![[10, 20, 30, 255]],
+                    colors1: vec![[40, 50, 60, 255]],
+                }],
+                uses_pollution: true,
+                uses_shared_materials: true,
+            }],
+        }],
+        ..ObjectRegistry::default()
+    });
+    let mut mare = SceneObject::new("mare", "NPCMareMA");
+    mare.raw_params
+        .insert("npc_parts_mask".to_string(), "1".to_string());
+    let parts = npc_accessory_specs(&document, &mare);
 
     assert_eq!(parts.len(), 1);
-    assert_eq!(parts[0].joint_name, Some("kubi"));
-    assert_eq!(parts[0].asset_suffix, "/peach/peach_hair_ponytail.bmd");
+    assert_eq!(parts[0].joint_name.as_deref(), Some("kubi"));
+    assert_eq!(parts[0].asset_suffix, "/custom_hat.bmd");
+    assert_eq!(parts[0].color_index_channel, 0);
+    assert_eq!(parts[0].color_changes[0].material_name, "_hat");
+    assert_eq!(parts[0].color_changes[0].colors1[0], [40, 50, 60, 255]);
+    assert!(parts[0].uses_pollution);
 }
 
 #[test]
 fn peach_hair_parts_use_their_retail_wait_animations() {
     assert_eq!(
-        accessory_joint_animation_suffix("/peach/peach_hair_normal.bmd"),
-        Some("/peach/peach_hair_normal_wait.bck")
+        accessory_joint_animation_path("stage.szs!/peach/peach_hair_normal.bmd").as_deref(),
+        Some("stage.szs!/peach/peach_hair_normal_wait.bck")
     );
     assert_eq!(
-        accessory_joint_animation_suffix("/peach/peach_hair_ponytail.bmd"),
-        Some("/peach/peach_hair_ponytail_wait.bck")
+        accessory_joint_animation_path("stage.szs!/peach/peach_hair_ponytail.bmd").as_deref(),
+        Some("stage.szs!/peach/peach_hair_ponytail_wait.bck")
     );
     assert_eq!(
-        accessory_joint_animation_suffix("/montemcommon/hata_model.bmd"),
-        None
+        accessory_joint_animation_path("stage.szs!/custom/lantern.bdl").as_deref(),
+        Some("stage.szs!/custom/lantern_wait.bck")
     );
-}
-
-#[test]
-fn toadsworth_parts_mask_attaches_cane_to_retail_finger_joint() {
-    let mut kinojii = SceneObject::new("kinojii", "NPCKinojii");
-    kinojii
-        .raw_params
-        .insert("npc_parts_mask".to_string(), "1".to_string());
-    let parts = npc_accessory_specs(&kinojii);
-
-    assert_eq!(parts.len(), 1);
-    assert_eq!(parts[0].joint_name, Some("jnt_rfinger_1"));
-    assert_eq!(parts[0].asset_suffix, "/kinoji_stick.bmd");
-}
-
-#[test]
-fn npc_parts_tables_cover_every_retail_family_with_parts() {
-    let cases = [
-        ("NPCMareM", 7),
-        ("NPCMareMB", 9),
-        ("NPCMareMC", 10),
-        ("NPCMareMD", 8),
-        ("NPCMareW", 6),
-        ("NPCMareWB", 7),
-        ("NPCKinopio", 1),
-        ("NPCKinojii", 1),
-        ("NPCPeach", 4),
-        ("NPCRaccoonDog", 1),
-    ];
-    for (factory, expected_count) in cases {
-        let mut object = SceneObject::new(factory, factory);
-        object
-            .raw_params
-            .insert("npc_parts_mask".to_string(), "-1".to_string());
-        assert_eq!(
-            npc_accessory_specs(&object).len(),
-            expected_count,
-            "{factory} parts table"
-        );
-    }
-}
-
-#[test]
-fn root_attached_noki_parts_do_not_require_a_body_joint() {
-    let mut fisherman = SceneObject::new("fisherman", "NPCMareMB");
-    fisherman
-        .raw_params
-        .insert("npc_parts_mask".to_string(), (1 << 9).to_string());
-    let parts = npc_accessory_specs(&fisherman);
-    assert_eq!(parts.len(), 1);
-    assert_eq!(parts[0].joint_name, None);
-    assert_eq!(parts[0].asset_suffix, "/marembturizao.bmd");
 }
 
 #[test]
@@ -447,6 +458,14 @@ fn monte_model_loader_flags_follow_manager_entries() {
     assert_eq!(
         actor_model_loader_flags(&SceneObject::new("boss", "GateKeeper")),
         Some(0x1121_0000)
+    );
+    assert_eq!(
+        actor_model_loader_flags(&SceneObject::new("mare-m", "NPCMareMD")),
+        Some(0x1030_0000)
+    );
+    assert_eq!(
+        actor_model_loader_flags(&SceneObject::new("mare-w", "NPCMareWB")),
+        Some(0x1030_0000)
     );
 }
 

@@ -5,6 +5,10 @@ struct Camera {
     forward: vec4<f32>,
     projection: vec4<f32>,
     clip: vec4<f32>,
+    light_position: vec4<f32>,
+    light_color: vec4<f32>,
+    ambient_color: vec4<f32>,
+    lighting_meta: vec4<f32>,
 };
 
 struct Material {
@@ -187,17 +191,22 @@ fn compute_color_channel(
     }
 
     let ambient_source = control.z;
+    let stored_ambient = select(
+        material.ambient_colors[material_index],
+        camera.ambient_color,
+        material_index == 0u && camera.lighting_meta.x > 0.5,
+    );
     let ambient = channel_source(
         ambient_source,
         vertex_color,
-        material.ambient_colors[material_index],
+        stored_ambient,
     );
     let packed = control.w;
     let diffuse_function = packed & 0xffu;
     let attenuation_function = (packed >> 8u) & 0xffu;
     let light_mask = (packed >> 16u) & 0xffu;
-    let light_position = vec3<f32>(200000.0, 500000.0, 200000.0);
-    let light_color = vec4<f32>(1.0);
+    let light_position = camera.light_position.xyz;
+    let light_color = camera.light_color;
     let light_direction = normalize(light_position - position);
     let normalized_normal = normalize(normal);
     if (attenuation_function == 0u) {

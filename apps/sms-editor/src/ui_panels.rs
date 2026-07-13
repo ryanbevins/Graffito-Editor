@@ -291,6 +291,10 @@ impl SmsEditorApp {
             ui.label(format!("{} object schema entries", registry.objects.len()));
             ui.label(format!("{} parameter hints", registry.params.len()));
             ui.label(format!("{} asset hints", registry.asset_hints.len()));
+            ui.label(format!(
+                "{} NPC initialization definitions",
+                registry.npc_actors.len()
+            ));
         } else {
             ui.label("Schema not generated.");
         }

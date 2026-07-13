@@ -495,6 +495,9 @@ pub(super) fn starting_joint_animation(
     object: &SceneObject,
     model_path: &str,
 ) -> Option<J3dJointAnimation> {
+    if let Some(animation) = root_accessory_body_pose(document, object, model_path) {
+        return Some(animation);
+    }
     let candidates = starting_joint_animation_candidates(object, model_path);
     let asset = document.assets.iter().find(|asset| {
         asset.kind == StageAssetKind::Animation
@@ -509,6 +512,61 @@ pub(super) fn starting_joint_animation(
     let bytes = read_stage_asset_bytes(&asset.path).ok()?;
     J3dJointAnimation::parse(bytes).ok()
 }
+fn root_accessory_body_pose(
+    document: &StageDocument,
+    object: &SceneObject,
+    body_model_path: &str,
+) -> Option<J3dJointAnimation> {
+    let body_bytes = read_stage_asset_bytes(body_model_path).ok()?;
+    let body_joint_count = J3dFile::parse(&body_bytes).ok()?.joint_names().ok()?.len();
+    let root_parts = npc_accessory_specs(document, object)
+        .into_iter()
+        .filter(|part| part.joint_name.is_none());
+
+    for part in root_parts {
+        let Some(part_asset) =
+            find_stage_asset_by_suffix(document, StageAssetKind::Model, &part.asset_suffix)
+        else {
+            continue;
+        };
+        let part_path = part_asset.path.to_string_lossy().replace('\\', "/");
+        let (part_directory, part_file) = part_path.rsplit_once('/')?;
+        let part_stem = part_file
+            .rsplit_once('.')
+            .map_or(part_file, |(stem, _)| stem);
+        let part_key = material_table_match_key(part_stem);
+        for asset in document
+            .assets
+            .iter()
+            .filter(|asset| asset.kind == StageAssetKind::Animation)
+        {
+            let animation_path = asset.path.to_string_lossy().replace('\\', "/");
+            let Some((animation_directory, animation_file)) = animation_path.rsplit_once('/')
+            else {
+                continue;
+            };
+            if !animation_directory.eq_ignore_ascii_case(part_directory) {
+                continue;
+            }
+            let animation_stem = animation_file
+                .rsplit_once('.')
+                .map_or(animation_file, |(stem, _)| stem);
+            if material_table_match_key(animation_stem) != part_key {
+                continue;
+            }
+            let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+                continue;
+            };
+            let Ok(animation) = J3dJointAnimation::parse(bytes) else {
+                continue;
+            };
+            if animation.joint_count() == body_joint_count {
+                return Some(animation);
+            }
+        }
+    }
+    None
+}
 
 pub(super) fn starting_joint_animation_candidates(
     object: &SceneObject,
@@ -517,7 +575,14 @@ pub(super) fn starting_joint_animation_candidates(
     let normalized = model_path.replace('\\', "/");
     let archive = normalized.split_once("!/").map(|(archive, _)| archive);
     let factory = object.factory_name.to_ascii_lowercase();
-    let relative_candidates: &[&str] = if factory.starts_with("npcmontem") {
+    let mut relative_candidates = Vec::new();
+    // Actor-specific animation volumes conventionally use the factory name
+    // without its NPC prefix (NPCMareMB -> maremb/maremb_wait.bck). Prefer
+    // that data-driven path before falling back to a shared family animation.
+    if let Some(actor_key) = factory.strip_prefix("npc") {
+        relative_candidates.push(format!("{actor_key}/{actor_key}_wait.bck"));
+    }
+    let family_candidates: &[&str] = if factory.starts_with("npcmontem") {
         &["montemcommon/mom_wait.bck", "montem/mom_wait.bck"]
     } else if factory.starts_with("npcmontew") {
         &["montewcommon/mow_wait.bck", "montew/mow_wait.bck"]
@@ -540,12 +605,14 @@ pub(super) fn starting_joint_animation_candidates(
     } else {
         &[]
     };
+    relative_candidates.extend(family_candidates.iter().map(|path| (*path).to_string()));
+    relative_candidates.dedup();
 
     relative_candidates
-        .iter()
+        .into_iter()
         .map(|relative| {
             archive.map_or_else(
-                || relative.to_string(),
+                || relative.clone(),
                 |archive| format!("{archive}!/{relative}"),
             )
         })
@@ -856,13 +923,19 @@ pub(super) fn is_npc_eye_material_name(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with("_eye_mat")
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct NpcAccessorySpec {
-    pub(super) joint_name: Option<&'static str>,
-    pub(super) asset_suffix: &'static str,
+    pub(super) joint_name: Option<String>,
+    pub(super) asset_suffix: String,
+    pub(super) color_index_channel: u8,
+    pub(super) color_changes: Vec<sms_schema::NpcColorChangeDefinition>,
+    pub(super) uses_pollution: bool,
 }
 
-pub(super) fn npc_accessory_specs(object: &SceneObject) -> Vec<NpcAccessorySpec> {
+pub(super) fn npc_accessory_specs(
+    document: &StageDocument,
+    object: &SceneObject,
+) -> Vec<NpcAccessorySpec> {
     let Some(mask) = object
         .raw_params
         .get("npc_parts_mask")
@@ -871,106 +944,25 @@ pub(super) fn npc_accessory_specs(object: &SceneObject) -> Vec<NpcAccessorySpec>
     else {
         return Vec::new();
     };
-    let factory = object.factory_name.to_ascii_lowercase();
-    let mut available = Vec::new();
-    if factory.starts_with("npcmontem") {
-        available.extend_from_slice(&[
-            (0, Some("kubi"), "/montemcommon/hata_model.bmd"),
-            (1, Some("kubi"), "/montemcommon/higea_model.bmd"),
-            (2, Some("kubi"), "/montemcommon/glassesa_model.bmd"),
-            (3, Some("kubi"), "/montemcommon/glassesb_model.bmd"),
-            (4, Some("kubi"), "/montemcommon/hatb_model.bmd"),
-            (5, Some("kubi"), "/montemcommon/hate_model.bmd"),
-            (6, Some("kubi"), "/montemcommon/hatd_model.bmd"),
-            (7, Some("kubi"), "/montemcommon/hatf_model.bmd"),
-            (8, Some("kubi"), "/montemcommon/hatg_model.bmd"),
-            (9, Some("body_jnt"), "/montemcommon/eria_model.bmd"),
-            (10, Some("body_jnt"), "/montemcommon/tieb_model.bmd"),
-        ]);
-        available.push(if factory == "npcmontemf" {
-            (11, Some("body_jnt"), "/tube_model.bmd")
-        } else if factory == "npcmontemg" {
-            (11, Some("handR_jnt"), "/mop_model.bmd")
-        } else if factory == "npcmontemh" {
-            (11, Some("body_jnt"), "/uklele_model.bmd")
-        } else {
-            (11, Some("body_jnt"), "/montemcommon/nimotsu_model.bmd")
-        });
-    } else if factory.starts_with("npcmontew") {
-        available.extend_from_slice(&[
-            (0, Some("yashi_jnt"), "/montewcommon/flower_model.bmd"),
-            (1, Some("kubi"), "/montewcommon/hwa_model.bmd"),
-            (2, Some("kubi"), "/montewcommon/gwb_model.bmd"),
-            (3, Some("handR_jnt"), "/montewcommon/arrowr_model.bmd"),
-            (4, Some("handR_jnt"), "/montewcommon/arrowl_model.bmd"),
-        ]);
-        if factory == "npcmontewc" {
-            available.extend_from_slice(&[
-                (5, Some("kubi"), "/hwc_model.bmd"),
-                (6, Some("handR_jnt"), "/udewar_model.bmd"),
-                (7, Some("handL_jnt"), "/udewal_model.bmd"),
-            ]);
-        }
-    } else if factory.starts_with("npcmarem") {
-        available.extend_from_slice(&[
-            (0, Some("kubi"), "/maremhat_a.bmd"),
-            (1, Some("kubi"), "/maremhat_b.bmd"),
-            (3, Some("kubi"), "/maremhat_e.bmd"),
-            (4, Some("koshi"), "/maremmakigai_a.bmd"),
-            (5, Some("koshi"), "/maremmakigai_b.bmd"),
-            (6, Some("kubi"), "/marem_grass.bmd"),
-            (7, Some("koshi"), "/marembivalve_b.bmd"),
-        ]);
-        if factory == "npcmaremb" {
-            available.extend_from_slice(&[
-                (8, Some("kubi"), "/maremb_set.bmd"),
-                (9, None, "/marembturizao.bmd"),
-            ]);
-        } else if factory == "npcmaremc" {
-            available.extend_from_slice(&[
-                (8, Some("kubi"), "/maremchat_f.bmd"),
-                (9, Some("kubi"), "/maremcagohige.bmd"),
-                (10, Some("kubi"), "/maremckuchihige.bmd"),
-            ]);
-        } else if factory == "npcmaremd" {
-            available.push((8, Some("migite"), "/maremdhoragai_a.bmd"));
-        }
-    } else if factory.starts_with("npcmarew") {
-        available.extend_from_slice(&[
-            (0, Some("kubi"), "/marewpearl_a.bmd"),
-            (1, Some("kubi"), "/marewhatw_a.bmd"),
-            (4, Some("koshi"), "/marewkai_a.bmd"),
-            (5, Some("koshi"), "/marewkai_b.bmd"),
-            (8, Some("koshi"), "/marewbivalvew_a.bmd"),
-            (9, Some("kubi"), "/marewhatw_d.bmd"),
-        ]);
-        if factory == "npcmarewb" {
-            available.push((10, None, "/marewbbaby.bmd"));
-        }
-    } else if factory == "npckinopio" {
-        available.push((0, Some("kubi"), "/kinopio_sunmegane.bmd"));
-    } else if factory == "npckinojii" {
-        available.push((0, Some("jnt_rfinger_1"), "/kinoji_stick.bmd"));
-    } else if factory == "npcpeach" {
-        // TNpcParts::partsPerform hides the parasol and alternate hands in
-        // Peach's default state, while her normal or ponytail hair remains
-        // attached to the neck joint. Keep the resource-mask bit positions in
-        // lockstep with sPeach_InitData in NpcInitData.cpp.
-        available.extend_from_slice(&[
-            (0, Some("kubi"), "/peach/peach_hair_normal.bmd"),
-            (1, Some("jnt_hand_L"), "/peach/peach_hand1_l.bmd"),
-            (2, Some("jnt_hand_R"), "/peach/peach_hand1_r.bmd"),
-            (3, Some("kubi"), "/peach/peach_hair_ponytail.bmd"),
-        ]);
-    } else if factory == "npcraccoondog" {
-        available.push((0, Some("ukiwa_null"), "/ukiwa.bmd"));
-    }
-    available
-        .into_iter()
-        .filter(|(bit, _, _)| mask & (1 << bit) != 0)
-        .map(|(_, joint_name, asset_suffix)| NpcAccessorySpec {
-            joint_name,
-            asset_suffix,
+    let Some(actor) = document
+        .registry
+        .as_ref()
+        .and_then(|registry| registry.find_npc_actor(&object.factory_name))
+    else {
+        return Vec::new();
+    };
+    actor
+        .parts
+        .iter()
+        .filter(|part| mask & (1 << part.bit_index) != 0)
+        .flat_map(|part| {
+            part.models.iter().map(|model| NpcAccessorySpec {
+                joint_name: model.joint_name.clone(),
+                asset_suffix: format!("/{}", model.model_name.to_ascii_lowercase()),
+                color_index_channel: part.color_index_channel,
+                color_changes: part.color_changes.clone(),
+                uses_pollution: part.uses_pollution,
+            })
         })
         .collect()
 }
@@ -994,32 +986,38 @@ pub(super) fn find_stage_asset_by_suffix<'a>(
 
 pub(super) fn accessory_joint_animation(
     document: &StageDocument,
-    asset_suffix: &str,
+    model_path: &str,
 ) -> Option<J3dJointAnimation> {
-    let animation_suffix = accessory_joint_animation_suffix(asset_suffix)?;
-    let asset = find_stage_asset_by_suffix(document, StageAssetKind::Animation, animation_suffix)?;
+    let model_bytes = read_stage_asset_bytes(model_path).ok()?;
+    let model_joint_count = J3dFile::parse(&model_bytes).ok()?.joint_names().ok()?.len();
+    let animation_path = accessory_joint_animation_path(model_path)?;
+    let asset = document.assets.iter().find(|asset| {
+        asset.kind == StageAssetKind::Animation
+            && asset
+                .path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .eq_ignore_ascii_case(&animation_path)
+    })?;
     let bytes = read_stage_asset_bytes(&asset.path).ok()?;
-    J3dJointAnimation::parse(bytes).ok()
+    let animation = J3dJointAnimation::parse(bytes).ok()?;
+    (animation.joint_count() == model_joint_count).then_some(animation)
 }
 
-pub(super) fn accessory_joint_animation_suffix(asset_suffix: &str) -> Option<&'static str> {
-    let normalized = asset_suffix.to_ascii_lowercase();
-    if normalized.ends_with("/peach/peach_hair_normal.bmd") {
-        Some("/peach/peach_hair_normal_wait.bck")
-    } else if normalized.ends_with("/peach/peach_hair_ponytail.bmd") {
-        Some("/peach/peach_hair_ponytail_wait.bck")
-    } else {
-        None
-    }
+pub(super) fn accessory_joint_animation_path(model_path: &str) -> Option<String> {
+    let normalized = model_path.replace('\\', "/");
+    let (base, extension) = normalized.rsplit_once('.')?;
+    matches!(extension.to_ascii_lowercase().as_str(), "bmd" | "bdl")
+        .then(|| format!("{base}_wait.bck"))
 }
 
 pub(super) fn push_accessory_instance_materials(
     materials: &mut Vec<J3dMaterial>,
     cached: &CachedAccessoryModelPreview,
     object: &SceneObject,
-    asset_suffix: &str,
+    spec: &NpcAccessorySpec,
 ) -> usize {
-    if !monte_accessory_has_instance_colors(asset_suffix) {
+    if spec.color_changes.is_empty() && !spec.uses_pollution {
         return cached.material_base;
     }
     let source_end = cached.material_base + cached.preview.materials.len();
@@ -1027,30 +1025,10 @@ pub(super) fn push_accessory_instance_materials(
     let material_base = materials.len();
     for mut material in source {
         material.material_index = materials.len();
-        apply_monte_accessory_material_color(&mut material, object, asset_suffix);
+        apply_npc_accessory_material_color(&mut material, object, spec);
         materials.push(material);
     }
     material_base
-}
-
-pub(super) fn monte_accessory_has_instance_colors(asset_suffix: &str) -> bool {
-    [
-        "hata_model.bmd",
-        "hatb_model.bmd",
-        "hatd_model.bmd",
-        "hate_model.bmd",
-        "hatf_model.bmd",
-        "hatg_model.bmd",
-        "higea_model.bmd",
-        "glassesb_model.bmd",
-        "eria_model.bmd",
-        "tieb_model.bmd",
-        "flower_model.bmd",
-        "hwa_model.bmd",
-        "gwb_model.bmd",
-    ]
-    .iter()
-    .any(|name| asset_suffix.ends_with(name))
 }
 
 pub(super) fn npc_parts_color_index(object: &SceneObject, channel: usize) -> Option<usize> {

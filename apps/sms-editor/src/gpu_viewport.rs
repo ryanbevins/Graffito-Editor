@@ -92,6 +92,97 @@ impl GpuViewportScene {
     }
 }
 
+#[cfg(test)]
+pub(super) fn render_preview_offscreen(
+    preview: &ModelPreview,
+    frame: GpuViewportFrame,
+    size: [u32; 2],
+) -> Result<egui::ColorImage, String> {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+    }))
+    .map_err(|error| format!("request WGPU adapter: {error}"))?;
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("Noki rendering test device"),
+        ..Default::default()
+    }))
+    .map_err(|error| format!("request WGPU device: {error}"))?;
+
+    let scene = GpuSceneData::from_preview(preview);
+    let mut resources = GpuViewportResources::new(&device, GX_COLOR_FORMAT);
+    resources.ensure_viewport_target(&device, size);
+    resources.ensure_scene(&device, &queue, &scene, 1, 0, true);
+    resources.write_frame(&queue, frame, &scene);
+
+    let bytes_per_pixel = 4u32;
+    let unpadded_row = size[0] * bytes_per_pixel;
+    let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded_row = unpadded_row.div_ceil(alignment) * alignment;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Noki rendering test readback"),
+        size: u64::from(padded_row) * u64::from(size[1]),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Noki rendering test encoder"),
+    });
+    resources.render_scene(&mut encoder);
+    let target = resources
+        .viewport_target
+        .as_ref()
+        .ok_or_else(|| "missing WGPU viewport target".to_string())?;
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target.color,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_row),
+                rows_per_image: Some(size[1]),
+            },
+        },
+        target.extent(),
+    );
+    queue.submit([encoder.finish()]);
+
+    let slice = readback.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|error| format!("poll WGPU device: {error}"))?;
+    receiver
+        .recv()
+        .map_err(|error| format!("receive WGPU map result: {error}"))?
+        .map_err(|error| format!("map WGPU readback: {error}"))?;
+
+    let mapped = slice.get_mapped_range();
+    let mut image =
+        egui::ColorImage::filled([size[0] as usize, size[1] as usize], egui::Color32::BLACK);
+    for y in 0..size[1] as usize {
+        let row = &mapped[y * padded_row as usize..y * padded_row as usize + unpadded_row as usize];
+        for (x, rgba) in row.chunks_exact(4).enumerate() {
+            image.pixels[y * size[0] as usize + x] =
+                egui::Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3]);
+        }
+    }
+    drop(mapped);
+    readback.unmap();
+    Ok(image)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct GpuViewportFrame {
     pub camera_position: [f32; 3],
@@ -104,6 +195,9 @@ pub struct GpuViewportFrame {
     pub near: f32,
     pub far: f32,
     pub animation_seconds: f32,
+    pub light_position: [f32; 3],
+    pub light_color: [f32; 4],
+    pub ambient_color: Option<[f32; 4]>,
 }
 
 impl Default for GpuViewportFrame {
@@ -119,6 +213,9 @@ impl Default for GpuViewportFrame {
             near: 8.0,
             far: 100_000.0,
             animation_seconds: 0.0,
+            light_position: [200_000.0, 500_000.0, 200_000.0],
+            light_color: [1.0; 4],
+            ambient_color: None,
         }
     }
 }
@@ -526,7 +623,7 @@ fn color32_to_f32(color: egui::Color32) -> [f32; 4] {
     color_u8_to_f32([r, g, b, a])
 }
 
-fn color_u8_to_f32(color: [u8; 4]) -> [f32; 4] {
+pub(super) fn color_u8_to_f32(color: [u8; 4]) -> [f32; 4] {
     color.map(|value| value as f32 / 255.0)
 }
 
@@ -1318,6 +1415,10 @@ struct GpuCameraUniform {
     forward: [f32; 4],
     projection: [f32; 4],
     clip: [f32; 4],
+    light_position: [f32; 4],
+    light_color: [f32; 4],
+    ambient_color: [f32; 4],
+    lighting_meta: [f32; 4],
 }
 
 impl From<GpuViewportFrame> for GpuCameraUniform {
@@ -1336,6 +1437,10 @@ impl From<GpuViewportFrame> for GpuCameraUniform {
                 -frame.viewport_pan[1] / half_height,
             ],
             clip: [frame.near, frame.far, 0.0, 0.0],
+            light_position: vec4(frame.light_position, 0.0),
+            light_color: frame.light_color,
+            ambient_color: frame.ambient_color.unwrap_or([1.0; 4]),
+            lighting_meta: [f32::from(frame.ambient_color.is_some()), 0.0, 0.0, 0.0],
         }
     }
 }
