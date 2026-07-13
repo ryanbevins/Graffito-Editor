@@ -34,31 +34,8 @@ impl J3dJointAnimation {
         let bytes = bytes.as_ref();
         require_len(FORMAT, bytes, FILE_HEADER_SIZE)?;
         require_magic(FORMAT, bytes, b"J3D1bck1")?;
-        let declared_size = be_u32(bytes, 0x08, FORMAT)? as usize;
-        if declared_size > bytes.len() || declared_size < FILE_HEADER_SIZE {
-            return Err(invalid_offset(declared_size, bytes.len()));
-        }
-        let section_count = be_u32(bytes, 0x0C, FORMAT)? as usize;
-        let mut section_offset = FILE_HEADER_SIZE;
-        let mut ank1 = None;
-        for _ in 0..section_count {
-            let header = checked_slice(FORMAT, bytes, section_offset, 8)?;
-            let size = be_u32(bytes, section_offset + 4, FORMAT)? as usize;
-            let end = section_offset
-                .checked_add(size)
-                .ok_or_else(|| invalid_offset(section_offset, declared_size))?;
-            if size < 8 || end > declared_size {
-                return Err(invalid_offset(end, declared_size));
-            }
-            if &header[..4] == b"ANK1" {
-                ank1 = Some((section_offset, end));
-            }
-            section_offset = end;
-        }
-        let (base, section_end) = ank1.ok_or_else(|| FormatError::Unsupported {
-            format: FORMAT,
-            message: "missing ANK1 section".to_string(),
-        })?;
+        let (declared_size, base, section_end) =
+            animation_section(bytes, b"ANK1", "missing ANK1 section")?;
         checked_slice(FORMAT, &bytes[..section_end], base, 0x24)?;
 
         let attribute = bytes[base + 0x08];
@@ -152,31 +129,8 @@ impl J3dTexturePatternAnimation {
         let bytes = bytes.as_ref();
         require_len(FORMAT, bytes, FILE_HEADER_SIZE)?;
         require_magic(FORMAT, bytes, b"J3D1btp1")?;
-        let declared_size = be_u32(bytes, 0x08, FORMAT)? as usize;
-        if declared_size > bytes.len() || declared_size < FILE_HEADER_SIZE {
-            return Err(invalid_offset(declared_size, bytes.len()));
-        }
-        let section_count = be_u32(bytes, 0x0C, FORMAT)? as usize;
-        let mut section_offset = FILE_HEADER_SIZE;
-        let mut tpt1 = None;
-        for _ in 0..section_count {
-            let header = checked_slice(FORMAT, bytes, section_offset, 8)?;
-            let size = be_u32(bytes, section_offset + 4, FORMAT)? as usize;
-            let end = section_offset
-                .checked_add(size)
-                .ok_or_else(|| invalid_offset(section_offset, declared_size))?;
-            if size < 8 || end > declared_size {
-                return Err(invalid_offset(end, declared_size));
-            }
-            if &header[..4] == b"TPT1" {
-                tpt1 = Some((section_offset, end));
-            }
-            section_offset = end;
-        }
-        let (base, section_end) = tpt1.ok_or_else(|| FormatError::Unsupported {
-            format: FORMAT,
-            message: "missing TPT1 section".to_string(),
-        })?;
+        let (declared_size, base, section_end) =
+            animation_section(bytes, b"TPT1", "missing TPT1 section")?;
         checked_slice(FORMAT, &bytes[..section_end], base, 0x20)?;
 
         let attribute = bytes[base + 0x08];
@@ -324,34 +278,8 @@ impl J3dTextureSrtAnimation {
         let bytes = bytes.as_ref();
         require_len(FORMAT, bytes, FILE_HEADER_SIZE)?;
         require_magic(FORMAT, bytes, b"J3D1btk1")?;
-        let declared_size = be_u32(bytes, 0x08, FORMAT)? as usize;
-        if declared_size > bytes.len() || declared_size < FILE_HEADER_SIZE {
-            return Err(invalid_offset(declared_size, bytes.len()));
-        }
-        let section_count = be_u32(bytes, 0x0C, FORMAT)? as usize;
-        let mut section_offset = FILE_HEADER_SIZE;
-        let mut ttk1 = None;
-        for _ in 0..section_count {
-            let header = checked_slice(FORMAT, bytes, section_offset, 8)?;
-            let size = be_u32(bytes, section_offset + 4, FORMAT)? as usize;
-            if size < 8 {
-                return Err(invalid_offset(section_offset, declared_size));
-            }
-            let end = section_offset
-                .checked_add(size)
-                .ok_or_else(|| invalid_offset(section_offset, declared_size))?;
-            if end > declared_size {
-                return Err(invalid_offset(end, declared_size));
-            }
-            if &header[..4] == b"TTK1" {
-                ttk1 = Some((section_offset, end));
-            }
-            section_offset = end;
-        }
-        let (base, section_end) = ttk1.ok_or_else(|| FormatError::Unsupported {
-            format: FORMAT,
-            message: "missing TTK1 section".to_string(),
-        })?;
+        let (declared_size, base, section_end) =
+            animation_section(bytes, b"TTK1", "missing TTK1 section")?;
         checked_slice(FORMAT, &bytes[..section_end], base, TTK1_HEADER_SIZE)?;
 
         let attribute = bytes[base + 0x08];
@@ -733,6 +661,54 @@ fn read_i16_block(
     read_i16_array(bytes, offset, count, limit)
 }
 
+fn animation_section(
+    bytes: &[u8],
+    section_magic: &[u8; 4],
+    missing_message: &str,
+) -> Result<(usize, usize, usize)> {
+    let declared_size = be_u32(bytes, 0x08, FORMAT)? as usize;
+    if declared_size > bytes.len() || declared_size < FILE_HEADER_SIZE {
+        return Err(invalid_offset(declared_size, bytes.len()));
+    }
+
+    let file = &bytes[..declared_size];
+    let section_count = be_u32(file, 0x0C, FORMAT)? as usize;
+    let mut section_offset = FILE_HEADER_SIZE;
+    let mut found = None;
+    for section_index in 0..section_count {
+        let header = checked_slice(FORMAT, file, section_offset, 8)?;
+        let size = be_u32(file, section_offset + 4, FORMAT)? as usize;
+        if size < 8 {
+            return Err(invalid_offset(section_offset, declared_size));
+        }
+        let claimed_end = section_offset
+            .checked_add(size)
+            .ok_or_else(|| invalid_offset(section_offset, declared_size))?;
+        let section_end = if claimed_end > declared_size {
+            if section_index + 1 != section_count {
+                return Err(invalid_offset(claimed_end, declared_size));
+            }
+            // Some retail J3D animations include absent trailing padding in
+            // the final block's size. J3D uses that size only to find another
+            // block, so cap the last block at the real file boundary while
+            // keeping every table and data read strictly bounds-checked.
+            declared_size
+        } else {
+            claimed_end
+        };
+        if &header[..4] == section_magic {
+            found = Some((section_offset, section_end));
+        }
+        section_offset = section_end;
+    }
+
+    let (section_offset, section_end) = found.ok_or_else(|| FormatError::Unsupported {
+        format: FORMAT,
+        message: missing_message.to_string(),
+    })?;
+    Ok((declared_size, section_offset, section_end))
+}
+
 fn section_relative(bytes: &[u8], base: usize, limit: usize, field: usize) -> Result<usize> {
     let relative = be_u32(bytes, base + field, FORMAT)? as usize;
     let offset = base
@@ -951,6 +927,42 @@ mod tests {
     fn rejects_texture_srt_tables_outside_the_section() {
         let mut bytes = test_btk();
         put_u32(&mut bytes, 0x20 + 0x14, 0xF0);
+        let oversized = (bytes.len() - FILE_HEADER_SIZE + 4) as u32;
+        put_u32(&mut bytes, FILE_HEADER_SIZE + 4, oversized);
+
+        assert!(matches!(
+            J3dTextureSrtAnimation::parse(bytes),
+            Err(FormatError::InvalidOffset { .. })
+        ));
+    }
+
+    #[test]
+    fn accepts_absent_padding_claimed_by_final_animation_section() {
+        let mut bck = test_bck();
+        let bck_section_size = (bck.len() - FILE_HEADER_SIZE + 4) as u32;
+        put_u32(&mut bck, FILE_HEADER_SIZE + 4, bck_section_size);
+        assert_eq!(J3dJointAnimation::parse(&bck).unwrap().to_bytes(), bck);
+
+        let mut btp = test_btp();
+        let btp_section_size = (btp.len() - FILE_HEADER_SIZE + 4) as u32;
+        put_u32(&mut btp, FILE_HEADER_SIZE + 4, btp_section_size);
+        assert_eq!(
+            J3dTexturePatternAnimation::parse(&btp).unwrap().to_bytes(),
+            btp
+        );
+
+        let mut btk = test_btk();
+        let btk_section_size = (btk.len() - FILE_HEADER_SIZE + 4) as u32;
+        put_u32(&mut btk, FILE_HEADER_SIZE + 4, btk_section_size);
+        assert_eq!(J3dTextureSrtAnimation::parse(&btk).unwrap().to_bytes(), btk);
+    }
+
+    #[test]
+    fn rejects_oversized_animation_section_before_another_section() {
+        let mut bytes = test_btk();
+        put_u32(&mut bytes, 0x0C, 2);
+        let oversized = (bytes.len() - FILE_HEADER_SIZE + 4) as u32;
+        put_u32(&mut bytes, FILE_HEADER_SIZE + 4, oversized);
 
         assert!(matches!(
             J3dTextureSrtAnimation::parse(bytes),
