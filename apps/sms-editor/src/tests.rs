@@ -10,6 +10,39 @@ fn assert_vec3_close(actual: [f32; 3], expected: [f32; 3]) {
 }
 
 #[test]
+fn coin_variants_use_the_item_managers_retail_rotation_speed() {
+    for (factory, class) in [
+        ("coin", "TCoin"),
+        ("CoinRed", ""),
+        ("CoinBlue", ""),
+        ("coin_red", "TCoinRed"),
+        ("coin_blue", "TCoinBlue"),
+        ("FlowerCoin", "TFlowerCoin"),
+        ("joint_coin", "TCoin"),
+    ] {
+        let mut object = SceneObject::new("coin-instance", factory);
+        object.class_name = Some(class.to_string());
+        assert_eq!(runtime_yaw_degrees_per_frame(&object), 2.0, "{factory}");
+    }
+
+    assert_eq!(
+        runtime_yaw_degrees_per_frame(&SceneObject::new("tree-instance", "PalmTree")),
+        0.0
+    );
+}
+
+#[test]
+fn runtime_rotation_uses_sunshines_clock_and_wraps_yaw() {
+    let transform = Transform {
+        rotation_degrees: [10.0, 350.0, 20.0],
+        ..Transform::default()
+    };
+    let animated = runtime_rotated_transform(transform, 1.0, 2.0);
+
+    assert_vec3_close(animated.rotation_degrees, [10.0, 110.0, 20.0]);
+}
+
+#[test]
 fn full_billboard_local_positive_z_moves_toward_the_camera() {
     let billboard = J3dBillboard {
         mode: sms_formats::J3dBillboardMode::Full,
@@ -443,6 +476,47 @@ fn npc_circle_shadow_uses_retail_default_radius() {
     assert_eq!(triangles[0].vertices[0], [10.0, 21.5, 30.0]);
     assert!((triangles[0].vertices[1][0] - 70.0).abs() < 0.001);
     assert_eq!(triangles[0].blend_mode.unwrap().mode, 1);
+}
+
+#[test]
+fn coin_circle_shadow_uses_retail_radius_on_the_world_surface() {
+    let mut world = textured_blended_triangle();
+    world.vertices = [
+        [-100.0, 10.0, -100.0],
+        [100.0, 10.0, -100.0],
+        [0.0, 10.0, 100.0],
+    ];
+    let mut water = world;
+    water.vertices = water.vertices.map(|mut vertex| {
+        vertex[1] = 20.0;
+        vertex
+    });
+    water.render_layer = PreviewRenderLayer::Water;
+
+    let transform = Transform {
+        translation: [0.0, 50.0, 0.0],
+        scale: [0.7, 0.7, 0.7],
+        ..Transform::default()
+    };
+    let ground_y = shadow_ground_height(transform.translation, &[world, water]).unwrap();
+    let mut shadows = Vec::new();
+    push_coin_circle_shadow(&mut shadows, transform, ground_y, 4, 8);
+
+    assert_eq!(ground_y, 10.0);
+    assert_eq!(shadows.len(), 20);
+    assert_eq!(shadows[0].vertices[0], [0.0, 11.5, 0.0]);
+    assert!((shadows[0].vertices[1][0] - 35.0).abs() < 0.001);
+    assert_eq!(shadows[0].render_layer, PreviewRenderLayer::Shadow);
+}
+
+#[test]
+fn invisible_coin_proxy_does_not_get_a_preview_shadow() {
+    let mut object = SceneObject::new("coin-proxy", "Coin");
+    object
+        .raw_params
+        .insert("stream_string_0".to_string(), "invisible_coin".to_string());
+
+    assert!(!is_coin_object(&object));
 }
 
 #[test]

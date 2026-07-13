@@ -870,6 +870,7 @@ impl SmsEditorApp {
             }
         }
 
+        let world_triangle_end = triangles.len();
         let mut object_model_cache =
             BTreeMap::<(String, u32, String), CachedObjectModelPreview>::new();
         let mut accessory_model_cache = BTreeMap::<String, CachedAccessoryModelPreview>::new();
@@ -1213,6 +1214,21 @@ impl SmsEditorApp {
                 );
                 next_packet_index += 1;
             }
+            if is_coin_object(object) {
+                if let Some(ground_y) = shadow_ground_height(
+                    object_preview_transform.translation,
+                    &triangles[..world_triangle_end],
+                ) {
+                    push_coin_circle_shadow(
+                        &mut triangles,
+                        object_preview_transform,
+                        ground_y,
+                        model_index,
+                        next_packet_index,
+                    );
+                    next_packet_index += 1;
+                }
+            }
             let instance = AnimatedModelInstance {
                 transform: object.transform,
                 model_index,
@@ -1220,14 +1236,7 @@ impl SmsEditorApp {
                 point_stride,
                 triangle_range: triangle_start..body_triangle_end,
                 accessories,
-                // TShine::control advances the normal live state by unk16C,
-                // whose constructor default is 2 degrees per retail frame.
-                runtime_yaw_degrees_per_frame: if object.factory_name.eq_ignore_ascii_case("shine")
-                {
-                    2.0
-                } else {
-                    0.0
-                },
+                runtime_yaw_degrees_per_frame: runtime_yaw_degrees_per_frame(object),
             };
             if let Some(cached) = object_model_cache.get_mut(&model_cache_key) {
                 cached.instances.push(instance);
@@ -1537,13 +1546,42 @@ fn push_npc_circle_shadow(
     model_index: usize,
     packet_index: usize,
 ) {
-    const SEGMENTS: usize = 20;
     let radius = 60.0 * transform.scale[0].abs().max(transform.scale[2].abs());
     let center = [
         transform.translation[0],
         transform.translation[1] + 1.5,
         transform.translation[2],
     ];
+    push_circle_shadow(triangles, center, radius, model_index, packet_index);
+}
+
+fn push_coin_circle_shadow(
+    triangles: &mut Vec<PreviewTriangle>,
+    transform: Transform,
+    ground_y: f32,
+    model_index: usize,
+    packet_index: usize,
+) {
+    // TMapObjBase::initActorData derives mScaledBodyRadius from the coin's
+    // TMapObjData value (50.0) and its X scale before TLiveActor submits the
+    // type-0 circle-shadow request.
+    let radius = 50.0 * transform.scale[0].abs();
+    let center = [
+        transform.translation[0],
+        ground_y + 1.5,
+        transform.translation[2],
+    ];
+    push_circle_shadow(triangles, center, radius, model_index, packet_index);
+}
+
+fn push_circle_shadow(
+    triangles: &mut Vec<PreviewTriangle>,
+    center: [f32; 3],
+    radius: f32,
+    model_index: usize,
+    packet_index: usize,
+) {
+    const SEGMENTS: usize = 20;
     let color = [0, 0, 0, 82];
     for segment in 0..SEGMENTS {
         let angle0 = segment as f32 * std::f32::consts::TAU / SEGMENTS as f32;
@@ -1597,6 +1635,35 @@ fn push_npc_circle_shadow(
             particle_environment_color: None,
         });
     }
+}
+
+fn shadow_ground_height(position: [f32; 3], world_triangles: &[PreviewTriangle]) -> Option<f32> {
+    world_triangles
+        .iter()
+        .filter(|triangle| triangle.render_layer == PreviewRenderLayer::Main)
+        .filter_map(|triangle| {
+            vertical_triangle_height(position[0], position[2], triangle.vertices)
+        })
+        // TMBindShadowManager starts the retail ground query 30 units above
+        // the actor and searches downward, so slightly embedded placements
+        // still resolve to the surface above them.
+        .filter(|height| *height <= position[1] + 30.0)
+        .max_by(f32::total_cmp)
+}
+
+fn vertical_triangle_height(x: f32, z: f32, vertices: [[f32; 3]; 3]) -> Option<f32> {
+    let [a, b, c] = vertices;
+    let denominator = (b[2] - c[2]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[2] - c[2]);
+    if denominator.abs() <= f32::EPSILON {
+        return None;
+    }
+
+    let a_weight = ((b[2] - c[2]) * (x - c[0]) + (c[0] - b[0]) * (z - c[2])) / denominator;
+    let b_weight = ((c[2] - a[2]) * (x - c[0]) + (a[0] - c[0]) * (z - c[2])) / denominator;
+    let c_weight = 1.0 - a_weight - b_weight;
+    const EDGE_EPSILON: f32 = 0.0001;
+    (a_weight >= -EDGE_EPSILON && b_weight >= -EDGE_EPSILON && c_weight >= -EDGE_EPSILON)
+        .then_some(a_weight * a[1] + b_weight * b[1] + c_weight * c[1])
 }
 
 fn material_table_candidates_for_model(model_path: &str) -> Vec<String> {
@@ -2494,6 +2561,67 @@ fn vector_drag(ui: &mut egui::Ui, values: &mut [f32; 3], speed: f32) -> VectorDr
         }
     });
     edit
+}
+
+fn runtime_yaw_degrees_per_frame(object: &SceneObject) -> f32 {
+    let factory = object.factory_name.to_ascii_lowercase();
+    let class = object
+        .class_name
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    // TItemManager::perform advances its shared item matrix by two degrees
+    // every retail frame. TItem::calc copies that matrix into coins, including
+    // the red, blue, flower, and joint-attached TCoin variants.
+    let is_coin = is_coin_object(object);
+    // TShine::control advances the normal live state by unk16C, whose
+    // constructor default is also two degrees per retail frame.
+    if is_coin || factory == "shine" || class == "tshine" {
+        2.0
+    } else {
+        0.0
+    }
+}
+
+fn is_coin_object(object: &SceneObject) -> bool {
+    let factory = object.factory_name.to_ascii_lowercase();
+    let class = object
+        .class_name
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let resource = object
+        .raw_params
+        .get("stream_string_0")
+        .map(|value| value.to_ascii_lowercase());
+    if resource.as_deref() == Some("invisible_coin") {
+        return false;
+    }
+
+    matches!(
+        factory.as_str(),
+        "coin" | "coinred" | "coinblue" | "coin_red" | "coin_blue" | "flowercoin" | "joint_coin"
+    ) || class.starts_with("tcoin")
+        || class == "coin"
+        || class == "coinred"
+        || class == "coinblue"
+        || class == "tflowercoin"
+        || matches!(
+            resource.as_deref(),
+            Some("coin" | "coin_red" | "coin_blue" | "joint_coin")
+        )
+}
+
+fn runtime_rotated_transform(
+    mut transform: Transform,
+    elapsed_seconds: f32,
+    yaw_degrees_per_frame: f32,
+) -> Transform {
+    transform.rotation_degrees[1] = (transform.rotation_degrees[1]
+        + elapsed_seconds.max(0.0) * SMS_ANIMATION_FRAMES_PER_SECOND * yaw_degrees_per_frame)
+        .rem_euclid(360.0);
+    transform
 }
 
 fn snap_transform(transform: &mut Transform, translation: f32, rotation: f32, scale: f32) {

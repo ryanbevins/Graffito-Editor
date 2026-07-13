@@ -687,10 +687,11 @@ impl SmsEditorApp {
             }
             for source in rotating_models {
                 for instance in &source.instances {
-                    let mut transform = instance.transform;
-                    transform.rotation_degrees[1] += elapsed_seconds
-                        * SMS_ANIMATION_FRAMES_PER_SECOND
-                        * instance.runtime_yaw_degrees_per_frame;
+                    let transform = runtime_rotated_transform(
+                        instance.transform,
+                        elapsed_seconds,
+                        instance.runtime_yaw_degrees_per_frame,
+                    );
                     for (point, position) in points[instance.point_range.clone()]
                         .iter_mut()
                         .zip(source.positions.iter().step_by(instance.point_stride))
