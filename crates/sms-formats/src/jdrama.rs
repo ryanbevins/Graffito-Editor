@@ -23,8 +23,19 @@ pub struct JDramaObjectRecord {
     #[serde(default)]
     pub map_wire_manager: Option<JDramaMapWireManagerParams>,
     pub map_event_sink: Option<JDramaMapEventSinkParams>,
+    #[serde(default)]
+    pub cube_general_info: Option<JDramaCubeGeneralInfo>,
     pub light: Option<JDramaLight>,
     pub ambient: Option<JDramaAmbient>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct JDramaCubeGeneralInfo {
+    pub center: [f32; 3],
+    pub rotation_degrees: [f32; 3],
+    pub dimensions: [f32; 3],
+    pub flags: u32,
+    pub data_no: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -122,6 +133,7 @@ fn parse_record_at(
         .and_then(|_| read_map_obj_grass_blade_count(bytes, after_name + 36, end, &type_name));
     let map_wire_manager = read_map_wire_manager_params(bytes, after_name, end, &type_name);
     let map_event_sink = read_map_event_sink_params(bytes, after_name, end, &type_name);
+    let cube_general_info = read_cube_general_info(bytes, after_name, end, &type_name);
     let short_type = type_name.rsplit("::").next().unwrap_or(&type_name);
     let light = (short_type == "Light")
         .then(|| read_light(bytes, after_name, end, object_name.clone()))
@@ -141,6 +153,7 @@ fn parse_record_at(
         map_obj_grass_blade_count,
         map_wire_manager,
         map_event_sink,
+        cube_general_info,
         light,
         ambient,
     });
@@ -156,6 +169,33 @@ fn parse_record_at(
     }
 
     Ok(size)
+}
+
+fn read_cube_general_info(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    type_name: &str,
+) -> Option<JDramaCubeGeneralInfo> {
+    if !type_name
+        .rsplit("::")
+        .next()?
+        .eq_ignore_ascii_case("CubeGeneralInfo")
+    {
+        return None;
+    }
+    if start.checked_add(48)? > end {
+        return None;
+    }
+
+    let dimensions = read_vec3(bytes, start + 24)?.map(|value| value * 100.0);
+    Some(JDramaCubeGeneralInfo {
+        center: read_vec3(bytes, start)?,
+        rotation_degrees: read_vec3(bytes, start + 12)?,
+        dimensions,
+        flags: be_u32(bytes, start + 36, FORMAT).ok()?,
+        data_no: be_u32(bytes, start + 44, FORMAT).ok()? as i32,
+    })
 }
 
 fn read_map_wire_manager_params(
@@ -586,6 +626,29 @@ mod tests {
             })
         );
         assert!(read_map_wire_manager_params(&bytes, 0, bytes.len(), "MapObjManager").is_none());
+    }
+
+    #[test]
+    fn reads_cube_general_info_using_runtime_scale_and_model_slot() {
+        let mut bytes = Vec::new();
+        for value in [10.0_f32, 20.0, 30.0, 0.0, 45.0, 0.0, 2.0, 3.0, 4.0] {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        bytes.extend_from_slice(&0x80_u32.to_be_bytes());
+        bytes.extend_from_slice(&2_u32.to_be_bytes());
+        bytes.extend_from_slice(&3_u32.to_be_bytes());
+
+        assert_eq!(
+            read_cube_general_info(&bytes, 0, bytes.len(), "JDrama::CubeGeneralInfo"),
+            Some(JDramaCubeGeneralInfo {
+                center: [10.0, 20.0, 30.0],
+                rotation_degrees: [0.0, 45.0, 0.0],
+                dimensions: [200.0, 300.0, 400.0],
+                flags: 0x80,
+                data_no: 3,
+            })
+        );
+        assert!(read_cube_general_info(&bytes, 0, bytes.len(), "MapObjBase").is_none());
     }
 
     #[test]

@@ -802,6 +802,34 @@ fn authored_mirror_surface_follows_environment_visibility() {
 }
 
 #[test]
+fn mirror_surface_slots_follow_the_runtime_filename_mapping() {
+    assert_eq!(
+        mirror_surface_model_slot("bianco7", "stage.szs!/map/mirror/mirror00.bmd"),
+        Some(0)
+    );
+    assert_eq!(
+        mirror_surface_model_slot("pinna0", "stage.szs!/map/mirror/mirror205.bmd"),
+        Some(0)
+    );
+    assert_eq!(
+        mirror_surface_model_slot("bianco7", "stage.szs!/map/map/map.bmd"),
+        None
+    );
+
+    let active = BTreeSet::from([0]);
+    assert!(mirror_surface_model_is_active(
+        "bianco7",
+        "stage.szs!/map/mirror/mirror00.bmd",
+        &active,
+    ));
+    assert!(!mirror_surface_model_is_active(
+        "bianco7",
+        "stage.szs!/map/mirror/mirror01.bmd",
+        &active,
+    ));
+}
+
+#[test]
 fn skybox_model_is_loaded_as_camera_relative_environment() {
     let path = "stage.szs!/map/map/sky.bmd";
 

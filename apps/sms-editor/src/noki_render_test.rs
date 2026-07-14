@@ -42,6 +42,48 @@ fn bianco_water_pollution_model_follows_map_static_placement() {
 }
 
 #[test]
+#[ignore = "requires an extracted retail base root"]
+fn bianco7_dirty_lake_does_not_activate_unreferenced_mirror_surface() {
+    let base_root = env::var_os(BASE_ROOT_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("set {BASE_ROOT_ENV} to the extracted game's data directory"));
+    for episode in 0..=7 {
+        let stage_id = format!("bianco{episode}");
+        let document = StageDocument::open(&base_root, &stage_id).expect("open Bianco episode");
+        let expected = if episode == 7 {
+            BTreeSet::new()
+        } else {
+            BTreeSet::from([0])
+        };
+        assert_eq!(
+            active_mirror_model_slots(&document),
+            expected,
+            "{stage_id} must follow its retail CubeMirror table"
+        );
+    }
+    let document = StageDocument::open(&base_root, "bianco7").expect("open bianco7");
+    let slots = active_mirror_model_slots(&document);
+    assert!(slots.is_empty(), "bianco7 has no active CubeMirror entries");
+    let mirror = document
+        .assets
+        .iter()
+        .find(|asset| {
+            asset
+                .path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .ends_with("/map/mirror/mirror00.bmd")
+        })
+        .expect("bianco7 contains the dormant authored mirror surface");
+    assert!(!mirror_surface_model_is_active(
+        &document.stage_id,
+        &mirror.path.to_string_lossy(),
+        &slots,
+    ));
+}
+
+#[test]
 #[ignore = "requires an extracted retail base root and is a manual performance probe"]
 fn profiles_dolpic0_preview_and_animation_updates() {
     let base_root = env::var_os(BASE_ROOT_ENV)

@@ -638,11 +638,19 @@ impl SmsEditorApp {
         const POINTS_PER_OBJECT_INSTANCE: usize = 500;
 
         let active_pollution_layers = active_pollution_layer_count(document);
+        let active_mirror_model_slots = active_mirror_model_slots(document);
         let models: Vec<_> = document
             .assets
             .iter()
             .filter(|asset| asset.kind == StageAssetKind::Model)
             .filter(|asset| map_static_model_is_active(document, &asset.path.to_string_lossy()))
+            .filter(|asset| {
+                mirror_surface_model_is_active(
+                    &document.stage_id,
+                    &asset.path.to_string_lossy(),
+                    &active_mirror_model_slots,
+                )
+            })
             .filter(|asset| {
                 pollution_layer_model_is_active(
                     &asset.path.to_string_lossy(),
@@ -2363,6 +2371,77 @@ fn path_is_mirror_surface_model_path(path: &str) -> bool {
         stem.strip_prefix("mirror")
             .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
     })
+}
+
+fn active_mirror_model_slots(document: &StageDocument) -> BTreeSet<usize> {
+    const MIRROR_CUBE_TABLE_NAME: &str = "鏡キューブテーブル";
+
+    let mut slots = BTreeSet::new();
+    for asset in document.assets.iter().filter(|asset| {
+        asset.kind == StageAssetKind::Placement
+            && asset
+                .path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .ends_with("/map/tables.bin")
+    }) {
+        let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+            continue;
+        };
+        let Ok(records) = parse_jdrama_object_records(&bytes) else {
+            continue;
+        };
+        let mirror_tables = records
+            .iter()
+            .filter(|record| {
+                record.type_name.rsplit("::").next() == Some("CubeGeneralInfoTable")
+                    && record.object_name.as_deref() == Some(MIRROR_CUBE_TABLE_NAME)
+            })
+            .map(|record| record.offset..record.offset + record.size)
+            .collect::<Vec<_>>();
+        for cube in records.iter().filter(|record| {
+            record.cube_general_info.is_some()
+                && mirror_tables.iter().any(|table| {
+                    record.offset > table.start && record.offset + record.size <= table.end
+                })
+        }) {
+            if let Some(slot) = cube
+                .cube_general_info
+                .and_then(|cube| usize::try_from(cube.data_no).ok())
+            {
+                slots.insert(slot);
+            }
+        }
+    }
+    slots
+}
+
+fn mirror_surface_model_is_active(
+    stage_id: &str,
+    path: &str,
+    active_slots: &BTreeSet<usize>,
+) -> bool {
+    mirror_surface_model_slot(stage_id, path).is_none_or(|slot| active_slots.contains(&slot))
+}
+
+fn mirror_surface_model_slot(stage_id: &str, path: &str) -> Option<usize> {
+    if !path_is_mirror_surface_model_path(path) {
+        return None;
+    }
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    let stem = path
+        .rsplit('/')
+        .next()?
+        .trim_end_matches(".bmd")
+        .trim_end_matches(".bdl");
+    let suffix = stem.strip_prefix("mirror")?;
+    if stage_id.to_ascii_lowercase().starts_with("pinna") && suffix == "205" {
+        // TMirrorModelManager maps Pinna Park's first mirror slot to mirror205.
+        Some(0)
+    } else {
+        suffix.parse().ok()
+    }
 }
 
 fn path_is_indirect_water_model_path(path: &str) -> bool {
