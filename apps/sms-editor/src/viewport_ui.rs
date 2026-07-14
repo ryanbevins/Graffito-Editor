@@ -835,10 +835,9 @@ impl SmsEditorApp {
         &self,
         rect: egui::Rect,
     ) -> Option<gpu_viewport::GpuViewportFrame> {
-        let preview = self.model_preview.as_ref()?;
+        self.model_preview.as_ref()?;
         let frame = self.camera_frame();
         let focal = perspective_focal_length(rect, self.viewport_zoom);
-        let far = preview.far_clip(self.renderer.camera().distance);
         let lighting = self
             .document
             .as_ref()
@@ -852,7 +851,6 @@ impl SmsEditorApp {
             viewport_size: [rect.width().max(1.0), rect.height().max(1.0)],
             viewport_pan: [self.viewport_pan.x, self.viewport_pan.y],
             near: VIEWPORT_NEAR_CLIP,
-            far,
             animation_seconds: self.animation_started_at.elapsed().as_secs_f32(),
             light_position: lighting
                 .map(|lighting| lighting.position)

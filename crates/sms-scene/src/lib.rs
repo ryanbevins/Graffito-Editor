@@ -639,6 +639,11 @@ fn load_scene_objects_from_assets(
                     params.action_flags.to_string(),
                 );
             }
+            if let Some(blade_count) = record.map_obj_grass_blade_count {
+                object
+                    .raw_params
+                    .insert("grass_blade_count".to_string(), blade_count.to_string());
+            }
 
             if let Some(model_path) = infer_preview_model_path(&object, &model_index) {
                 object.asset_hints.push(AssetRef {

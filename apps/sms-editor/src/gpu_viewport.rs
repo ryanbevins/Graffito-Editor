@@ -199,7 +199,6 @@ pub struct GpuViewportFrame {
     pub viewport_size: [f32; 2],
     pub viewport_pan: [f32; 2],
     pub near: f32,
-    pub far: f32,
     pub animation_seconds: f32,
     pub light_position: [f32; 3],
     pub light_color: [f32; 4],
@@ -217,7 +216,6 @@ impl Default for GpuViewportFrame {
             viewport_size: [1.0, 1.0],
             viewport_pan: [0.0; 2],
             near: 8.0,
-            far: 100_000.0,
             animation_seconds: 0.0,
             light_position: [200_000.0, 500_000.0, 200_000.0],
             light_color: [1.0; 4],
@@ -1049,16 +1047,29 @@ impl GpuMaterialState {
         } else {
             GpuBatchPass::Opaque
         };
-        GpuPipelineKey {
-            pass,
-            depth: GpuDepthState {
+        let depth = if pass == GpuBatchPass::Sky {
+            // The retail sky model is camera-relative and some of its opaque
+            // materials write depth. That is safe inside Sunshine's gameplay
+            // camera range, but a free editor camera can put level geometry
+            // beyond the finite sky sphere. Keep sky as a true background so
+            // it cannot occlude world geometry at long viewing distances.
+            GpuDepthState {
+                write: false,
+                compare: GpuDepthCompare::Always,
+            }
+        } else {
+            GpuDepthState {
                 write: self.depth.update_enable != 0,
                 compare: if self.depth.compare_enable == 0 {
                     GpuDepthCompare::Always
                 } else {
                     gx_compare_to_gpu(self.depth.func)
                 },
-            },
+            }
+        };
+        GpuPipelineKey {
+            pass,
+            depth,
             cull: self.cull,
             blend: GpuBlendKey {
                 mode: self.blend.mode,
@@ -1576,7 +1587,7 @@ impl From<GpuViewportFrame> for GpuCameraUniform {
                 frame.viewport_pan[0] / half_width,
                 -frame.viewport_pan[1] / half_height,
             ],
-            clip: [frame.near, frame.far, 0.0, 0.0],
+            clip: [frame.near, 0.0, 0.0, 0.0],
             light_position: vec4(frame.light_position, 0.0),
             light_color: frame.light_color,
             ambient_color: frame.ambient_color.unwrap_or([1.0; 4]),

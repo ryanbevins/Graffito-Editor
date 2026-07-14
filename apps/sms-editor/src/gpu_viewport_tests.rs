@@ -28,8 +28,28 @@ fn j3d_shader_parses_and_validates() {
 }
 
 #[test]
+fn viewport_projection_has_no_far_clip_plane() {
+    assert!(J3D_SHADER.contains("let clip_z = depth - camera.clip.x;"));
+    assert!(!J3D_SHADER.contains("camera.clip.y - camera.clip.x"));
+}
+
+#[test]
 fn j3d_vertex_shader_stops_after_the_material_texgen_count() {
     assert!(J3D_SHADER.contains("i >= material.counts.y"));
+}
+
+#[test]
+fn sky_pass_cannot_occlude_distant_level_geometry() {
+    let key = GpuMaterialState::from_j3d(&test_material(1)).pipeline_key(PreviewRenderLayer::Sky);
+
+    assert_eq!(key.pass, GpuBatchPass::Sky);
+    assert_eq!(
+        key.depth,
+        GpuDepthState {
+            write: false,
+            compare: GpuDepthCompare::Always,
+        }
+    );
 }
 
 #[test]
@@ -470,7 +490,6 @@ fn geometry_update_preview() -> ModelPreview {
         bounds_max: [11.0, 1.0, 0.0],
         camera_bounds_min: [0.0; 3],
         camera_bounds_max: [11.0, 1.0, 0.0],
-        sky_radius: 0.0,
         loaded_models: 2,
         failed_models: 0,
         source_vertices: 6,

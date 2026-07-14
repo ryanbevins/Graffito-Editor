@@ -281,7 +281,6 @@ fn render_isolated_noki(
             viewport_size: [640.0, 640.0],
             viewport_pan: [0.0; 2],
             near: 8.0,
-            far: 20_000.0,
             animation_seconds: 0.0,
             light_position: lighting.position,
             light_color: gpu_viewport::color_u8_to_f32(lighting.color),

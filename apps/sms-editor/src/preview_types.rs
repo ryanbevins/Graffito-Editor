@@ -13,7 +13,6 @@ pub(super) struct ModelPreview {
     pub(super) bounds_max: [f32; 3],
     pub(super) camera_bounds_min: [f32; 3],
     pub(super) camera_bounds_max: [f32; 3],
-    pub(super) sky_radius: f32,
     pub(super) loaded_models: usize,
     pub(super) failed_models: usize,
     pub(super) source_vertices: usize,
@@ -69,12 +68,6 @@ impl ModelPreview {
         let dy = self.camera_bounds_max[1] - self.camera_bounds_min[1];
         let dz = self.camera_bounds_max[2] - self.camera_bounds_min[2];
         ((dx * dx + dy * dy + dz * dz).sqrt() * 0.5).max(1000.0)
-    }
-
-    pub(super) fn far_clip(&self, camera_distance: f32) -> f32 {
-        (camera_distance + self.radius() * 5.0)
-            .max(self.sky_radius * 1.05)
-            .max(20_000.0)
     }
 }
 

@@ -347,9 +347,9 @@ fn vs_main(input: VertexIn) -> VertexOut {
     let depth = view_position.z;
     let clip_x = view_position.x * camera.projection.x + camera.projection.z * depth;
     let clip_y = view_position.y * camera.projection.y + camera.projection.w * depth;
-    let depth_range = max(camera.clip.y - camera.clip.x, 1.0);
-    let clip_z = (camera.clip.y / depth_range) * depth
-        - (camera.clip.y * camera.clip.x / depth_range);
+    // Infinite-far perspective projection. This retains the near clip while
+    // allowing an isolated level to remain visible at any camera distance.
+    let clip_z = depth - camera.clip.x;
 
     let rgb0 = compute_color_channel(0u, 0u, input.color0, input.normal, input.position);
     let alpha0 = compute_color_channel(1u, 0u, input.color0, input.normal, input.position);

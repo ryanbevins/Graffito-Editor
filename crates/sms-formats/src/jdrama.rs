@@ -18,9 +18,23 @@ pub struct JDramaObjectRecord {
     pub transform: Option<JDramaTransform>,
     pub stream_strings: Vec<String>,
     pub npc_params: Option<JDramaNpcParams>,
+    #[serde(default)]
+    pub map_obj_grass_blade_count: Option<u32>,
+    #[serde(default)]
+    pub map_wire_manager: Option<JDramaMapWireManagerParams>,
     pub map_event_sink: Option<JDramaMapEventSinkParams>,
     pub light: Option<JDramaLight>,
     pub ambient: Option<JDramaAmbient>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct JDramaMapWireManagerParams {
+    pub wire_capacity: u32,
+    pub actor_capacity: u32,
+    pub draw_width: f32,
+    pub draw_height: f32,
+    pub upper_surface: [u8; 4],
+    pub lower_surface: [u8; 4],
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -104,6 +118,9 @@ fn parse_record_at(
         .unwrap_or_default();
     let npc_params =
         transform.and_then(|_| read_npc_params(bytes, after_name + 36, end, &type_name));
+    let map_obj_grass_blade_count = transform
+        .and_then(|_| read_map_obj_grass_blade_count(bytes, after_name + 36, end, &type_name));
+    let map_wire_manager = read_map_wire_manager_params(bytes, after_name, end, &type_name);
     let map_event_sink = read_map_event_sink_params(bytes, after_name, end, &type_name);
     let short_type = type_name.rsplit("::").next().unwrap_or(&type_name);
     let light = (short_type == "Light")
@@ -121,6 +138,8 @@ fn parse_record_at(
         transform,
         stream_strings,
         npc_params,
+        map_obj_grass_blade_count,
+        map_wire_manager,
         map_event_sink,
         light,
         ambient,
@@ -137,6 +156,82 @@ fn parse_record_at(
     }
 
     Ok(size)
+}
+
+fn read_map_wire_manager_params(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    type_name: &str,
+) -> Option<JDramaMapWireManagerParams> {
+    if !type_name
+        .rsplit("::")
+        .next()?
+        .eq_ignore_ascii_case("MapWireManager")
+    {
+        return None;
+    }
+
+    // TMapWireManager::load reads a character name followed by capacities,
+    // draw dimensions, and six u32 color channels. This is deliberately kept
+    // here with the JDrama stream parser instead of inferred by the renderer.
+    let (_, cursor) = read_len_string(bytes, start, end).ok()?;
+    if cursor.checked_add(40)? > end {
+        return None;
+    }
+    let color = |offset: usize| u8::try_from(be_u32(bytes, offset, FORMAT).ok()?).ok();
+    Some(JDramaMapWireManagerParams {
+        wire_capacity: be_u32(bytes, cursor, FORMAT).ok()?,
+        actor_capacity: be_u32(bytes, cursor + 4, FORMAT).ok()?,
+        draw_width: be_f32(bytes, cursor + 8, FORMAT).ok()?,
+        draw_height: be_f32(bytes, cursor + 12, FORMAT).ok()?,
+        upper_surface: [
+            color(cursor + 16)?,
+            color(cursor + 20)?,
+            color(cursor + 24)?,
+            0xff,
+        ],
+        lower_surface: [
+            color(cursor + 28)?,
+            color(cursor + 32)?,
+            color(cursor + 36)?,
+            0xff,
+        ],
+    })
+}
+
+fn read_map_obj_grass_blade_count(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    type_name: &str,
+) -> Option<u32> {
+    if !type_name
+        .rsplit("::")
+        .next()?
+        .eq_ignore_ascii_case("MapObjGrassGroup")
+    {
+        return None;
+    }
+
+    // TMapObjGrassGroup::load first delegates to JDrama::TActor::load. After
+    // the transform that base loader consumes a character name followed by a
+    // TLightMap (count, then index/name pairs). The grass blade count is the
+    // next big-endian u32 in the placement stream.
+    let (_, mut cursor) = read_len_string(bytes, start, end).ok()?;
+    let light_count = be_u32(bytes, cursor, FORMAT).ok()? as usize;
+    if light_count > 64 {
+        return None;
+    }
+    cursor = cursor.checked_add(4)?;
+    for _ in 0..light_count {
+        cursor = cursor.checked_add(4)?;
+        let (_, next) = read_len_string(bytes, cursor, end).ok()?;
+        cursor = next;
+    }
+
+    let count = be_u32(bytes, cursor, FORMAT).ok()?;
+    (count <= 200_000).then_some(count)
 }
 
 fn read_light(bytes: &[u8], start: usize, end: usize, name: Option<String>) -> Option<JDramaLight> {
@@ -446,6 +541,51 @@ mod tests {
         assert_eq!(params.parts_color_indices, [1, 255, 2]);
         assert_eq!(params.parts_mask, 264);
         assert_eq!(params.action_flags, 100);
+    }
+
+    #[test]
+    fn reads_map_obj_grass_count_after_actor_light_map() {
+        let mut bytes = Vec::new();
+        put_len_string(&mut bytes, b"grass character");
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.extend_from_slice(&3_u32.to_be_bytes());
+        put_len_string(&mut bytes, b"object light");
+        bytes.extend_from_slice(&21_000_u32.to_be_bytes());
+
+        assert_eq!(
+            read_map_obj_grass_blade_count(&bytes, 0, bytes.len(), "JDrama::MapObjGrassGroup"),
+            Some(21_000)
+        );
+        assert_eq!(
+            read_map_obj_grass_blade_count(&bytes, 0, bytes.len(), "MapObjGrassManager"),
+            None
+        );
+    }
+
+    #[test]
+    fn reads_map_wire_manager_draw_settings() {
+        let mut bytes = Vec::new();
+        put_len_string(&mut bytes, b"wire character");
+        bytes.extend_from_slice(&200_u32.to_be_bytes());
+        bytes.extend_from_slice(&10_u32.to_be_bytes());
+        bytes.extend_from_slice(&10.0_f32.to_be_bytes());
+        bytes.extend_from_slice(&20.0_f32.to_be_bytes());
+        for channel in [200_u32, 201, 202, 128, 129, 130] {
+            bytes.extend_from_slice(&channel.to_be_bytes());
+        }
+
+        assert_eq!(
+            read_map_wire_manager_params(&bytes, 0, bytes.len(), "MapWireManager"),
+            Some(JDramaMapWireManagerParams {
+                wire_capacity: 200,
+                actor_capacity: 10,
+                draw_width: 10.0,
+                draw_height: 20.0,
+                upper_surface: [200, 201, 202, 255],
+                lower_surface: [128, 129, 130, 255],
+            })
+        );
+        assert!(read_map_wire_manager_params(&bytes, 0, bytes.len(), "MapObjManager").is_none());
     }
 
     #[test]

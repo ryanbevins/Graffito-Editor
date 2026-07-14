@@ -649,7 +649,6 @@ fn preview_for_texture_alpha(has_alpha: bool, has_translucent_alpha: bool) -> Mo
         bounds_max: [1.0, 1.0, 1.0],
         camera_bounds_min: [0.0, 0.0, 0.0],
         camera_bounds_max: [1.0, 1.0, 1.0],
-        sky_radius: 0.0,
         loaded_models: 1,
         failed_models: 0,
         source_vertices: 0,
@@ -921,15 +920,6 @@ fn skybox_vertices_track_camera_translation() {
         preview_triangle_world_vertices(vertices, PreviewRenderLayer::Main, camera),
         vertices
     );
-}
-
-#[test]
-fn skybox_radius_expands_the_far_clip() {
-    let mut preview = preview_for_texture_alpha(false, false);
-    preview.sky_radius = 150_000.0;
-
-    let far = preview.far_clip(1_000.0);
-    assert!((157_000.0..158_000.0).contains(&far));
 }
 
 #[test]
@@ -1445,7 +1435,6 @@ fn updating_object_transform_moves_cached_preview_mesh() {
             bounds_max: [1.0, 2.0, 3.0],
             camera_bounds_min: [0.0, 0.0, 0.0],
             camera_bounds_max: [1.0, 2.0, 3.0],
-            sky_radius: 0.0,
             loaded_models: 1,
             failed_models: 0,
             source_vertices: 3,

@@ -11,7 +11,7 @@ use std::time::Instant;
 use eframe::egui;
 use sms_formats::{
     decode_bti_texture, discover_scene_archives, mount_scene_archive, parse_jdrama_object_records,
-    read_stage_asset_bytes, J3dAlphaCompare, J3dBillboard, J3dBlendMode, J3dFile,
+    read_stage_asset_bytes, J3dAlphaCompare, J3dBillboard, J3dBillboardMode, J3dBlendMode, J3dFile,
     J3dGeometryPreview, J3dJointAnimation, J3dJointTransformOverride, J3dMaterial, J3dMatrix34,
     J3dPreparedAnimatedTriangles, J3dPreviewCombineMode, J3dTexturePatternAnimation,
     J3dTextureSrtAnimation, J3dTriangle, J3dZMode, JpaEffect, SceneArchiveInfo, StageAsset,
@@ -688,7 +688,6 @@ impl SmsEditorApp {
         let mut bounds_max = [f32::NEG_INFINITY; 3];
         let mut camera_bounds_min = [f32::INFINITY; 3];
         let mut camera_bounds_max = [f32::NEG_INFINITY; 3];
-        let mut sky_radius = 0.0f32;
         let mut camera_bound_points = Vec::new();
         let mut loaded_models = 0;
         let mut failed_models = 0;
@@ -754,9 +753,7 @@ impl SmsEditorApp {
                     source_vertices += preview.positions.len();
                     source_triangles += preview.triangles.len();
                     source_textures += preview.textures.len();
-                    if is_sky {
-                        sky_radius = sky_radius.max(max_distance_from_origin(&preview.positions));
-                    } else {
+                    if !is_sky {
                         merge_bounds(
                             &mut bounds_min,
                             &mut bounds_max,
@@ -846,9 +843,7 @@ impl SmsEditorApp {
                     loaded_models += 1;
                     let model_index = loaded_models;
                     source_vertices += preview.positions.len();
-                    if is_sky {
-                        sky_radius = sky_radius.max(max_distance_from_origin(&preview.positions));
-                    } else {
+                    if !is_sky {
                         merge_bounds(
                             &mut bounds_min,
                             &mut bounds_max,
@@ -880,6 +875,49 @@ impl SmsEditorApp {
         }
 
         let world_triangle_end = triangles.len();
+        if visibility.environment {
+            let grass =
+                build_procedural_grass_preview(document, loaded_models + 1, next_packet_index);
+            if grass.group_count != 0 {
+                loaded_models += grass.group_count;
+                source_vertices += grass.blade_count * 3;
+                source_triangles += grass.blade_count;
+                merge_bounds(
+                    &mut bounds_min,
+                    &mut bounds_max,
+                    grass.bounds_min,
+                    grass.bounds_max,
+                );
+                points.extend(grass.points);
+                triangles.extend(grass.triangles);
+                object_model_indices.extend(grass.object_model_indices);
+                next_packet_index += 1;
+            }
+
+            let wires = build_procedural_wire_preview(
+                document,
+                loaded_models + 1,
+                next_packet_index,
+                &mut textures,
+                &mut materials,
+            );
+            if wires.wire_count != 0 {
+                loaded_models += wires.wire_count;
+                source_vertices += wires.source_vertices;
+                source_triangles += wires.source_triangles;
+                source_textures += wires.source_textures;
+                merge_bounds(
+                    &mut bounds_min,
+                    &mut bounds_max,
+                    wires.bounds_min,
+                    wires.bounds_max,
+                );
+                points.extend(wires.points);
+                triangles.extend(wires.triangles);
+                next_packet_index += wires.packet_count;
+                material_animation_bindings.resize_with(materials.len(), Vec::new);
+            }
+        }
         let mut object_model_cache =
             BTreeMap::<(String, u32, String), CachedObjectModelPreview>::new();
         let mut accessory_model_cache = BTreeMap::<String, CachedAccessoryModelPreview>::new();
@@ -1351,7 +1389,6 @@ impl SmsEditorApp {
             bounds_max,
             camera_bounds_min,
             camera_bounds_max,
-            sky_radius,
             loaded_models,
             failed_models,
             source_vertices,
@@ -1472,6 +1509,12 @@ use preview_assets::*;
 
 mod preview_particles;
 use preview_particles::*;
+
+mod preview_grass;
+use preview_grass::*;
+
+mod preview_wires;
+use preview_wires::*;
 
 mod npc_accessories;
 use npc_accessories::*;
@@ -1886,14 +1929,6 @@ fn merge_bounds(
         bounds_min[axis] = bounds_min[axis].min(next_min[axis]);
         bounds_max[axis] = bounds_max[axis].max(next_max[axis]);
     }
-}
-
-fn max_distance_from_origin(points: &[[f32; 3]]) -> f32 {
-    points
-        .iter()
-        .filter(|point| point.iter().all(|value| value.is_finite()))
-        .map(|point| vec3_dot(*point, *point).sqrt())
-        .fold(0.0, f32::max)
 }
 
 fn preview_triangle_world_vertices(
