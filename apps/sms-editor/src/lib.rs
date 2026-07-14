@@ -642,6 +642,7 @@ impl SmsEditorApp {
             .assets
             .iter()
             .filter(|asset| asset.kind == StageAssetKind::Model)
+            .filter(|asset| map_static_model_is_active(document, &asset.path.to_string_lossy()))
             .filter(|asset| {
                 pollution_layer_model_is_active(
                     &asset.path.to_string_lossy(),
@@ -2371,6 +2372,44 @@ fn path_is_indirect_water_model_path(path: &str) -> bool {
 
 fn path_is_goop_model_path(path: &str) -> bool {
     path.contains("/map/pollution/") || path.contains("pollution")
+}
+
+fn map_static_model_is_active(document: &StageDocument, model_path: &str) -> bool {
+    let Some(registry) = document.registry.as_ref() else {
+        return true;
+    };
+    let model_path = normalized_preview_asset_path(model_path);
+    let matching_definitions = registry
+        .map_static_models
+        .iter()
+        .filter(|definition| runtime_model_path_matches_asset(&definition.model_path, &model_path))
+        .collect::<Vec<_>>();
+    if matching_definitions.is_empty() {
+        return true;
+    }
+
+    matching_definitions.iter().any(|definition| {
+        document.objects.iter().any(|object| {
+            object.factory_name.eq_ignore_ascii_case("MapStaticObj")
+                && object
+                    .raw_params
+                    .get("stream_string_0")
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&definition.actor_name))
+        })
+    })
+}
+
+fn runtime_model_path_matches_asset(runtime_path: &str, asset_path: &str) -> bool {
+    let runtime_path = runtime_path.replace('\\', "/").to_ascii_lowercase();
+    let asset_path = asset_path.replace('\\', "/").to_ascii_lowercase();
+    if asset_path.ends_with(&runtime_path) {
+        return true;
+    }
+    let mounted_path = asset_path
+        .split_once("!/")
+        .map(|(_, path)| format!("/{path}"))
+        .unwrap_or_else(|| asset_path.clone());
+    runtime_path.ends_with(&mounted_path)
 }
 
 fn active_pollution_layer_count(document: &StageDocument) -> usize {

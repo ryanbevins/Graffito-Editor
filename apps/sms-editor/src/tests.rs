@@ -1129,6 +1129,57 @@ fn named_pollution_map_meshes_are_goop() {
 }
 
 #[test]
+fn decomp_owned_map_static_models_require_a_matching_placement() {
+    let mut document = test_document(Vec::new());
+    document.registry = Some(ObjectRegistry {
+        map_static_models: vec![
+            sms_schema::MapStaticModelDefinition {
+                actor_name: "BiancoRiver".to_string(),
+                model_path: "/scene/map/map/BiancoRiver.bmd".to_string(),
+                load_flags: 0x1021_0000,
+                source_file: "src/Map/MapStaticObject.cpp".to_string(),
+            },
+            sms_schema::MapStaticModelDefinition {
+                actor_name: "BiaWaterPollution".to_string(),
+                model_path: "/scene/map/map/BiaWaterPollution.bmd".to_string(),
+                load_flags: 0x1122_0000,
+                source_file: "src/Map/MapStaticObject.cpp".to_string(),
+            },
+        ],
+        ..ObjectRegistry::default()
+    });
+    let mut river = SceneObject::new("river", "MapStaticObj");
+    river
+        .raw_params
+        .insert("stream_string_0".to_string(), "BiancoRiver".to_string());
+    document.objects.push(river);
+
+    assert!(map_static_model_is_active(
+        &document,
+        "stage.szs!/map/map/BiancoRiver.bmd"
+    ));
+    assert!(!map_static_model_is_active(
+        &document,
+        "stage.szs!/map/map/BiaWaterPollution.bmd"
+    ));
+    assert!(map_static_model_is_active(
+        &document,
+        "stage.szs!/map/map/map.bmd"
+    ));
+
+    let mut pollution = SceneObject::new("dirty lake", "MapStaticObj");
+    pollution.raw_params.insert(
+        "stream_string_0".to_string(),
+        "BiaWaterPollution".to_string(),
+    );
+    document.objects.push(pollution);
+    assert!(map_static_model_is_active(
+        &document,
+        "stage.szs!/map/map/BiaWaterPollution.bmd"
+    ));
+}
+
+#[test]
 fn sea_meshes_are_level_water_layer() {
     let path = "stage.szs!/map/map/sea.bmd";
 

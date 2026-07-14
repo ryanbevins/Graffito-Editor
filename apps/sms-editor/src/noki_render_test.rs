@@ -6,6 +6,42 @@ const BASE_ROOT_ENV: &str = "SMS_NOKI_TEST_BASE_ROOT";
 const OUTPUT_ENV: &str = "SMS_NOKI_TEST_OUTPUT";
 
 #[test]
+#[ignore = "requires an extracted retail base root"]
+fn bianco_water_pollution_model_follows_map_static_placement() {
+    let base_root = env::var_os(BASE_ROOT_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("set {BASE_ROOT_ENV} to the extracted game's data directory"));
+    let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let registry = SchemaGenerator::new(decomp_root)
+        .generate()
+        .expect("generate decomp-derived object metadata");
+
+    for (stage_id, expected_active) in [("bianco5", false), ("bianco6", false), ("bianco7", true)] {
+        let document = StageDocument::open(&base_root, stage_id)
+            .unwrap_or_else(|error| panic!("open {stage_id}: {error}"))
+            .with_registry(registry.clone());
+        let asset = document
+            .assets
+            .iter()
+            .find(|asset| {
+                asset
+                    .path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_ascii_lowercase()
+                    .ends_with("/map/map/biawaterpollution.bmd")
+            })
+            .unwrap_or_else(|| panic!("{stage_id} contains BiaWaterPollution.bmd"));
+
+        assert_eq!(
+            map_static_model_is_active(&document, &asset.path.to_string_lossy()),
+            expected_active,
+            "{stage_id} must follow its retail MapStaticObj placement"
+        );
+    }
+}
+
+#[test]
 #[ignore = "requires an extracted retail base root and is a manual performance probe"]
 fn profiles_dolpic0_preview_and_animation_updates() {
     let base_root = env::var_os(BASE_ROOT_ENV)

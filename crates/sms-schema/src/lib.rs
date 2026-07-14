@@ -27,6 +27,8 @@ pub struct ObjectRegistry {
     pub params: Vec<ParamDefinition>,
     pub asset_hints: Vec<AssetHint>,
     #[serde(default)]
+    pub map_static_models: Vec<MapStaticModelDefinition>,
+    #[serde(default)]
     pub particle_resources: Vec<ParticleResourceDefinition>,
     #[serde(default)]
     pub actor_particle_bindings: Vec<ActorParticleBinding>,
@@ -126,6 +128,14 @@ pub struct AssetHint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapStaticModelDefinition {
+    pub actor_name: String,
+    pub model_path: String,
+    pub load_flags: u32,
+    pub source_file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParticleResourceDefinition {
     pub effect_id: u16,
     pub path: String,
@@ -218,6 +228,7 @@ impl SchemaGenerator {
         self.scan_mar_name_ref_gen(&mut registry)?;
         self.scan_map_obj_manager(&mut registry)?;
         self.scan_params_and_assets(&mut registry)?;
+        self.scan_map_static_models(&mut registry)?;
         self.scan_particle_bindings(&mut registry)?;
         self.scan_npc_init_data(&mut registry)?;
         dedup_registry(&mut registry);
@@ -304,6 +315,14 @@ impl SchemaGenerator {
             extract_particle_resources(&text, &source_file, registry);
             extract_calc_particle_bindings(&text, &source_file, registry);
         }
+        Ok(())
+    }
+
+    fn scan_map_static_models(&self, registry: &mut ObjectRegistry) -> Result<()> {
+        let path = self.repo_root.join("src/Map/MapStaticObject.cpp");
+        let text = read_required(&path)?;
+        let source_file = normalize_source_path(&self.repo_root, &path);
+        registry.map_static_models = extract_map_static_models(&text, &source_file);
         Ok(())
     }
 
@@ -581,6 +600,55 @@ fn parse_cpp_u32(value: &str) -> Option<u32> {
     }
 }
 
+fn extract_map_static_models(text: &str, source_file: &str) -> Vec<MapStaticModelDefinition> {
+    let table_re = Regex::new(
+        r"static\s+const\s+TMapStaticObj::ActorDataTableEntry\s+actor_data_table\s*\[\s*\]\s*=\s*\{",
+    )
+    .expect("valid map-static table regex");
+    let Some(table) = table_re.find(text) else {
+        return Vec::new();
+    };
+    let Some(body) = braced_body(text, table.end() - 1) else {
+        return Vec::new();
+    };
+    let entry_re = Regex::new(r"\{([^{}]+)\}").expect("valid map-static entry regex");
+    let mut models = Vec::new();
+
+    for entry in entry_re.captures_iter(body) {
+        let fields = split_cpp_initializer_fields(&entry[1]);
+        if fields.len() < 17 {
+            continue;
+        }
+        let Some(actor_name) = parse_cpp_string(fields[0]) else {
+            continue;
+        };
+        let Some(model_name) = parse_cpp_string(fields[8]) else {
+            continue;
+        };
+        let Some(load_flags) = parse_cpp_u32(fields[9]) else {
+            continue;
+        };
+        let Some(resource_flags) = parse_cpp_u32(fields[16]) else {
+            continue;
+        };
+        let directory = if resource_flags & 0x2 != 0 {
+            "/common/map"
+        } else if resource_flags & 0x4 != 0 {
+            "/scene/mapObj"
+        } else {
+            "/scene/map/map"
+        };
+        models.push(MapStaticModelDefinition {
+            actor_name,
+            model_path: format!("{directory}/{model_name}.bmd"),
+            load_flags,
+            source_file: source_file.to_string(),
+        });
+    }
+
+    models
+}
+
 fn extract_particle_resources(text: &str, source_file: &str, registry: &mut ObjectRegistry) {
     let load_re = Regex::new(
         r#"(?:gpResourceManager|[A-Za-z_][A-Za-z0-9_]*ResourceManager)\s*->\s*load\s*\(\s*\"([^\"]+\.jpa)\"\s*,\s*(0[xX][0-9A-Fa-f]+|[0-9]+)"#,
@@ -828,6 +896,14 @@ fn dedup_registry(registry: &mut ObjectRegistry) {
     });
     registry.asset_hints.dedup();
 
+    registry.map_static_models.sort_by(|a, b| {
+        a.model_path
+            .cmp(&b.model_path)
+            .then_with(|| a.actor_name.cmp(&b.actor_name))
+            .then_with(|| a.source_file.cmp(&b.source_file))
+    });
+    registry.map_static_models.dedup();
+
     registry.particle_resources.sort_by(|a, b| {
         a.effect_id
             .cmp(&b.effect_id)
@@ -975,6 +1051,29 @@ mod tests {
         assert!(actor.parts[0].uses_shared_materials);
         assert_eq!(actor.parts[1].bit_index, 2);
         assert_eq!(actor.parts[1].models[0].joint_name, None);
+    }
+
+    #[test]
+    fn extracts_map_static_model_paths_and_loader_flags_from_decomp_table() {
+        let text = r#"
+            static const TMapStaticObj::ActorDataTableEntry actor_data_table[] = {
+                { "BiancoRiver", 0, 0, 0.0f, 0.0f, 0.0f, 0.0f, nullptr,
+                  "BiancoRiver", 0x10210000, nullptr, 0, 0xFFFFFFFF, 0, 0, 0, 0x40 },
+                { "CommonThing", 0, 0, 0.0f, 0.0f, 0.0f, 0.0f, nullptr,
+                  "SharedModel", 0x11220000, nullptr, 0, 0xFFFFFFFF, 0, 0, 0, 0x2 },
+                { "NoModel", 0, 0, 0.0f, 0.0f, 0.0f, 0.0f, nullptr,
+                  nullptr, 0x10210000, nullptr, 0, 0xFFFFFFFF, 0, 0, 0, 0 },
+            };
+        "#;
+
+        let models = extract_map_static_models(text, "src/Map/MapStaticObject.cpp");
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].actor_name, "BiancoRiver");
+        assert_eq!(models[0].model_path, "/scene/map/map/BiancoRiver.bmd");
+        assert_eq!(models[0].load_flags, 0x1021_0000);
+        assert_eq!(models[1].model_path, "/common/map/SharedModel.bmd");
+        assert_eq!(models[1].load_flags, 0x1122_0000);
     }
 
     #[test]
