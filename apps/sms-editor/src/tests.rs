@@ -434,6 +434,26 @@ fn npc_eye_material_names_are_treated_as_two_sided_decals() {
 }
 
 #[test]
+fn enemy_material_colors_override_only_decomp_assigned_channels() {
+    let registry = ObjectRegistry {
+        enemy_material_colors: vec![sms_schema::EnemyMaterialTevColorDefinition {
+            factory_name: "PoiHanaRed".to_string(),
+            material_name: "_body".to_string(),
+            tev_register: 0,
+            color: [Some(283), Some(-53), Some(-122), None],
+            source_file: "src/Enemy/poihana.cpp".to_string(),
+        }],
+        ..ObjectRegistry::default()
+    };
+    let mut tev_colors = [[0; 4]; 4];
+    tev_colors[0] = [1, 2, 3, 77];
+
+    apply_enemy_tev_overrides(&mut tev_colors, "_body", "PoiHanaRed", Some(&registry));
+
+    assert_eq!(tev_colors[0], [283, -53, -122, 77]);
+}
+
+#[test]
 fn npc_parts_mask_uses_decomp_schema_metadata() {
     let mut document = test_document(Vec::new());
     document.registry = Some(ObjectRegistry {
@@ -562,7 +582,8 @@ fn monte_model_loader_flags_follow_manager_entries() {
     );
     assert_eq!(
         actor_model_loader_flags(&SceneObject::new("boss", "GateKeeper")),
-        Some(0x1121_0000)
+        None,
+        "enemy loader flags come from the decomp-derived preview catalog"
     );
     assert_eq!(
         actor_model_loader_flags(&SceneObject::new("mare-m", "NPCMareMD")),
@@ -621,6 +642,30 @@ fn palm_leaf_placement_is_kept_as_an_object_preview() {
     assert_eq!(
         object_preview_model_path(&palm_leaf, &BTreeSet::new()).as_deref(),
         Some("stage.szs!/mapobj/palmleaf.bmd")
+    );
+}
+
+#[test]
+fn explicit_preview_hints_stay_distinct_from_inferred_fallbacks() {
+    let mut object = SceneObject::new("boss", "BossTelesa");
+    object.asset_hints.push(AssetRef {
+        path: "stage.szs!/btelesa/guessed.bmd".to_string(),
+        role: AssetRole::InferredPreviewModel,
+    });
+
+    assert!(object_preview_model_path(&object, &BTreeSet::new()).is_none());
+    assert_eq!(
+        object_inferred_preview_model_path(&object, &BTreeSet::new()).as_deref(),
+        Some("stage.szs!/btelesa/guessed.bmd")
+    );
+
+    object.asset_hints.push(AssetRef {
+        path: "stage.szs!/btelesa/explicit.bmd".to_string(),
+        role: AssetRole::PreviewModel,
+    });
+    assert_eq!(
+        object_preview_model_path(&object, &BTreeSet::new()).as_deref(),
+        Some("stage.szs!/btelesa/explicit.bmd")
     );
 }
 
@@ -1166,12 +1211,21 @@ fn decomp_owned_map_static_models_require_a_matching_placement() {
                 model_path: "/scene/map/map/BiancoRiver.bmd".to_string(),
                 load_flags: 0x1021_0000,
                 source_file: "src/Map/MapStaticObject.cpp".to_string(),
+                stage_bootstrap_created: false,
             },
             sms_schema::MapStaticModelDefinition {
                 actor_name: "BiaWaterPollution".to_string(),
                 model_path: "/scene/map/map/BiaWaterPollution.bmd".to_string(),
                 load_flags: 0x1122_0000,
                 source_file: "src/Map/MapStaticObject.cpp".to_string(),
+                stage_bootstrap_created: false,
+            },
+            sms_schema::MapStaticModelDefinition {
+                actor_name: "sea".to_string(),
+                model_path: "/scene/map/map/sea.bmd".to_string(),
+                load_flags: 0x1022_0000,
+                source_file: "src/Map/MapStaticObject.cpp".to_string(),
+                stage_bootstrap_created: true,
             },
         ],
         ..ObjectRegistry::default()
@@ -1189,6 +1243,10 @@ fn decomp_owned_map_static_models_require_a_matching_placement() {
     assert!(!map_static_model_is_active(
         &document,
         "stage.szs!/map/map/BiaWaterPollution.bmd"
+    ));
+    assert!(map_static_model_is_active(
+        &document,
+        "stage.szs!/map/map/sea.bmd"
     ));
     assert!(map_static_model_is_active(
         &document,
@@ -1603,5 +1661,6 @@ fn test_document(objects: Vec<SceneObject>) -> StageDocument {
         registry: None,
         load_issues: Vec::new(),
         lighting: Default::default(),
+        actor_previews: BTreeMap::new(),
     }
 }

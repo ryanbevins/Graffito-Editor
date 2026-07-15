@@ -57,7 +57,9 @@ impl RenderScene {
         for object in &document.objects {
             for hint in &object.asset_hints {
                 match hint.role {
-                    AssetRole::PreviewModel => model_paths.push(hint.path.clone()),
+                    AssetRole::PreviewModel | AssetRole::InferredPreviewModel => {
+                        model_paths.push(hint.path.clone())
+                    }
                     AssetRole::Collision => collision_paths.push(hint.path.clone()),
                     _ => {}
                 }
@@ -176,6 +178,7 @@ mod tests {
             registry: None,
             load_issues: Vec::new(),
             lighting: Default::default(),
+            actor_previews: BTreeMap::new(),
         };
         let scene = RenderScene::from_document(&document);
         let renderer = ViewportRenderer::new(RendererConfig::default());

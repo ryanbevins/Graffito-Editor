@@ -17,6 +17,16 @@ pub struct JDramaObjectRecord {
     pub object_name: Option<String>,
     pub transform: Option<JDramaTransform>,
     pub stream_strings: Vec<String>,
+    #[serde(default)]
+    pub obj_chara_folder: Option<String>,
+    #[serde(default)]
+    pub obj_manager_chara: Option<String>,
+    #[serde(default)]
+    pub live_actor_manager: Option<String>,
+    #[serde(default)]
+    pub actor_character: Option<String>,
+    #[serde(default)]
+    pub mario_modoki_telesa_imitation_index: Option<u32>,
     pub npc_params: Option<JDramaNpcParams>,
     #[serde(default)]
     pub map_obj_grass_blade_count: Option<u32>,
@@ -127,6 +137,19 @@ fn parse_record_at(
     let stream_strings = transform
         .map(|_| scan_ascii_stream_strings(bytes, after_name + 36, end))
         .unwrap_or_default();
+    let obj_chara_folder = read_obj_chara_folder(bytes, after_name, end, &type_name);
+    let obj_manager_chara = read_obj_manager_chara(bytes, after_name, end, &type_name);
+    let live_actor_manager =
+        transform.and_then(|_| read_live_actor_manager(bytes, after_name + 36, end));
+    let actor_character = transform.and_then(|_| {
+        read_len_string(bytes, after_name + 36, end)
+            .ok()
+            .map(|(value, _)| value)
+            .filter(|value| !value.is_empty())
+    });
+    let mario_modoki_telesa_imitation_index = transform.and_then(|_| {
+        read_mario_modoki_telesa_imitation_index(bytes, after_name + 36, end, &type_name)
+    });
     let npc_params =
         transform.and_then(|_| read_npc_params(bytes, after_name + 36, end, &type_name));
     let map_obj_grass_blade_count = transform
@@ -149,6 +172,11 @@ fn parse_record_at(
         object_name,
         transform,
         stream_strings,
+        obj_chara_folder,
+        obj_manager_chara,
+        live_actor_manager,
+        actor_character,
+        mario_modoki_telesa_imitation_index,
         npc_params,
         map_obj_grass_blade_count,
         map_wire_manager,
@@ -169,6 +197,101 @@ fn parse_record_at(
     }
 
     Ok(size)
+}
+
+fn read_mario_modoki_telesa_imitation_index(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    type_name: &str,
+) -> Option<u32> {
+    // TSmallEnemy::load consumes the actor character/light map, manager,
+    // graph, and coin ID. TMarioModokiTelesa::load then appends one u32.
+    // Follow that stream layout instead of interpreting arbitrary tail bytes.
+    if type_name.rsplit("::").next()? != "MarioModokiTelesa" {
+        return None;
+    }
+    let (_, cursor) = read_live_actor_manager_with_cursor(bytes, start, end)?;
+    let (_, cursor) = read_len_string(bytes, cursor, end).ok()?; // graph
+    let selector = cursor.checked_add(4)?; // coin ID
+    if selector.checked_add(4)? != end {
+        return None;
+    }
+    // Values outside the decomp's explicit 1..=12 switch cases are valid and
+    // intentionally retain the default imitation model (retail uses 120).
+    be_u32(bytes, selector, FORMAT).ok()
+}
+
+fn read_obj_chara_folder(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    type_name: &str,
+) -> Option<String> {
+    type_name
+        .rsplit("::")
+        .next()?
+        .eq_ignore_ascii_case("ObjChara")
+        .then(|| {
+            read_len_string(bytes, start, end)
+                .ok()
+                .map(|(value, _)| value)
+        })
+        .flatten()
+}
+
+fn read_obj_manager_chara(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    type_name: &str,
+) -> Option<String> {
+    type_name
+        .rsplit("::")
+        .next()?
+        .contains("Manager")
+        .then(|| {
+            read_len_string(bytes, start, end)
+                .ok()
+                .map(|(value, _)| value)
+        })
+        .flatten()
+}
+
+fn read_live_actor_manager(bytes: &[u8], start: usize, end: usize) -> Option<String> {
+    read_live_actor_manager_with_cursor(bytes, start, end).map(|(manager, _)| manager)
+}
+
+fn read_live_actor_manager_with_cursor(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+) -> Option<(String, usize)> {
+    // JDrama::TActor::load reads a TCharacter name followed by a TLightMap.
+    // TLiveActor and TSpineEnemy then read the TLiveManager name. Following
+    // that exact stream layout avoids guessing a manager from an actor type.
+    let (_, mut cursor) = read_len_string(bytes, start, end).ok()?;
+    if cursor.checked_add(4)? > end {
+        return None;
+    }
+    let light_count = be_u32(bytes, cursor, FORMAT).ok()? as usize;
+    cursor = cursor.checked_add(4)?;
+    // Every light-map entry contains a u32 index and at least the u16 length
+    // of its name. Bound the loop by the containing record instead of
+    // imposing a format limit that JDrama itself does not have.
+    if light_count > end.checked_sub(cursor)? / 6 {
+        return None;
+    }
+    for _ in 0..light_count {
+        if cursor.checked_add(4)? > end {
+            return None;
+        }
+        cursor = cursor.checked_add(4)?;
+        let (_, next) = read_len_string(bytes, cursor, end).ok()?;
+        cursor = next;
+    }
+    let (manager, cursor) = read_len_string(bytes, cursor, end).ok()?;
+    (!manager.is_empty()).then_some((manager, cursor))
 }
 
 fn read_cube_general_info(
@@ -260,10 +383,10 @@ fn read_map_obj_grass_blade_count(
     // next big-endian u32 in the placement stream.
     let (_, mut cursor) = read_len_string(bytes, start, end).ok()?;
     let light_count = be_u32(bytes, cursor, FORMAT).ok()? as usize;
-    if light_count > 64 {
+    cursor = cursor.checked_add(4)?;
+    if light_count > end.checked_sub(cursor)? / 6 {
         return None;
     }
-    cursor = cursor.checked_add(4)?;
     for _ in 0..light_count {
         cursor = cursor.checked_add(4)?;
         let (_, next) = read_len_string(bytes, cursor, end).ok()?;
@@ -351,6 +474,9 @@ fn read_npc_params(
     let (_, mut cursor) = read_len_string(bytes, start, end).ok()?;
     let light_count = be_u32(bytes, cursor, FORMAT).ok()? as usize;
     cursor = cursor.checked_add(4)?;
+    if light_count > end.checked_sub(cursor)? / 6 {
+        return None;
+    }
     for _ in 0..light_count {
         cursor = cursor.checked_add(4)?;
         let (_, next) = read_len_string(bytes, cursor, end).ok()?;
@@ -629,6 +755,90 @@ mod tests {
     }
 
     #[test]
+    fn reads_obj_chara_folder_and_manager_reference_from_their_load_streams() {
+        let mut chara_bytes = Vec::new();
+        put_len_string(&mut chara_bytes, b"/scene/hamukuri");
+        assert_eq!(
+            read_obj_chara_folder(&chara_bytes, 0, chara_bytes.len(), "ObjChara").as_deref(),
+            Some("/scene/hamukuri")
+        );
+        assert!(
+            read_obj_chara_folder(&chara_bytes, 0, chara_bytes.len(), "HamuKuriManager").is_none()
+        );
+
+        let mut manager_bytes = Vec::new();
+        put_len_string(&mut manager_bytes, b"HamuKuriChara");
+        manager_bytes.extend_from_slice(&32_u32.to_be_bytes());
+        assert_eq!(
+            read_obj_manager_chara(&manager_bytes, 0, manager_bytes.len(), "HamuKuriManager")
+                .as_deref(),
+            Some("HamuKuriChara")
+        );
+        assert_eq!(
+            read_obj_manager_chara(&manager_bytes, 0, manager_bytes.len(), "FruitsBoatManagerB")
+                .as_deref(),
+            Some("HamuKuriChara")
+        );
+        assert!(
+            read_obj_manager_chara(&manager_bytes, 0, manager_bytes.len(), "HamuKuri").is_none()
+        );
+    }
+
+    #[test]
+    fn reads_live_actor_manager_after_character_and_light_map() {
+        let mut bytes = Vec::new();
+        put_len_string(&mut bytes, b"Enemy Character");
+        bytes.extend_from_slice(&2_u32.to_be_bytes());
+        bytes.extend_from_slice(&7_u32.to_be_bytes());
+        put_len_string(&mut bytes, b"Object Light");
+        bytes.extend_from_slice(&11_u32.to_be_bytes());
+        put_len_string(&mut bytes, b"Object Shadow Light");
+        put_len_string(&mut bytes, b"HamuKuri Manager");
+
+        assert_eq!(
+            read_live_actor_manager(&bytes, 0, bytes.len()).as_deref(),
+            Some("HamuKuri Manager")
+        );
+    }
+
+    #[test]
+    fn reads_live_actor_manager_with_record_bounded_large_light_map() {
+        let mut bytes = Vec::new();
+        put_len_string(&mut bytes, b"Enemy Character");
+        bytes.extend_from_slice(&65_u32.to_be_bytes());
+        for index in 0..65_u32 {
+            bytes.extend_from_slice(&index.to_be_bytes());
+            put_len_string(&mut bytes, b"Object Light");
+        }
+        put_len_string(&mut bytes, b"HamuKuri Manager");
+
+        assert_eq!(
+            read_live_actor_manager(&bytes, 0, bytes.len()).as_deref(),
+            Some("HamuKuri Manager")
+        );
+    }
+
+    #[test]
+    fn reads_mario_modoki_telesa_imitation_index_from_subclass_tail() {
+        let mut bytes = Vec::new();
+        put_len_string(&mut bytes, b"Telesa Character");
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        put_len_string(&mut bytes, b"Telesa Manager");
+        put_len_string(&mut bytes, b"(null)");
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+        bytes.extend_from_slice(&120_u32.to_be_bytes());
+
+        assert_eq!(
+            read_mario_modoki_telesa_imitation_index(&bytes, 0, bytes.len(), "MarioModokiTelesa"),
+            Some(120)
+        );
+        assert_eq!(
+            read_mario_modoki_telesa_imitation_index(&bytes, 0, bytes.len(), "Telesa"),
+            None
+        );
+    }
+
+    #[test]
     fn reads_cube_general_info_using_runtime_scale_and_model_slot() {
         let mut bytes = Vec::new();
         for value in [10.0_f32, 20.0, 30.0, 0.0, 45.0, 0.0, 2.0, 3.0, 4.0] {
@@ -690,5 +900,27 @@ mod tests {
 
         assert_eq!(value, "バルーンヘルプv1");
         assert_eq!(next, bytes.len());
+    }
+
+    #[test]
+    #[ignore = "requires an extracted retail base root"]
+    fn parses_retail_obj_chara_resource_folders() {
+        let base_root = std::env::var_os("SMS_BASE_ROOT")
+            .map(std::path::PathBuf::from)
+            .expect("set SMS_BASE_ROOT to the extracted game's root");
+        let bytes = std::fs::read(base_root.join("files/data/scenecmn.bin"))
+            .expect("read retail scenecmn.bin");
+        let records = parse_jdrama_object_records(&bytes).expect("parse retail scenecmn.bin");
+        let folders = records
+            .iter()
+            .filter_map(|record| record.obj_chara_folder.as_deref())
+            .collect::<Vec<_>>();
+        assert!(
+            folders.len() > 40,
+            "unexpected ObjChara coverage: {folders:?}"
+        );
+        assert!(folders.contains(&"/scene/hamukuri"));
+        assert!(folders.contains(&"/scene/bgeso"));
+        assert!(folders.contains(&"/scene/bosseel"));
     }
 }

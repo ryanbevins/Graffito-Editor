@@ -4,12 +4,20 @@ pub(super) fn push_object_preview_materials(
     materials: &mut Vec<J3dMaterial>,
     cached: &CachedObjectModelPreview,
     object: &SceneObject,
+    registry: Option<&ObjectRegistry>,
 ) -> usize {
     let nozzle_tev_reg1 = nozzle_box_tev_reg1_color(object);
     let has_npc_colors = monte_material_colors(object).is_some()
         || mare_body_color(object).is_some()
         || npc_pollution_k_color(object).is_some();
-    if nozzle_tev_reg1.is_none() && !has_npc_colors {
+    let has_enemy_colors = registry.is_some_and(|registry| {
+        registry.enemy_material_colors.iter().any(|definition| {
+            definition
+                .factory_name
+                .eq_ignore_ascii_case(&object.factory_name)
+        })
+    });
+    if nozzle_tev_reg1.is_none() && !has_npc_colors && !has_enemy_colors {
         return cached.material_base;
     }
     let source_end = cached.material_base + cached.preview.materials.len();
@@ -27,9 +35,47 @@ pub(super) fn push_object_preview_materials(
         }
         apply_monte_material_color(&mut material, object);
         apply_mare_material_color(&mut material, object);
+        apply_enemy_material_colors(&mut material, object, registry);
         materials.push(material);
     }
     material_base
+}
+
+pub(super) fn apply_enemy_material_colors(
+    material: &mut J3dMaterial,
+    object: &SceneObject,
+    registry: Option<&ObjectRegistry>,
+) {
+    apply_enemy_tev_overrides(
+        &mut material.tev_colors,
+        &material.name,
+        &object.factory_name,
+        registry,
+    );
+}
+
+pub(super) fn apply_enemy_tev_overrides(
+    tev_colors: &mut [[i16; 4]; 4],
+    material_name: &str,
+    factory_name: &str,
+    registry: Option<&ObjectRegistry>,
+) {
+    let Some(registry) = registry else {
+        return;
+    };
+    for definition in registry.enemy_material_colors.iter().filter(|definition| {
+        definition.factory_name.eq_ignore_ascii_case(factory_name)
+            && definition.material_name.eq_ignore_ascii_case(material_name)
+    }) {
+        let Some(target) = tev_colors.get_mut(usize::from(definition.tev_register)) else {
+            continue;
+        };
+        for (target, source) in target.iter_mut().zip(definition.color) {
+            if let Some(source) = source {
+                *target = source;
+            }
+        }
+    }
 }
 
 pub(super) fn apply_mare_material_color(material: &mut J3dMaterial, object: &SceneObject) {

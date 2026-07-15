@@ -204,6 +204,7 @@ mod tests {
             registry: None,
             load_issues: Vec::new(),
             lighting: Default::default(),
+            actor_previews: BTreeMap::new(),
         };
         let mut grass = SceneObject::new("grass-0", "MapObjGrassGroup");
         grass.transform.translation = [100.0, 20.0, -50.0];

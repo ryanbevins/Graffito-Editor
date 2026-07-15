@@ -7,6 +7,63 @@ const OUTPUT_ENV: &str = "SMS_NOKI_TEST_OUTPUT";
 
 #[test]
 #[ignore = "requires an extracted retail base root"]
+fn mamma0_ocean_water_survives_enemy_preview_catalog() {
+    let base_root = env::var_os(BASE_ROOT_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("set {BASE_ROOT_ENV} to the extracted game's data directory"));
+    let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let registry = SchemaGenerator::new(decomp_root)
+        .generate()
+        .expect("generate decomp-derived object metadata");
+    let document = StageDocument::open(&base_root, "mamma0")
+        .expect("open mamma0")
+        .with_registry(registry);
+
+    let preview = SmsEditorApp::build_model_preview(
+        &document,
+        PreviewVisibility {
+            environment: true,
+            goop: true,
+            effects: false,
+        },
+    )
+    .expect("build mamma0 preview");
+    let water_triangles = preview
+        .triangles
+        .iter()
+        .filter(|triangle| triangle.render_layer == PreviewRenderLayer::Water)
+        .count();
+
+    assert_eq!(water_triangles, 1_595, "mamma0 retail sea geometry");
+
+    for (factory_name, expected_rgb) in [
+        ("PoiHana", [-191, 8, 303]),
+        ("PoiHanaRed", [283, -53, -122]),
+    ] {
+        let object = document
+            .objects
+            .iter()
+            .find(|object| object.factory_name.eq_ignore_ascii_case(factory_name))
+            .unwrap_or_else(|| panic!("mamma0 contains {factory_name}"));
+        let model_index = preview.object_model_indices[&object.id];
+        let body_material = preview
+            .triangles
+            .iter()
+            .filter(|triangle| triangle.model_index == model_index)
+            .filter_map(|triangle| triangle.material_index)
+            .map(|index| &preview.materials[index])
+            .find(|material| material.name.eq_ignore_ascii_case("_body"))
+            .unwrap_or_else(|| panic!("{factory_name} _body material"));
+        assert_eq!(
+            body_material.tev_colors[0][..3],
+            expected_rgb,
+            "{factory_name} runtime TEV register 0 color"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires an extracted retail base root"]
 fn bianco_water_pollution_model_follows_map_static_placement() {
     let base_root = env::var_os(BASE_ROOT_ENV)
         .map(PathBuf::from)

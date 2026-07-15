@@ -9,7 +9,9 @@ use sms_formats::{
     parse_jdrama_object_records, read_stage_asset_bytes, scan_stage_assets, JDramaAmbient,
     JDramaLight, SourceLocation, StageAsset, StageAssetKind,
 };
-use sms_schema::ObjectRegistry;
+use sms_schema::{
+    EnemyActorDefinition, EnemyManagerDefinition, EnemyModelDefinition, ObjectRegistry,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -70,6 +72,15 @@ pub struct StageDocument {
     pub load_issues: Vec<ValidationIssue>,
     #[serde(default)]
     pub lighting: StageLighting,
+    #[serde(skip)]
+    pub actor_previews: BTreeMap<String, ActorPreview>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorPreview {
+    pub model_path: String,
+    pub load_flags: u32,
+    pub manager_factory: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -136,12 +147,35 @@ impl StageDocument {
             registry: None,
             load_issues,
             lighting,
+            actor_previews: BTreeMap::new(),
         })
     }
 
     pub fn with_registry(mut self, registry: ObjectRegistry) -> Self {
-        self.registry = Some(registry);
+        self.set_registry(registry);
         self
+    }
+
+    pub fn set_registry(&mut self, registry: ObjectRegistry) {
+        let (actor_previews, preview_issues) =
+            build_actor_preview_catalog(&self.base_root, &self.assets, &registry);
+        self.actor_previews = actor_previews;
+        self.load_issues
+            .retain(|issue| !issue.code.starts_with("enemy-preview-"));
+        self.load_issues.extend(preview_issues);
+        self.registry = Some(registry);
+    }
+
+    pub fn actor_preview(&self, object: &SceneObject) -> Option<&ActorPreview> {
+        object
+            .source
+            .as_ref()
+            .and_then(actor_preview_source_key)
+            .and_then(|key| self.actor_previews.get(&key))
+            .or_else(|| {
+                self.actor_previews
+                    .get(&actor_preview_factory_key(&object.factory_name))
+            })
     }
 
     pub fn add_object(&mut self, object: SceneObject) {
@@ -415,6 +449,7 @@ pub struct AssetRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AssetRole {
     PreviewModel,
+    InferredPreviewModel,
     Collision,
     Texture,
     Animation,
@@ -648,7 +683,7 @@ fn load_scene_objects_from_assets(
             if let Some(model_path) = infer_preview_model_path(&object, &model_index) {
                 object.asset_hints.push(AssetRef {
                     path: model_path,
-                    role: AssetRole::PreviewModel,
+                    role: AssetRole::InferredPreviewModel,
                 });
             }
 
@@ -678,6 +713,439 @@ fn stage_model_index(assets: &[StageAsset]) -> Vec<(String, String)> {
         .collect();
     models.sort_by(|a, b| a.0.cmp(&b.0));
     models
+}
+
+#[derive(Clone)]
+struct StageManagerResource {
+    factory_name: String,
+    chara_name: String,
+}
+
+fn build_actor_preview_catalog(
+    base_root: &Path,
+    assets: &[StageAsset],
+    registry: &ObjectRegistry,
+) -> (BTreeMap<String, ActorPreview>, Vec<ValidationIssue>) {
+    let chara_folders = match load_obj_chara_folders(base_root) {
+        Ok(folders) => folders,
+        Err(_) if registry.enemy_managers.is_empty() => return (BTreeMap::new(), Vec::new()),
+        Err(message) => {
+            return (
+                BTreeMap::new(),
+                vec![ValidationIssue::warning(
+                    "enemy-preview-catalog-unavailable",
+                    message,
+                )],
+            );
+        }
+    };
+    let model_index = stage_model_index(assets);
+    let mut catalog = BTreeMap::new();
+    let mut issues = Vec::new();
+    let mut unresolved_factories = BTreeSet::new();
+
+    for asset in assets
+        .iter()
+        .filter(|asset| asset.kind == StageAssetKind::Placement)
+        .filter(|asset| {
+            asset
+                .path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .ends_with("/map/scene.bin")
+        })
+    {
+        let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+            issues.push(ValidationIssue::warning(
+                "enemy-preview-placement-read-failed",
+                format!(
+                    "Could not reread {} while resolving enemy previews",
+                    asset.path.display()
+                ),
+            ));
+            continue;
+        };
+        let Ok(records) = parse_jdrama_object_records(&bytes) else {
+            issues.push(ValidationIssue::warning(
+                "enemy-preview-placement-parse-failed",
+                format!(
+                    "Could not reparse {} while resolving enemy previews",
+                    asset.path.display()
+                ),
+            ));
+            continue;
+        };
+        let managers = records
+            .iter()
+            .filter_map(|record| {
+                Some((
+                    record.object_name.clone()?,
+                    StageManagerResource {
+                        factory_name: record.type_name.clone(),
+                        chara_name: record.obj_manager_chara.clone()?,
+                    },
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        for actor in &registry.enemy_actors {
+            let factory_key = actor_preview_factory_key(&actor.factory_name);
+            if let Some(model) = actor.indexed_models.iter().find(|model| model.index == 0) {
+                if let Some(model_path) =
+                    resolve_resource_model_path(&model.model_path, &model_index)
+                {
+                    catalog
+                        .entry(factory_key.clone())
+                        .or_insert_with(|| ActorPreview {
+                            model_path,
+                            load_flags: model.load_flags,
+                            manager_factory: format!("{} actor", actor.factory_name),
+                        });
+                }
+            }
+            for manager_factory in &actor.manager_factories {
+                let Some(manager_resource) = managers
+                    .values()
+                    .find(|resource| resource.factory_name.eq_ignore_ascii_case(manager_factory))
+                else {
+                    continue;
+                };
+                let Some(manager) = registry.find_enemy_manager(&manager_resource.factory_name)
+                else {
+                    continue;
+                };
+                let Some(folder) = chara_folders.get(&manager_resource.chara_name) else {
+                    continue;
+                };
+                let Some(preview) =
+                    resolve_manager_actor_preview(actor, manager, folder, &model_index)
+                else {
+                    continue;
+                };
+                catalog.entry(factory_key.clone()).or_insert(preview);
+                break;
+            }
+            if catalog.contains_key(&factory_key) {
+                continue;
+            }
+            for manager_factory in &actor.manager_factories {
+                let Some(target_manager) = registry.find_enemy_manager(manager_factory) else {
+                    continue;
+                };
+                for manager_resource in managers.values() {
+                    let Some(stage_manager) =
+                        registry.find_enemy_manager(&manager_resource.factory_name)
+                    else {
+                        continue;
+                    };
+                    if !manager_model_tables_are_aliases(target_manager, stage_manager) {
+                        continue;
+                    }
+                    let Some(folder) = chara_folders.get(&manager_resource.chara_name) else {
+                        continue;
+                    };
+                    let Some(preview) =
+                        resolve_manager_actor_preview(actor, target_manager, folder, &model_index)
+                    else {
+                        continue;
+                    };
+                    catalog.insert(factory_key.clone(), preview);
+                    break;
+                }
+                if catalog.contains_key(&factory_key) {
+                    break;
+                }
+            }
+        }
+
+        for record in records.iter().filter(|record| record.transform.is_some()) {
+            let has_manager_model_binding = record
+                .live_actor_manager
+                .as_ref()
+                .and_then(|manager_name| managers.get(manager_name))
+                .and_then(|resource| {
+                    Some((
+                        registry.find_enemy_manager(&resource.factory_name)?,
+                        chara_folders.get(&resource.chara_name)?,
+                    ))
+                })
+                .is_some();
+            let has_actor_model_binding =
+                registry
+                    .find_enemy_actor(&record.type_name)
+                    .is_some_and(|actor| {
+                        (!actor.fallback_models.is_empty()
+                            && record
+                                .actor_character
+                                .as_ref()
+                                .and_then(|character| chara_folders.get(character))
+                                .is_some())
+                            || actor.named_models.iter().any(|model| {
+                                record
+                                    .object_name
+                                    .as_ref()
+                                    .is_some_and(|name| name == &model.actor_name)
+                            })
+                            || (!actor.indexed_models.is_empty()
+                                && record.mario_modoki_telesa_imitation_index.is_some())
+                    });
+            let direct_actor_preview = (|| {
+                let actor = registry.find_enemy_actor(&record.type_name)?;
+                if let Some(selected) = actor
+                    .named_models
+                    .iter()
+                    .find(|model| record.object_name.as_ref() == Some(&model.actor_name))
+                {
+                    return resolve_resource_model_path(&selected.model_path, &model_index).map(
+                        |path| {
+                            (
+                                path,
+                                selected.load_flags,
+                                format!("{} actor", actor.factory_name),
+                            )
+                        },
+                    );
+                }
+                let index = record.mario_modoki_telesa_imitation_index?;
+                let exact = actor
+                    .indexed_models
+                    .iter()
+                    .find(|model| model.index == index);
+                let default = actor.indexed_models.iter().find(|model| model.index == 0);
+                exact
+                    .into_iter()
+                    .chain(default.filter(|_| index != 0))
+                    .find_map(|model| {
+                        resolve_resource_model_path(&model.model_path, &model_index).map(|path| {
+                            (
+                                path,
+                                model.load_flags,
+                                format!("{} actor", actor.factory_name),
+                            )
+                        })
+                    })
+            })();
+            let manager_preview = (|| {
+                let manager_name = record.live_actor_manager.as_ref()?;
+                let manager_resource = managers.get(manager_name)?;
+                let manager = registry.find_enemy_manager(&manager_resource.factory_name)?;
+                let folder = chara_folders.get(&manager_resource.chara_name)?;
+                let actor = registry.find_enemy_actor(&record.type_name);
+                resolve_manager_actor_preview(actor?, manager, folder, &model_index).map(
+                    |preview| {
+                        (
+                            preview.model_path,
+                            preview.load_flags,
+                            preview.manager_factory,
+                        )
+                    },
+                )
+            })();
+            let actor_preview = (|| {
+                let actor = registry.find_enemy_actor(&record.type_name)?;
+                let character = record.actor_character.as_ref()?;
+                let folder = chara_folders.get(character)?;
+                actor.fallback_models.iter().find_map(|model| {
+                    resolve_chara_model_path(folder, &model.model_name, &model_index).map(|path| {
+                        (
+                            path,
+                            model.load_flags,
+                            format!("{} actor", actor.factory_name),
+                        )
+                    })
+                })
+            })();
+            let Some((model_path, load_flags, manager_factory)) =
+                direct_actor_preview.or(manager_preview).or(actor_preview)
+            else {
+                if has_manager_model_binding || has_actor_model_binding {
+                    unresolved_factories.insert(record.type_name.clone());
+                }
+                continue;
+            };
+            let source = SourceLocation {
+                path: asset.path.clone(),
+                offset: Some(record.offset as u64),
+                length: Some(record.size as u64),
+            };
+            let Some(key) = actor_preview_source_key(&source) else {
+                continue;
+            };
+            let preview = ActorPreview {
+                model_path,
+                load_flags,
+                manager_factory,
+            };
+            catalog.insert(key, preview.clone());
+            let used_named_actor_preview = registry
+                .find_enemy_actor(&record.type_name)
+                .is_some_and(|actor| {
+                    actor
+                        .named_models
+                        .iter()
+                        .any(|model| record.object_name.as_ref() == Some(&model.actor_name))
+                });
+            let factory_preview = registry
+                .find_enemy_actor(&record.type_name)
+                .and_then(|actor| {
+                    let model = actor.indexed_models.iter().find(|model| model.index == 0)?;
+                    Some(ActorPreview {
+                        model_path: resolve_resource_model_path(&model.model_path, &model_index)?,
+                        load_flags: model.load_flags,
+                        manager_factory: format!("{} actor", actor.factory_name),
+                    })
+                })
+                .or_else(|| (!used_named_actor_preview).then(|| preview.clone()));
+            if let Some(factory_preview) = factory_preview {
+                catalog
+                    .entry(actor_preview_factory_key(&record.type_name))
+                    .or_insert(factory_preview);
+            }
+        }
+    }
+    if !unresolved_factories.is_empty() {
+        issues.push(ValidationIssue::warning(
+            "enemy-preview-model-unresolved",
+            format!(
+                "Could not resolve stage model assets for: {}",
+                unresolved_factories
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+    (catalog, issues)
+}
+
+fn load_obj_chara_folders(
+    base_root: &Path,
+) -> std::result::Result<BTreeMap<String, String>, String> {
+    let candidates = [
+        base_root.join("files/data/scenecmn.bin"),
+        base_root.join("data/scenecmn.bin"),
+        base_root.join("scenecmn.bin"),
+    ];
+    let Some(path) = candidates.into_iter().find(|path| path.is_file()) else {
+        return Err(format!(
+            "Could not find data/scenecmn.bin under {} for enemy resource binding",
+            base_root.display()
+        ));
+    };
+    let bytes = fs::read(&path).map_err(|error| {
+        format!(
+            "Could not read {} for enemy resource binding: {error}",
+            path.display()
+        )
+    })?;
+    let records = parse_jdrama_object_records(&bytes).map_err(|error| {
+        format!(
+            "Could not parse {} for enemy resource binding: {error}",
+            path.display()
+        )
+    })?;
+    Ok(records
+        .into_iter()
+        .filter_map(|record| Some((record.object_name?, record.obj_chara_folder?)))
+        .collect())
+}
+
+fn resolve_chara_model_path(
+    folder: &str,
+    model_name: &str,
+    model_index: &[(String, String)],
+) -> Option<String> {
+    resolve_resource_model_path(&format!("{folder}/{model_name}"), model_index)
+}
+
+fn resolve_manager_actor_preview(
+    actor: &EnemyActorDefinition,
+    manager: &EnemyManagerDefinition,
+    folder: &str,
+    model_index: &[(String, String)],
+) -> Option<ActorPreview> {
+    actor_manager_model_candidates(actor, manager)
+        .into_iter()
+        .find_map(|model| {
+            resolve_chara_model_path(folder, &model.model_name, model_index).map(|model_path| {
+                ActorPreview {
+                    model_path,
+                    load_flags: model.load_flags,
+                    manager_factory: manager.factory_name.clone(),
+                }
+            })
+        })
+}
+
+fn actor_manager_model_candidates<'a>(
+    actor: &'a EnemyActorDefinition,
+    manager: &'a EnemyManagerDefinition,
+) -> Vec<&'a EnemyModelDefinition> {
+    if !actor.fallback_models.is_empty() {
+        return actor.fallback_models.iter().collect();
+    }
+    if let Some(model_index) = actor.model_index.or(manager.model_index) {
+        return manager.models.get(model_index).into_iter().collect();
+    }
+    if let Some(primary_model) = &actor.primary_model {
+        return manager
+            .models
+            .iter()
+            .filter(|model| model.model_name.eq_ignore_ascii_case(primary_model))
+            .collect();
+    }
+    manager.models.first().into_iter().collect()
+}
+
+fn manager_model_tables_are_aliases(
+    target: &EnemyManagerDefinition,
+    stage: &EnemyManagerDefinition,
+) -> bool {
+    !target.models.is_empty()
+        && target.models.len() == stage.models.len()
+        && target
+            .models
+            .iter()
+            .all(|model| !model.model_name.eq_ignore_ascii_case("default.bmd"))
+        && target
+            .models
+            .iter()
+            .zip(&stage.models)
+            .all(|(target, stage)| {
+                target.model_name.eq_ignore_ascii_case(&stage.model_name)
+                    && target.load_flags == stage.load_flags
+            })
+}
+
+fn resolve_resource_model_path(
+    model_path: &str,
+    model_index: &[(String, String)],
+) -> Option<String> {
+    let normalized = model_path.replace('\\', "/").to_ascii_lowercase();
+    let suffix = normalized
+        .strip_prefix("/scene/")
+        .unwrap_or_else(|| normalized.trim_start_matches('/'));
+    model_index
+        .iter()
+        .find(|(path, _)| {
+            path.replace('\\', "/")
+                .to_ascii_lowercase()
+                .ends_with(&suffix)
+        })
+        .map(|(path, _)| path.clone())
+}
+
+fn actor_preview_source_key(source: &SourceLocation) -> Option<String> {
+    Some(format!(
+        "{}@{:x}",
+        source.path.to_string_lossy().replace('\\', "/"),
+        source.offset?
+    ))
+}
+
+fn actor_preview_factory_key(factory_name: &str) -> String {
+    format!("factory:{}", factory_name.to_ascii_lowercase())
 }
 
 fn infer_preview_model_path(
@@ -746,9 +1214,6 @@ fn infer_preview_model_path(
 
 fn actor_preview_model_identity(factory_name: &str) -> Option<(&'static str, &'static str)> {
     match factory_name.to_ascii_lowercase().as_str() {
-        // TBiancoGateKeeperManager::createModelData registers this model, while
-        // the placement factory is simply `GateKeeper`.
-        "gatekeeper" => Some(("gatekeeper", "gene_pakkun_model1.bmd")),
         "npcmontem" => Some(("montem", "mom_model.bmd")),
         "npcmontema" => Some(("montema", "moma_model.bmd")),
         "npcmontemb" => Some(("montemb", "momb_model.bmd")),
@@ -895,6 +1360,7 @@ mod tests {
             registry: None,
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
+            actor_previews: BTreeMap::new(),
         };
         let mut object = SceneObject::new("obj-1", "coin");
         object.transform.translation[0] = f32::NAN;
@@ -915,6 +1381,7 @@ mod tests {
             registry: None,
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
+            actor_previews: BTreeMap::new(),
         };
 
         doc.queue_editor_overlay_change().unwrap();
@@ -1022,6 +1489,7 @@ mod tests {
             registry: None,
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
+            actor_previews: BTreeMap::new(),
         }
     }
 
@@ -1051,7 +1519,274 @@ mod tests {
     }
 
     #[test]
-    fn resolves_gatekeeper_model_from_decomp_manager_resource_name() {
+    #[ignore = "requires the extracted retail game and neighboring SMS decomp"]
+    fn audits_all_retail_enemy_and_boss_previews() {
+        let base_root = std::env::var_os("SMS_BASE_ROOT")
+            .map(PathBuf::from)
+            .expect("set SMS_BASE_ROOT to the extracted game's root");
+        let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let registry = sms_schema::SchemaGenerator::new(decomp_root)
+            .generate()
+            .expect("generate enemy schema");
+        let boss_factories = registry
+            .enemy_actors
+            .iter()
+            .filter(|actor| {
+                registry
+                    .find_object(&actor.factory_name)
+                    .is_some_and(|object| object.category == "Boss")
+            })
+            .map(|actor| actor.factory_name.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(boss_factories.len(), 21, "unexpected boss schema coverage");
+        let archives = sms_formats::discover_scene_archives(&base_root)
+            .expect("discover retail scene archives");
+        assert_eq!(archives.len(), 107, "unexpected retail scene archive count");
+        let mut placed = BTreeMap::<String, usize>::new();
+        let mut rendered = BTreeMap::<String, usize>::new();
+        let mut preview_models = BTreeMap::<(String, u32), String>::new();
+        let mut factory_previews = BTreeSet::new();
+        let mut boss_factory_previews = BTreeSet::new();
+        let mut hino_model_paths = BTreeSet::new();
+        let mut named_emario_count = 0;
+
+        for archive in archives {
+            let assets = sms_formats::mount_scene_archive(&archive.path)
+                .unwrap_or_else(|error| panic!("mount {}: {error}", archive.path.display()));
+            hino_model_paths.extend(
+                assets
+                    .iter()
+                    .filter(|asset| asset.kind == StageAssetKind::Model)
+                    .map(|asset| asset.path.to_string_lossy().replace('\\', "/"))
+                    .filter(|path| path.to_ascii_lowercase().contains("hinokuri2")),
+            );
+            let (catalog, issues) = build_actor_preview_catalog(&base_root, &assets, &registry);
+            assert!(
+                issues.is_empty(),
+                "enemy preview issues in {}: {issues:?}",
+                archive.stage_id
+            );
+            for actor in &registry.enemy_actors {
+                let factory = &actor.factory_name;
+                if let Some(preview) = catalog.get(&actor_preview_factory_key(factory)) {
+                    factory_previews.insert(factory.clone());
+                    if boss_factories.contains(factory) {
+                        boss_factory_previews.insert(factory.clone());
+                    }
+                    preview_models
+                        .entry((preview.model_path.clone(), preview.load_flags))
+                        .or_insert_with(|| factory.clone());
+                }
+            }
+            for asset in assets.iter().filter(|asset| {
+                asset.kind == StageAssetKind::Placement
+                    && asset
+                        .path
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                        .to_ascii_lowercase()
+                        .ends_with("/map/scene.bin")
+            }) {
+                let bytes = read_stage_asset_bytes(&asset.path).expect("read placement");
+                let records = parse_jdrama_object_records(&bytes).expect("parse placement");
+                for record in
+                    records.iter().filter(|record| {
+                        record.transform.is_some()
+                            && registry
+                                .find_object(&record.type_name)
+                                .is_some_and(|object| {
+                                    matches!(object.category.as_str(), "Enemy" | "Boss")
+                                        && !object.class_name.rsplit("::").next().is_some_and(
+                                            |class_name| class_name.ends_with("Manager"),
+                                        )
+                                })
+                    })
+                {
+                    assert!(
+                        registry.find_enemy_actor(&record.type_name).is_some(),
+                        "missing enemy actor schema for placed {}",
+                        record.type_name
+                    );
+                    *placed.entry(record.type_name.clone()).or_default() += 1;
+                    let source = SourceLocation {
+                        path: asset.path.clone(),
+                        offset: Some(record.offset as u64),
+                        length: Some(record.size as u64),
+                    };
+                    let preview =
+                        actor_preview_source_key(&source).and_then(|key| catalog.get(&key));
+                    if let Some(preview) = preview {
+                        *rendered.entry(record.type_name.clone()).or_default() += 1;
+                        preview_models
+                            .entry((preview.model_path.clone(), preview.load_flags))
+                            .or_insert_with(|| record.type_name.clone());
+                        if record.type_name == "EMario"
+                            && record.object_name.as_deref() == Some("モンテマン")
+                        {
+                            assert!(preview
+                                .model_path
+                                .replace('\\', "/")
+                                .to_ascii_lowercase()
+                                .ends_with("/map/map/pad/monteman_model.bmd"));
+                            assert_eq!(preview.load_flags, 0x1004_0000);
+                            named_emario_count += 1;
+                        } else if record.type_name == "EMario" {
+                            assert!(preview
+                                .model_path
+                                .replace('\\', "/")
+                                .to_ascii_lowercase()
+                                .ends_with("/kagemario/default.bmd"));
+                            assert_eq!(preview.load_flags, 0x1130_0000);
+                        }
+                        if record.type_name == "MarioModokiTelesa" {
+                            let actor = registry.find_enemy_actor(&record.type_name).unwrap();
+                            let index = record
+                                .mario_modoki_telesa_imitation_index
+                                .expect("typed imitation selector");
+                            let expected = actor
+                                .indexed_models
+                                .iter()
+                                .find(|model| model.index == index)
+                                .or_else(|| {
+                                    actor.indexed_models.iter().find(|model| model.index == 0)
+                                })
+                                .unwrap();
+                            assert!(preview
+                                .model_path
+                                .replace('\\', "/")
+                                .to_ascii_lowercase()
+                                .ends_with(
+                                    expected
+                                        .model_path
+                                        .trim_start_matches("/scene/")
+                                        .to_ascii_lowercase()
+                                        .as_str()
+                                ));
+                            assert_eq!(preview.load_flags, expected.load_flags);
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            placed.len(),
+            70,
+            "unexpected placed enemy/boss factory count"
+        );
+
+        let unresolved = placed
+            .iter()
+            .filter_map(|(factory, count)| {
+                let resolved = rendered.get(factory).copied().unwrap_or(0);
+                (resolved != *count).then_some((factory.clone(), *count, resolved))
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "enemy preview factories: {} placed, {} fully resolved; unresolved={unresolved:?}",
+            placed.len(),
+            placed.len() - unresolved.len()
+        );
+        assert_eq!(
+            unresolved
+                .iter()
+                .map(|(factory, _, _)| factory.as_str())
+                .collect::<Vec<_>>(),
+            ["EffectBiancoFunsui", "EffectPinnaFunsui"],
+            "only the particle-only fountain actors may lack models"
+        );
+        assert_eq!(rendered.get("EMario"), placed.get("EMario"));
+        assert_eq!(named_emario_count, 3);
+        for factory in placed.keys().filter(|factory| {
+            !matches!(factory.as_str(), "EffectBiancoFunsui" | "EffectPinnaFunsui")
+        }) {
+            assert!(
+                factory_previews.contains(factory),
+                "placed enemy {factory} lacks a source-less factory preview"
+            );
+        }
+        for factory in ["EggGenerator", "WickedEggGenerator"] {
+            assert!(
+                factory_previews.contains(factory),
+                "runtime enemy {factory} lacks a source-less factory preview"
+            );
+        }
+        let missing_actor_factory_previews = registry
+            .enemy_actors
+            .iter()
+            .map(|actor| actor.factory_name.clone())
+            .filter(|factory| !factory_previews.contains(factory))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            missing_actor_factory_previews,
+            [
+                "EffectBiancoFunsui",
+                "EffectEnemy",
+                "EffectPinnaFunsui",
+                "HinoKuri2",
+                "KageMarioModoki",
+                "NamekuriLauncher",
+            ],
+            "only particle-only or registered-but-unshipped enemy factories may lack a retail preview"
+        );
+
+        let unplaced_bosses = boss_factories
+            .iter()
+            .filter(|factory| !placed.contains_key(*factory))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unplaced_bosses.len(),
+            6,
+            "unexpected runtime-created boss coverage: {unplaced_bosses:?}"
+        );
+        assert!(
+            hino_model_paths.is_empty(),
+            "HinoKuri2 unexpectedly has retail model resources: {hino_model_paths:?}"
+        );
+        let missing_boss_previews = boss_factories
+            .difference(&boss_factory_previews)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            missing_boss_previews,
+            ["HinoKuri2"],
+            "only the unshipped HinoKuri2 factory may lack a retail preview"
+        );
+
+        for (factory, count) in &placed {
+            let is_boss = registry
+                .find_object(factory)
+                .is_some_and(|object| object.category == "Boss");
+            if is_boss {
+                assert_eq!(
+                    rendered.get(factory),
+                    Some(count),
+                    "unresolved boss {factory}"
+                );
+            }
+        }
+
+        for ((model_path, load_flags), factory) in preview_models {
+            let bytes = read_stage_asset_bytes(&model_path).unwrap_or_else(|error| {
+                panic!("read {factory} preview {model_path} ({load_flags:#010x}): {error}")
+            });
+            let file = sms_formats::J3dFile::parse(&bytes)
+                .unwrap_or_else(|error| panic!("parse {factory} preview {model_path}: {error}"));
+            let geometry = file
+                .geometry_preview_with_loader_flags(load_flags)
+                .unwrap_or_else(|error| {
+                    panic!("prepare {factory} preview {model_path} ({load_flags:#010x}): {error}")
+                });
+            assert!(
+                !geometry.triangles.is_empty(),
+                "empty {factory} preview {model_path} ({load_flags:#010x})"
+            );
+        }
+    }
+
+    #[test]
+    fn resolves_enemy_model_from_exact_chara_folder_and_decomp_model_name() {
         let models = vec![
             (
                 "stage.szs!/gatekeeper/gene_pakkun_model1.bmd".to_string(),
@@ -1062,12 +1797,231 @@ mod tests {
                 "stampkeepermodel1".to_string(),
             ),
         ];
-        let object = SceneObject::new("bianco boss", "GateKeeper");
-
         assert_eq!(
-            infer_preview_model_path(&object, &models).as_deref(),
+            resolve_chara_model_path("/scene/gatekeeper", "gene_pakkun_model1.bmd", &models)
+                .as_deref(),
             Some("stage.szs!/gatekeeper/gene_pakkun_model1.bmd")
         );
+    }
+
+    #[test]
+    fn actor_default_model_flags_override_the_manager_table() {
+        let actor = EnemyActorDefinition {
+            factory_name: "EMario".to_string(),
+            class_name: "TEMario".to_string(),
+            model_index: None,
+            fallback_models: vec![sms_schema::EnemyModelDefinition {
+                model_name: "default.bmd".to_string(),
+                load_flags: 0x1130_0000,
+                source_file: "src/Enemy/emario.cpp".to_string(),
+            }],
+            primary_model: None,
+            named_models: Vec::new(),
+            indexed_models: Vec::new(),
+            manager_factories: vec!["EMarioManager".to_string()],
+        };
+        let manager = EnemyManagerDefinition {
+            factory_name: "EMarioManager".to_string(),
+            class_name: "TEMarioManager".to_string(),
+            model_index: None,
+            spawned_actor_class: Some("TEMario".to_string()),
+            models: vec![sms_schema::EnemyModelDefinition {
+                model_name: "default.bmd".to_string(),
+                load_flags: 0x1021_0000,
+                source_file: "src/Strategic/ObjModel.cpp".to_string(),
+            }],
+        };
+        let models = vec![(
+            "stage.szs!/kagemario/default.bmd".to_string(),
+            "kagemariodefault".to_string(),
+        )];
+
+        let preview =
+            resolve_manager_actor_preview(&actor, &manager, "/scene/kagemario", &models).unwrap();
+
+        assert_eq!(preview.model_path, "stage.szs!/kagemario/default.bmd");
+        assert_eq!(preview.load_flags, 0x1130_0000);
+        assert_eq!(preview.manager_factory, "EMarioManager");
+    }
+
+    #[test]
+    fn indexed_enemy_variant_uses_its_decomp_model_slot() {
+        let actor = EnemyActorDefinition {
+            factory_name: "ButterflyC".to_string(),
+            class_name: "TButterfloid".to_string(),
+            model_index: Some(2),
+            fallback_models: Vec::new(),
+            primary_model: None,
+            named_models: Vec::new(),
+            indexed_models: Vec::new(),
+            manager_factories: vec!["ButterflyManager".to_string()],
+        };
+        let manager = EnemyManagerDefinition {
+            factory_name: "ButterflyManager".to_string(),
+            class_name: "TButterfloidManager".to_string(),
+            model_index: None,
+            spawned_actor_class: None,
+            models: ["butterflyA.bmd", "butterflyB.bmd", "butterflyC.bmd"]
+                .into_iter()
+                .map(|model_name| sms_schema::EnemyModelDefinition {
+                    model_name: model_name.to_string(),
+                    load_flags: 0x1021_0000,
+                    source_file: "src/Animal/Butterfly.cpp".to_string(),
+                })
+                .collect(),
+        };
+        let models = ["butterflyA.bmd", "butterflyB.bmd", "butterflyC.bmd"]
+            .into_iter()
+            .map(|model_name| {
+                (
+                    format!("stage.szs!/butterfly/{model_name}"),
+                    normalize_model_key(model_name),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let preview =
+            resolve_manager_actor_preview(&actor, &manager, "/scene/butterfly", &models).unwrap();
+
+        assert_eq!(preview.model_path, "stage.szs!/butterfly/butterflyC.bmd");
+        assert_eq!(preview.load_flags, 0x1021_0000);
+    }
+
+    #[test]
+    fn managerless_runtime_boss_reuses_an_exact_manager_model_table() {
+        let actor = EnemyActorDefinition {
+            factory_name: "LimitKoopa".to_string(),
+            class_name: "TLimitKoopa".to_string(),
+            model_index: None,
+            fallback_models: Vec::new(),
+            primary_model: None,
+            named_models: Vec::new(),
+            indexed_models: Vec::new(),
+            manager_factories: vec!["LimitKoopaManager".to_string()],
+        };
+        let target_manager = EnemyManagerDefinition {
+            factory_name: "LimitKoopaManager".to_string(),
+            class_name: "TLimitKoopaManager".to_string(),
+            model_index: None,
+            spawned_actor_class: None,
+            models: vec![sms_schema::EnemyModelDefinition {
+                model_name: "koopa_model.bmd".to_string(),
+                load_flags: 0x1424_0000,
+                source_file: "src/Enemy/limitkoopa.cpp".to_string(),
+            }],
+        };
+        let stage_manager = EnemyManagerDefinition {
+            factory_name: "KoopaManager".to_string(),
+            class_name: "TKoopaManager".to_string(),
+            model_index: None,
+            spawned_actor_class: None,
+            models: vec![sms_schema::EnemyModelDefinition {
+                model_name: "koopa_model.bmd".to_string(),
+                load_flags: 0x1424_0000,
+                source_file: "src/Enemy/koopa.cpp".to_string(),
+            }],
+        };
+        let models = vec![(
+            "coronaBoss.szs!/koopa/koopa_model.bmd".to_string(),
+            "koopakoopamodel".to_string(),
+        )];
+
+        assert!(manager_model_tables_are_aliases(
+            &target_manager,
+            &stage_manager
+        ));
+        let preview =
+            resolve_manager_actor_preview(&actor, &target_manager, "/scene/koopa", &models)
+                .unwrap();
+        assert_eq!(preview.model_path, "coronaBoss.szs!/koopa/koopa_model.bmd");
+        assert_eq!(preview.load_flags, 0x1424_0000);
+
+        let mut generic_target = target_manager.clone();
+        generic_target.models[0].model_name = "default.bmd".to_string();
+        let mut generic_stage = stage_manager;
+        generic_stage.models[0].model_name = "default.bmd".to_string();
+        assert!(!manager_model_tables_are_aliases(
+            &generic_target,
+            &generic_stage
+        ));
+    }
+
+    #[test]
+    fn actor_primary_model_is_not_substituted_with_a_base_manager_model() {
+        let actor = EnemyActorDefinition {
+            factory_name: "HaneHamuKuri2".to_string(),
+            class_name: "THaneHamuKuri2".to_string(),
+            model_index: None,
+            fallback_models: Vec::new(),
+            primary_model: Some("hanekuri.bmd".to_string()),
+            named_models: Vec::new(),
+            indexed_models: Vec::new(),
+            manager_factories: vec!["HaneHamuKuriManager".to_string()],
+        };
+        let base_manager = EnemyManagerDefinition {
+            factory_name: "HamuKuriManager".to_string(),
+            class_name: "THamuKuriManager".to_string(),
+            model_index: None,
+            spawned_actor_class: Some("THamuKuri".to_string()),
+            models: vec![sms_schema::EnemyModelDefinition {
+                model_name: "default.bmd".to_string(),
+                load_flags: 0x1022_0000,
+                source_file: "src/Enemy/hamukuri.cpp".to_string(),
+            }],
+        };
+        let models = vec![(
+            "stage.szs!/hamukuri/default.bmd".to_string(),
+            "hamukuridefault".to_string(),
+        )];
+
+        assert!(
+            resolve_manager_actor_preview(&actor, &base_manager, "/scene/hamukuri", &models)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn source_less_spawned_enemy_reuses_stage_factory_preview() {
+        let mut document = empty_document("bianco0");
+        document.actor_previews.insert(
+            actor_preview_factory_key("HamuKuri"),
+            ActorPreview {
+                model_path: "bianco0.szs!/hamukuri/default.bmd".to_string(),
+                load_flags: 0x1022_0000,
+                manager_factory: "HamuKuriManager".to_string(),
+            },
+        );
+        let spawned = SceneObject::new("spawned", "HamuKuri");
+
+        let preview = document.actor_preview(&spawned).unwrap();
+        assert_eq!(preview.model_path, "bianco0.szs!/hamukuri/default.bmd");
+        assert_eq!(preview.load_flags, 0x1022_0000);
+    }
+
+    #[test]
+    fn replacing_registry_rebuilds_catalog_and_replaces_catalog_issues() {
+        let mut document = empty_document("bianco0");
+        document.actor_previews.insert(
+            actor_preview_factory_key("HamuKuri"),
+            ActorPreview {
+                model_path: "stale.bmd".to_string(),
+                load_flags: 0,
+                manager_factory: "stale".to_string(),
+            },
+        );
+        document.load_issues.push(ValidationIssue::warning(
+            "enemy-preview-stale",
+            "old catalog issue",
+        ));
+        document
+            .load_issues
+            .push(ValidationIssue::warning("unrelated", "keep me"));
+
+        document.set_registry(ObjectRegistry::default());
+
+        assert!(document.actor_previews.is_empty());
+        assert_eq!(document.load_issues.len(), 1);
+        assert_eq!(document.load_issues[0].code, "unrelated");
     }
 
     #[test]

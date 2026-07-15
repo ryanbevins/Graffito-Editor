@@ -503,7 +503,7 @@ impl SmsEditorApp {
                                 registry.objects.len()
                             ));
                             if let Some(document) = &mut self.document {
-                                document.registry = Some(registry.clone());
+                                document.set_registry(registry.clone());
                                 self.issues = document.validate();
                             }
                             self.registry = Some(registry);
@@ -931,10 +931,21 @@ impl SmsEditorApp {
             BTreeMap::<(String, u32, String), CachedObjectModelPreview>::new();
         let mut accessory_model_cache = BTreeMap::<String, CachedAccessoryModelPreview>::new();
         for object in &document.objects {
-            let Some(model_path) = object_preview_model_path(object, &world_model_paths) else {
+            let explicit_model_path = object_preview_model_path(object, &world_model_paths);
+            let catalog_preview = explicit_model_path
+                .is_none()
+                .then(|| document.actor_preview(object))
+                .flatten()
+                .filter(|preview| is_supported_object_preview_model_path(&preview.model_path));
+            let model_path = explicit_model_path
+                .or_else(|| catalog_preview.map(|preview| preview.model_path.clone()))
+                .or_else(|| object_inferred_preview_model_path(object, &world_model_paths));
+            let Some(model_path) = model_path else {
                 continue;
             };
-            let loader_flags = actor_model_loader_flags(object)
+            let loader_flags = catalog_preview
+                .map(|preview| preview.load_flags)
+                .or_else(|| actor_model_loader_flags(object))
                 .unwrap_or_else(|| model_loader_flags_for_path(&model_path));
             let object_render_layer = preview_render_layer_for_model_path(&model_path);
             let object_preview_transform = if object_render_layer == PreviewRenderLayer::Heatwave {
@@ -1002,8 +1013,12 @@ impl SmsEditorApp {
             let Some(cached) = object_model_cache.get(&model_cache_key) else {
                 continue;
             };
-            let object_material_base =
-                push_object_preview_materials(&mut materials, cached, object);
+            let object_material_base = push_object_preview_materials(
+                &mut materials,
+                cached,
+                object,
+                document.registry.as_ref(),
+            );
             material_animation_bindings.resize_with(materials.len(), Vec::new);
             attach_model_texture_srt_animation(
                 document,
@@ -1875,10 +1890,25 @@ fn object_preview_model_path(
     object: &SceneObject,
     world_model_paths: &BTreeSet<String>,
 ) -> Option<String> {
+    object_preview_model_path_for_role(object, world_model_paths, AssetRole::PreviewModel)
+}
+
+fn object_inferred_preview_model_path(
+    object: &SceneObject,
+    world_model_paths: &BTreeSet<String>,
+) -> Option<String> {
+    object_preview_model_path_for_role(object, world_model_paths, AssetRole::InferredPreviewModel)
+}
+
+fn object_preview_model_path_for_role(
+    object: &SceneObject,
+    world_model_paths: &BTreeSet<String>,
+    role: AssetRole,
+) -> Option<String> {
     object
         .asset_hints
         .iter()
-        .find(|hint| hint.role == AssetRole::PreviewModel)
+        .find(|hint| hint.role == role)
         .map(|hint| hint.path.as_str())
         .filter(|path| should_instance_object_preview_model(path, world_model_paths))
         .map(str::to_owned)
@@ -2466,6 +2496,12 @@ fn map_static_model_is_active(document: &StageDocument, model_path: &str) -> boo
     if matching_definitions.is_empty() {
         return true;
     }
+    if matching_definitions
+        .iter()
+        .any(|definition| definition.stage_bootstrap_created)
+    {
+        return true;
+    }
 
     matching_definitions.iter().any(|definition| {
         document.objects.iter().any(|object| {
@@ -2570,9 +2606,6 @@ fn model_loader_flags_for_path(path: &str) -> u32 {
 fn actor_model_loader_flags(object: &SceneObject) -> Option<u32> {
     let factory = object.factory_name.to_ascii_lowercase();
     Some(match factory.as_str() {
-        // TBiancoGateKeeperManager::createModelData uses these flags for
-        // gene_pakkun_model1.bmd.
-        "gatekeeper" => 0x1121_0000,
         "npcmontem" | "npcmontema" | "npcmontemc" | "npcmontew" | "npcmontewa" => 0x1030_0000,
         "npcmontemb" | "npcmontemd" | "npcmontemf" | "npcmontemg" | "npcmontemh" | "npcmontewb"
         | "npcmontewc" => 0x1021_0000,
