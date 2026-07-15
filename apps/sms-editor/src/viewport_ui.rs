@@ -6,6 +6,20 @@ const CAMERA_SPEED_SCROLL_SCALE: f32 = 240.0;
 const CAMERA_FLY_ACCELERATION_INTERP_SPEED: f32 = 8.0;
 const CAMERA_FLY_DECELERATION_INTERP_SPEED: f32 = 12.0;
 const CAMERA_FLY_STOP_SPEED: f32 = 0.5;
+const PICK_DEPTH_EPSILON: f32 = 0.01;
+
+fn preview_triangle_writes_opaque_depth(
+    preview: &ModelPreview,
+    triangle: &PreviewTriangle,
+) -> bool {
+    !matches!(
+        triangle.render_layer,
+        PreviewRenderLayer::Sky
+            | PreviewRenderLayer::MirrorScene
+            | PreviewRenderLayer::WaveFoam
+            | PreviewRenderLayer::IndirectWater
+    ) && !preview_triangle_is_translucent(preview, triangle)
+}
 
 pub(super) fn outline_segments_from_coverage(
     coverage: &[bool],
@@ -265,14 +279,21 @@ impl SmsEditorApp {
                 })
                 .min_by(|a, b| a.0.total_cmp(&b.0))
         });
-        [
+        let object_hit = [
             self.object_mesh_hit_at_screen_position(rect, pos),
             origin_hit,
         ]
         .into_iter()
         .flatten()
-        .min_by(|a, b| a.0.total_cmp(&b.0))
-        .map(|(_, object_id)| object_id)
+        .min_by(|a, b| a.0.total_cmp(&b.0));
+        let stage_depth = self.stage_surface_depth_at_screen_position(rect, pos);
+
+        object_hit
+            .filter(|(object_depth, _)| {
+                stage_depth
+                    .is_none_or(|stage_depth| *object_depth <= stage_depth + PICK_DEPTH_EPSILON)
+            })
+            .map(|(_, object_id)| object_id)
     }
 
     #[cfg(test)]
@@ -325,6 +346,45 @@ impl SmsEditorApp {
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(depth, object_id)| (depth, object_id.to_string()))
+    }
+
+    fn stage_surface_depth_at_screen_position(
+        &self,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+    ) -> Option<f32> {
+        if !rect.contains(pos) {
+            return None;
+        }
+
+        let preview = self.model_preview.as_ref()?;
+        let size = framebuffer_size_for_rect(rect);
+        let framebuffer_pos = [
+            (pos.x - rect.left()) * size[0] as f32 / rect.width().max(1.0),
+            (pos.y - rect.top()) * size[1] as f32 / rect.height().max(1.0),
+        ];
+        let object_model_indices = preview
+            .object_model_indices
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        preview
+            .triangles
+            .iter()
+            .filter(|triangle| {
+                !object_model_indices.contains(&triangle.model_index)
+                    && preview_triangle_writes_opaque_depth(preview, triangle)
+            })
+            .filter_map(|triangle| {
+                let projected = self.project_preview_triangle(rect, size, triangle)?;
+                projected_triangle_depth_at_point(
+                    projected.screen,
+                    framebuffer_pos[0],
+                    framebuffer_pos[1],
+                )
+            })
+            .min_by(f32::total_cmp)
     }
 
     pub(super) fn handle_viewport_keyboard_fly(
@@ -1295,15 +1355,11 @@ impl SmsEditorApp {
             }
         }
 
-        for triangle in preview.triangles.iter().filter(|triangle| {
-            !matches!(
-                triangle.render_layer,
-                PreviewRenderLayer::Sky
-                    | PreviewRenderLayer::MirrorScene
-                    | PreviewRenderLayer::WaveFoam
-                    | PreviewRenderLayer::IndirectWater
-            ) && !preview_triangle_is_translucent(preview, triangle)
-        }) {
+        for triangle in preview
+            .triangles
+            .iter()
+            .filter(|triangle| preview_triangle_writes_opaque_depth(preview, triangle))
+        {
             if let Some(projected) = self.project_preview_triangle(rect, size, triangle) {
                 rasterize_projected_preview_triangle(
                     preview, &mut image, &mut depth, projected, true,

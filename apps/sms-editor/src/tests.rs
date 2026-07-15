@@ -235,6 +235,105 @@ fn viewport_picking_does_not_let_a_hidden_origin_behind_the_mesh_win() {
 }
 
 #[test]
+fn viewport_picking_rejects_an_object_hidden_behind_stage_geometry() {
+    let mut object = SceneObject::new("hidden-object", "Coin");
+    object.transform.translation = [0.0, 0.0, 1000.0];
+    let mut preview = preview_for_texture_alpha(false, false);
+    preview.object_model_indices.insert(object.id.clone(), 2);
+    for (model_index, depth, extent) in [(1, 500.0, 150.0), (2, 1000.0, 200.0)] {
+        let mut triangle = textured_blended_triangle();
+        triangle.vertices = [
+            [-extent, -extent, depth],
+            [extent, -extent, depth],
+            [0.0, extent, depth],
+        ];
+        triangle.model_index = model_index;
+        triangle.texture_index = None;
+        triangle.tex_coords = None;
+        preview.triangles.push(triangle);
+    }
+
+    let app = SmsEditorApp {
+        document: Some(test_document(vec![object])),
+        model_preview: Some(preview),
+        ..camera_app()
+    };
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
+
+    assert_eq!(app.object_at_screen_position(rect, rect.center()), None);
+}
+
+#[test]
+fn viewport_picking_keeps_an_object_in_front_of_stage_geometry_selectable() {
+    let mut object = SceneObject::new("visible-object", "Coin");
+    object.transform.translation = [0.0, 0.0, 500.0];
+    let mut preview = preview_for_texture_alpha(false, false);
+    preview.object_model_indices.insert(object.id.clone(), 2);
+    for (model_index, depth, extent) in [(1, 1000.0, 200.0), (2, 500.0, 150.0)] {
+        let mut triangle = textured_blended_triangle();
+        triangle.vertices = [
+            [-extent, -extent, depth],
+            [extent, -extent, depth],
+            [0.0, extent, depth],
+        ];
+        triangle.model_index = model_index;
+        triangle.texture_index = None;
+        triangle.tex_coords = None;
+        preview.triangles.push(triangle);
+    }
+
+    let app = SmsEditorApp {
+        document: Some(test_document(vec![object])),
+        model_preview: Some(preview),
+        ..camera_app()
+    };
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
+
+    assert_eq!(
+        app.object_at_screen_position(rect, rect.center())
+            .as_deref(),
+        Some("visible-object")
+    );
+}
+
+#[test]
+fn viewport_picking_ignores_translucent_stage_geometry() {
+    let mut object = SceneObject::new("object-under-water", "Coin");
+    object.transform.translation = [0.0, 0.0, 1000.0];
+    let mut preview = preview_for_texture_alpha(false, false);
+    preview.object_model_indices.insert(object.id.clone(), 2);
+    for (model_index, depth, extent, render_layer) in [
+        (1, 500.0, 150.0, PreviewRenderLayer::Water),
+        (2, 1000.0, 200.0, PreviewRenderLayer::Main),
+    ] {
+        let mut triangle = textured_blended_triangle();
+        triangle.vertices = [
+            [-extent, -extent, depth],
+            [extent, -extent, depth],
+            [0.0, extent, depth],
+        ];
+        triangle.model_index = model_index;
+        triangle.render_layer = render_layer;
+        triangle.texture_index = None;
+        triangle.tex_coords = None;
+        preview.triangles.push(triangle);
+    }
+
+    let app = SmsEditorApp {
+        document: Some(test_document(vec![object])),
+        model_preview: Some(preview),
+        ..camera_app()
+    };
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
+
+    assert_eq!(
+        app.object_at_screen_position(rect, rect.center())
+            .as_deref(),
+        Some("object-under-water")
+    );
+}
+
+#[test]
 fn selected_object_outline_keeps_the_silhouette_and_removes_internal_edges() {
     let mut preview = preview_for_texture_alpha(false, false);
     preview
