@@ -22,6 +22,18 @@ The editor reads data from a user-supplied, legally obtained extracted copy of
 the game. It does not include Nintendo assets, and it is designed to keep the
 extracted base game read-only.
 
+## AI-Assisted Development
+
+This project is developed with the assistance of AI coding tools. They are used
+to support research, draft and revise code, write tests and documentation, and
+accelerate iteration.
+
+AI-generated output is not treated as authoritative. Formats and behavior are
+checked against the SMS decompilation and Nintendo's JSystem/GX behavior, and
+changes are held to the same testing and repository standards as any other
+contribution. The maintainer remains responsible for the project's design,
+technical decisions, and published code.
+
 ## Current Development State
 
 The following functionality exists in the current source tree. All of it should
