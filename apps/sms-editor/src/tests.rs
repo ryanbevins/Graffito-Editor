@@ -1616,6 +1616,26 @@ fn shimmer_draw_transform_keeps_scale_but_cancels_placement_pose() {
 }
 
 #[test]
+fn actor_runtime_scale_replaces_authored_non_uniform_preview_scale() {
+    let transform = Transform {
+        scale: [1.0, 5.0, 1.0],
+        ..Transform::default()
+    };
+    let preview = sms_scene::ActorPreview {
+        model_path: "stage.szs!/fixture/default.bmd".to_string(),
+        load_flags: 0,
+        manager_factory: "FixtureManager".to_string(),
+        runtime_uniform_scale: Some(1.0),
+    };
+
+    assert_eq!(
+        actor_runtime_preview_transform(transform, Some(&preview)).scale,
+        [1.0; 3]
+    );
+    assert_eq!(actor_runtime_preview_transform(transform, None), transform);
+}
+
+#[test]
 fn reset_fruit_draw_transform_matches_runtime_body_radius_offsets() {
     let registry = reset_fruit_registry();
     let transform = Transform {

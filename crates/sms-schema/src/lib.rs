@@ -534,6 +534,9 @@ pub struct EnemyManagerDefinition {
     pub model_index: Option<usize>,
     #[serde(default)]
     pub spawned_actor_class: Option<String>,
+    /// Parameter archive path constructed by the manager's decomp load routine.
+    #[serde(default)]
+    pub parameter_path: Option<String>,
     pub models: Vec<EnemyModelDefinition>,
 }
 
@@ -552,6 +555,16 @@ pub struct EnemyActorDefinition {
     pub indexed_models: Vec<EnemyIndexedModelDefinition>,
     #[serde(default)]
     pub manager_factories: Vec<String>,
+    /// Post-load uniform scale selected from named runtime parameters.
+    #[serde(default)]
+    pub runtime_uniform_scale: Option<EnemyRuntimeUniformScaleDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnemyRuntimeUniformScaleDefinition {
+    pub low_parameter: String,
+    pub high_parameter: String,
+    pub source_file: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -708,10 +721,13 @@ impl SchemaGenerator {
         let mut actor_primary_models = BTreeMap::<String, String>::new();
         let mut actor_named_models = BTreeMap::<String, Vec<EnemyNamedModelDefinition>>::new();
         let mut actor_indexed_models = BTreeMap::<String, Vec<EnemyIndexedModelDefinition>>::new();
+        let mut actor_runtime_uniform_scales =
+            BTreeMap::<String, EnemyRuntimeUniformScaleDefinition>::new();
         let mut owned_actor_classes = BTreeMap::<String, Vec<String>>::new();
         let mut actor_root_parts = BTreeMap::<String, String>::new();
         let mut part_model_indices = BTreeMap::<String, usize>::new();
         let mut manager_actor_classes = BTreeMap::<String, String>::new();
+        let mut manager_parameter_paths = BTreeMap::<String, String>::new();
         let mut inheritance = BTreeMap::<String, String>::new();
         let mut tev_color_bindings = Vec::new();
         let mut init_tev_colors = BTreeMap::new();
@@ -765,10 +781,20 @@ impl SchemaGenerator {
                         .or_default()
                         .extend(models);
                 }
+                for (class_name, definition) in
+                    extract_enemy_runtime_uniform_scales(text, &source_file)
+                {
+                    actor_runtime_uniform_scales
+                        .entry(class_name)
+                        .or_insert(definition);
+                }
                 extract_owned_actor_classes(text, &mut owned_actor_classes);
                 extract_actor_root_parts(text, &mut actor_root_parts);
                 extract_part_model_indices(text, &mut part_model_indices);
                 extract_enemy_manager_actor_classes(text, &mut manager_actor_classes);
+                for (class_name, path) in extract_enemy_manager_parameter_paths(text) {
+                    manager_parameter_paths.entry(class_name).or_insert(path);
+                }
                 tev_color_bindings.extend(extract_enemy_tev_color_bindings(text, &source_file));
                 extract_enemy_init_tev_colors(text, &mut init_tev_colors);
             }
@@ -832,6 +858,11 @@ impl SchemaGenerator {
             definition.indexed_models =
                 inherited_actor_models(&definition.class_name, &actor_indexed_models, &inheritance)
                     .unwrap_or_default();
+            definition.runtime_uniform_scale = inherited_actor_value(
+                &definition.class_name,
+                &actor_runtime_uniform_scales,
+                &inheritance,
+            );
         }
 
         let manager_objects = registry
@@ -866,6 +897,11 @@ impl SchemaGenerator {
                 spawned_actor_class: inherited_actor_class(
                     &object.class_name,
                     &manager_actor_classes,
+                    &inheritance,
+                ),
+                parameter_path: inherited_string_value(
+                    &object.class_name,
+                    &manager_parameter_paths,
                     &inheritance,
                 ),
                 class_name: object.class_name,
@@ -1872,6 +1908,7 @@ fn extract_enemy_factory_variants(text: &str, registry: &mut ObjectRegistry) {
                 class_name,
                 model_index,
                 spawned_actor_class: None,
+                parameter_path: None,
                 models: Vec::new(),
             });
         } else {
@@ -1884,6 +1921,7 @@ fn extract_enemy_factory_variants(text: &str, registry: &mut ObjectRegistry) {
                 named_models: Vec::new(),
                 indexed_models: Vec::new(),
                 manager_factories: Vec::new(),
+                runtime_uniform_scale: None,
             });
         }
     }
@@ -1897,6 +1935,79 @@ fn extract_class_inheritance(text: &str, inheritance: &mut BTreeMap<String, Stri
     for captures in class_re.captures_iter(text) {
         inheritance.insert(captures[1].to_string(), captures[2].to_string());
     }
+}
+
+fn extract_enemy_manager_parameter_paths(text: &str) -> Vec<(String, String)> {
+    let method_re = Regex::new(r"void\s+([A-Za-z_][A-Za-z0-9_]*)::load\s*\([^)]*\)\s*\{")
+        .expect("valid enemy manager parameter method regex");
+    let path_re = Regex::new(r#"new\s+[A-Za-z_][A-Za-z0-9_:<>]*\s*\(\s*\"([^\"]+\.prm)\"\s*\)"#)
+        .expect("valid enemy manager parameter path regex");
+    method_re
+        .captures_iter(text)
+        .filter_map(|method| {
+            let whole = method.get(0)?;
+            let body = braced_body(text, whole.end() - 1)?;
+            let path = path_re.captures(body)?;
+            Some((method[1].to_string(), path[1].to_string()))
+        })
+        .collect()
+}
+
+fn extract_enemy_runtime_uniform_scales(
+    text: &str,
+    source_file: &str,
+) -> Vec<(String, EnemyRuntimeUniformScaleDefinition)> {
+    let alias_re =
+        Regex::new(r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\.get\(\)\s*;")
+            .expect("valid enemy scale parameter alias regex");
+    let aliases = alias_re
+        .captures_iter(text)
+        .map(|capture| (capture[1].to_string(), capture[2].to_string()))
+        .collect::<BTreeMap<_, _>>();
+    let method_re = Regex::new(r"void\s+([A-Za-z_][A-Za-z0-9_]*)::reset\s*\([^)]*\)\s*\{")
+        .expect("valid enemy reset method regex");
+    let uniform_re = Regex::new(
+        r"mScaling\.set\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+    )
+    .expect("valid enemy uniform scale regex");
+    let mut definitions = Vec::new();
+    for method in method_re.captures_iter(text) {
+        let Some(whole) = method.get(0) else {
+            continue;
+        };
+        let Some(body) = braced_body(text, whole.end() - 1) else {
+            continue;
+        };
+        let Some(uniform) = uniform_re.captures(body) else {
+            continue;
+        };
+        if uniform[1] != uniform[2] || uniform[1] != uniform[3] {
+            continue;
+        }
+        let scale_member = regex::escape(&uniform[1]);
+        let range_re = Regex::new(&format!(
+            r"(?s)\b{scale_member}\s*=\s*[A-Za-z_][A-Za-z0-9_]*\s*\([^;]*?->\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*[^;]*?->\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*;"
+        ))
+        .expect("valid enemy scale range regex");
+        let Some(range) = range_re.captures(body) else {
+            continue;
+        };
+        let Some(low_parameter) = aliases.get(&range[1]) else {
+            continue;
+        };
+        let Some(high_parameter) = aliases.get(&range[2]) else {
+            continue;
+        };
+        definitions.push((
+            method[1].to_string(),
+            EnemyRuntimeUniformScaleDefinition {
+                low_parameter: low_parameter.clone(),
+                high_parameter: high_parameter.clone(),
+                source_file: source_file.to_string(),
+            },
+        ));
+    }
+    definitions
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2784,6 +2895,22 @@ fn inherited_actor_models<T: Clone>(
     while visited.insert(current.to_string()) {
         if let Some(models) = actor_models.get(current) {
             return Some(models.clone());
+        }
+        current = inheritance.get(current)?.rsplit("::").next()?;
+    }
+    None
+}
+
+fn inherited_actor_value<T: Clone>(
+    class_name: &str,
+    values: &BTreeMap<String, T>,
+    inheritance: &BTreeMap<String, String>,
+) -> Option<T> {
+    let mut current = class_name.rsplit("::").next().unwrap_or(class_name);
+    let mut visited = BTreeSet::new();
+    while visited.insert(current.to_string()) {
+        if let Some(value) = values.get(current) {
+            return Some(value.clone());
         }
         current = inheritance.get(current)?.rsplit("::").next()?;
     }
@@ -3714,6 +3841,7 @@ mod tests {
             named_models: Vec::new(),
             indexed_models: Vec::new(),
             manager_factories: Vec::new(),
+            runtime_uniform_scale: None,
         })
         .collect::<Vec<_>>();
 
@@ -3769,6 +3897,7 @@ mod tests {
             named_models: Vec::new(),
             indexed_models: Vec::new(),
             manager_factories: Vec::new(),
+            runtime_uniform_scale: None,
         };
         let managers = vec![
             EnemyManagerDefinition {
@@ -3776,6 +3905,7 @@ mod tests {
                 class_name: "THamuKuriManager".to_string(),
                 model_index: None,
                 spawned_actor_class: Some("THamuKuri".to_string()),
+                parameter_path: None,
                 models: Vec::new(),
             },
             EnemyManagerDefinition {
@@ -3783,6 +3913,7 @@ mod tests {
                 class_name: "THaneHamuKuriManager".to_string(),
                 model_index: None,
                 spawned_actor_class: Some("THaneHamuKuri".to_string()),
+                parameter_path: None,
                 models: Vec::new(),
             },
         ];
@@ -3794,12 +3925,57 @@ mod tests {
     }
 
     #[test]
+    fn extracts_inherited_runtime_scale_parameters_and_manager_path() {
+        let text = r#"
+            TSmallEnemyParams::TSmallEnemyParams(const char* path)
+                : PARAM_INIT(mSLBodyScaleLow, 0.5f)
+                , PARAM_INIT(mSLBodyScaleHigh, 1.5f)
+            {
+                TParams::load(path);
+                unk2CC = mSLBodyScaleLow.get();
+                unk2D0 = mSLBodyScaleHigh.get();
+            }
+
+            void TSmallEnemy::reset() {
+                TSmallEnemyParams* params = getSaveParam2();
+                mBodyScale = chooseScale(params->unk2CC, params->unk2D0);
+                mScaling.set(mBodyScale, mBodyScale, mBodyScale);
+            }
+
+            void TFixtureManager::load(JSUMemoryInputStream& stream) {
+                unk38 = new TSmallEnemyParams("/enemy/fixture.prm");
+            }
+        "#;
+        let scales = extract_enemy_runtime_uniform_scales(text, "src/Enemy/fixture.cpp");
+        assert_eq!(scales.len(), 1);
+        assert_eq!(scales[0].0, "TSmallEnemy");
+        assert_eq!(scales[0].1.low_parameter, "mSLBodyScaleLow");
+        assert_eq!(scales[0].1.high_parameter, "mSLBodyScaleHigh");
+        assert_eq!(
+            extract_enemy_manager_parameter_paths(text),
+            [(
+                "TFixtureManager".to_string(),
+                "/enemy/fixture.prm".to_string()
+            )]
+        );
+
+        let inherited = inherited_actor_value(
+            "TFixtureEnemy",
+            &scales.into_iter().collect(),
+            &BTreeMap::from([("TFixtureEnemy".to_string(), "TSmallEnemy".to_string())]),
+        )
+        .expect("inherit runtime scale metadata");
+        assert_eq!(inherited.source_file, "src/Enemy/fixture.cpp");
+    }
+
+    #[test]
     fn associates_indexed_variants_with_the_manager_class_stem() {
         let manager = EnemyManagerDefinition {
             factory_name: "ButterflyManager".to_string(),
             class_name: "TButterfloidManager".to_string(),
             model_index: None,
             spawned_actor_class: None,
+            parameter_path: None,
             models: Vec::new(),
         };
         let actor = EnemyActorDefinition {
@@ -3811,6 +3987,7 @@ mod tests {
             named_models: Vec::new(),
             indexed_models: Vec::new(),
             manager_factories: Vec::new(),
+            runtime_uniform_scale: None,
         };
 
         assert_eq!(
@@ -3823,6 +4000,7 @@ mod tests {
             class_name: "TFishoidManager".to_string(),
             model_index: None,
             spawned_actor_class: None,
+            parameter_path: None,
             models: Vec::new(),
         };
         let actor = EnemyActorDefinition {
@@ -3834,6 +4012,7 @@ mod tests {
             named_models: Vec::new(),
             indexed_models: Vec::new(),
             manager_factories: Vec::new(),
+            runtime_uniform_scale: None,
         };
         assert_eq!(
             compatible_enemy_managers(&actor, &[manager], &BTreeMap::new()),
@@ -3845,6 +4024,7 @@ mod tests {
             class_name: "TEggGenManager".to_string(),
             model_index: None,
             spawned_actor_class: None,
+            parameter_path: None,
             models: vec![EnemyModelDefinition {
                 model_name: "gene_egg_model1.bmd".to_string(),
                 load_flags: 0,
@@ -3860,6 +4040,7 @@ mod tests {
             named_models: Vec::new(),
             indexed_models: Vec::new(),
             manager_factories: Vec::new(),
+            runtime_uniform_scale: None,
         };
         assert_eq!(
             compatible_enemy_managers(&actor, &[manager], &BTreeMap::new()),
@@ -3878,12 +4059,14 @@ mod tests {
             named_models: Vec::new(),
             indexed_models: Vec::new(),
             manager_factories: Vec::new(),
+            runtime_uniform_scale: None,
         };
         let exact = EnemyManagerDefinition {
             factory_name: "FishoidManager".to_string(),
             class_name: "TUnrelatedManager".to_string(),
             model_index: None,
             spawned_actor_class: None,
+            parameter_path: None,
             models: Vec::new(),
         };
         let wrong_case = EnemyManagerDefinition {
@@ -3891,6 +4074,7 @@ mod tests {
             class_name: "TWrongManager".to_string(),
             model_index: None,
             spawned_actor_class: None,
+            parameter_path: None,
             models: Vec::new(),
         };
 
@@ -3933,12 +4117,14 @@ mod tests {
             named_models: Vec::new(),
             indexed_models: Vec::new(),
             manager_factories: Vec::new(),
+            runtime_uniform_scale: None,
         };
         let manager = EnemyManagerDefinition {
             factory_name: "UnrelatedManager".to_string(),
             class_name: "TNoClassMatchManager".to_string(),
             model_index: None,
             spawned_actor_class: None,
+            parameter_path: None,
             models: vec![EnemyModelDefinition {
                 model_name: "FISHOID.BMD".to_string(),
                 load_flags: 0,

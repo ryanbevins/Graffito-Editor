@@ -659,12 +659,22 @@ impl SmsEditorApp {
                     .objects
                     .iter()
                     .find(|object| object.id == object_id)?;
-                Some((object, document.registry.as_ref()))
+                Some((
+                    object,
+                    document.registry.as_ref(),
+                    document.actor_preview(object),
+                ))
             })
-            .map(|(object, registry)| {
+            .map(|(object, registry, actor_preview)| {
                 (
-                    reset_fruit_preview_transform(object, old_transform, registry),
-                    reset_fruit_preview_transform(object, new_transform, registry),
+                    actor_runtime_preview_transform(
+                        reset_fruit_preview_transform(object, old_transform, registry),
+                        actor_preview,
+                    ),
+                    actor_runtime_preview_transform(
+                        reset_fruit_preview_transform(object, new_transform, registry),
+                        actor_preview,
+                    ),
                 )
             })
             .unwrap_or((old_transform, new_transform));

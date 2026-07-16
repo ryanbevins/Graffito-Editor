@@ -11,6 +11,7 @@ mod j3d;
 mod j3d_anim;
 mod jdrama;
 mod jpa;
+mod prm;
 mod rarc;
 mod raw;
 mod stage_assets;
@@ -40,6 +41,7 @@ pub use jpa::{
     JpaBaseShape, JpaChildShape, JpaColorAnimation, JpaColorKey, JpaEffect, JpaEmitter,
     JpaExtraShape, JpaField, JpaKeyframeCurve, JpaRawBlock,
 };
+pub use prm::{PrmEntry, PrmFile};
 pub use rarc::{RarcArchive, RarcFileEntry, RarcHeader};
 pub use raw::{RawFile, RawFormat};
 pub use stage_assets::{

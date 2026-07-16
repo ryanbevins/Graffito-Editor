@@ -9,8 +9,9 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sms_formats::{
-    parse_jdrama_object_records, read_stage_asset_bytes, scan_stage_assets, JDramaAmbient,
-    JDramaLight, JDramaObjectRecord, SourceLocation, StageAsset, StageAssetKind,
+    mount_scene_archive, parse_jdrama_object_records, read_stage_asset_bytes, scan_stage_assets,
+    JDramaAmbient, JDramaLight, JDramaObjectRecord, PrmFile, SourceLocation, StageAsset,
+    StageAssetKind,
 };
 use sms_schema::{
     EnemyActorDefinition, EnemyManagerDefinition, EnemyModelDefinition, ObjectRegistry,
@@ -155,11 +156,12 @@ pub struct LoadedProjectState {
     pub project_fingerprint: u128,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ActorPreview {
     pub model_path: String,
     pub load_flags: u32,
     pub manager_factory: String,
+    pub runtime_uniform_scale: Option<f32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1104,6 +1106,125 @@ struct StageManagerResource {
     chara_name: String,
 }
 
+fn enemy_runtime_uniform_scale(
+    actor: &EnemyActorDefinition,
+    manager: &EnemyManagerDefinition,
+    assets: &[StageAsset],
+) -> std::result::Result<Option<f32>, String> {
+    let Some(definition) = &actor.runtime_uniform_scale else {
+        return Ok(None);
+    };
+    let Some(parameter_path) = &manager.parameter_path else {
+        return Ok(None);
+    };
+    let stage_suffix = format!(
+        "/map/params/{}",
+        parameter_path
+            .replace('\\', "/")
+            .trim_start_matches('/')
+            .to_ascii_lowercase()
+    );
+    let global_suffix = format!(
+        "!/{}",
+        parameter_path
+            .replace('\\', "/")
+            .trim_start_matches('/')
+            .to_ascii_lowercase()
+    );
+    let stage_matches = assets.iter().filter(|asset| {
+        asset
+            .path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase()
+            .ends_with(&stage_suffix)
+    });
+    let mut matches = stage_matches.peekable();
+    let use_global = matches.peek().is_none();
+    let mut global_matches = assets.iter().filter(|asset| {
+        asset
+            .path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase()
+            .ends_with(&global_suffix)
+    });
+    let asset = if use_global {
+        global_matches.next()
+    } else {
+        matches.next()
+    };
+    let Some(asset) = asset else {
+        return Err(format!(
+            "Could not resolve decomp-authored parameter path {parameter_path} for {}",
+            manager.factory_name
+        ));
+    };
+    if (use_global && global_matches.next().is_some()) || (!use_global && matches.next().is_some())
+    {
+        return Err(format!(
+            "Decomp-authored parameter path {parameter_path} for {} matched multiple stage assets",
+            manager.factory_name
+        ));
+    }
+    let bytes = read_stage_asset_bytes(&asset.path).map_err(|error| {
+        format!(
+            "Could not read runtime scale parameters {}: {error}",
+            asset.path.display()
+        )
+    })?;
+    let parameters = PrmFile::parse(&bytes).map_err(|error| {
+        format!(
+            "Could not parse runtime scale parameters {}: {error}",
+            asset.path.display()
+        )
+    })?;
+    let low = parameters.f32(&definition.low_parameter).ok_or_else(|| {
+        format!(
+            "Runtime scale parameter {} from {} is missing or not an f32 in {}",
+            definition.low_parameter,
+            definition.source_file,
+            asset.path.display()
+        )
+    })?;
+    let high = parameters.f32(&definition.high_parameter).ok_or_else(|| {
+        format!(
+            "Runtime scale parameter {} from {} is missing or not an f32 in {}",
+            definition.high_parameter,
+            definition.source_file,
+            asset.path.display()
+        )
+    })?;
+    let scale = low + (high - low) * 0.5;
+    if !scale.is_finite() {
+        return Err(format!(
+            "Runtime scale range {low}..{high} in {} is not finite",
+            asset.path.display()
+        ));
+    }
+    Ok(Some(scale))
+}
+
+fn load_global_parameter_assets(base_root: &Path) -> std::result::Result<Vec<StageAsset>, String> {
+    let candidates = [
+        base_root.join("files/data/params.szs"),
+        base_root.join("data/params.szs"),
+        base_root.join("params.szs"),
+    ];
+    let Some(path) = candidates.into_iter().find(|path| path.is_file()) else {
+        return Err(format!(
+            "Could not find data/params.szs under {} for runtime actor scale binding",
+            base_root.display()
+        ));
+    };
+    mount_scene_archive(&path).map_err(|error| {
+        format!(
+            "Could not mount {} for runtime actor scale binding: {error}",
+            path.display()
+        )
+    })
+}
+
 fn enemy_actor_manager_name<'a>(
     record: &'a JDramaObjectRecord,
     registry: &ObjectRegistry,
@@ -1136,6 +1257,20 @@ fn build_actor_preview_catalog(
     let mut catalog = BTreeMap::new();
     let mut issues = Vec::new();
     let mut unresolved_factories = BTreeSet::new();
+    let mut parameter_assets = assets.to_vec();
+    if registry
+        .enemy_actors
+        .iter()
+        .any(|actor| actor.runtime_uniform_scale.is_some())
+    {
+        match load_global_parameter_assets(base_root) {
+            Ok(global_assets) => parameter_assets.extend(global_assets),
+            Err(message) => issues.push(ValidationIssue::warning(
+                "enemy-preview-runtime-parameters-unavailable",
+                message,
+            )),
+        }
+    }
 
     for asset in assets
         .iter()
@@ -1181,6 +1316,33 @@ fn build_actor_preview_catalog(
                 ))
             })
             .collect::<BTreeMap<_, _>>();
+        let mut runtime_uniform_scales = BTreeMap::new();
+        for actor in &registry.enemy_actors {
+            for manager_factory in &actor.manager_factories {
+                let Some(manager_resource) = managers
+                    .values()
+                    .find(|resource| resource.factory_name == *manager_factory)
+                else {
+                    continue;
+                };
+                let Some(manager) = registry.find_enemy_manager(&manager_resource.factory_name)
+                else {
+                    continue;
+                };
+                match enemy_runtime_uniform_scale(actor, manager, &parameter_assets) {
+                    Ok(scale) => {
+                        runtime_uniform_scales.insert(
+                            (actor.factory_name.clone(), manager.factory_name.clone()),
+                            scale,
+                        );
+                    }
+                    Err(message) => issues.push(ValidationIssue::warning(
+                        "enemy-preview-runtime-scale-unresolved",
+                        message,
+                    )),
+                }
+            }
+        }
 
         for actor in &registry.enemy_actors {
             let factory_key = actor_preview_factory_key(&actor.factory_name);
@@ -1194,6 +1356,7 @@ fn build_actor_preview_catalog(
                             model_path,
                             load_flags: model.load_flags,
                             manager_factory: format!("{} actor", actor.factory_name),
+                            runtime_uniform_scale: None,
                         });
                 }
             }
@@ -1211,11 +1374,15 @@ fn build_actor_preview_catalog(
                 let Some(folder) = chara_folders.get(&manager_resource.chara_name) else {
                     continue;
                 };
-                let Some(preview) =
+                let Some(mut preview) =
                     resolve_manager_actor_preview(actor, manager, folder, &model_index)
                 else {
                     continue;
                 };
+                preview.runtime_uniform_scale = runtime_uniform_scales
+                    .get(&(actor.factory_name.clone(), manager.factory_name.clone()))
+                    .copied()
+                    .flatten();
                 catalog.entry(factory_key.clone()).or_insert(preview);
                 break;
             }
@@ -1238,11 +1405,18 @@ fn build_actor_preview_catalog(
                     let Some(folder) = chara_folders.get(&manager_resource.chara_name) else {
                         continue;
                     };
-                    let Some(preview) =
+                    let Some(mut preview) =
                         resolve_manager_actor_preview(actor, target_manager, folder, &model_index)
                     else {
                         continue;
                     };
+                    preview.runtime_uniform_scale = runtime_uniform_scales
+                        .get(&(
+                            actor.factory_name.clone(),
+                            target_manager.factory_name.clone(),
+                        ))
+                        .copied()
+                        .flatten();
                     catalog.insert(factory_key.clone(), preview);
                     break;
                 }
@@ -1294,6 +1468,7 @@ fn build_actor_preview_catalog(
                                 path,
                                 selected.load_flags,
                                 format!("{} actor", actor.factory_name),
+                                None,
                             )
                         },
                     );
@@ -1313,6 +1488,7 @@ fn build_actor_preview_catalog(
                                 path,
                                 model.load_flags,
                                 format!("{} actor", actor.factory_name),
+                                None,
                             )
                         })
                     })
@@ -1329,6 +1505,10 @@ fn build_actor_preview_catalog(
                             preview.model_path,
                             preview.load_flags,
                             preview.manager_factory,
+                            runtime_uniform_scales
+                                .get(&(record.type_name.clone(), manager.factory_name.clone()))
+                                .copied()
+                                .flatten(),
                         )
                     },
                 )
@@ -1343,11 +1523,12 @@ fn build_actor_preview_catalog(
                             path,
                             model.load_flags,
                             format!("{} actor", actor.factory_name),
+                            None,
                         )
                     })
                 })
             })();
-            let Some((model_path, load_flags, manager_factory)) =
+            let Some((model_path, load_flags, manager_factory, runtime_uniform_scale)) =
                 direct_actor_preview.or(manager_preview).or(actor_preview)
             else {
                 if has_manager_model_binding || has_actor_model_binding {
@@ -1367,6 +1548,7 @@ fn build_actor_preview_catalog(
                 model_path,
                 load_flags,
                 manager_factory,
+                runtime_uniform_scale,
             };
             catalog.insert(key, preview.clone());
             let used_named_actor_preview = registry
@@ -1385,6 +1567,7 @@ fn build_actor_preview_catalog(
                         model_path: resolve_resource_model_path(&model.model_path, &model_index)?,
                         load_flags: model.load_flags,
                         manager_factory: format!("{} actor", actor.factory_name),
+                        runtime_uniform_scale: None,
                     })
                 })
                 .or_else(|| (!used_named_actor_preview).then(|| preview.clone()));
@@ -1464,6 +1647,7 @@ fn resolve_manager_actor_preview(
                     model_path,
                     load_flags: model.load_flags,
                     manager_factory: manager.factory_name.clone(),
+                    runtime_uniform_scale: None,
                 }
             })
         })
@@ -2910,6 +3094,91 @@ mod tests {
     }
 
     #[test]
+    fn runtime_uniform_scale_comes_from_named_parameter_asset_values() {
+        let root = unique_test_project_root("runtime-enemy-scale");
+        let path = root.join("map/params/enemy/fixture.prm");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut bytes = 2u32.to_be_bytes().to_vec();
+        for (key, name, value) in [(1u16, "lowScale", 0.75f32), (2u16, "highScale", 1.25f32)] {
+            bytes.extend_from_slice(&key.to_be_bytes());
+            bytes.extend_from_slice(&(name.len() as u16).to_be_bytes());
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.extend_from_slice(&4u32.to_be_bytes());
+            bytes.extend_from_slice(&value.to_bits().to_be_bytes());
+        }
+        fs::write(&path, bytes).unwrap();
+        let actor = EnemyActorDefinition {
+            factory_name: "Fixture".to_string(),
+            class_name: "TFixture".to_string(),
+            model_index: None,
+            fallback_models: Vec::new(),
+            primary_model: None,
+            named_models: Vec::new(),
+            indexed_models: Vec::new(),
+            manager_factories: vec!["FixtureManager".to_string()],
+            runtime_uniform_scale: Some(sms_schema::EnemyRuntimeUniformScaleDefinition {
+                low_parameter: "lowScale".to_string(),
+                high_parameter: "highScale".to_string(),
+                source_file: "src/Enemy/fixture.cpp".to_string(),
+            }),
+        };
+        let manager = EnemyManagerDefinition {
+            factory_name: "FixtureManager".to_string(),
+            class_name: "TFixtureManager".to_string(),
+            model_index: None,
+            spawned_actor_class: Some("TFixture".to_string()),
+            parameter_path: Some("/enemy/fixture.prm".to_string()),
+            models: Vec::new(),
+        };
+        let assets = [StageAsset {
+            path: path.clone(),
+            kind: StageAssetKind::Placement,
+        }];
+
+        assert_eq!(
+            enemy_runtime_uniform_scale(&actor, &manager, &assets).unwrap(),
+            Some(1.0)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires the extracted retail game and neighboring SMS decomp"]
+    fn retail_mare_cannon_uses_its_post_reset_parameter_scale() {
+        let base_root = std::env::var_os("SMS_BASE_ROOT")
+            .map(PathBuf::from)
+            .expect("set SMS_BASE_ROOT to the extracted game's root");
+        let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let registry = sms_schema::SchemaGenerator::new(decomp_root)
+            .generate()
+            .expect("generate enemy schema");
+        let document = StageDocument::open(&base_root, "mare0")
+            .expect("open mare0")
+            .with_registry(registry);
+        let cannon = document
+            .objects
+            .iter()
+            .find(|object| object.factory_name == "Cannon")
+            .expect("mare0 cannon placement");
+
+        assert_eq!(cannon.transform.scale, [1.0, 5.0, 1.0]);
+        assert_eq!(
+            document
+                .actor_preview(cannon)
+                .and_then(|preview| preview.runtime_uniform_scale),
+            Some(1.0)
+        );
+        assert!(
+            document
+                .load_issues
+                .iter()
+                .all(|issue| issue.code != "enemy-preview-runtime-scale-unresolved"),
+            "unexpected runtime-scale issues: {:?}",
+            document.load_issues
+        );
+    }
+
+    #[test]
     fn actor_default_model_flags_override_the_manager_table() {
         let actor = EnemyActorDefinition {
             factory_name: "EMario".to_string(),
@@ -2924,12 +3193,14 @@ mod tests {
             named_models: Vec::new(),
             indexed_models: Vec::new(),
             manager_factories: vec!["EMarioManager".to_string()],
+            runtime_uniform_scale: None,
         };
         let manager = EnemyManagerDefinition {
             factory_name: "EMarioManager".to_string(),
             class_name: "TEMarioManager".to_string(),
             model_index: None,
             spawned_actor_class: Some("TEMario".to_string()),
+            parameter_path: None,
             models: vec![sms_schema::EnemyModelDefinition {
                 model_name: "default.bmd".to_string(),
                 load_flags: 0x1021_0000,
@@ -2960,12 +3231,14 @@ mod tests {
             named_models: Vec::new(),
             indexed_models: Vec::new(),
             manager_factories: vec!["ButterflyManager".to_string()],
+            runtime_uniform_scale: None,
         };
         let manager = EnemyManagerDefinition {
             factory_name: "ButterflyManager".to_string(),
             class_name: "TButterfloidManager".to_string(),
             model_index: None,
             spawned_actor_class: None,
+            parameter_path: None,
             models: ["butterflyA.bmd", "butterflyB.bmd", "butterflyC.bmd"]
                 .into_iter()
                 .map(|model_name| sms_schema::EnemyModelDefinition {
@@ -3003,12 +3276,14 @@ mod tests {
             named_models: Vec::new(),
             indexed_models: Vec::new(),
             manager_factories: vec!["LimitKoopaManager".to_string()],
+            runtime_uniform_scale: None,
         };
         let target_manager = EnemyManagerDefinition {
             factory_name: "LimitKoopaManager".to_string(),
             class_name: "TLimitKoopaManager".to_string(),
             model_index: None,
             spawned_actor_class: None,
+            parameter_path: None,
             models: vec![sms_schema::EnemyModelDefinition {
                 model_name: "koopa_model.bmd".to_string(),
                 load_flags: 0x1424_0000,
@@ -3020,6 +3295,7 @@ mod tests {
             class_name: "TKoopaManager".to_string(),
             model_index: None,
             spawned_actor_class: None,
+            parameter_path: None,
             models: vec![sms_schema::EnemyModelDefinition {
                 model_name: "koopa_model.bmd".to_string(),
                 load_flags: 0x1424_0000,
@@ -3062,12 +3338,14 @@ mod tests {
             named_models: Vec::new(),
             indexed_models: Vec::new(),
             manager_factories: vec!["HaneHamuKuriManager".to_string()],
+            runtime_uniform_scale: None,
         };
         let base_manager = EnemyManagerDefinition {
             factory_name: "HamuKuriManager".to_string(),
             class_name: "THamuKuriManager".to_string(),
             model_index: None,
             spawned_actor_class: Some("THamuKuri".to_string()),
+            parameter_path: None,
             models: vec![sms_schema::EnemyModelDefinition {
                 model_name: "default.bmd".to_string(),
                 load_flags: 0x1022_0000,
@@ -3094,6 +3372,7 @@ mod tests {
                 model_path: "bianco0.szs!/hamukuri/default.bmd".to_string(),
                 load_flags: 0x1022_0000,
                 manager_factory: "HamuKuriManager".to_string(),
+                runtime_uniform_scale: None,
             },
         );
         let spawned = SceneObject::new("spawned", "HamuKuri");
@@ -3112,6 +3391,7 @@ mod tests {
                 model_path: "stale.bmd".to_string(),
                 load_flags: 0,
                 manager_factory: "stale".to_string(),
+                runtime_uniform_scale: None,
             },
         );
         document.load_issues.push(ValidationIssue::warning(

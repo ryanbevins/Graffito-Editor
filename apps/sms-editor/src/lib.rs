@@ -1277,6 +1277,10 @@ impl SmsEditorApp {
             } else {
                 reset_fruit_preview_transform(object, object.transform, document.registry.as_ref())
             };
+            let object_preview_transform = actor_runtime_preview_transform(
+                object_preview_transform,
+                document.actor_preview(object),
+            );
             let animation_profile = std::iter::once(object.factory_name.clone())
                 .chain(
                     npc_accessory_specs(document, object)
@@ -2737,6 +2741,16 @@ fn shimmer_preview_transform(transform: Transform) -> Transform {
         rotation_degrees: [0.0; 3],
         scale: transform.scale,
     }
+}
+
+fn actor_runtime_preview_transform(
+    mut transform: Transform,
+    preview: Option<&sms_scene::ActorPreview>,
+) -> Transform {
+    if let Some(scale) = preview.and_then(|preview| preview.runtime_uniform_scale) {
+        transform.scale = [scale; 3];
+    }
+    transform
 }
 
 fn reset_fruit_preview_transform(
