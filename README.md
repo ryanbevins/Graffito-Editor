@@ -94,6 +94,10 @@ The `sms-cli` package currently provides commands to:
 - extract individual files from mounted archives;
 - print stage and renderer-preview diagnostics;
 - validate a parsed stage document;
+- run a strict source-free stage-archive rebuild audit to an external path;
+- apply a saved object overlay to a new rebuilt stage archive outside the base tree;
+- import a stage into a standalone typed document and rebuild it without the
+  retail archive;
 - save an editor-project overlay; and
 - launch Dolphin, optionally with an isolated user directory.
 
@@ -108,10 +112,46 @@ an editor-only project folder containing:
 - `sms-project.toml`; and
 - a JSON scene overlay under `files/editor/stages/`.
 
-This output records the editor's current object representation. It does **not**
-rewrite retail `scene.bin`, repack a RARC stage archive, patch a game image, or
-produce files that Dolphin can run as a mod. The Dolphin launch helper only
-starts the user-supplied game and does not apply the editor overlay.
+This output records the editor's current object representation and typed archive
+edits. The stage's semantic archive is freshly imported from the configured base
+root when the stage opens; it is not cached in the project. Saving a project does
+**not** rewrite retail `scene.bin`, patch a game image, or produce files that
+Dolphin can run as a mod. The separate **Export Stage** action rebuilds a new
+RARC/Yaz0 archive outside the extracted base tree. The Dolphin launch helper only
+starts the user-supplied game and does not apply either output.
+
+The experimental `rebuild-stage` CLI command audits the binary authoring
+pipeline. It imports every stage resource into typed documents, discards the
+source buffers, regenerates the child files plus RARC/Yaz0 layers, and writes
+only after a byte-identical second rebuild. It refuses output inside the
+extracted base tree and rejects unsupported resource kinds instead of copying
+payloads through.
+
+The `export-stage` command and desktop **Export Stage** action create a new
+external archive from the semantic archive imported when the stage was opened.
+Typed transform, deletion, duplicate, model, collision, and complete JDrama
+insertion edits are applied before every resource and container layer is
+rebuilt. Source-less palette objects and unmodeled parameter changes are
+rejected instead of producing incomplete placement streams. Existing outputs
+and every destination inside the extracted base tree are refused. Model geometry
+is canonically relaid out when it is replaced. Version 3 editor projects persist
+typed edits, while the semantic baseline is freshly imported when the stage is
+opened. Export uses that in-memory import and never rereads the retail archive
+path.
+
+For a detached workflow, `import-stage-document` first proves an exact rebuild
+and then creates a standalone typed JSON document whose RARC payload slots are
+required to be empty. `export-stage-document` rebuilds and reparses that document
+without reading the retail archive again. Loader-ignored layout values that vary
+between otherwise equivalent files are represented as bounded typed
+reconstruction metadata, never as an original file buffer or opaque child
+payload.
+
+"No cached bytes" does not mean "no imported data": geometry, collision,
+textures, object records, compression choices, and every other varying authored
+value must exist in the semantic document to reproduce the file. The strict
+contract is that output bytes come from typed fields or deterministic writers;
+no writer can fall back to a retained source file.
 
 Project output is deliberately required to live outside the extracted base game
 directory. Even with that safeguard, the project format is unstable and may
@@ -163,7 +203,7 @@ cargo run --release -p sms-editor -- `
 | --- | --- |
 | `sms-editor` | Desktop UI, object interactions, preview preparation, and GPU viewport |
 | `sms-cli` | Extraction helpers, inspection, validation, diagnostics, project export, and Dolphin launch |
-| `sms-formats` | Checked readers for SMS/GameCube formats and preservation of source bytes |
+| `sms-formats` | Checked preview readers plus strict source-free semantic readers/writers for supported SMS/GameCube formats |
 | `sms-schema` | Object and preview metadata generated from the SMS decompilation source |
 | `sms-scene` | Parsed stage documents, supported object edits, validation, and editor-project persistence |
 | `sms-render` | Renderer-facing scene, camera, selection, and viewport support types |

@@ -140,6 +140,16 @@ impl SmsEditorApp {
     }
 
     pub(super) fn save_project(&mut self) -> bool {
+        if let Some(document) = &self.document {
+            if !document_uses_selected_base(document, self.base_root.trim()) {
+                self.log.push(format!(
+                    "Project save blocked: the open stage belongs to '{}', but Base Game Root is '{}'. Open a stage from the selected base before saving its project.",
+                    document.base_root.display(),
+                    self.base_root.trim()
+                ));
+                return false;
+            }
+        }
         if let Some(document) = &mut self.document {
             self.issues = document.validate();
             if self
@@ -187,6 +197,38 @@ impl SmsEditorApp {
             }
         };
         result
+    }
+
+    pub(super) fn export_stage_archive(&mut self) {
+        if self.background_receiver.is_some() {
+            self.log
+                .push("Another background operation is already running.".to_string());
+            return;
+        }
+        let output_path = self.stage_export_path.trim().to_string();
+        if output_path.is_empty() {
+            self.log
+                .push("Stage archive export path is required.".to_string());
+            return;
+        }
+        let Some(document) = self.document.clone() else {
+            self.log.push("No stage open.".to_string());
+            return;
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let task_path = output_path.clone();
+        thread::spawn(move || {
+            let result = document
+                .export_stage_archive_new(PathBuf::from(&task_path))
+                .map_err(|error| error.to_string());
+            let _ = sender.send(BackgroundResult::Export(result));
+        });
+        self.background_receiver = Some(receiver);
+        self.background_label = Some("Exporting stage archive".to_string());
+        self.log.push(format!(
+            "Rebuilding stage archive from semantic documents into '{output_path}'..."
+        ));
     }
 
     pub(super) fn launch_dolphin(&mut self) {
@@ -259,6 +301,10 @@ impl SmsEditorApp {
 
         let mut clone = source;
         clone.id = id.clone();
+        clone.placement = clone
+            .placement
+            .as_ref()
+            .map(|binding| sms_scene::PlacementBinding::CloneOf(binding.address().clone()));
         clone.transform.translation[0] += self.snap_translation.max(25.0);
         clone.transform.translation[2] += self.snap_translation.max(25.0);
         let index = self

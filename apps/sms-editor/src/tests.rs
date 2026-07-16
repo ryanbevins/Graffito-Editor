@@ -587,14 +587,9 @@ fn placement_stream_rgb_reaches_the_decomp_selected_tev_register() {
         ..ObjectRegistry::default()
     };
     let mut object = SceneObject::new("paint", "FixturePaint");
-    object.source_record_bytes = Some(
-        [0xAA, 0xBB]
-            .into_iter()
-            .chain(0x0000_01FFu32.to_be_bytes())
-            .chain(0x0000_0078u32.to_be_bytes())
-            .chain(0x1234_5609u32.to_be_bytes())
-            .collect(),
-    );
+    object.insert_source_raw_param("tev_red", "511");
+    object.insert_source_raw_param("tev_green", "120");
+    object.insert_source_raw_param("tev_blue", "305419785");
 
     assert_eq!(
         map_obj_stream_tev_color(&object, Some(&registry)),
@@ -2481,6 +2476,7 @@ fn project_save_uses_the_same_trimmed_project_path_as_project_load() {
             .as_nanos()
     ));
     let mut app = SmsEditorApp {
+        base_root: ".".to_string(),
         project_root: format!("  {}  ", root.display()),
         document: Some(test_document(vec![SceneObject::new("obj-1", "Coin")])),
         ..SmsEditorApp::default()
@@ -2489,6 +2485,165 @@ fn project_save_uses_the_same_trimmed_project_path_as_project_load() {
     assert!(app.save_project());
     assert!(root.join("sms-project.toml").is_file());
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn project_save_is_blocked_when_the_selected_base_differs_from_the_open_document() {
+    let root = std::env::temp_dir().join(format!(
+        "sms-editor-app-stale-base-save-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let jp_base = root.join("SunshineJPExtract");
+    let us_base = root.join("SunshineUSExtract");
+    let project_root = root.join("us-project");
+    std::fs::create_dir_all(&jp_base).unwrap();
+    std::fs::create_dir_all(&us_base).unwrap();
+    let mut document = test_document(Vec::new());
+    document.base_root = jp_base;
+    let mut app = SmsEditorApp {
+        base_root: us_base.to_string_lossy().into_owned(),
+        project_root: project_root.to_string_lossy().into_owned(),
+        document: Some(document),
+        ..SmsEditorApp::default()
+    };
+
+    assert!(!app.save_project());
+    assert!(!project_root.exists());
+    assert!(app
+        .log
+        .iter()
+        .any(|message| message.contains("open stage belongs") && message.contains("blocked")));
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn project_from_another_base_selects_separate_project_without_blocking_stage_open() {
+    let root = std::env::temp_dir().join(format!(
+        "sms-editor-app-project-base-mismatch-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let jp_base = root.join("jp-base");
+    let us_base = root.join("us-base");
+    let project_root = root.join("sms-editor-project");
+    std::fs::create_dir_all(&jp_base).unwrap();
+    std::fs::create_dir_all(&us_base).unwrap();
+
+    let mut jp_document = test_document(vec![SceneObject::new("jp-object", "Coin")]);
+    jp_document.base_root = jp_base.clone();
+    jp_document.save_project_folder(&project_root).unwrap();
+
+    let mut us_document = test_document(vec![SceneObject::new("us-object", "Coin")]);
+    us_document.base_root = us_base.clone();
+    let selection =
+        load_project_for_stage(&mut us_document, &project_root.to_string_lossy()).unwrap();
+    let warning = selection
+        .warning
+        .expect("a mismatched project should select a separate project folder");
+
+    assert!(warning.contains("Project Folder automatically switched"));
+    assert_ne!(selection.project_root, project_root.to_string_lossy());
+    assert!(selection.project_root.contains("us-base"));
+    assert_eq!(us_document.objects[0].id, "us-object");
+
+    us_document
+        .save_project_folder(&selection.project_root)
+        .unwrap();
+    let mut reopened_us = test_document(vec![SceneObject::new("base-us-object", "Coin")]);
+    reopened_us.base_root = us_base;
+    assert!(reopened_us
+        .load_project_folder(&selection.project_root)
+        .unwrap());
+    assert_eq!(reopened_us.objects[0].id, "us-object");
+
+    let mut reopened_jp = test_document(vec![SceneObject::new("base-jp-object", "Coin")]);
+    reopened_jp.base_root = jp_base;
+    let jp_selection = load_project_for_stage(&mut reopened_jp, &selection.project_root).unwrap();
+    assert_eq!(PathBuf::from(jp_selection.project_root), project_root);
+    assert_eq!(reopened_jp.objects[0].id, "jp-object");
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn project_folder_inside_the_base_is_moved_to_a_safe_sibling() {
+    let root = std::env::temp_dir().join(format!(
+        "sms-editor-app-project-overlap-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let base_root = root.join("SunshineUSExtract");
+    std::fs::create_dir_all(&base_root).unwrap();
+    let mut document = test_document(Vec::new());
+    document.base_root = base_root.clone();
+
+    let selection = load_project_for_stage(&mut document, &base_root.to_string_lossy()).unwrap();
+
+    assert_eq!(
+        PathBuf::from(&selection.project_root),
+        root.join("SunshineUSExtract-sms-editor-project")
+    );
+    assert!(selection
+        .warning
+        .is_some_and(|warning| warning.contains("must be outside")));
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn stage_archive_export_requires_an_explicit_output_path() {
+    let mut app = SmsEditorApp {
+        document: Some(test_document(Vec::new())),
+        stage_export_path: "   ".to_string(),
+        ..SmsEditorApp::default()
+    };
+
+    app.export_stage_archive();
+
+    assert!(app.background_receiver.is_none());
+    assert!(app
+        .log
+        .iter()
+        .any(|message| message.contains("export path is required")));
+}
+
+#[test]
+fn completed_stage_archive_export_reports_the_external_output() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    sender
+        .send(BackgroundResult::Export(Ok(StageArchiveExportOutcome {
+            source_path: PathBuf::from("base/dolpic0.szs"),
+            output_path: PathBuf::from("mods/dolpic0.szs"),
+            size_bytes: 1234,
+            changed: false,
+        })))
+        .unwrap();
+    let mut app = SmsEditorApp {
+        background_receiver: Some(receiver),
+        background_label: Some("Exporting stage archive".to_string()),
+        ..SmsEditorApp::default()
+    };
+
+    app.poll_background_task(&egui::Context::default());
+
+    assert!(app.background_receiver.is_none());
+    assert!(app.background_label.is_none());
+    assert!(app.log.iter().any(|message| {
+        message.contains("1234 bytes")
+            && message.contains("mods/dolpic0.szs")
+            && message.contains("byte-identical")
+    }));
 }
 
 #[test]
@@ -2503,10 +2658,12 @@ fn completed_stage_load_is_discarded_when_the_project_path_changed() {
     };
     let loaded = LoadedStage {
         base_root: "base-root".to_string(),
+        requested_project_root: "project-a".to_string(),
         project_root: "project-a".to_string(),
         archives: Vec::new(),
         registry: None,
         schema_warning: None,
+        project_warning: None,
         document,
         scene,
         preview: None,
@@ -2522,6 +2679,38 @@ fn completed_stage_load_is_discarded_when_the_project_path_changed() {
 }
 
 #[test]
+fn completed_stage_load_adopts_the_resolved_project_folder() {
+    let document = test_document(Vec::new());
+    let scene = RenderScene::from_document(&document);
+    let mut app = SmsEditorApp {
+        base_root: "base-root".to_string(),
+        project_root: "sms-editor-project".to_string(),
+        stage_id: "dolpic0".to_string(),
+        ..SmsEditorApp::default()
+    };
+    let loaded = LoadedStage {
+        base_root: "base-root".to_string(),
+        requested_project_root: "sms-editor-project".to_string(),
+        project_root: "sms-editor-project-SunshineUSExtract".to_string(),
+        archives: Vec::new(),
+        registry: None,
+        schema_warning: None,
+        project_warning: Some("Project Folder automatically switched.".to_string()),
+        document,
+        scene,
+        preview: None,
+    };
+
+    app.apply_loaded_stage(loaded);
+
+    assert_eq!(app.project_root, "sms-editor-project-SunshineUSExtract");
+    assert!(app
+        .log
+        .iter()
+        .any(|message| message.contains("automatically switched")));
+}
+
+#[test]
 fn completed_stage_load_is_discarded_when_the_selected_stage_changed() {
     let document = test_document(Vec::new());
     let scene = RenderScene::from_document(&document);
@@ -2533,10 +2722,12 @@ fn completed_stage_load_is_discarded_when_the_selected_stage_changed() {
     };
     let loaded = LoadedStage {
         base_root: "base-root".to_string(),
+        requested_project_root: "project".to_string(),
         project_root: "project".to_string(),
         archives: Vec::new(),
         registry: None,
         schema_warning: None,
+        project_warning: None,
         document,
         scene,
         preview: None,
@@ -2635,6 +2826,9 @@ fn test_document(objects: Vec<SceneObject>) -> StageDocument {
         assets: Vec::new(),
         objects,
         changed_files: BTreeMap::new(),
+        stage_archive: None,
+        stage_archive_source_path: None,
+        archive_edits: sms_scene::StageArchiveEdits::default(),
         registry: None,
         load_issues: Vec::new(),
         lighting: Default::default(),

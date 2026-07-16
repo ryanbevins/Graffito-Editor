@@ -19,6 +19,15 @@ impl SmsEditorApp {
             if command_button(ui, "Save Project", self.document.is_some()).clicked() {
                 self.save_project();
             }
+            let export_enabled = self.document.is_some()
+                && !self.stage_export_path.trim().is_empty()
+                && self.background_receiver.is_none();
+            if command_button(ui, "Export Stage", export_enabled)
+                .on_hover_text("Create a new rebuilt stage archive at the explicit external path")
+                .clicked()
+            {
+                self.export_stage_archive();
+            }
             if command_button(ui, "Launch", true).clicked() {
                 self.launch_dolphin();
             }
@@ -163,8 +172,23 @@ impl SmsEditorApp {
         ui.heading("SMS Level Editor");
         ui.add_space(4.0);
         labeled_text(ui, "Repo Root", &mut self.repo_root);
-        labeled_text(ui, "Base Root", &mut self.base_root);
-        labeled_text(ui, "Project Folder", &mut self.project_root);
+        labeled_text(ui, "Base Game Root", &mut self.base_root);
+        labeled_text(ui, "Editor Project", &mut self.project_root);
+        ui.small(
+            "Each game region uses a separate editor project. Project files are kept outside the extracted base game.",
+        );
+        if let Some(document) = &self.document {
+            if !document_uses_selected_base(document, self.base_root.trim()) {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 150, 104),
+                    format!(
+                        "The open stage is still from '{}'. Open a stage from the selected Base Game Root before saving.",
+                        document.base_root.display()
+                    ),
+                );
+            }
+        }
+        labeled_text(ui, "Stage Export", &mut self.stage_export_path);
         labeled_text(ui, "Stage", &mut self.stage_id);
 
         ui.separator();
@@ -304,7 +328,7 @@ impl SmsEditorApp {
     pub(super) fn content_browser_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Content Browser");
         ui.add_space(4.0);
-        labeled_text(ui, "Base Root", &mut self.base_root);
+        labeled_text(ui, "Base Game Root", &mut self.base_root);
 
         ui.horizontal(|ui| {
             let can_scan = PathBuf::from(self.base_root.trim()).exists();

@@ -10,8 +10,8 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sms_formats::{
     mount_scene_archive, parse_jdrama_object_records, read_stage_asset_bytes, scan_stage_assets,
-    JDramaAmbient, JDramaLight, JDramaObjectRecord, PrmFile, SourceLocation, StageAsset,
-    StageAssetKind,
+    JDramaAmbient, JDramaDocument, JDramaField, JDramaFieldValue, JDramaLight, JDramaObjectRecord,
+    JDramaRecord, JDramaRecordPayload, PrmFile, SourceLocation, StageAsset, StageAssetKind,
 };
 use sms_schema::{
     EnemyActorDefinition, EnemyManagerDefinition, EnemyModelDefinition, ObjectRegistry,
@@ -19,7 +19,18 @@ use sms_schema::{
 use thiserror::Error;
 
 mod project_store;
+mod stage_archive;
+mod stage_export;
 mod validation;
+
+pub use stage_archive::{
+    SourceFreeStageArchive, StageCompression, StageObjectPlacement, StageResource,
+    StageResourceDocument,
+};
+pub use stage_export::{
+    StageArchiveEdits, StageArchiveExportOutcome, StageCollisionEdit, StageModelEdit,
+    StagePlacementInsert,
+};
 
 #[derive(Debug, Error)]
 pub enum SceneError {
@@ -29,6 +40,16 @@ pub enum SceneError {
     Io(#[from] std::io::Error),
     #[error("format error: {0}")]
     Format(#[from] sms_formats::FormatError),
+    #[error("stage resource {path}: {source}")]
+    StageResource {
+        path: String,
+        #[source]
+        source: sms_formats::FormatError,
+    },
+    #[error("stage archive export failed: {0}")]
+    StageExport(String),
+    #[error("rebuilt stage archive output overlaps the extracted base directory: {0}")]
+    StageArchiveOutputOverlapsBase(PathBuf),
     #[error("manifest serialization error: {0}")]
     TomlSer(#[from] toml::ser::Error),
     #[error("manifest parsing error: {0}")]
@@ -47,6 +68,14 @@ pub enum SceneError {
     UnownedProjectRoot(PathBuf),
     #[error("unsupported SMS Editor project manifest at {path}: {reason}")]
     UnsupportedProjectManifest { path: PathBuf, reason: String },
+    #[error(
+        "SMS Editor project manifest at {path} belongs to base root '{manifest_base}', not the open base root '{open_base}'"
+    )]
+    ProjectBaseMismatch {
+        path: PathBuf,
+        manifest_base: PathBuf,
+        open_base: PathBuf,
+    },
     #[error("project export is blocked by validation errors: {0}")]
     ValidationFailed(String),
     #[error(
@@ -140,6 +169,14 @@ pub struct StageDocument {
     pub assets: Vec<StageAsset>,
     pub objects: Vec<SceneObject>,
     pub changed_files: BTreeMap<PathBuf, Vec<u8>>,
+    /// Complete detached semantic import of the stage archive. The original
+    /// archive bytes and RARC child payload slots are never retained here.
+    pub stage_archive: Option<SourceFreeStageArchive>,
+    /// Informational source identity captured at import time. Export never
+    /// opens this path again.
+    pub stage_archive_source_path: Option<PathBuf>,
+    /// Source-free model and collision replacements authored for stage export.
+    pub archive_edits: StageArchiveEdits,
     pub registry: Option<ObjectRegistry>,
     pub load_issues: Vec<ValidationIssue>,
     pub lighting: StageLighting,
@@ -233,13 +270,29 @@ impl StageDocument {
 
         let stage_id = stage_id.into();
         let assets = scan_stage_assets(&base_root, &stage_id)?;
-        let (objects, load_issues, lighting) = load_scene_objects_from_assets(&assets);
+        let (objects, mut load_issues, lighting) = load_scene_objects_from_assets(&assets);
+        let (stage_archive_source_path, stage_archive) =
+            match stage_export::import_exact_stage_archive(&base_root, &stage_id) {
+                Ok((source_path, archive)) => (Some(source_path), Some(archive)),
+                Err(error) => {
+                    load_issues.push(ValidationIssue::error(
+                        "stage-semantic-import-failed",
+                        format!(
+                            "Could not import a detached semantic archive for stage '{stage_id}': {error}"
+                        ),
+                    ));
+                    (None, None)
+                }
+            };
         Ok(Self {
             stage_id,
             base_root,
             assets,
             objects,
             changed_files: BTreeMap::new(),
+            stage_archive,
+            stage_archive_source_path,
+            archive_edits: StageArchiveEdits::default(),
             registry: None,
             load_issues,
             lighting,
@@ -340,6 +393,7 @@ impl StageDocument {
         let overlay = EditorSceneOverlay {
             stage_id: self.stage_id.clone(),
             objects: self.objects.clone(),
+            archive_edits: self.archive_edits.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&overlay)?;
         self.mark_changed_file(path, bytes)?;
@@ -379,6 +433,10 @@ impl StageDocument {
         project_store::load_project_overlay(self, project_root.as_ref())
     }
 
+    pub fn project_root_overlaps_base(&self, project_root: impl AsRef<Path>) -> Result<bool> {
+        project_store::project_root_overlaps_base(self, project_root.as_ref())
+    }
+
     pub fn validate_for_export(&self) -> Result<()> {
         let errors: Vec<_> = self
             .validate()
@@ -402,19 +460,47 @@ impl StageDocument {
 pub struct EditorSceneOverlay {
     pub stage_id: String,
     pub objects: Vec<SceneObject>,
+    #[serde(default)]
+    pub archive_edits: StageArchiveEdits,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SceneObject {
     pub id: String,
     pub source: Option<SourceLocation>,
+    /// Source-free address of this actor in the JDrama group tree.
+    ///
+    /// Existing records are edited in place. `CloneOf` retains only the typed
+    /// template address so export can clone the semantic record rather than
+    /// copying its original bytes.
+    #[serde(default)]
+    pub placement: Option<PlacementBinding>,
     pub factory_name: String,
     pub class_name: Option<String>,
     pub transform: Transform,
     pub raw_params: BTreeMap<String, SceneParameter>,
     pub asset_hints: Vec<AssetRef>,
-    #[serde(skip, default)]
-    pub source_record_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PlacementAddress {
+    pub raw_resource_path: Vec<u8>,
+    pub record_path: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "address", rename_all = "snake_case")]
+pub enum PlacementBinding {
+    Existing(PlacementAddress),
+    CloneOf(PlacementAddress),
+}
+
+impl PlacementBinding {
+    pub fn address(&self) -> &PlacementAddress {
+        match self {
+            Self::Existing(address) | Self::CloneOf(address) => address,
+        }
+    }
 }
 
 impl SceneObject {
@@ -422,12 +508,12 @@ impl SceneObject {
         Self {
             id: id.into(),
             source: None,
+            placement: None,
             factory_name: factory_name.into(),
             class_name: None,
             transform: Transform::default(),
             raw_params: BTreeMap::new(),
             asset_hints: Vec::new(),
-            source_record_bytes: None,
         }
     }
 
@@ -773,6 +859,7 @@ fn load_scene_objects_from_assets(
                 continue;
             }
         };
+        let semantic_placement = JDramaDocument::parse(&bytes).ok();
 
         for record in records {
             if let Some(light) = record.light.clone() {
@@ -799,12 +886,13 @@ fn load_scene_objects_from_assets(
                 offset: Some(record.offset as u64),
                 length: Some(record.size as u64),
             });
+            object.placement = archive_resource_path(&asset.path).map(|raw_resource_path| {
+                PlacementBinding::Existing(PlacementAddress {
+                    raw_resource_path,
+                    record_path: record.record_path.clone(),
+                })
+            });
             object.class_name = Some(type_name);
-            object.source_record_bytes = record
-                .offset
-                .checked_add(record.size)
-                .and_then(|end| bytes.get(record.offset..end))
-                .map(<[u8]>::to_vec);
             object.transform = Transform {
                 translation: transform.translation,
                 rotation_degrees: transform.rotation,
@@ -851,6 +939,12 @@ fn load_scene_objects_from_assets(
             if let Some(blade_count) = record.map_obj_grass_blade_count {
                 object.insert_source_raw_param("grass_blade_count", blade_count.to_string());
             }
+            if let Some(semantic_record) = semantic_placement
+                .as_ref()
+                .and_then(|document| jdrama_record_at(&document.root, &record.record_path))
+            {
+                insert_typed_jdrama_params(&mut object, semantic_record);
+            }
 
             if let Some(model_path) = infer_preview_model_path(&object, &model_index) {
                 object.asset_hints.push(AssetRef {
@@ -871,6 +965,48 @@ fn load_scene_objects_from_assets(
     }
 
     (objects, issues, lighting)
+}
+
+fn jdrama_record_at<'a>(mut record: &'a JDramaRecord, path: &[usize]) -> Option<&'a JDramaRecord> {
+    for index in path {
+        let JDramaRecordPayload::Group { children, .. } = &record.payload else {
+            return None;
+        };
+        record = children.get(*index)?;
+    }
+    Some(record)
+}
+
+fn insert_typed_jdrama_params(object: &mut SceneObject, record: &JDramaRecord) {
+    let fields: &[JDramaField] = match &record.payload {
+        JDramaRecordPayload::Actor { fields, .. }
+        | JDramaRecordPayload::Fields { fields }
+        | JDramaRecordPayload::Group { fields, .. } => fields,
+        JDramaRecordPayload::Empty => &[],
+    };
+    for field in fields {
+        let raw_value = match &field.value {
+            JDramaFieldValue::U32(value) => value.to_string(),
+            JDramaFieldValue::I32(value) => value.to_string(),
+            JDramaFieldValue::F32(value) => value.to_string(),
+            JDramaFieldValue::Vec2F32(value) => format!("{},{}", value[0], value[1]),
+            JDramaFieldValue::Vec3F32(value) => {
+                format!("{},{},{}", value[0], value[1], value[2])
+            }
+            JDramaFieldValue::ColorRgba8(value) => {
+                format!("{},{},{},{}", value[0], value[1], value[2], value[3])
+            }
+            JDramaFieldValue::String(value) => value.clone(),
+            JDramaFieldValue::LightMap(_) => continue,
+        };
+        object.insert_source_raw_param(field.name.clone(), raw_value);
+    }
+}
+
+fn archive_resource_path(path: &Path) -> Option<Vec<u8>> {
+    path.to_string_lossy()
+        .split_once("!/")
+        .map(|(_, internal_path)| internal_path.as_bytes().to_vec())
 }
 
 fn stable_path_identity(path: &str) -> u64 {
@@ -1842,6 +1978,9 @@ mod tests {
             assets: vec![],
             objects: vec![],
             changed_files: BTreeMap::new(),
+            stage_archive: None,
+            stage_archive_source_path: None,
+            archive_edits: StageArchiveEdits::default(),
             registry: None,
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
@@ -1876,6 +2015,9 @@ mod tests {
             assets: vec![],
             objects: vec![SceneObject::new("obj-1", "coin")],
             changed_files: BTreeMap::new(),
+            stage_archive: None,
+            stage_archive_source_path: None,
+            archive_edits: StageArchiveEdits::default(),
             registry: None,
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
@@ -1910,11 +2052,29 @@ mod tests {
     }
 
     #[test]
+    fn ignores_legacy_embedded_archive_with_non_finite_json_nulls() {
+        let overlay: EditorSceneOverlay = serde_json::from_str(
+            r#"{
+                "stage_id": "dolpic",
+                "objects": [],
+                "archive_edits": {},
+                "stage_archive": {
+                    "resources": [{"parameters": [1000000.0, 0.000001, null]}]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(overlay.stage_id, "dolpic");
+        assert!(overlay.objects.is_empty());
+        assert_eq!(overlay.archive_edits, StageArchiveEdits::default());
+    }
+
+    #[test]
     fn scene_parameters_keep_one_raw_decoded_dirty_state_and_legacy_json_shape() {
         let mut object = SceneObject::new("fixture", "Fixture");
         object.insert_source_raw_param("source", "17");
         object.set_decoded_param("edited", "23", ParamValue::Int(23));
-        object.source_record_bytes = Some(vec![1, 2, 3, 4]);
 
         assert!(!object.raw_params["source"].is_dirty());
         assert!(object.raw_params["edited"].is_dirty());
@@ -1933,12 +2093,50 @@ mod tests {
         assert_eq!(restored.raw_param("source"), Some("17"));
         assert_eq!(restored.raw_param("edited"), Some("23"));
         assert!(!restored.raw_params["edited"].is_dirty());
-        assert!(restored.source_record_bytes.is_none());
+        assert_eq!(restored.id, "fixture");
 
         assert_eq!(
             SceneParameter::from_source("23"),
             SceneParameter::edited("23", Some(ParamValue::Int(23)))
         );
+    }
+
+    #[test]
+    fn typed_jdrama_stream_colors_populate_source_parameters_without_record_bytes() {
+        let record = JDramaRecord::new(
+            "FixturePaint",
+            "paint",
+            JDramaRecordPayload::Actor {
+                transform: sms_formats::JDramaTransform {
+                    translation: [0.0; 3],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: "paint".to_string(),
+                light_map: sms_formats::JDramaLightMap::default(),
+                fields: vec![
+                    JDramaField {
+                        name: "tev_red".to_string(),
+                        value: JDramaFieldValue::U32(511),
+                    },
+                    JDramaField {
+                        name: "tev_green".to_string(),
+                        value: JDramaFieldValue::U32(120),
+                    },
+                    JDramaField {
+                        name: "tev_blue".to_string(),
+                        value: JDramaFieldValue::U32(9),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let mut object = SceneObject::new("paint", "FixturePaint");
+        insert_typed_jdrama_params(&mut object, &record);
+        assert_eq!(object.raw_param("tev_red"), Some("511"));
+        assert_eq!(object.raw_param("tev_green"), Some("120"));
+        assert_eq!(object.raw_param("tev_blue"), Some("9"));
+        assert!(object.raw_params.values().all(|value| !value.is_dirty()));
     }
 
     #[test]
@@ -2032,19 +2230,29 @@ mod tests {
         let root = unique_test_project_root("overlay-round-trip");
         let mut saved = empty_document("dolpic");
         saved.objects = vec![SceneObject::new("edited-object", "Coin")];
+        saved.archive_edits.replace_collision(
+            b"map/map.col".to_vec(),
+            sms_formats::ColFile::new(vec![], vec![]),
+        );
+        saved.archive_edits.insert_placement(
+            b"map/scene.bin".to_vec(),
+            Vec::new(),
+            JDramaRecord::new("NameRef", "inserted", JDramaRecordPayload::Empty).unwrap(),
+        );
         saved.queue_editor_overlay_change().unwrap();
         saved.save_project_folder(&root).unwrap();
 
         let mut reopened = empty_document("dolpic");
         assert!(reopened.load_project_folder(&root).unwrap());
         assert_eq!(reopened.objects, saved.objects);
+        assert_eq!(reopened.archive_edits, saved.archive_edits);
         assert!(reopened.loaded_project.is_some());
 
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn project_overlay_reload_reattaches_source_bytes_and_refreshes_derived_metadata() {
+    fn project_overlay_reload_refreshes_source_identity_and_derived_metadata() {
         let root = unique_test_project_root("source-record-round-trip");
         let source_root = unique_test_project_root("source-record-alias");
         fs::create_dir_all(&source_root).unwrap();
@@ -2060,7 +2268,6 @@ mod tests {
         };
         let mut base_object = SceneObject::new("retail-object", "Coin");
         base_object.source = Some(overlay_source.clone());
-        base_object.source_record_bytes = Some(vec![1, 2, 3, 4]);
 
         let mut saved = empty_document("dolpic");
         saved.objects = vec![base_object.clone()];
@@ -2097,10 +2304,6 @@ mod tests {
         reopened.objects = vec![base_object];
         reopened.load_project_folder(&root).unwrap();
         assert_eq!(reopened.objects[0].source, Some(reopened_source));
-        assert_eq!(
-            reopened.objects[0].source_record_bytes.as_deref(),
-            Some([1, 2, 3, 4].as_slice())
-        );
         assert_eq!(reopened.objects[0].transform.translation[0], 42.0);
         assert_eq!(
             reopened.objects[0].raw_param("name"),
@@ -2129,6 +2332,68 @@ mod tests {
     }
 
     #[test]
+    fn version_two_project_sources_migrate_to_semantic_existing_and_clone_bindings() {
+        let root = unique_test_project_root("v2-placement-migration");
+        let source_root = unique_test_project_root("v2-placement-source");
+        fs::create_dir_all(&source_root).unwrap();
+        let archive_path = source_root.join("stage.szs");
+        fs::write(&archive_path, []).unwrap();
+        let source = SourceLocation {
+            path: PathBuf::from(format!(
+                "{}!/map/scene.bin",
+                fs::canonicalize(&archive_path).unwrap().display()
+            )),
+            offset: Some(32),
+            length: Some(16),
+        };
+        let address = PlacementAddress {
+            raw_resource_path: b"map/scene.bin".to_vec(),
+            record_path: vec![2, 4],
+        };
+        let mut original = SceneObject::new("retail-object", "Coin");
+        original.source = Some(source.clone());
+        original.placement = Some(PlacementBinding::Existing(address.clone()));
+        original.insert_source_raw_param("name", "coin");
+        let mut duplicate = original.clone();
+        duplicate.id = "duplicate".to_string();
+        duplicate.placement = Some(PlacementBinding::CloneOf(address.clone()));
+
+        let mut saved = empty_document("dolpic");
+        saved.objects = vec![original.clone(), duplicate];
+        saved.save_project_folder(&root).unwrap();
+
+        let overlay_path = root.join("files/editor/stages/dolpic.scene.json");
+        let mut overlay: serde_json::Value =
+            serde_json::from_slice(&fs::read(&overlay_path).unwrap()).unwrap();
+        for object in overlay["objects"].as_array_mut().unwrap() {
+            object.as_object_mut().unwrap().remove("placement");
+        }
+        overlay.as_object_mut().unwrap().remove("archive_edits");
+        fs::write(&overlay_path, serde_json::to_vec_pretty(&overlay).unwrap()).unwrap();
+        let manifest_path = root.join("sms-project.toml");
+        let mut manifest: EditorProjectManifest =
+            toml::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        manifest.format_version = 2;
+        fs::write(&manifest_path, toml::to_string_pretty(&manifest).unwrap()).unwrap();
+
+        let mut reopened = empty_document("dolpic");
+        reopened.objects = vec![original];
+        assert!(reopened.load_project_folder(&root).unwrap());
+        assert_eq!(
+            reopened.objects[0].placement,
+            Some(PlacementBinding::Existing(address.clone()))
+        );
+        assert_eq!(
+            reopened.objects[1].placement,
+            Some(PlacementBinding::CloneOf(address))
+        );
+        assert_eq!(reopened.archive_edits, StageArchiveEdits::default());
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(source_root).unwrap();
+    }
+
+    #[test]
     fn project_save_always_persists_the_current_scene_overlay() {
         let root = unique_test_project_root("automatic-overlay");
         let mut document = empty_document("dolpic");
@@ -2141,6 +2406,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(overlay.objects, document.objects);
+        assert_eq!(overlay.archive_edits, document.archive_edits);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2418,6 +2684,9 @@ mod tests {
             assets: vec![],
             objects: vec![],
             changed_files: BTreeMap::new(),
+            stage_archive: None,
+            stage_archive_source_path: None,
+            archive_edits: StageArchiveEdits::default(),
             registry: None,
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
@@ -3099,8 +3368,8 @@ mod tests {
         let path = root.join("map/params/enemy/fixture.prm");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut bytes = 2u32.to_be_bytes().to_vec();
-        for (key, name, value) in [(1u16, "lowScale", 0.75f32), (2u16, "highScale", 1.25f32)] {
-            bytes.extend_from_slice(&key.to_be_bytes());
+        for (name, value) in [("mSLBodyScaleLow", 0.75f32), ("mSLBodyScaleHigh", 1.25f32)] {
+            bytes.extend_from_slice(&sms_formats::jdrama_key_code(name).unwrap().to_be_bytes());
             bytes.extend_from_slice(&(name.len() as u16).to_be_bytes());
             bytes.extend_from_slice(name.as_bytes());
             bytes.extend_from_slice(&4u32.to_be_bytes());
@@ -3117,8 +3386,8 @@ mod tests {
             indexed_models: Vec::new(),
             manager_factories: vec!["FixtureManager".to_string()],
             runtime_uniform_scale: Some(sms_schema::EnemyRuntimeUniformScaleDefinition {
-                low_parameter: "lowScale".to_string(),
-                high_parameter: "highScale".to_string(),
+                low_parameter: "mSLBodyScaleLow".to_string(),
+                high_parameter: "mSLBodyScaleHigh".to_string(),
                 source_file: "src/Enemy/fixture.cpp".to_string(),
             }),
         };

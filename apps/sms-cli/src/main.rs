@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -6,7 +7,7 @@ use clap::{Parser, Subcommand};
 use sms_formats::{
     discover_scene_archives, read_stage_asset_bytes, J3dFile, J3dTriangle, StageAssetKind,
 };
-use sms_scene::StageDocument;
+use sms_scene::{SourceFreeStageArchive, StageDocument};
 use sms_schema::SchemaGenerator;
 
 #[derive(Debug, Parser)]
@@ -103,6 +104,52 @@ enum Commands {
         stage: String,
         #[arg(long)]
         project_root: PathBuf,
+    },
+    /// Rebuild every resource in a scene archive from semantic documents.
+    RebuildStage {
+        #[arg(long)]
+        base_root: PathBuf,
+        #[arg(long)]
+        stage: String,
+        /// Existing output directory plus archive filename; never the base tree.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Apply a saved editor object overlay and create a rebuilt external stage archive.
+    ExportStage {
+        #[arg(long)]
+        base_root: PathBuf,
+        #[arg(long)]
+        stage: String,
+        /// Optional SMS Editor project whose object overlay should be applied.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+        /// Existing output directory plus a new archive filename; never the base tree.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Import an archive into a standalone typed JSON document with no source payload cache.
+    ImportStageDocument {
+        /// Extracted base root, used only to enforce the no-write safety boundary.
+        #[arg(long)]
+        base_root: PathBuf,
+        /// Retail or rebuilt RARC/Yaz0 stage archive to import.
+        #[arg(long)]
+        archive: PathBuf,
+        /// Existing output directory plus a new semantic JSON filename.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Rebuild an archive from a standalone typed JSON document.
+    ExportStageDocument {
+        /// Extracted base root, used only to enforce the no-write safety boundary.
+        #[arg(long)]
+        base_root: PathBuf,
+        #[arg(long)]
+        document: PathBuf,
+        /// Existing output directory plus a new archive filename.
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Launch Dolphin with an isolated user directory when provided.
     LaunchDolphin {
@@ -359,6 +406,96 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&outcome.manifest)?);
             Ok(())
         }
+        Commands::RebuildStage {
+            base_root,
+            stage,
+            out,
+        } => rebuild_stage_archive(base_root, &stage, out),
+        Commands::ExportStage {
+            base_root,
+            stage,
+            project_root,
+            out,
+        } => {
+            let mut document = StageDocument::open(base_root, stage)?;
+            if let Some(project_root) = project_root {
+                document.load_project_folder(&project_root)?;
+                if document.loaded_project.is_none() {
+                    bail!(
+                        "no SMS Editor project manifest was found at {}",
+                        project_root.display()
+                    );
+                }
+            }
+            let outcome = document.export_stage_archive_new(out)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "source": outcome.source_path,
+                    "output": outcome.output_path,
+                    "size_bytes": outcome.size_bytes,
+                    "changed": outcome.changed,
+                    "second_rebuild_stable": true,
+                    "source_buffers_retained": false,
+                })
+            );
+            Ok(())
+        }
+        Commands::ImportStageDocument {
+            base_root,
+            archive,
+            out,
+        } => {
+            let source = std::fs::read(&archive)
+                .with_context(|| format!("read stage archive {}", archive.display()))?;
+            let document = SourceFreeStageArchive::parse(&source)
+                .with_context(|| format!("semantic import of {}", archive.display()))?;
+            let rebuilt = document.encode()?;
+            if rebuilt != source {
+                bail!(
+                    "semantic rebuild of {} was not byte-identical ({} source bytes, {} rebuilt bytes)",
+                    archive.display(),
+                    source.len(),
+                    rebuilt.len()
+                );
+            }
+            let semantic_json = document.to_semantic_json()?;
+            let output = write_create_new_external_synced(&base_root, &out, &semantic_json)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "source": archive,
+                    "output": output,
+                    "semantic_document_bytes": semantic_json.len(),
+                    "source_archive_bytes_retained": false,
+                    "byte_identical_rebuild_proved": true,
+                })
+            );
+            Ok(())
+        }
+        Commands::ExportStageDocument {
+            base_root,
+            document,
+            out,
+        } => {
+            let semantic_json = std::fs::read(&document)
+                .with_context(|| format!("read semantic document {}", document.display()))?;
+            let archive = SourceFreeStageArchive::from_semantic_json(&semantic_json)
+                .with_context(|| format!("load semantic document {}", document.display()))?;
+            let rebuilt = archive.encode()?;
+            let output = write_create_new_external_synced(&base_root, &out, &rebuilt)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "source": document,
+                    "output": output,
+                    "size_bytes": rebuilt.len(),
+                    "second_rebuild_stable": true,
+                    "source_archive_required": false,
+                })
+            );
+            Ok(())
+        }
         Commands::LaunchDolphin {
             dolphin,
             game,
@@ -366,6 +503,159 @@ fn main() -> Result<()> {
             batch,
         } => launch_dolphin(dolphin, game, user_dir, batch),
     }
+}
+
+fn write_create_new_synced(path: &std::path::Path, bytes: &[u8]) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .context("--out must include an existing parent directory")?;
+    if !parent.is_dir() {
+        bail!("output parent does not exist: {}", parent.display());
+    }
+    let file_name = path.file_name().context("--out must include a filename")?;
+    let output = std::fs::canonicalize(parent)
+        .with_context(|| format!("canonicalize output parent {}", parent.display()))?
+        .join(file_name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output)
+        .with_context(|| format!("create new output {}", output.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("write output {}", output.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync output {}", output.display()))?;
+    Ok(output)
+}
+
+fn write_create_new_external_synced(
+    base_root: &std::path::Path,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .context("--out must include an existing parent directory")?;
+    if !parent.is_dir() {
+        bail!("output parent does not exist: {}", parent.display());
+    }
+    let file_name = path.file_name().context("--out must include a filename")?;
+    let canonical_base = std::fs::canonicalize(base_root)
+        .with_context(|| format!("canonicalize base root {}", base_root.display()))?;
+    let canonical_output = std::fs::canonicalize(parent)
+        .with_context(|| format!("canonicalize output parent {}", parent.display()))?
+        .join(file_name);
+    if path_is_same_or_child(&canonical_output, &canonical_base) {
+        bail!(
+            "refusing to write output inside extracted base root: {}",
+            canonical_output.display()
+        );
+    }
+    write_create_new_synced(&canonical_output, bytes)
+}
+
+fn rebuild_stage_archive(base_root: PathBuf, stage: &str, out: PathBuf) -> Result<()> {
+    let archives = discover_scene_archives(&base_root)?;
+    let matches = archives
+        .into_iter()
+        .filter(|archive| archive.stage_id.eq_ignore_ascii_case(stage))
+        .collect::<Vec<_>>();
+    let archive = match matches.as_slice() {
+        [archive] => archive,
+        [] => bail!("no scene archive exactly matches stage '{stage}'"),
+        _ => bail!("multiple scene archives exactly match stage '{stage}'"),
+    };
+
+    let output_parent = out
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .context("--out must include an existing parent directory")?;
+    if !output_parent.is_dir() {
+        bail!(
+            "output parent must already exist so its location can be verified: {}",
+            output_parent.display()
+        );
+    }
+    let output_name = out
+        .file_name()
+        .context("--out must include an archive filename")?;
+    let canonical_base = std::fs::canonicalize(&base_root)
+        .with_context(|| format!("canonicalize base root {}", base_root.display()))?;
+    let canonical_output = std::fs::canonicalize(output_parent)
+        .with_context(|| format!("canonicalize output parent {}", output_parent.display()))?
+        .join(output_name);
+    if path_is_same_or_child(&canonical_output, &canonical_base) {
+        bail!(
+            "refusing to write rebuilt archive inside extracted base root: {}",
+            canonical_output.display()
+        );
+    }
+
+    let source = std::fs::read(&archive.path)
+        .with_context(|| format!("read source archive {}", archive.path.display()))?;
+    let document = SourceFreeStageArchive::parse(&source)
+        .with_context(|| format!("semantic import of stage '{stage}'"))?;
+    let rebuilt = document
+        .encode()
+        .with_context(|| format!("semantic export of stage '{stage}'"))?;
+    if rebuilt != source {
+        bail!(
+            "semantic rebuild of stage '{stage}' was not byte-identical ({} source bytes, {} rebuilt bytes)",
+            source.len(),
+            rebuilt.len()
+        );
+    }
+    let reopened = SourceFreeStageArchive::parse(&rebuilt)
+        .with_context(|| format!("verification reimport of stage '{stage}'"))?;
+    if reopened.encode()? != rebuilt {
+        bail!("second semantic rebuild of stage '{stage}' was not stable");
+    }
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&canonical_output)
+        .with_context(|| {
+            format!(
+                "create new rebuilt archive {} (existing outputs are never replaced)",
+                canonical_output.display()
+            )
+        })?;
+    output
+        .write_all(&rebuilt)
+        .with_context(|| format!("write rebuilt archive {}", canonical_output.display()))?;
+    output
+        .sync_all()
+        .with_context(|| format!("sync rebuilt archive {}", canonical_output.display()))?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "stage": archive.stage_id,
+            "source": archive.path,
+            "output": canonical_output,
+            "size_bytes": rebuilt.len(),
+            "byte_identical": true,
+            "source_buffers_retained": false,
+        })
+    );
+    Ok(())
+}
+
+fn path_is_same_or_child(path: &std::path::Path, parent: &std::path::Path) -> bool {
+    let normalize = |value: &std::path::Path| {
+        value
+            .to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+    let path = normalize(path);
+    let parent = normalize(parent);
+    path == parent
+        || path
+            .strip_prefix(&parent)
+            .is_some_and(|tail| tail.starts_with('\\'))
 }
 
 fn count_assets(document: &StageDocument, kind: StageAssetKind) -> usize {
@@ -775,6 +1065,117 @@ mod tests {
             } if base_root == std::path::Path::new("base")
                 && stage == "dolpic0"
                 && project_root == std::path::Path::new("project")
+        ));
+    }
+
+    #[test]
+    fn rebuild_stage_command_requires_explicit_external_output() {
+        let args = Args::try_parse_from([
+            "sms-cli",
+            "rebuild-stage",
+            "--base-root",
+            "base",
+            "--stage",
+            "dolpic0",
+            "--out",
+            "mod/dolpic0.szs",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            args.command,
+            Commands::RebuildStage {
+                base_root,
+                stage,
+                out,
+            } if base_root == std::path::Path::new("base")
+                && stage == "dolpic0"
+                && out == std::path::Path::new("mod/dolpic0.szs")
+        ));
+    }
+
+    #[test]
+    fn export_stage_command_accepts_a_project_overlay_and_external_output() {
+        let args = Args::try_parse_from([
+            "sms-cli",
+            "export-stage",
+            "--base-root",
+            "base",
+            "--stage",
+            "dolpic0",
+            "--project-root",
+            "project",
+            "--out",
+            "mod/dolpic0.szs",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            args.command,
+            Commands::ExportStage {
+                base_root,
+                stage,
+                project_root: Some(project_root),
+                out,
+            } if base_root == std::path::Path::new("base")
+                && stage == "dolpic0"
+                && project_root == std::path::Path::new("project")
+                && out == std::path::Path::new("mod/dolpic0.szs")
+        ));
+    }
+
+    #[test]
+    fn standalone_semantic_stage_document_commands_require_explicit_paths() {
+        let import = Args::try_parse_from([
+            "sms-cli",
+            "import-stage-document",
+            "--base-root",
+            "base",
+            "--archive",
+            "base/dolpic0.szs",
+            "--out",
+            "project/dolpic0.stage.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            import.command,
+            Commands::ImportStageDocument { base_root, archive, out }
+                if base_root == std::path::Path::new("base")
+                    && archive == std::path::Path::new("base/dolpic0.szs")
+                    && out == std::path::Path::new("project/dolpic0.stage.json")
+        ));
+
+        let export = Args::try_parse_from([
+            "sms-cli",
+            "export-stage-document",
+            "--base-root",
+            "base",
+            "--document",
+            "project/dolpic0.stage.json",
+            "--out",
+            "mod/dolpic0.szs",
+        ])
+        .unwrap();
+        assert!(matches!(
+            export.command,
+            Commands::ExportStageDocument { base_root, document, out }
+                if base_root == std::path::Path::new("base")
+                    && document == std::path::Path::new("project/dolpic0.stage.json")
+                    && out == std::path::Path::new("mod/dolpic0.szs")
+        ));
+    }
+
+    #[test]
+    fn rebuilt_stage_output_boundary_is_component_aware() {
+        let base = std::path::Path::new(r"C:\game\base");
+        assert!(path_is_same_or_child(
+            std::path::Path::new(r"C:\game\base\files\scene.szs"),
+            base
+        ));
+        assert!(path_is_same_or_child(base, base));
+        assert!(!path_is_same_or_child(
+            std::path::Path::new(r"C:\game\base-mod\scene.szs"),
+            base
         ));
     }
 }

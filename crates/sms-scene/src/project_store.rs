@@ -11,7 +11,7 @@ use super::{
 };
 
 pub(super) const PROJECT_KIND: &str = "sms-editor-project";
-pub(super) const PROJECT_FORMAT_VERSION: u32 = 2;
+pub(super) const PROJECT_FORMAT_VERSION: u32 = 3;
 const MAX_PROJECT_MANIFEST_BYTES: u64 = 1024 * 1024;
 static PROJECT_TRANSACTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -26,12 +26,9 @@ pub(super) fn save_project_folder(
     {
         return Err(SceneError::InvalidProjectRoot(project_root.to_path_buf()));
     }
-    let project_comparison = normalized_absolute_for_comparison(project_root)?;
     let base_comparison = normalized_absolute_for_comparison(&document.base_root)?;
     let manifest_base_path = fs::canonicalize(&document.base_root)?;
-    if path_is_same_or_child(&project_comparison, &base_comparison)
-        || path_is_same_or_child(&base_comparison, &project_comparison)
-    {
+    if project_root_overlaps_base(document, project_root)? {
         return Err(SceneError::ProjectOverlapsBase(project_root.to_path_buf()));
     }
     let parent = project_root
@@ -48,13 +45,10 @@ pub(super) fn save_project_folder(
     if let Some(existing_manifest) = &existing_manifest {
         let existing_base = normalized_absolute_for_comparison(&existing_manifest.base_path)?;
         if existing_base != base_comparison {
-            return Err(SceneError::UnsupportedProjectManifest {
+            return Err(SceneError::ProjectBaseMismatch {
                 path: project_root.join("sms-project.toml"),
-                reason: format!(
-                    "manifest base path '{}' does not match the open base root '{}'",
-                    existing_manifest.base_path.display(),
-                    document.base_root.display()
-                ),
+                manifest_base: existing_manifest.base_path.clone(),
+                open_base: document.base_root.clone(),
             });
         }
     }
@@ -285,6 +279,16 @@ pub(super) fn save_project_folder(
     ))
 }
 
+pub(super) fn project_root_overlaps_base(
+    document: &StageDocument,
+    project_root: &Path,
+) -> Result<bool> {
+    let project_comparison = normalized_absolute_for_comparison(project_root)?;
+    let base_comparison = normalized_absolute_for_comparison(&document.base_root)?;
+    Ok(path_is_same_or_child(&project_comparison, &base_comparison)
+        || path_is_same_or_child(&base_comparison, &project_comparison))
+}
+
 pub(super) fn load_project_overlay(
     document: &mut StageDocument,
     project_root: &Path,
@@ -296,13 +300,10 @@ pub(super) fn load_project_overlay(
     let manifest_base = normalized_absolute_for_comparison(&manifest.base_path)?;
     let document_base = normalized_absolute_for_comparison(&document.base_root)?;
     if manifest_base != document_base {
-        return Err(SceneError::UnsupportedProjectManifest {
+        return Err(SceneError::ProjectBaseMismatch {
             path: project_root.join("sms-project.toml"),
-            reason: format!(
-                "manifest base path '{}' does not match the open base root '{}'",
-                manifest.base_path.display(),
-                document.base_root.display()
-            ),
+            manifest_base: manifest.base_path,
+            open_base: document.base_root.clone(),
         });
     }
 
@@ -359,6 +360,7 @@ pub(super) fn load_project_overlay(
         project_fingerprint,
     };
     document.objects = overlay.objects;
+    document.archive_edits = overlay.archive_edits;
     document.loaded_project = Some(loaded_project);
     Ok(true)
 }
@@ -390,15 +392,43 @@ fn reattach_overlay_source_records(
         let Some(base_source) = base_object.source.as_ref() else {
             unreachable!("base source records are indexed only when they have a source");
         };
-        let Some(source_record_bytes) = base_object.source_record_bytes.as_deref() else {
+        if let Some(base_placement) = base_object.placement.as_ref() {
+            match object.placement.as_ref() {
+                Some(placement) if placement.address() != base_placement.address() => {
+                    return Err(SceneError::ProjectOverlaySourceMismatch {
+                        object_id: object.id.clone(),
+                        source_path: source.path.clone(),
+                        offset: source.offset,
+                    });
+                }
+                Some(_) => {}
+                None if object.id == base_object.id => {
+                    object.placement = Some(super::PlacementBinding::Existing(
+                        base_placement.address().clone(),
+                    ));
+                }
+                None => {
+                    // Version 1/2 projects represented duplicates by retaining
+                    // the source record location on an object with a new id.
+                    object.placement = Some(super::PlacementBinding::CloneOf(
+                        base_placement.address().clone(),
+                    ));
+                }
+            }
+        } else if object.placement.is_some() {
             return Err(SceneError::ProjectOverlaySourceMismatch {
                 object_id: object.id.clone(),
                 source_path: source.path.clone(),
                 offset: source.offset,
             });
-        };
+        }
         object.source = Some(base_source.clone());
-        object.source_record_bytes = Some(source_record_bytes.to_vec());
+
+        for (name, value) in &mut object.raw_params {
+            if base_object.raw_param(name) != Some(value.raw()) {
+                *value = super::SceneParameter::edited(value.raw().to_string(), None);
+            }
+        }
 
         // Overlay values win, but newly understood source fields must become
         // available when an older project is reopened against a newer parser.
@@ -476,7 +506,7 @@ enum ProjectEntryFingerprint {
     File { length: u64, hash: u128 },
 }
 
-const MAX_PROJECT_OVERLAY_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PROJECT_OVERLAY_BYTES: u64 = 512 * 1024 * 1024;
 
 fn snapshot_project_root(project_root: &Path) -> Result<ProjectSnapshot> {
     let root_metadata = match fs::symlink_metadata(project_root) {

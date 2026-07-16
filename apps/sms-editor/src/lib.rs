@@ -22,7 +22,8 @@ use sms_render::{
     gx_blend_compatibility, GxBlendCompatibility, RenderScene, RendererConfig, ViewportRenderer,
 };
 use sms_scene::{
-    AssetRef, AssetRole, SceneObject, StageDocument, Transform, ValidationIssue, ValidationSeverity,
+    AssetRef, AssetRole, SceneError, SceneObject, StageArchiveExportOutcome, StageDocument,
+    Transform, ValidationIssue, ValidationSeverity,
 };
 use sms_schema::{ObjectDefinition, ObjectRegistry, ParticleBindingTarget, SchemaGenerator};
 
@@ -116,13 +117,20 @@ struct PreviewVisibility {
 
 struct LoadedStage {
     base_root: String,
+    requested_project_root: String,
     project_root: String,
     archives: Vec<SceneArchiveInfo>,
     registry: Option<ObjectRegistry>,
     schema_warning: Option<String>,
+    project_warning: Option<String>,
     document: StageDocument,
     scene: RenderScene,
     preview: Option<ModelPreview>,
+}
+
+struct ProjectLoadSelection {
+    project_root: String,
+    warning: Option<String>,
 }
 
 enum BackgroundResult {
@@ -132,6 +140,7 @@ enum BackgroundResult {
         result: Result<Vec<SceneArchiveInfo>, String>,
     },
     Open(Result<Box<LoadedStage>, String>),
+    Export(Result<StageArchiveExportOutcome, String>),
 }
 
 mod preview_types;
@@ -283,6 +292,7 @@ struct SmsEditorApp {
     repo_root: String,
     base_root: String,
     project_root: String,
+    stage_export_path: String,
     stage_id: String,
     dolphin_path: String,
     game_path: String,
@@ -354,6 +364,7 @@ impl Default for SmsEditorApp {
             repo_root: args.repo_root.unwrap_or_else(default_repo_root),
             base_root,
             project_root: "sms-editor-project".to_string(),
+            stage_export_path: String::new(),
             stage_id: args.stage_id.unwrap_or_else(|| "dolpic0".to_string()),
             dolphin_path: String::new(),
             game_path: String::new(),
@@ -640,11 +651,10 @@ impl SmsEditorApp {
                 };
                 let mut document = StageDocument::open(PathBuf::from(&base_root), stage_id)
                     .map_err(|err| err.to_string())?;
-                if !project_root.is_empty() {
-                    document
-                        .load_project_folder(PathBuf::from(&project_root))
+                let requested_project_root = project_root;
+                let project_selection =
+                    load_project_for_stage(&mut document, &requested_project_root)
                         .map_err(|err| err.to_string())?;
-                }
                 if let Some(registry) = registry.clone() {
                     document = document.with_registry(registry);
                 }
@@ -652,10 +662,12 @@ impl SmsEditorApp {
                 let preview = SmsEditorApp::build_model_preview(&document, visibility);
                 Ok(Box::new(LoadedStage {
                     base_root,
-                    project_root,
+                    requested_project_root,
+                    project_root: project_selection.project_root,
                     archives,
                     registry,
                     schema_warning,
+                    project_warning: project_selection.warning,
                     document,
                     scene,
                     preview,
@@ -723,6 +735,22 @@ impl SmsEditorApp {
                         Ok(loaded) => self.apply_loaded_stage(*loaded),
                         Err(err) => self.log.push(format!("Open stage failed: {err}")),
                     },
+                    BackgroundResult::Export(result) => match result {
+                        Ok(outcome) => {
+                            let rebuild_kind = if outcome.changed {
+                                "with authored semantic changes"
+                            } else {
+                                "byte-identical to the imported archive"
+                            };
+                            self.log.push(format!(
+                                "Exported {} bytes to '{}' ({rebuild_kind}; source '{}').",
+                                outcome.size_bytes,
+                                outcome.output_path.display(),
+                                outcome.source_path.display(),
+                            ));
+                        }
+                        Err(err) => self.log.push(format!("Stage archive export failed: {err}")),
+                    },
                 }
             }
             Some(Err(TryRecvError::Empty)) => {
@@ -741,10 +769,12 @@ impl SmsEditorApp {
     fn apply_loaded_stage(&mut self, loaded: LoadedStage) {
         let LoadedStage {
             base_root,
+            requested_project_root,
             project_root,
             archives,
             registry,
             schema_warning,
+            project_warning,
             document,
             scene,
             preview,
@@ -755,9 +785,9 @@ impl SmsEditorApp {
             ));
             return;
         }
-        if self.project_root.trim() != project_root {
+        if self.project_root.trim() != requested_project_root {
             self.log.push(format!(
-                "Discarded stage load for superseded project root {project_root}."
+                "Discarded stage load for superseded project root {requested_project_root}."
             ));
             return;
         }
@@ -773,6 +803,10 @@ impl SmsEditorApp {
                 "Schema generation failed; stage opened without it: {warning}"
             ));
         }
+        if let Some(warning) = project_warning {
+            self.log.push(warning);
+        }
+        self.project_root = project_root;
         self.registry = registry;
         self.scene_archives = archives;
         self.last_scanned_base_root = self.base_root.trim().to_string();
@@ -1922,6 +1956,183 @@ fn japanese_font_candidates() -> Vec<PathBuf> {
         .map(PathBuf::from)
         .collect()
     }
+}
+
+fn load_project_for_stage(
+    document: &mut StageDocument,
+    project_root: &str,
+) -> Result<ProjectLoadSelection, SceneError> {
+    if project_root.is_empty() {
+        return Ok(ProjectLoadSelection {
+            project_root: String::new(),
+            warning: None,
+        });
+    }
+    let requested = PathBuf::from(project_root);
+    if document.project_root_overlaps_base(&requested)? {
+        let selected = load_first_compatible_project(
+            document,
+            external_project_roots_for_base(&document.base_root),
+        )?;
+        return Ok(ProjectLoadSelection {
+            warning: Some(format!(
+                "Project Folder automatically changed from '{}' to '{}' because editor projects must be outside the extracted base game directory.",
+                requested.display(),
+                selected.display()
+            )),
+            project_root: selected.to_string_lossy().into_owned(),
+        });
+    }
+    match document.load_project_folder(&requested) {
+        Ok(_) => Ok(ProjectLoadSelection {
+            project_root: project_root.to_string(),
+            warning: None,
+        }),
+        Err(SceneError::ProjectBaseMismatch {
+            path,
+            manifest_base,
+            open_base,
+        }) => {
+            let selected = load_first_compatible_project(
+                document,
+                regional_project_roots(&requested, &document.base_root, &manifest_base),
+            )?;
+            Ok(ProjectLoadSelection {
+                warning: Some(format!(
+                    "Project Folder automatically switched from '{}' to '{}' because '{}' belongs to base root '{}', not '{}'.",
+                    requested.display(),
+                    selected.display(),
+                    path.display(),
+                    manifest_base.display(),
+                    open_base.display()
+                )),
+                project_root: selected.to_string_lossy().into_owned(),
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn document_uses_selected_base(document: &StageDocument, selected_base_root: &str) -> bool {
+    let selected = PathBuf::from(selected_base_root);
+    let document_base = std::fs::canonicalize(&document.base_root);
+    let selected_base = std::fs::canonicalize(selected);
+    match (document_base, selected_base) {
+        (Ok(document_base), Ok(selected_base)) => {
+            #[cfg(windows)]
+            {
+                document_base
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&selected_base.to_string_lossy())
+            }
+            #[cfg(not(windows))]
+            {
+                document_base == selected_base
+            }
+        }
+        _ => false,
+    }
+}
+
+fn load_first_compatible_project(
+    document: &mut StageDocument,
+    candidates: Vec<PathBuf>,
+) -> Result<PathBuf, SceneError> {
+    let mut last_mismatch = None;
+    for candidate in candidates {
+        match document.load_project_folder(&candidate) {
+            Ok(_) => return Ok(candidate),
+            Err(error @ SceneError::ProjectBaseMismatch { .. }) => last_mismatch = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_mismatch.unwrap_or_else(|| SceneError::InvalidProjectRoot(PathBuf::new())))
+}
+
+fn regional_project_roots(
+    requested: &std::path::Path,
+    base_root: &std::path::Path,
+    manifest_base: &std::path::Path,
+) -> Vec<PathBuf> {
+    const DEFAULT_PROJECT_NAME: &str = "sms-editor-project";
+    let parent = requested
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let requested_name = requested
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(DEFAULT_PROJECT_NAME);
+    let manifest_suffix = format!("-{}", project_base_slug(manifest_base));
+    let family_name = requested_name
+        .strip_suffix(&manifest_suffix)
+        .unwrap_or(requested_name);
+
+    let mut candidates = Vec::new();
+    let legacy_root = parent.join(family_name);
+    if requested != legacy_root && legacy_root.join("sms-project.toml").is_file() {
+        candidates.push(legacy_root);
+    }
+    let slug = project_base_slug(base_root);
+    let regional_root = parent.join(format!("{family_name}-{slug}"));
+    if regional_root != requested && !candidates.contains(&regional_root) {
+        candidates.push(regional_root.clone());
+    }
+    candidates.push(parent.join(format!(
+        "{family_name}-{slug}-{:08x}",
+        project_base_hash(base_root) as u32
+    )));
+    candidates
+}
+
+fn external_project_roots_for_base(base_root: &std::path::Path) -> Vec<PathBuf> {
+    let parent = base_root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let slug = project_base_slug(base_root);
+    vec![
+        parent.join(format!("{slug}-sms-editor-project")),
+        parent.join(format!(
+            "{slug}-sms-editor-project-{:08x}",
+            project_base_hash(base_root) as u32
+        )),
+    ]
+}
+
+fn project_base_slug(base_root: &std::path::Path) -> String {
+    let source = base_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("base");
+    let mut slug = String::new();
+    for character in source.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+            slug.push(character);
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "base".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+fn project_base_hash(base_root: &std::path::Path) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    base_root
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+        .bytes()
+        .fold(FNV_OFFSET, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+        })
 }
 
 fn command_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
