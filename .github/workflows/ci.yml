@@ -44,6 +44,12 @@ jobs:
       checks: write
     steps:
       - uses: actions/checkout@v7
+      # The action installs without --locked, which currently resolves a
+      # Rust-1.96-only transitive dependency despite cargo-audit's 1.88 MSRV.
+      - run: cargo install cargo-audit --version 0.22.2 --locked
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # quick-xml is only used by wayland-scanner at build time on trusted
+          # protocol XML. Remove these ignores when a compatible scanner ships.
+          ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195
