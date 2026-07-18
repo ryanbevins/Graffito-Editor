@@ -3140,6 +3140,8 @@ fn completed_stage_load_is_discarded_when_the_project_path_changed() {
         preview: None,
         scene_labels: BTreeMap::new(),
         scene_label_warning: None,
+        retail_skyboxes: Vec::new(),
+        skybox_warnings: Vec::new(),
     };
 
     app.apply_loaded_stage(loaded);
@@ -3174,6 +3176,8 @@ fn completed_stage_load_adopts_the_resolved_project_folder() {
         preview: None,
         scene_labels: BTreeMap::new(),
         scene_label_warning: None,
+        retail_skyboxes: Vec::new(),
+        skybox_warnings: Vec::new(),
     };
 
     app.apply_loaded_stage(loaded);
@@ -3208,6 +3212,8 @@ fn completed_stage_load_is_discarded_when_the_selected_stage_changed() {
         preview: None,
         scene_labels: BTreeMap::new(),
         scene_label_warning: None,
+        retail_skyboxes: Vec::new(),
+        skybox_warnings: Vec::new(),
     };
 
     app.apply_loaded_stage(loaded);

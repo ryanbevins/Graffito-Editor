@@ -30,6 +30,11 @@ const COLLISION_WALL_PADDING: f32 = 80.0;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StageArchiveEdits {
+    /// Source-free resources removed before insert/upsert edits are applied.
+    /// Missing paths are ignored so one bundle can replace stages with
+    /// different optional companion files.
+    #[serde(default)]
+    pub resource_removals: Vec<Vec<u8>>,
     #[serde(default)]
     pub resources: Vec<StageResourceEdit>,
     #[serde(default)]
@@ -105,6 +110,23 @@ pub struct StageArchiveExportOutcome {
 }
 
 impl StageArchiveEdits {
+    pub fn remove_resource(&mut self, raw_resource_path: impl Into<Vec<u8>>) {
+        let raw_resource_path = raw_resource_path.into();
+        self.resources
+            .retain(|edit| edit.raw_resource_path != raw_resource_path);
+        self.models
+            .retain(|edit| edit.raw_resource_path != raw_resource_path);
+        self.collisions
+            .retain(|edit| edit.raw_resource_path != raw_resource_path);
+        if !self
+            .resource_removals
+            .iter()
+            .any(|path| path == &raw_resource_path)
+        {
+            self.resource_removals.push(raw_resource_path);
+        }
+    }
+
     pub fn insert_resource(
         &mut self,
         raw_resource_path: impl Into<Vec<u8>>,
@@ -135,6 +157,8 @@ impl StageArchiveEdits {
         document: StageResourceDocument,
         mode: StageResourceEditMode,
     ) {
+        self.resource_removals
+            .retain(|path| path != &raw_resource_path);
         if let Some(edit) = self
             .resources
             .iter_mut()
@@ -181,6 +205,8 @@ impl StageArchiveEdits {
         document: J3dRebuildDocument,
         mode: StageModelEditMode,
     ) {
+        self.resource_removals
+            .retain(|path| path != &raw_resource_path);
         if let Some(edit) = self
             .models
             .iter_mut()
@@ -216,8 +242,11 @@ impl StageArchiveEdits {
     /// Appends a collision document after the current document at this path.
     /// Multiple append edits for one path are retained and applied in order.
     pub fn append_collision(&mut self, raw_resource_path: impl Into<Vec<u8>>, document: ColFile) {
+        let raw_resource_path = raw_resource_path.into();
+        self.resource_removals
+            .retain(|path| path != &raw_resource_path);
         self.collisions.push(StageCollisionEdit {
-            raw_resource_path: raw_resource_path.into(),
+            raw_resource_path,
             document,
             mode: StageCollisionEditMode::Append,
         });
@@ -229,6 +258,8 @@ impl StageArchiveEdits {
         document: ColFile,
         mode: StageCollisionEditMode,
     ) {
+        self.resource_removals
+            .retain(|path| path != &raw_resource_path);
         // A replacement/upsert starts a new base for this path. Appends made
         // after it remain ordered, while earlier operations are superseded.
         self.collisions
@@ -487,6 +518,10 @@ fn apply_resource_edits(
     edits: &StageArchiveEdits,
 ) -> Result<()> {
     reject_duplicate_edit_paths(
+        edits.resource_removals.iter().map(Vec::as_slice),
+        "resource removal",
+    )?;
+    reject_duplicate_edit_paths(
         edits
             .resources
             .iter()
@@ -501,6 +536,12 @@ fn apply_resource_edits(
         "model",
     )?;
     reject_duplicate_collision_bases(&edits.collisions)?;
+
+    for raw_path in &edits.resource_removals {
+        if archive.resource(raw_path).is_some() {
+            archive.remove_resource(raw_path)?;
+        }
+    }
 
     // General resources are applied first so later typed edits can update or
     // append to a resource intentionally created by this transaction.
@@ -1755,6 +1796,37 @@ mod tests {
             panic!("rebuilt collision has wrong kind");
         };
         assert_eq!(collision.vertices()[0].position[1], 75.0);
+    }
+
+    #[test]
+    fn resource_removal_is_idempotent_and_superseded_by_upsert() {
+        let fixture = StageFixture::new("resource-removal");
+        let document = fixture.document();
+        let mut edits = StageArchiveEdits::default();
+        edits.remove_resource(b"map.bmd".to_vec());
+        edits.remove_resource(b"missing.bmd".to_vec());
+
+        let rebuilt = document.build_stage_archive_with_edits(&edits).unwrap();
+        let reopened = SourceFreeStageArchive::parse(&rebuilt).unwrap();
+        assert!(reopened.resource(b"map.bmd").is_none());
+
+        let source = fs::read(&fixture.archive_path).unwrap();
+        let source_archive = SourceFreeStageArchive::parse(&source).unwrap();
+        let replacement = match source_archive.resource(b"map.bmd").unwrap() {
+            StageResourceDocument::Model(model) => model.clone(),
+            _ => panic!("fixture model has wrong kind"),
+        };
+        edits.upsert_model(b"map.bmd".to_vec(), replacement.clone());
+        assert!(!edits
+            .resource_removals
+            .iter()
+            .any(|path| path == b"map.bmd"));
+        let rebuilt = document.build_stage_archive_with_edits(&edits).unwrap();
+        let reopened = SourceFreeStageArchive::parse(&rebuilt).unwrap();
+        assert_eq!(
+            reopened.resource(b"map.bmd"),
+            Some(&StageResourceDocument::Model(replacement))
+        );
     }
 
     #[test]

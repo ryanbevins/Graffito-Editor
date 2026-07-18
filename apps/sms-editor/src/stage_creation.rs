@@ -152,6 +152,7 @@ impl SmsEditorApp {
         let background_stage_id = stage_id.clone();
         let mut archives = self.scene_archives.clone();
         let scene_labels = self.scene_labels.clone();
+        let retail_skyboxes = self.retail_skyboxes.clone();
         let existing_registry = self.registry.clone();
         let visibility = self.preview_visibility();
         let (sender, receiver) = mpsc::channel();
@@ -244,6 +245,8 @@ impl SmsEditorApp {
                     preview,
                     scene_labels,
                     scene_label_warning: None,
+                    retail_skyboxes,
+                    skybox_warnings: Vec::new(),
                 }))
             })();
             let _ = sender.send(BackgroundResult::CreateStage(result));

@@ -40,6 +40,7 @@ mod outliner;
 mod project;
 mod project_ui;
 mod scene_labels;
+mod skybox_library;
 mod stage_creation;
 mod ui_panels;
 mod viewport_ui;
@@ -49,6 +50,7 @@ use outliner::*;
 use project::*;
 use project_ui::{path_display_row, NewProjectDraft};
 use scene_labels::*;
+use skybox_library::*;
 use stage_creation::{insert_authored_scene_archive, NewStageDraft};
 
 const VIEWPORT_NEAR_CLIP: f32 = 8.0;
@@ -187,6 +189,8 @@ struct LoadedStage {
     preview: Option<ModelPreview>,
     scene_labels: BTreeMap<String, SceneArchiveLabel>,
     scene_label_warning: Option<String>,
+    retail_skyboxes: Vec<RetailSkyboxEntry>,
+    skybox_warnings: Vec<String>,
 }
 
 struct ProjectLoadSelection {
@@ -198,6 +202,8 @@ struct SceneScanResult {
     archives: Vec<SceneArchiveInfo>,
     labels: BTreeMap<String, SceneArchiveLabel>,
     label_warning: Option<String>,
+    retail_skyboxes: Vec<RetailSkyboxEntry>,
+    skybox_warnings: Vec<String>,
 }
 
 enum BackgroundResult {
@@ -208,6 +214,7 @@ enum BackgroundResult {
     },
     Open(Result<Box<LoadedStage>, String>),
     CreateStage(Result<Box<LoadedStage>, String>),
+    RetailSkybox(Result<RetailSkyboxSelection, String>),
     Build(Result<managed_build::ManagedGameBuildOutcome, String>),
     BuildAndRun(Result<managed_build::ManagedGameLaunchOutcome, String>),
 }
@@ -512,6 +519,7 @@ struct SmsEditorApp {
     render_scene: Option<RenderScene>,
     scene_archives: Vec<SceneArchiveInfo>,
     scene_labels: BTreeMap<String, SceneArchiveLabel>,
+    retail_skyboxes: Vec<RetailSkyboxEntry>,
     model_preview: Option<ModelPreview>,
     gpu_viewport: Option<gpu_viewport::GpuViewportScene>,
     gpu_target_format: Option<eframe::wgpu::TextureFormat>,
@@ -524,6 +532,7 @@ struct SmsEditorApp {
     palette_factory: Option<String>,
     object_filter: String,
     scene_filter: String,
+    skybox_filter: String,
     content_browser_kind: ContentBrowserKind,
     model_asset_filter: String,
     model_folder_filter: Option<String>,
@@ -698,6 +707,7 @@ impl Default for SmsEditorApp {
             render_scene: None,
             scene_archives: Vec::new(),
             scene_labels: BTreeMap::new(),
+            retail_skyboxes: Vec::new(),
             model_preview: None,
             gpu_viewport: None,
             gpu_target_format: None,
@@ -710,6 +720,7 @@ impl Default for SmsEditorApp {
             palette_factory: None,
             object_filter: String::new(),
             scene_filter: String::new(),
+            skybox_filter: String::new(),
             content_browser_kind: ContentBrowserKind::default(),
             model_asset_filter: String::new(),
             model_folder_filter: None,
@@ -1015,10 +1026,13 @@ impl SmsEditorApp {
                     Ok(labels) => (labels, None),
                     Err(error) => (BTreeMap::new(), Some(error)),
                 };
+                let (retail_skyboxes, skybox_warnings) = index_retail_skyboxes(&archives);
                 Ok(SceneScanResult {
                     archives,
                     labels,
                     label_warning,
+                    retail_skyboxes,
+                    skybox_warnings,
                 })
             })();
             let _ = sender.send(BackgroundResult::Scan {
@@ -1128,6 +1142,7 @@ impl SmsEditorApp {
                 if let Some(registry) = registry.clone() {
                     document = document.with_registry(registry);
                 }
+                let (retail_skyboxes, skybox_warnings) = index_retail_skyboxes(&archives);
                 let scene = RenderScene::from_document(&document);
                 let preview = SmsEditorApp::build_model_preview(&document, visibility);
                 Ok(Box::new(LoadedStage {
@@ -1143,6 +1158,8 @@ impl SmsEditorApp {
                     preview,
                     scene_labels,
                     scene_label_warning,
+                    retail_skyboxes,
+                    skybox_warnings,
                 }))
             })();
             let _ = sender.send(BackgroundResult::Open(result));
@@ -1198,8 +1215,10 @@ impl SmsEditorApp {
                             }
                             let count = scan.archives.len();
                             let label_count = scan.labels.len();
+                            let skybox_count = scan.retail_skyboxes.len();
                             self.scene_archives = scan.archives;
                             self.scene_labels = scan.labels;
+                            self.retail_skyboxes = scan.retail_skyboxes;
                             self.last_scanned_base_root = base_root;
                             if self.stage_id.trim().is_empty() {
                                 if let Some(first) = self.scene_archives.first() {
@@ -1212,6 +1231,12 @@ impl SmsEditorApp {
                                 self.log.push(format!(
                                     "Loaded {label_count} localized scene label(s) from the extracted game."
                                 ));
+                            }
+                            self.log.push(format!(
+                                "Indexed {skybox_count} complete retail skybox bundle(s)."
+                            ));
+                            for warning in scan.skybox_warnings {
+                                self.log.push(warning);
                             }
                             if let Some(warning) = scan.label_warning {
                                 self.log.push(format!(
@@ -1261,6 +1286,12 @@ impl SmsEditorApp {
                             );
                         }
                         Err(err) => self.log.push(format!("Create stage failed: {err}")),
+                    },
+                    BackgroundResult::RetailSkybox(result) => match result {
+                        Ok(selection) => self.apply_retail_skybox(selection),
+                        Err(err) => self
+                            .log
+                            .push(format!("Retail skybox selection failed: {err}")),
                     },
                     BackgroundResult::Build(result) => match result {
                         Ok(outcome) => {
@@ -1355,6 +1386,8 @@ impl SmsEditorApp {
             preview,
             scene_labels,
             scene_label_warning,
+            retail_skyboxes,
+            skybox_warnings,
         } = loaded;
         if self.base_root.trim() != base_root {
             self.log.push(format!(
@@ -1393,6 +1426,7 @@ impl SmsEditorApp {
         self.registry = registry;
         self.scene_archives = archives;
         self.scene_labels = scene_labels;
+        self.retail_skyboxes = retail_skyboxes;
         self.last_scanned_base_root = self.base_root.trim().to_string();
         self.log.push(format!(
             "Opened stage '{}' with {} asset(s), {} model(s), {} collision file(s).",
@@ -1401,6 +1435,9 @@ impl SmsEditorApp {
             scene.model_paths.len(),
             scene.collision_paths.len()
         ));
+        for warning in skybox_warnings {
+            self.log.push(warning);
+        }
         if let Some(preview) = &preview {
             self.log.push(format!(
                 "Viewport preview loaded {} model(s), {} sampled point(s), {} triangle(s), {} texture(s), {} BTK material animation(s), {} BCK skeletal animation(s), {} procedural map-joint transformation(s), {} level-change JPA effect(s), {} actor-bound JPA effect(s), {} source vertex/vertices.",

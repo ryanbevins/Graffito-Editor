@@ -430,11 +430,80 @@ impl StageDocument {
         if let (Some(archive), Some(source_path)) =
             (&self.stage_archive, &self.stage_archive_source_path)
         {
+            if let Some(raw_resource_path) = semantic_resource_path_for_asset(source_path, path) {
+                if let Some(edit) = self
+                    .archive_edits
+                    .resources
+                    .iter()
+                    .find(|edit| edit.raw_resource_path == raw_resource_path)
+                {
+                    return Ok(edit.document.to_bytes()?);
+                }
+                if let Some(edit) = self
+                    .archive_edits
+                    .models
+                    .iter()
+                    .find(|edit| edit.raw_resource_path == raw_resource_path)
+                {
+                    return Ok(edit.document.to_bytes()?);
+                }
+            }
             if let Some(bytes) = read_matching_semantic_stage_asset(archive, source_path, path)? {
                 return Ok(bytes);
             }
         }
         Ok(read_stage_asset_bytes(path)?)
+    }
+
+    fn sync_archive_edit_assets(&mut self) {
+        let Some(source_path) = self.stage_archive_source_path.as_ref() else {
+            return;
+        };
+        self.assets.retain(|asset| {
+            semantic_resource_path_for_asset(source_path, &asset.path).is_none_or(|raw_path| {
+                !self
+                    .archive_edits
+                    .resource_removals
+                    .iter()
+                    .any(|removed| removed.eq_ignore_ascii_case(&raw_path))
+            })
+        });
+
+        let mut edited_paths = self
+            .archive_edits
+            .resources
+            .iter()
+            .map(|edit| edit.raw_resource_path.as_slice())
+            .chain(
+                self.archive_edits
+                    .models
+                    .iter()
+                    .map(|edit| edit.raw_resource_path.as_slice()),
+            )
+            .chain(
+                self.archive_edits
+                    .collisions
+                    .iter()
+                    .map(|edit| edit.raw_resource_path.as_slice()),
+            )
+            .collect::<Vec<_>>();
+        edited_paths.sort();
+        edited_paths.dedup();
+        for raw_path in edited_paths {
+            let path = PathBuf::from(format!(
+                "{}!/{}",
+                source_path.display(),
+                String::from_utf8_lossy(raw_path)
+            ));
+            if !self.assets.iter().any(|asset| asset.path == path) {
+                self.assets.push(StageAsset {
+                    path,
+                    kind: semantic_stage_asset_kind(raw_path),
+                });
+            }
+        }
+        self.assets
+            .sort_by(|left, right| left.path.cmp(&right.path));
     }
 
     pub fn with_registry(mut self, registry: ObjectRegistry) -> Self {

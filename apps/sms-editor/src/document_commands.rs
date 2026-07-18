@@ -190,7 +190,73 @@ fn ensure_authored_mario_placement(
     })
 }
 
-fn authored_runtime_readiness_error(document: &StageDocument) -> Option<String> {
+pub(super) fn ensure_sky_placement(
+    document: &mut StageDocument,
+    translation: [f32; 3],
+) -> Result<sms_scene::PlacementAddress, String> {
+    let used_addresses = document
+        .objects
+        .iter()
+        .filter_map(|object| {
+            object
+                .placement
+                .as_ref()
+                .map(|binding| binding.address().clone())
+        })
+        .collect::<BTreeSet<_>>();
+    let archive = document
+        .stage_archive
+        .as_mut()
+        .ok_or_else(|| "the stage has no detached semantic archive".to_string())?;
+    let transform = sms_formats::JDramaTransform {
+        translation,
+        rotation: [0.0; 3],
+        scale: [1.0; 3],
+    };
+    if let Some(placement) = archive.object_placements().into_iter().find(|placement| {
+        placement
+            .type_name
+            .rsplit("::")
+            .next()
+            .is_some_and(|type_name| type_name == "Sky")
+            && !used_addresses.contains(&sms_scene::PlacementAddress {
+                raw_resource_path: placement.raw_resource_path.clone(),
+                record_path: placement.record_path.clone(),
+            })
+    }) {
+        archive
+            .set_object_transform(
+                &placement.raw_resource_path,
+                &placement.record_path,
+                transform,
+            )
+            .map_err(|error| error.to_string())?;
+        return Ok(sms_scene::PlacementAddress {
+            raw_resource_path: placement.raw_resource_path,
+            record_path: placement.record_path,
+        });
+    }
+
+    let parent_path = archive
+        .find_group_record_path(b"map/scene.bin", "IdxGroup", Some(1))
+        .map_err(|error| format!("could not locate the typed sky group: {error}"))?
+        .ok_or_else(|| {
+            "map/scene.bin has no unambiguous IdxGroup with group_index 1 for Sky".to_string()
+        })?;
+    let record = sms_scene::blank_stage_sky_record(transform).map_err(|error| error.to_string())?;
+    let record_path = archive
+        .insert_placement_record(b"map/scene.bin", &parent_path, record)
+        .map_err(|error| error.to_string())?;
+    Ok(sms_scene::PlacementAddress {
+        raw_resource_path: b"map/scene.bin".to_vec(),
+        record_path,
+    })
+}
+
+fn authored_runtime_readiness_error(
+    document: &StageDocument,
+    has_authored_skybox_model: bool,
+) -> Option<String> {
     let authored_blank = document
         .stage_archive
         .as_ref()
@@ -206,6 +272,31 @@ fn authored_runtime_readiness_error(document: &StageDocument) -> Option<String> 
     {
         return Some(
             "The authored stage has no Mario placement. Drag the Mario class from the Object Palette into the viewport before building or launching."
+            .to_string(),
+        );
+    }
+    let has_sky_actor = document.objects.iter().any(|object| {
+        object
+            .factory_name
+            .rsplit("::")
+            .next()
+            .is_some_and(|factory| factory == "Sky")
+    });
+    let has_skybox_resource = document
+        .stage_archive
+        .as_ref()
+        .is_some_and(|archive| archive.resource(b"map/map/sky.bmd").is_some())
+        || document.archive_edits.resources.iter().any(|edit| {
+            edit.raw_resource_path
+                .eq_ignore_ascii_case(b"map/map/sky.bmd")
+        })
+        || document.archive_edits.models.iter().any(|edit| {
+            edit.raw_resource_path
+                .eq_ignore_ascii_case(b"map/map/sky.bmd")
+        });
+    if authored_blank && has_sky_actor && !has_skybox_resource && !has_authored_skybox_model {
+        return Some(
+            "The authored stage has a Sky actor but no skybox model. Drag a .smsmodel into the viewport and set its Stage export role to Stage skybox before building or launching."
                 .to_string(),
         );
     }
@@ -336,11 +427,13 @@ impl SmsEditorApp {
             self.log.push("No stage open.".to_string());
             return;
         }
-        if let Some(error) = self
-            .document
-            .as_ref()
-            .and_then(authored_runtime_readiness_error)
-        {
+        let has_authored_skybox_model = self.model_instances.iter().any(|instance| {
+            instance.stage_id.eq_ignore_ascii_case(&self.stage_id)
+                && instance.placement.export_mode == sms_authoring::ModelInstanceExportMode::Skybox
+        });
+        if let Some(error) = self.document.as_ref().and_then(|document| {
+            authored_runtime_readiness_error(document, has_authored_skybox_model)
+        }) {
             self.log.push(format!("Stage build stopped: {error}"));
             return;
         }
@@ -574,6 +667,29 @@ impl SmsEditorApp {
             let mut object = SceneObject::new(id.clone(), factory_name.clone());
             object.placement = Some(sms_scene::PlacementBinding::Existing(address));
             object
+        } else if factory_name == "Sky" {
+            if document
+                .objects
+                .iter()
+                .any(|object| object.factory_name == "Sky")
+            {
+                self.log.push(
+                    "This stage already has its stage-global Sky actor; move the existing Sky instead."
+                        .to_string(),
+                );
+                return;
+            }
+            let address = match ensure_sky_placement(document, translation) {
+                Ok(address) => address,
+                Err(error) => {
+                    self.log
+                        .push(format!("Could not place the Sky class: {error}"));
+                    return;
+                }
+            };
+            let mut object = SceneObject::new(id.clone(), factory_name.clone());
+            object.placement = Some(sms_scene::PlacementBinding::Existing(address));
+            object
         } else if let Some(mut template) = template {
             template.id = id.clone();
             template.source = None;
@@ -630,6 +746,13 @@ impl SmsEditorApp {
                     .objects
                     .iter()
                     .any(|object| object.factory_name == "Mario");
+        }
+        if factory_name == "Sky" {
+            return document.stage_archive.is_some()
+                && !document
+                    .objects
+                    .iter()
+                    .any(|object| object.factory_name == "Sky");
         }
         document
             .objects
@@ -1409,7 +1532,7 @@ mod tests {
         assert_eq!(placements[0].record_path, address.record_path);
         assert_eq!(placements[0].transform.translation, [10.0, 20.0, 30.0]);
         assert_eq!(placements[0].transform.scale, [1.0; 3]);
-        assert!(authored_runtime_readiness_error(&document).is_some());
+        assert!(authored_runtime_readiness_error(&document, false).is_some());
         document.objects.push(SceneObject {
             id: "mario".to_string(),
             source: None,
@@ -1420,6 +1543,74 @@ mod tests {
             raw_params: BTreeMap::new(),
             asset_hints: Vec::new(),
         });
-        assert_eq!(authored_runtime_readiness_error(&document), None);
+        assert_eq!(authored_runtime_readiness_error(&document, false), None);
+    }
+
+    #[test]
+    fn authored_sky_placement_uses_typed_sky_group_and_requires_model() {
+        let sky_group = JDramaRecord::new(
+            "IdxGroup",
+            "sky group",
+            JDramaRecordPayload::Group {
+                fields: vec![JDramaField {
+                    name: "group_index".to_string(),
+                    value: JDramaFieldValue::U32(1),
+                }],
+                children: Vec::new(),
+            },
+        )
+        .unwrap();
+        let root = JDramaRecord::new(
+            "GroupObj",
+            "scene",
+            JDramaRecordPayload::Group {
+                fields: Vec::new(),
+                children: vec![sky_group],
+            },
+        )
+        .unwrap();
+        let mut archive = sms_scene::SourceFreeStageArchive::new().unwrap();
+        archive
+            .insert_resource(
+                b"map/scene.bin".to_vec(),
+                StageResourceDocument::Placement(JDramaDocument { root }),
+            )
+            .unwrap();
+        archive.set_origin(sms_scene::StageOrigin::Blank {
+            target_slot: "custom0".to_string(),
+            preset_version: sms_scene::BLANK_STAGE_PRESET_VERSION,
+        });
+        let mut document = StageDocument {
+            stage_id: "custom0".to_string(),
+            base_root: PathBuf::from("."),
+            assets: Vec::new(),
+            objects: vec![SceneObject::new("mario", "Mario")],
+            changed_files: BTreeMap::new(),
+            stage_archive: Some(archive),
+            stage_archive_source_path: Some(PathBuf::from("custom0.szs")),
+            archive_edits: sms_scene::StageArchiveEdits::default(),
+            registry: None,
+            load_issues: Vec::new(),
+            lighting: sms_scene::StageLighting::default(),
+            actor_previews: BTreeMap::new(),
+            loaded_project: None,
+        };
+
+        let address = ensure_sky_placement(&mut document, [10.0, 20.0, 30.0]).unwrap();
+        assert_eq!(address.raw_resource_path, b"map/scene.bin");
+        let placements = document.stage_archive.as_ref().unwrap().object_placements();
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].type_name, "Sky");
+        assert_eq!(placements[0].record_path, address.record_path);
+        assert_eq!(placements[0].transform.translation, [10.0, 20.0, 30.0]);
+        assert_eq!(placements[0].transform.scale, [1.0; 3]);
+
+        let mut sky = SceneObject::new("sky", "Sky");
+        sky.placement = Some(sms_scene::PlacementBinding::Existing(address));
+        document.objects.push(sky);
+        let error = authored_runtime_readiness_error(&document, false)
+            .expect("a Sky actor without sky.bmd is not runnable");
+        assert!(error.contains("no skybox model"), "{error}");
+        assert_eq!(authored_runtime_readiness_error(&document, true), None);
     }
 }

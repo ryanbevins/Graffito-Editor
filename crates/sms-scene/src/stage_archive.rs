@@ -103,6 +103,15 @@ pub enum StageResourceDocument {
     Texture(BtiFile),
 }
 
+impl StageResourceDocument {
+    /// Encodes this detached typed resource without consulting its source
+    /// archive. Editor previews use this for project overlay resources that do
+    /// not exist in the retail stage being edited.
+    pub fn to_bytes(&self) -> sms_formats::Result<Vec<u8>> {
+        encode_resource(self)
+    }
+}
+
 impl SourceFreeStageArchive {
     /// Creates an empty source-free stage archive with the canonical `scene`
     /// RARC root. Blank-stage authoring defaults to the dedicated `test11`

@@ -37,6 +37,7 @@ pub(super) enum ContentBrowserKind {
     #[default]
     Stages,
     Models,
+    GameSkyboxes,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

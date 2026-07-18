@@ -378,6 +378,7 @@ pub(super) fn load_project_overlay(
     };
     document.objects = overlay.objects;
     document.archive_edits = overlay.archive_edits;
+    document.sync_archive_edit_assets();
     if let Some(lighting) = overlay.lighting {
         document.lighting = lighting;
     }

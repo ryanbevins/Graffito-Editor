@@ -593,11 +593,98 @@ impl SmsEditorApp {
                 ContentBrowserKind::Models,
                 "Model Assets",
             );
+            ui.selectable_value(
+                &mut self.content_browser_kind,
+                ContentBrowserKind::GameSkyboxes,
+                "Game Skyboxes",
+            );
         });
         ui.separator();
         match self.content_browser_kind {
             ContentBrowserKind::Stages => self.stage_content_browser_panel(ui),
             ContentBrowserKind::Models => self.model_content_browser_panel(ui),
+            ContentBrowserKind::GameSkyboxes => self.game_skybox_content_browser_panel(ui),
+        }
+    }
+
+    fn game_skybox_content_browser_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Game Skyboxes");
+            ui.label("Search");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.skybox_filter)
+                    .desired_width(220.0)
+                    .hint_text("Stage or localized name"),
+            );
+        });
+        ui.small(
+            "Indexed from the extracted game's stage archives. Applying one copies the complete typed sky.* bundle into the open scene and creates Sky when the stage does not have it yet.",
+        );
+        ui.separator();
+
+        let filter = self.skybox_filter.to_ascii_lowercase();
+        let entries = self
+            .retail_skyboxes
+            .iter()
+            .filter(|entry| {
+                let localized = self.scene_labels.get(&entry.stage_id.to_ascii_lowercase());
+                filter.is_empty()
+                    || entry.stage_id.to_ascii_lowercase().contains(&filter)
+                    || localized.is_some_and(|label| {
+                        label
+                            .stage_name
+                            .as_ref()
+                            .is_some_and(|name| name.to_ascii_lowercase().contains(&filter))
+                            || label
+                                .scenario_names
+                                .iter()
+                                .any(|name| name.to_ascii_lowercase().contains(&filter))
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut apply = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let layout = content_browser_layout(ui.available_width(), entries.len());
+            egui::Grid::new("game-skybox-content-browser-grid")
+                .num_columns(layout.columns)
+                .min_col_width(layout.card_width)
+                .max_col_width(layout.card_width)
+                .spacing(egui::vec2(8.0, 8.0))
+                .show(ui, |ui| {
+                    for (index, entry) in entries.iter().enumerate() {
+                        let localized = self
+                            .scene_labels
+                            .get(&entry.stage_id.to_ascii_lowercase());
+                        let mut lines = vec![entry.stage_id.clone()];
+                        if let Some(name) = localized.and_then(|label| label.stage_name.as_deref()) {
+                            lines.push(name.to_string());
+                        }
+                        lines.push(format!("{} sky.* resources", entry.resource_count));
+                        let response = content_browser_card_button(
+                            ui,
+                            egui::vec2(layout.card_width, 88.0),
+                            false,
+                            &lines.join("\n"),
+                        )
+                        .on_hover_text(format!(
+                            "Source: {}\nApply this complete retail skybox bundle to the open stage.",
+                            entry.archive_path.display()
+                        ));
+                        if response.clicked() {
+                            apply = Some(entry.clone());
+                        }
+                        if (index + 1) % layout.columns == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
+            if entries.is_empty() {
+                ui.label("No indexed retail skyboxes match this search.");
+            }
+        });
+        if let Some(entry) = apply {
+            self.request_retail_skybox(entry);
         }
     }
 
@@ -752,19 +839,25 @@ impl SmsEditorApp {
                 ui.horizontal(|ui| {
                     let selected = self.palette_factory.as_deref() == Some(&object.factory_name);
                     let placeable = self.can_spawn_factory(&object.factory_name);
+                    let placement_help = if placeable && object.factory_name == "Sky" {
+                        format!(
+                            "{} / {}\nDrag into the viewport to create the typed TSky placement. Then drag a .smsmodel into the viewport and set its Stage export role to Stage skybox.",
+                            object.category, object.class_name
+                        )
+                    } else if placeable {
+                        format!(
+                            "{} / {}\nDrag into the viewport to create a typed placement.",
+                            object.category, object.class_name
+                        )
+                    } else {
+                        format!(
+                            "{} / {}\nThis stage has no typed constructor or existing instance to clone.",
+                            object.category, object.class_name
+                        )
+                    };
                     let response = ui
                         .selectable_label(selected, &object.factory_name)
-                        .on_hover_text(if placeable {
-                            format!(
-                                "{} / {}\nDrag into the viewport to create a typed placement.",
-                                object.category, object.class_name
-                            )
-                        } else {
-                            format!(
-                                "{} / {}\nThis stage has no typed constructor or existing instance to clone.",
-                                object.category, object.class_name
-                            )
-                        });
+                        .on_hover_text(placement_help);
                     if placeable {
                         response.dnd_set_drag_payload(ObjectPaletteDragPayload {
                             factory_name: object.factory_name.clone(),
