@@ -11,10 +11,13 @@ mod bmg;
 mod bmp;
 mod bti;
 mod col;
+mod gx_material;
+mod gx_texture;
 mod j3d;
 mod j3d_anim;
 mod j3d_anim_rebuild;
 mod j3d_rebuild;
+mod j3d_static;
 mod jdrama;
 mod jpa;
 mod jpa_rebuild;
@@ -32,6 +35,8 @@ pub use bmg::{BmgEntry, BmgFile, BmgMessage, BmgMessageToken};
 pub use bmp::BmpFile;
 pub use bti::BtiFile;
 pub use col::{ColFile, ColGroup, ColHeader, ColTriangle, ColVertex};
+pub use gx_material::*;
+pub use gx_texture::*;
 pub use j3d::{
     decode_bti_texture, J3dAlphaCompare, J3dBillboard, J3dBillboardMode, J3dBlendMode,
     J3dColorChannel, J3dFile, J3dFog, J3dGeometryPreview, J3dHeader, J3dIndirectMaterial,
@@ -40,6 +45,7 @@ pub use j3d::{
     J3dPreparedAnimatedTriangles, J3dPreviewCombineMode, J3dSection, J3dTevOrder, J3dTevStage,
     J3dTexGen, J3dTexMatrix, J3dTextureMipPreview, J3dTexturePreview, J3dTriangle, J3dZMode,
     SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS, SMS_MAP_MODEL_LOAD_FLAGS, SMS_POLLUTION_MODEL_LOAD_FLAGS,
+    SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS,
 };
 pub use j3d_anim::{
     J3dJointAnimation, J3dJointTransform, J3dTexturePatternAnimation, J3dTexturePatternBinding,
@@ -47,6 +53,7 @@ pub use j3d_anim::{
 };
 pub use j3d_anim_rebuild::*;
 pub use j3d_rebuild::*;
+pub use j3d_static::*;
 pub use jdrama::{
     effective_npc_parts_mask, encode_jdrama_document, jdrama_key_code, parse_jdrama_document,
     parse_jdrama_object_records, parse_jdrama_scenario_archive_entries, JDramaAmbient,
@@ -64,8 +71,8 @@ pub use mario_record::{MarioRecordBundle, MarioRecordChannel, MarioRecordFile, M
 pub use marker::{MarkerLineEnding, MarkerTextFile};
 pub use prm::{PrmEntry, PrmFile, PrmValue};
 pub use rarc::{
-    rarc_name_hash, RarcArchive, RarcDocument, RarcEntryRecord, RarcFileEntry, RarcHeader,
-    RarcLayout, RarcNodeRecord,
+    rarc_name_hash, RarcArchive, RarcBuilder, RarcDocument, RarcEntryRecord, RarcFileEntry,
+    RarcHeader, RarcLayout, RarcNodeRecord,
 };
 pub use raw::{RawFile, RawFormat};
 pub use stage_assets::{

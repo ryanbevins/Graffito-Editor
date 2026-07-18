@@ -4,6 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod gltf_fixtures;
+
 const US_REGRESSION_FOLDER: &str = "SunshineUSExport";
 const EXPECTED_US_STAGE_COUNT: usize = 108;
 
@@ -18,12 +20,22 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let options = RegressionOptions::parse(env::args_os().skip(1))?;
+    let arguments = env::args_os().skip(1).collect::<Vec<_>>();
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
         .ok_or_else(|| "could not resolve the workspace root".to_string())?;
 
+    match arguments.first().and_then(|argument| argument.to_str()) {
+        Some("regression") => run_regression(repo_root, RegressionOptions::parse(arguments)?),
+        Some("gltf-fixtures") => gltf_fixtures::run(repo_root, &arguments[1..]),
+        Some(command) => Err(usage(&format!("unknown command '{command}'"))),
+        None => Err(usage("missing command")),
+    }
+}
+
+fn run_regression(repo_root: &Path, options: RegressionOptions) -> Result<(), String> {
+    gltf_fixtures::check(repo_root)?;
     run_cargo(repo_root, &["fmt", "--all", "--", "--check"], None)?;
     run_cargo(
         repo_root,
@@ -112,7 +124,9 @@ fn usage(error: &str) -> String {
     } else {
         format!("{error}\n\n")
     };
-    format!("{prefix}usage: cargo regression [--code-only | --base-root <EXTRACTED_US_ROOT>]")
+    format!(
+        "{prefix}usage:\n  cargo regression [--code-only | --base-root <EXTRACTED_US_ROOT>]\n  cargo gltf-fixtures [--check]"
+    )
 }
 
 fn select_retail_root(explicit: Option<PathBuf>) -> Result<PathBuf, String> {

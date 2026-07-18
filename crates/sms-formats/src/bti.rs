@@ -245,9 +245,9 @@ impl BtiFile {
 
 fn encoded_texture_size(format: u8, width: u16, height: u16) -> Result<usize> {
     let (tile_width, tile_height, block_bytes) = match format {
-        0 => (8usize, 8usize, 32usize),
-        1 | 2 | 8 => (8, 4, 32),
-        3 | 4 | 5 | 9 | 10 => (4, 4, 32),
+        0 | 8 => (8usize, 8usize, 32usize),
+        1 | 2 | 9 => (8, 4, 32),
+        3 | 4 | 5 | 10 => (4, 4, 32),
         6 => (4, 4, 64),
         14 => (8, 8, 32),
         _ => {

@@ -74,6 +74,8 @@ pub(super) struct SmsProjectFile {
     pub(super) base_game_root: PathBuf,
     pub(super) project_data_root: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) managed_build_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) schema_source_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) last_stage: Option<String>,
@@ -98,6 +100,7 @@ impl SmsProjectFile {
             created_with: env!("CARGO_PKG_VERSION").to_string(),
             base_game_root,
             project_data_root,
+            managed_build_root: None,
             schema_source_root,
             last_stage: None,
             stage_cameras: BTreeMap::new(),
@@ -149,10 +152,12 @@ impl SmsProjectFile {
             .map_err(|error| format!("Could not save project '{}': {error}", path.display()))
     }
 
-    fn validate_locations(&self, path: &Path) -> Result<(), String> {
+    pub(super) fn validate_locations(&self, path: &Path) -> Result<(), String> {
         let descriptor_path = normalized_absolute_with_missing_tail(path)?;
         let base_root = normalized_absolute_with_missing_tail(&self.base_game_root)?;
         let data_root = normalized_absolute_with_missing_tail(&self.resolved_data_root(path))?;
+        let build_root =
+            normalized_absolute_with_missing_tail(&self.resolved_managed_build_root(path))?;
         if path_is_same_or_child(&descriptor_path, &base_root) {
             return Err(format!(
                 "Project descriptor must be outside the extracted base game directory: {}",
@@ -167,6 +172,28 @@ impl SmsProjectFile {
                 data_root.display()
             ));
         }
+        if path_is_same_or_child(&build_root, &base_root)
+            || path_is_same_or_child(&base_root, &build_root)
+        {
+            return Err(format!(
+                "Managed build output must not overlap the extracted base game directory: {}",
+                build_root.display()
+            ));
+        }
+        if path_is_same_or_child(&build_root, &data_root)
+            || path_is_same_or_child(&data_root, &build_root)
+        {
+            return Err(format!(
+                "Managed build output must not overlap project data: {}",
+                build_root.display()
+            ));
+        }
+        if path_is_same_or_child(&descriptor_path, &build_root) {
+            return Err(format!(
+                "Project descriptor must be outside the managed build directory: {}",
+                path.display()
+            ));
+        }
         Ok(())
     }
 
@@ -179,6 +206,18 @@ impl SmsProjectFile {
                 .filter(|parent| !parent.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new("."))
                 .join(&self.project_data_root)
+        }
+    }
+
+    pub(super) fn resolved_managed_build_root(&self, descriptor_path: &Path) -> PathBuf {
+        match &self.managed_build_root {
+            Some(build_root) if build_root.is_absolute() => build_root.clone(),
+            Some(build_root) => descriptor_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .join(build_root),
+            None => descriptor_path.with_extension("smsbuild"),
         }
     }
 
@@ -241,6 +280,28 @@ impl SmsProjectFile {
                 self.project_data_root.display()
             ));
         }
+        if let Some(build_root) = &self.managed_build_root {
+            if build_root.as_os_str().is_empty() {
+                return Err(format!(
+                    "Project '{}' has an empty managed build path",
+                    path.display()
+                ));
+            }
+            if !build_root.is_absolute()
+                && build_root.components().any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(format!(
+                    "Project '{}' has an unsafe relative managed build path '{}'",
+                    path.display(),
+                    build_root.display()
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -267,6 +328,11 @@ impl OpenProject {
 
     pub(super) fn data_root(&self) -> PathBuf {
         self.descriptor.resolved_data_root(&self.descriptor_path)
+    }
+
+    pub(super) fn managed_build_root(&self) -> PathBuf {
+        self.descriptor
+            .resolved_managed_build_root(&self.descriptor_path)
     }
 }
 
@@ -530,7 +596,7 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn normalized_absolute_with_missing_tail(path: &Path) -> Result<PathBuf, String> {
+pub(super) fn normalized_absolute_with_missing_tail(path: &Path) -> Result<PathBuf, String> {
     let absolute = absolute_path(path)?;
     if let Ok(canonical) = fs::canonicalize(&absolute) {
         return Ok(canonical);
@@ -554,7 +620,7 @@ fn normalized_absolute_with_missing_tail(path: &Path) -> Result<PathBuf, String>
     Ok(normalized)
 }
 
-fn path_is_same_or_child(candidate: &Path, parent: &Path) -> bool {
+pub(super) fn path_is_same_or_child(candidate: &Path, parent: &Path) -> bool {
     let candidate = comparable_components(candidate);
     let parent = comparable_components(parent);
     candidate.len() >= parent.len()

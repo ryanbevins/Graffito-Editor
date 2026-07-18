@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sms_formats::{
-    discover_scene_archives, ColFile, J3dRebuildDocument, JDramaRecord, JDramaRecordPayload,
-    JDramaTransform,
+    discover_scene_archives, ColFile, J3dRebuildDocument, JDramaDocument, JDramaField,
+    JDramaFieldValue, JDramaRecord, JDramaRecordPayload, JDramaTransform,
 };
 
 use crate::{
@@ -17,8 +17,21 @@ use crate::{
     StageDocument, StageObjectPlacement, StageResourceDocument,
 };
 
+const WORLD_COLLISION_PATH: &[u8] = b"map/map.col";
+const WORLD_SCENE_PATH: &[u8] = b"map/scene.bin";
+const COLLISION_GRID_WIDTH_FIELD: &str = "collision_grid_width";
+const COLLISION_GRID_HEIGHT_FIELD: &str = "collision_grid_height";
+const COLLISION_TRIANGLE_CAPACITY_FIELD: &str = "collision_triangle_capacity";
+const COLLISION_LIST_CAPACITY_FIELD: &str = "collision_list_capacity";
+const COLLISION_WARP_CAPACITY_FIELD: &str = "collision_warp_capacity";
+const COLLISION_GRID_CELL_SIZE: f32 = 1024.0;
+const COLLISION_GRID_CELL_RECIPROCAL: f32 = 1.0 / COLLISION_GRID_CELL_SIZE;
+const COLLISION_WALL_PADDING: f32 = 80.0;
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StageArchiveEdits {
+    #[serde(default)]
+    pub resources: Vec<StageResourceEdit>,
     #[serde(default)]
     pub models: Vec<StageModelEdit>,
     #[serde(default)]
@@ -28,15 +41,52 @@ pub struct StageArchiveEdits {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageResourceEdit {
+    pub raw_resource_path: Vec<u8>,
+    pub document: StageResourceDocument,
+    #[serde(default)]
+    pub mode: StageResourceEditMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageResourceEditMode {
+    #[default]
+    Insert,
+    Upsert,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StageModelEdit {
     pub raw_resource_path: Vec<u8>,
     pub document: J3dRebuildDocument,
+    #[serde(default)]
+    pub mode: StageModelEditMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageModelEditMode {
+    #[default]
+    Replace,
+    Upsert,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StageCollisionEdit {
     pub raw_resource_path: Vec<u8>,
     pub document: ColFile,
+    #[serde(default)]
+    pub mode: StageCollisionEditMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageCollisionEditMode {
+    #[default]
+    Replace,
+    Upsert,
+    Append,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -55,40 +105,139 @@ pub struct StageArchiveExportOutcome {
 }
 
 impl StageArchiveEdits {
+    pub fn insert_resource(
+        &mut self,
+        raw_resource_path: impl Into<Vec<u8>>,
+        document: StageResourceDocument,
+    ) {
+        self.set_resource_edit(
+            raw_resource_path.into(),
+            document,
+            StageResourceEditMode::Insert,
+        );
+    }
+
+    pub fn upsert_resource(
+        &mut self,
+        raw_resource_path: impl Into<Vec<u8>>,
+        document: StageResourceDocument,
+    ) {
+        self.set_resource_edit(
+            raw_resource_path.into(),
+            document,
+            StageResourceEditMode::Upsert,
+        );
+    }
+
+    fn set_resource_edit(
+        &mut self,
+        raw_resource_path: Vec<u8>,
+        document: StageResourceDocument,
+        mode: StageResourceEditMode,
+    ) {
+        if let Some(edit) = self
+            .resources
+            .iter_mut()
+            .find(|edit| edit.raw_resource_path == raw_resource_path)
+        {
+            edit.document = document;
+            edit.mode = mode;
+        } else {
+            self.resources.push(StageResourceEdit {
+                raw_resource_path,
+                document,
+                mode,
+            });
+        }
+    }
+
     pub fn replace_model(
         &mut self,
         raw_resource_path: impl Into<Vec<u8>>,
         document: J3dRebuildDocument,
     ) {
-        let raw_resource_path = raw_resource_path.into();
+        self.set_model_edit(
+            raw_resource_path.into(),
+            document,
+            StageModelEditMode::Replace,
+        );
+    }
+
+    pub fn upsert_model(
+        &mut self,
+        raw_resource_path: impl Into<Vec<u8>>,
+        document: J3dRebuildDocument,
+    ) {
+        self.set_model_edit(
+            raw_resource_path.into(),
+            document,
+            StageModelEditMode::Upsert,
+        );
+    }
+
+    fn set_model_edit(
+        &mut self,
+        raw_resource_path: Vec<u8>,
+        document: J3dRebuildDocument,
+        mode: StageModelEditMode,
+    ) {
         if let Some(edit) = self
             .models
             .iter_mut()
             .find(|edit| edit.raw_resource_path == raw_resource_path)
         {
             edit.document = document;
+            edit.mode = mode;
         } else {
             self.models.push(StageModelEdit {
                 raw_resource_path,
                 document,
+                mode,
             });
         }
     }
 
     pub fn replace_collision(&mut self, raw_resource_path: impl Into<Vec<u8>>, document: ColFile) {
-        let raw_resource_path = raw_resource_path.into();
-        if let Some(edit) = self
-            .collisions
-            .iter_mut()
-            .find(|edit| edit.raw_resource_path == raw_resource_path)
-        {
-            edit.document = document;
-        } else {
-            self.collisions.push(StageCollisionEdit {
-                raw_resource_path,
-                document,
-            });
-        }
+        self.set_collision_edit(
+            raw_resource_path.into(),
+            document,
+            StageCollisionEditMode::Replace,
+        );
+    }
+
+    pub fn upsert_collision(&mut self, raw_resource_path: impl Into<Vec<u8>>, document: ColFile) {
+        self.set_collision_edit(
+            raw_resource_path.into(),
+            document,
+            StageCollisionEditMode::Upsert,
+        );
+    }
+
+    /// Appends a collision document after the current document at this path.
+    /// Multiple append edits for one path are retained and applied in order.
+    pub fn append_collision(&mut self, raw_resource_path: impl Into<Vec<u8>>, document: ColFile) {
+        self.collisions.push(StageCollisionEdit {
+            raw_resource_path: raw_resource_path.into(),
+            document,
+            mode: StageCollisionEditMode::Append,
+        });
+    }
+
+    fn set_collision_edit(
+        &mut self,
+        raw_resource_path: Vec<u8>,
+        document: ColFile,
+        mode: StageCollisionEditMode,
+    ) {
+        // A replacement/upsert starts a new base for this path. Appends made
+        // after it remain ordered, while earlier operations are superseded.
+        self.collisions
+            .retain(|edit| edit.raw_resource_path != raw_resource_path);
+        self.collisions.push(StageCollisionEdit {
+            raw_resource_path,
+            document,
+            mode,
+        });
     }
 
     /// Appends a complete typed JDrama record beneath an existing semantic
@@ -201,18 +350,38 @@ fn apply_resource_edits(
 ) -> Result<()> {
     reject_duplicate_edit_paths(
         edits
+            .resources
+            .iter()
+            .map(|edit| edit.raw_resource_path.as_slice()),
+        "resource",
+    )?;
+    reject_duplicate_edit_paths(
+        edits
             .models
             .iter()
             .map(|edit| edit.raw_resource_path.as_slice()),
         "model",
     )?;
-    reject_duplicate_edit_paths(
-        edits
-            .collisions
-            .iter()
-            .map(|edit| edit.raw_resource_path.as_slice()),
-        "collision",
-    )?;
+    reject_duplicate_collision_bases(&edits.collisions)?;
+
+    // General resources are applied first so later typed edits can update or
+    // append to a resource intentionally created by this transaction.
+    for edit in &edits.resources {
+        match edit.mode {
+            StageResourceEditMode::Insert => {
+                archive.insert_resource(edit.raw_resource_path.clone(), edit.document.clone())?
+            }
+            StageResourceEditMode::Upsert => {
+                if archive.resource(&edit.raw_resource_path).is_some() {
+                    archive.replace_resource(&edit.raw_resource_path, edit.document.clone())?;
+                } else {
+                    archive
+                        .insert_resource(edit.raw_resource_path.clone(), edit.document.clone())?;
+                }
+            }
+        }
+    }
+
     for edit in &edits.models {
         let mut replacement = edit.document.clone();
         replacement
@@ -221,37 +390,673 @@ fn apply_resource_edits(
                 path: display_raw_path(&edit.raw_resource_path),
                 source,
             })?;
-        match archive.resource_mut(&edit.raw_resource_path) {
-            Some(StageResourceDocument::Model(document)) => *document = replacement,
+        match archive.resource(&edit.raw_resource_path) {
+            Some(StageResourceDocument::Model(_)) => {
+                archive.replace_resource(
+                    &edit.raw_resource_path,
+                    StageResourceDocument::Model(replacement),
+                )?;
+            }
             Some(_) => {
                 return Err(stage_export_error(format!(
                     "{} is not a model resource",
                     display_raw_path(&edit.raw_resource_path)
-                )))
+                )));
+            }
+            None if edit.mode == StageModelEditMode::Upsert => {
+                archive.insert_resource(
+                    edit.raw_resource_path.clone(),
+                    StageResourceDocument::Model(replacement),
+                )?;
             }
             None => {
                 return Err(stage_export_error(format!(
                     "model resource {} was not found",
                     display_raw_path(&edit.raw_resource_path)
-                )))
+                )));
             }
         }
     }
     for edit in &edits.collisions {
-        match archive.resource_mut(&edit.raw_resource_path) {
-            Some(StageResourceDocument::Collision(document)) => *document = edit.document.clone(),
+        match archive.resource(&edit.raw_resource_path) {
+            Some(StageResourceDocument::Collision(document)) => {
+                let replacement = match edit.mode {
+                    StageCollisionEditMode::Replace | StageCollisionEditMode::Upsert => {
+                        edit.document.clone()
+                    }
+                    StageCollisionEditMode::Append => append_collision_document(
+                        document,
+                        &edit.document,
+                        &edit.raw_resource_path,
+                    )?,
+                };
+                if edit.mode == StageCollisionEditMode::Append
+                    && edit.raw_resource_path == WORLD_COLLISION_PATH
+                {
+                    preserve_world_collision_runtime_headroom(archive, &edit.document)?;
+                }
+                archive.replace_resource(
+                    &edit.raw_resource_path,
+                    StageResourceDocument::Collision(replacement),
+                )?;
+            }
             Some(_) => {
                 return Err(stage_export_error(format!(
                     "{} is not a collision resource",
                     display_raw_path(&edit.raw_resource_path)
-                )))
+                )));
+            }
+            None if edit.mode == StageCollisionEditMode::Upsert => {
+                archive.insert_resource(
+                    edit.raw_resource_path.clone(),
+                    StageResourceDocument::Collision(edit.document.clone()),
+                )?;
             }
             None => {
                 return Err(stage_export_error(format!(
                     "collision resource {} was not found",
                     display_raw_path(&edit.raw_resource_path)
-                )))
+                )));
             }
+        }
+    }
+    Ok(())
+}
+
+fn append_collision_document(
+    existing: &ColFile,
+    authored: &ColFile,
+    raw_resource_path: &[u8],
+) -> Result<ColFile> {
+    // Validate the authored document in its own index space before remapping.
+    authored
+        .encode()
+        .map_err(|source| SceneError::StageResource {
+            path: display_raw_path(raw_resource_path),
+            source,
+        })?;
+
+    let vertex_base = existing.vertices().len();
+    let mut appended_groups = authored.groups().to_vec();
+    for (group_index, group) in appended_groups.iter_mut().enumerate() {
+        for (triangle_index, triangle) in group.triangles.iter_mut().enumerate() {
+            for vertex_index in &mut triangle.vertex_indices {
+                let remapped = vertex_base
+                    .checked_add(usize::from(*vertex_index))
+                    .ok_or_else(|| {
+                        stage_export_error(format!(
+                            "collision append for {} overflowed while remapping group {group_index} triangle {triangle_index}",
+                            display_raw_path(raw_resource_path)
+                        ))
+                    })?;
+                if remapped > i16::MAX as usize {
+                    return Err(stage_export_error(format!(
+                        "collision append for {} cannot remap group {group_index} triangle {triangle_index} vertex {vertex_index}: index {remapped} exceeds the retail COL signed-index limit {}",
+                        display_raw_path(raw_resource_path),
+                        i16::MAX
+                    )));
+                }
+                *vertex_index = remapped as u16;
+            }
+        }
+    }
+
+    let mut merged = existing.clone();
+    merged.vertices_mut().extend_from_slice(authored.vertices());
+    // Retail groups stay byte-semantically unchanged and in their original
+    // order. Authored groups are appended rather than coalesced by surface.
+    merged.groups_mut().append(&mut appended_groups);
+    merged
+        .encode()
+        .map_err(|source| SceneError::StageResource {
+            path: display_raw_path(raw_resource_path),
+            source,
+        })?;
+    Ok(merged)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MapCollisionRuntimeConfig {
+    grid_width: i32,
+    grid_height: i32,
+    triangle_capacity: i32,
+    list_capacity: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CollisionTrianglePoints {
+    points: [[f32; 3]; 3],
+    normal_y: f32,
+}
+
+fn preserve_world_collision_runtime_headroom(
+    archive: &mut SourceFreeStageArchive,
+    authored: &ColFile,
+) -> Result<()> {
+    let placement = match archive.resource_mut(WORLD_SCENE_PATH) {
+        Some(StageResourceDocument::Placement(document)) => document,
+        Some(_) => {
+            return Err(stage_export_error(format!(
+                "{} is not a typed placement resource required by {}",
+                display_raw_path(WORLD_SCENE_PATH),
+                display_raw_path(WORLD_COLLISION_PATH)
+            )));
+        }
+        None => {
+            return Err(stage_export_error(format!(
+                "world collision append requires placement resource {}",
+                display_raw_path(WORLD_SCENE_PATH)
+            )));
+        }
+    };
+    let map_record = unique_map_record_mut(placement)?;
+    let JDramaRecordPayload::Fields { fields } = &mut map_record.payload else {
+        return Err(stage_export_error(format!(
+            "the unique Map record in {} does not have a typed fields payload",
+            display_raw_path(WORLD_SCENE_PATH)
+        )));
+    };
+    let config = read_map_collision_runtime_config(fields)?;
+    let triangle_delta = authored_collision_triangle_count(authored)?;
+    let list_delta = authored_collision_grid_link_count(authored, config)?;
+    let triangle_capacity = config
+        .triangle_capacity
+        .checked_add(triangle_delta)
+        .ok_or_else(|| {
+            stage_export_error(format!(
+                "Map field '{COLLISION_TRIANGLE_CAPACITY_FIELD}' overflows i32 while preserving {triangle_delta} authored collision triangles"
+            ))
+        })?;
+    let list_capacity = config.list_capacity.checked_add(list_delta).ok_or_else(|| {
+        stage_export_error(format!(
+            "Map field '{COLLISION_LIST_CAPACITY_FIELD}' overflows i32 while preserving {list_delta} authored collision grid links"
+        ))
+    })?;
+
+    set_unique_i32_field(fields, COLLISION_TRIANGLE_CAPACITY_FIELD, triangle_capacity)?;
+    set_unique_i32_field(fields, COLLISION_LIST_CAPACITY_FIELD, list_capacity)?;
+    Ok(())
+}
+
+fn unique_map_record_mut(document: &mut JDramaDocument) -> Result<&mut JDramaRecord> {
+    let mut paths = Vec::new();
+    collect_record_paths_by_type(&document.root, "Map", &mut Vec::new(), &mut paths);
+    let path = match paths.as_slice() {
+        [path] => path.as_slice(),
+        [] => {
+            return Err(stage_export_error(format!(
+                "{} has no typed Map record for world collision capacities",
+                display_raw_path(WORLD_SCENE_PATH)
+            )));
+        }
+        _ => {
+            return Err(stage_export_error(format!(
+                "{} has {} typed Map records; world collision capacity target is ambiguous",
+                display_raw_path(WORLD_SCENE_PATH),
+                paths.len()
+            )));
+        }
+    };
+    jdrama_record_mut_at(&mut document.root, path)
+}
+
+fn collect_record_paths_by_type(
+    record: &JDramaRecord,
+    expected_type: &str,
+    path: &mut Vec<usize>,
+    matches: &mut Vec<Vec<usize>>,
+) {
+    if semantic_record_type_name(&record.type_name) == expected_type {
+        matches.push(path.clone());
+    }
+    if let JDramaRecordPayload::Group { children, .. } = &record.payload {
+        for (index, child) in children.iter().enumerate() {
+            path.push(index);
+            collect_record_paths_by_type(child, expected_type, path, matches);
+            path.pop();
+        }
+    }
+}
+
+fn jdrama_record_mut_at<'a>(
+    mut record: &'a mut JDramaRecord,
+    path: &[usize],
+) -> Result<&'a mut JDramaRecord> {
+    for (depth, index) in path.iter().copied().enumerate() {
+        let JDramaRecordPayload::Group { children, .. } = &mut record.payload else {
+            return Err(stage_export_error(format!(
+                "Map record path {} crosses a non-group at depth {depth}",
+                display_record_path(path)
+            )));
+        };
+        record = children.get_mut(index).ok_or_else(|| {
+            stage_export_error(format!(
+                "Map record path {} has no child {index} at depth {depth}",
+                display_record_path(path)
+            ))
+        })?;
+    }
+    Ok(record)
+}
+
+fn semantic_record_type_name(type_name: &str) -> &str {
+    type_name.rsplit("::").next().unwrap_or(type_name)
+}
+
+fn read_map_collision_runtime_config(fields: &[JDramaField]) -> Result<MapCollisionRuntimeConfig> {
+    let grid_width = unique_i32_field(fields, COLLISION_GRID_WIDTH_FIELD)?;
+    let grid_height = unique_i32_field(fields, COLLISION_GRID_HEIGHT_FIELD)?;
+    let triangle_capacity = unique_i32_field(fields, COLLISION_TRIANGLE_CAPACITY_FIELD)?;
+    let list_capacity = unique_i32_field(fields, COLLISION_LIST_CAPACITY_FIELD)?;
+    let warp_capacity = unique_i32_field(fields, COLLISION_WARP_CAPACITY_FIELD)?;
+
+    if grid_width <= 0 || grid_height <= 0 {
+        return Err(stage_export_error(format!(
+            "Map collision grid dimensions must be positive, got {grid_width}x{grid_height}"
+        )));
+    }
+    grid_width.checked_mul(grid_height).ok_or_else(|| {
+        stage_export_error(format!(
+            "Map collision grid dimensions {grid_width}x{grid_height} overflow the runtime cell count"
+        ))
+    })?;
+    for (name, value) in [
+        (COLLISION_TRIANGLE_CAPACITY_FIELD, triangle_capacity),
+        (COLLISION_LIST_CAPACITY_FIELD, list_capacity),
+        (COLLISION_WARP_CAPACITY_FIELD, warp_capacity),
+    ] {
+        if value < 0 {
+            return Err(stage_export_error(format!(
+                "Map field '{name}' must be non-negative, got {value}"
+            )));
+        }
+    }
+
+    Ok(MapCollisionRuntimeConfig {
+        grid_width,
+        grid_height,
+        triangle_capacity,
+        list_capacity,
+    })
+}
+
+fn unique_i32_field(fields: &[JDramaField], name: &str) -> Result<i32> {
+    let index = unique_field_index(fields, name)?;
+    match fields[index].value {
+        JDramaFieldValue::I32(value) => Ok(value),
+        _ => Err(stage_export_error(format!(
+            "Map field '{name}' in {} is not typed i32",
+            display_raw_path(WORLD_SCENE_PATH)
+        ))),
+    }
+}
+
+fn set_unique_i32_field(fields: &mut [JDramaField], name: &str, value: i32) -> Result<()> {
+    let index = unique_field_index(fields, name)?;
+    let JDramaFieldValue::I32(current) = &mut fields[index].value else {
+        return Err(stage_export_error(format!(
+            "Map field '{name}' in {} is not typed i32",
+            display_raw_path(WORLD_SCENE_PATH)
+        )));
+    };
+    *current = value;
+    Ok(())
+}
+
+fn unique_field_index(fields: &[JDramaField], name: &str) -> Result<usize> {
+    let matches = fields
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| (field.name == name).then_some(index))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [index] => Ok(*index),
+        [] => Err(stage_export_error(format!(
+            "Map record in {} is missing field '{name}'",
+            display_raw_path(WORLD_SCENE_PATH)
+        ))),
+        _ => Err(stage_export_error(format!(
+            "Map record in {} has {} fields named '{name}'",
+            display_raw_path(WORLD_SCENE_PATH),
+            matches.len()
+        ))),
+    }
+}
+
+fn authored_collision_triangle_count(authored: &ColFile) -> Result<i32> {
+    let count = authored.groups().iter().try_fold(0usize, |count, group| {
+        count.checked_add(group.triangles.len()).ok_or_else(|| {
+            stage_export_error("authored world collision triangle count overflowed usize")
+        })
+    })?;
+    i32::try_from(count).map_err(|_| {
+        stage_export_error(format!(
+            "authored world collision has {count} triangles, exceeding the runtime i32 capacity"
+        ))
+    })
+}
+
+fn authored_collision_grid_link_count(
+    authored: &ColFile,
+    config: MapCollisionRuntimeConfig,
+) -> Result<i32> {
+    let extent_x = (config.grid_width / 2) as f32 * COLLISION_GRID_CELL_SIZE;
+    let extent_z = (config.grid_height / 2) as f32 * COLLISION_GRID_CELL_SIZE;
+    if !extent_x.is_finite() || !extent_z.is_finite() {
+        return Err(stage_export_error(
+            "Map collision grid extents are not finite",
+        ));
+    }
+
+    let mut link_count = 0i32;
+    for (group_index, group) in authored.groups().iter().enumerate() {
+        for (triangle_index, triangle) in group.triangles.iter().enumerate() {
+            let points = collision_triangle_points(
+                authored,
+                triangle.vertex_indices,
+                group_index,
+                triangle_index,
+            )?;
+            let plane_type = collision_plane_type(group.surface_type, points.normal_y);
+            let Some([min_x, min_z, max_x, max_z]) = collision_grid_bounds(
+                points.points,
+                plane_type,
+                extent_x,
+                extent_z,
+                config.grid_width,
+                config.grid_height,
+                group_index,
+                triangle_index,
+            )?
+            else {
+                continue;
+            };
+
+            for z_index in min_z..=max_z {
+                for x_index in min_x..=max_x {
+                    let cell_min_x = x_index as f32 * COLLISION_GRID_CELL_SIZE - extent_x;
+                    let cell_min_z = z_index as f32 * COLLISION_GRID_CELL_SIZE - extent_z;
+                    let cell_max_x = (x_index + 1) as f32 * COLLISION_GRID_CELL_SIZE - extent_x;
+                    let cell_max_z = (z_index + 1) as f32 * COLLISION_GRID_CELL_SIZE - extent_z;
+                    let (cell_min_x, cell_min_z, cell_max_x, cell_max_z) =
+                        if plane_type == CollisionPlaneType::Wall {
+                            (
+                                cell_min_x - COLLISION_WALL_PADDING,
+                                cell_min_z - COLLISION_WALL_PADDING,
+                                cell_max_x + COLLISION_WALL_PADDING,
+                                cell_max_z + COLLISION_WALL_PADDING,
+                            )
+                        } else {
+                            (cell_min_x, cell_min_z, cell_max_x, cell_max_z)
+                        };
+                    if polygon_is_in_grid(cell_min_x, cell_min_z, cell_max_x, cell_max_z, points) {
+                        link_count = link_count.checked_add(1).ok_or_else(|| {
+                            stage_export_error(format!(
+                                "authored world collision grid-link count exceeds i32 at group {group_index} triangle {triangle_index}"
+                            ))
+                        })?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(link_count)
+}
+
+fn collision_triangle_points(
+    authored: &ColFile,
+    indices: [u16; 3],
+    group_index: usize,
+    triangle_index: usize,
+) -> Result<CollisionTrianglePoints> {
+    let mut points = [[0.0; 3]; 3];
+    for (point, index) in points.iter_mut().zip(indices) {
+        *point = authored
+            .vertices()
+            .get(usize::from(index))
+            .ok_or_else(|| {
+                stage_export_error(format!(
+                    "authored world collision group {group_index} triangle {triangle_index} references missing vertex {index}"
+                ))
+            })?
+            .position;
+        if point.iter().any(|component| !component.is_finite()) {
+            return Err(stage_export_error(format!(
+                "authored world collision group {group_index} triangle {triangle_index} has a non-finite vertex"
+            )));
+        }
+    }
+
+    let [point_1, point_2, point_3] = points;
+    let normal = [
+        (point_2[1] - point_1[1]) * (point_3[2] - point_2[2])
+            - (point_2[2] - point_1[2]) * (point_3[1] - point_2[1]),
+        (point_2[2] - point_1[2]) * (point_3[0] - point_2[0])
+            - (point_2[0] - point_1[0]) * (point_3[2] - point_2[2]),
+        (point_2[0] - point_1[0]) * (point_3[1] - point_2[1])
+            - (point_2[1] - point_1[1]) * (point_3[0] - point_2[0]),
+    ];
+    if normal.iter().any(|component| !component.is_finite()) {
+        return Err(stage_export_error(format!(
+            "authored world collision group {group_index} triangle {triangle_index} overflows while calculating its normal"
+        )));
+    }
+    let normal_y = if normal.iter().any(|component| *component != 0.0) {
+        let magnitude_squared =
+            normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2];
+        if !magnitude_squared.is_finite() || magnitude_squared <= 0.0 {
+            return Err(stage_export_error(format!(
+                "authored world collision group {group_index} triangle {triangle_index} has an unrepresentable normal"
+            )));
+        }
+        normal[1] / magnitude_squared.sqrt()
+    } else {
+        0.0
+    };
+    if !normal_y.is_finite() {
+        return Err(stage_export_error(format!(
+            "authored world collision group {group_index} triangle {triangle_index} has a non-finite normalized normal"
+        )));
+    }
+    Ok(CollisionTrianglePoints { points, normal_y })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollisionPlaneType {
+    Ground,
+    Roof,
+    Wall,
+}
+
+fn collision_plane_type(surface_type: u16, normal_y: f32) -> CollisionPlaneType {
+    if surface_type == 0x0801 || normal_y > 0.2 {
+        CollisionPlaneType::Ground
+    } else if normal_y < -0.2 {
+        CollisionPlaneType::Roof
+    } else {
+        CollisionPlaneType::Wall
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collision_grid_bounds(
+    points: [[f32; 3]; 3],
+    plane_type: CollisionPlaneType,
+    extent_x: f32,
+    extent_z: f32,
+    grid_width: i32,
+    grid_height: i32,
+    group_index: usize,
+    triangle_index: usize,
+) -> Result<Option<[i32; 4]>> {
+    let mut min_x = points[0][0].min(points[1][0]).min(points[2][0]);
+    let mut min_z = points[0][2].min(points[1][2]).min(points[2][2]);
+    let mut max_x = points[0][0].max(points[1][0]).max(points[2][0]);
+    let mut max_z = points[0][2].max(points[1][2]).max(points[2][2]);
+    if max_x < -extent_x || max_z < -extent_z || min_x > extent_x || min_z > extent_z {
+        return Ok(None);
+    }
+    if plane_type == CollisionPlaneType::Wall {
+        min_x -= COLLISION_WALL_PADDING;
+        min_z -= COLLISION_WALL_PADDING;
+        max_x += COLLISION_WALL_PADDING;
+        max_z += COLLISION_WALL_PADDING;
+    }
+    if [min_x, min_z, max_x, max_z]
+        .iter()
+        .any(|value| !value.is_finite())
+    {
+        return Err(stage_export_error(format!(
+            "authored world collision group {group_index} triangle {triangle_index} has non-finite grid bounds"
+        )));
+    }
+
+    let min_x = checked_trunc_grid_index(
+        (min_x + extent_x) * COLLISION_GRID_CELL_RECIPROCAL,
+        group_index,
+        triangle_index,
+    )?
+    .max(0);
+    let min_z = checked_trunc_grid_index(
+        (min_z + extent_z) * COLLISION_GRID_CELL_RECIPROCAL,
+        group_index,
+        triangle_index,
+    )?
+    .max(0);
+    let max_x = checked_trunc_grid_index(
+        (max_x + extent_x) * COLLISION_GRID_CELL_RECIPROCAL,
+        group_index,
+        triangle_index,
+    )?
+    .min(grid_width - 1);
+    let max_z = checked_trunc_grid_index(
+        (max_z + extent_z) * COLLISION_GRID_CELL_RECIPROCAL,
+        group_index,
+        triangle_index,
+    )?
+    .min(grid_height - 1);
+    if min_x > max_x || min_z > max_z {
+        return Ok(None);
+    }
+    Ok(Some([min_x, min_z, max_x, max_z]))
+}
+
+fn checked_trunc_grid_index(value: f32, group_index: usize, triangle_index: usize) -> Result<i32> {
+    if !value.is_finite() || (value as f64) < i32::MIN as f64 || (value as f64) > i32::MAX as f64 {
+        return Err(stage_export_error(format!(
+            "authored world collision group {group_index} triangle {triangle_index} has a grid index outside i32"
+        )));
+    }
+    Ok(value as i32)
+}
+
+fn polygon_is_in_grid(
+    min_x: f32,
+    min_z: f32,
+    max_x: f32,
+    max_z: f32,
+    triangle: CollisionTrianglePoints,
+) -> bool {
+    if triangle.normal_y < 0.0 {
+        return true;
+    }
+    if triangle
+        .points
+        .iter()
+        .any(|point| point_is_in_grid(point[0], point[2], min_x, min_z, max_x, max_z))
+    {
+        return true;
+    }
+    if [
+        (min_x, min_z),
+        (max_x, min_z),
+        (min_x, max_z),
+        (max_x, max_z),
+    ]
+    .into_iter()
+    .any(|(x, z)| point_is_in_polygon(x, z, triangle.points))
+    {
+        return true;
+    }
+    check_line_polygon_collision(min_x, min_z, max_x, min_z, triangle.points)
+        || check_line_polygon_collision(min_x, max_z, max_x, max_z, triangle.points)
+        || check_line_polygon_collision(min_x, min_z, min_x, max_z, triangle.points)
+        || check_line_polygon_collision(max_x, min_z, max_x, max_z, triangle.points)
+}
+
+fn point_is_in_grid(x: f32, z: f32, min_x: f32, min_z: f32, max_x: f32, max_z: f32) -> bool {
+    min_x <= x && x <= max_x && min_z <= z && z <= max_z
+}
+
+fn point_is_in_polygon(x: f32, z: f32, points: [[f32; 3]; 3]) -> bool {
+    let [point_1, point_2, point_3] = points;
+    if (point_1[2] - z) * (point_2[0] - point_1[0]) - (point_1[0] - x) * (point_2[2] - point_1[2])
+        < 0.0
+    {
+        return false;
+    }
+    if (point_2[2] - z) * (point_3[0] - point_2[0]) - (point_2[0] - x) * (point_3[2] - point_2[2])
+        < 0.0
+    {
+        return false;
+    }
+    (point_3[2] - z) * (point_1[0] - point_3[0]) - (point_3[0] - x) * (point_1[2] - point_3[2])
+        >= 0.0
+}
+
+fn check_line_polygon_collision(
+    start_x: f32,
+    start_z: f32,
+    end_x: f32,
+    end_z: f32,
+    points: [[f32; 3]; 3],
+) -> bool {
+    let [point_1, point_2, point_3] = points;
+    check_lines_collision(
+        start_x, start_z, end_x, end_z, point_1[0], point_1[2], point_2[0], point_2[2],
+    ) || check_lines_collision(
+        start_x, start_z, end_x, end_z, point_2[0], point_2[2], point_3[0], point_3[2],
+    ) || check_lines_collision(
+        start_x, start_z, end_x, end_z, point_3[0], point_3[2], point_1[0], point_1[2],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_lines_collision(
+    a_x: f32,
+    a_z: f32,
+    b_x: f32,
+    b_z: f32,
+    c_x: f32,
+    c_z: f32,
+    d_x: f32,
+    d_z: f32,
+) -> bool {
+    let delta_ab_x = b_x - a_x;
+    let delta_ab_z = b_z - a_z;
+    let cross_c = delta_ab_z * (c_x - b_x) - delta_ab_x * (c_z - b_z);
+    let cross_d = delta_ab_z * (d_x - b_x) - delta_ab_x * (d_z - b_z);
+    if (cross_c >= 0.0 && cross_d >= 0.0) || (cross_c < 0.0 && cross_d < 0.0) {
+        return false;
+    }
+
+    let delta_cd_x = d_x - c_x;
+    let delta_cd_z = d_z - c_z;
+    let cross_a = delta_cd_z * (a_x - d_x) - delta_cd_x * (a_z - d_z);
+    let cross_b = delta_cd_z * (b_x - d_x) - delta_cd_x * (b_z - d_z);
+    !((cross_a >= 0.0 && cross_b >= 0.0) || (cross_a < 0.0 && cross_b < 0.0))
+}
+
+fn reject_duplicate_collision_bases(edits: &[StageCollisionEdit]) -> Result<()> {
+    let mut unique = BTreeSet::new();
+    for edit in edits {
+        if edit.mode != StageCollisionEditMode::Append
+            && !unique.insert(edit.raw_resource_path.clone())
+        {
+            return Err(stage_export_error(format!(
+                "duplicate collision base edit for {}",
+                display_raw_path(&edit.raw_resource_path)
+            )));
         }
     }
     Ok(())
@@ -393,18 +1198,17 @@ fn reconcile_scene_objects(
 
     // Appending clones does not shift any imported child index, so original
     // addresses remain valid for the deletions that follow.
-    for (address, object, mut record) in clones {
-        let JDramaRecordPayload::Actor { transform, .. } = &mut record.payload else {
-            return Err(stage_export_error(format!(
-                "clone template for '{}' is not an actor",
-                object.id
-            )));
-        };
-        *transform = to_jdrama_transform(object);
+    for (address, object, record) in clones {
         let (_, parent_path) = address.record_path.split_last().ok_or_else(|| {
             stage_export_error(format!("object '{}' references the root record", object.id))
         })?;
-        archive.insert_placement_record(&address.raw_resource_path, parent_path, record)?;
+        let record_path =
+            archive.insert_placement_record(&address.raw_resource_path, parent_path, record)?;
+        archive.set_object_transform(
+            &address.raw_resource_path,
+            &record_path,
+            to_jdrama_transform(object),
+        )?;
     }
 
     let mut deletions = baseline
@@ -588,8 +1392,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use sms_formats::{
-        ColGroup, ColTriangle, ColVertex, JDramaDocument, JDramaLightMap, RarcDocument,
-        RarcEntryRecord, RarcLayout, RarcNodeRecord,
+        ColGroup, ColTriangle, ColVertex, JDramaDocument, JDramaField, JDramaFieldValue,
+        JDramaLightMap, PrmEntry, PrmFile, PrmValue, RarcDocument, RarcEntryRecord, RarcLayout,
+        RarcNodeRecord,
     };
 
     use crate::{PlacementBinding, Transform};
@@ -615,6 +1420,60 @@ mod tests {
         assert_eq!(placements[0].transform.translation, [10.0, 20.0, 30.0]);
         assert_eq!(placements[1].name, "first");
         assert_eq!(placements[1].transform.translation, [40.0, 50.0, 60.0]);
+    }
+
+    #[test]
+    fn typed_field_placement_transform_and_clone_survive_reimport() {
+        let fixture = StageFixture::new("typed-field-placement");
+        let mut document = fixture.document();
+        let archive = document.stage_archive.as_mut().unwrap();
+        let path = archive
+            .insert_placement_record(b"scene.bin", &[], area_cylinder_record("area"))
+            .unwrap();
+        assert_eq!(path, [2]);
+
+        let mut area = SceneObject::new("retail-area", "AreaCylinder");
+        area.placement = Some(PlacementBinding::Existing(address(&path)));
+        area.insert_source_raw_param("name", "area");
+        area.transform = Transform {
+            translation: [100.0, 200.0, 300.0],
+            rotation_degrees: [10.0, 20.0, 30.0],
+            scale: [40.0, 50.0, 60.0],
+        };
+        document.objects.push(area.clone());
+
+        let mut clone = area;
+        clone.id = "area-clone".to_string();
+        clone.placement = Some(PlacementBinding::CloneOf(address(&path)));
+        clone.transform.translation = [400.0, 500.0, 600.0];
+        document.objects.push(clone);
+
+        let rebuilt = document.build_stage_archive().unwrap();
+        let reopened = SourceFreeStageArchive::parse(&rebuilt).unwrap();
+        assert_eq!(reopened.encode().unwrap(), rebuilt);
+        let areas = reopened
+            .object_placements()
+            .into_iter()
+            .filter(|placement| placement.type_name == "AreaCylinder")
+            .collect::<Vec<_>>();
+        assert_eq!(areas.len(), 2);
+        assert_eq!(areas[0].transform.translation, [100.0, 200.0, 300.0]);
+        assert_eq!(areas[0].transform.rotation, [10.0, 20.0, 30.0]);
+        assert_eq!(areas[0].transform.scale, [40.0, 50.0, 60.0]);
+        assert_eq!(areas[1].transform.translation, [400.0, 500.0, 600.0]);
+    }
+
+    #[test]
+    fn genuinely_missing_placement_address_is_still_rejected() {
+        let fixture = StageFixture::new("missing-placement-address");
+        let mut document = fixture.document();
+        document.objects[0].placement = Some(PlacementBinding::Existing(address(&[99])));
+
+        let error = document.build_stage_archive().unwrap_err().to_string();
+        assert!(
+            error.contains("references missing placement scene.bin:99"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -667,6 +1526,625 @@ mod tests {
             panic!("rebuilt collision has wrong kind");
         };
         assert_eq!(collision.vertices()[0].position[1], 75.0);
+    }
+
+    #[test]
+    fn resource_and_typed_upserts_insert_missing_archive_children() {
+        let fixture = StageFixture::new("resource-upserts");
+        let document = fixture.document();
+        let source = fs::read(&fixture.archive_path).unwrap();
+        let source_archive = SourceFreeStageArchive::parse(&source).unwrap();
+        let mut model = match source_archive.resource(b"map.bmd").unwrap() {
+            StageResourceDocument::Model(model) => model.clone(),
+            _ => panic!("fixture model has wrong kind"),
+        };
+        model.reserved_words[0] = 0xAABB_CCDD;
+        let collision = authored_collision(0x4100, 20.0, 3);
+        let parameters = PrmFile {
+            entries: vec![PrmEntry {
+                name: "mSize".to_string(),
+                value: PrmValue::from_f32(2.5),
+            }],
+        };
+        let mut edits = StageArchiveEdits::default();
+        edits.insert_resource(
+            b"mapobj/authored.prm".to_vec(),
+            StageResourceDocument::Parameters(parameters.clone()),
+        );
+        edits.upsert_model(b"mapobj/authored.bmd".to_vec(), model.clone());
+        edits.upsert_collision(b"mapobj/authored.col".to_vec(), collision.clone());
+
+        let rebuilt = document.build_stage_archive_with_edits(&edits).unwrap();
+        let reopened = SourceFreeStageArchive::parse(&rebuilt).unwrap();
+        assert_eq!(
+            reopened.resource(b"mapobj/authored.prm"),
+            Some(&StageResourceDocument::Parameters(parameters))
+        );
+        assert_eq!(
+            reopened.resource(b"mapobj/authored.bmd"),
+            Some(&StageResourceDocument::Model(model))
+        );
+        assert_eq!(
+            reopened.resource(b"mapobj/authored.col"),
+            Some(&StageResourceDocument::Collision(collision))
+        );
+        assert_eq!(reopened.encode().unwrap(), rebuilt);
+    }
+
+    #[test]
+    fn general_insert_rejects_existing_paths_while_explicit_upsert_replaces() {
+        let fixture = StageFixture::new("general-resource-modes");
+        let document = fixture.document();
+        let collision = authored_collision(0x4100, 12.0, 4);
+        let mut insert = StageArchiveEdits::default();
+        insert.insert_resource(
+            b"map.col".to_vec(),
+            StageResourceDocument::Collision(collision.clone()),
+        );
+        let error = document
+            .build_stage_archive_with_edits(&insert)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already exists"), "{error}");
+
+        let mut upsert = StageArchiveEdits::default();
+        upsert.upsert_resource(
+            b"map.col".to_vec(),
+            StageResourceDocument::Collision(collision.clone()),
+        );
+        let rebuilt = document.build_stage_archive_with_edits(&upsert).unwrap();
+        let reopened = SourceFreeStageArchive::parse(&rebuilt).unwrap();
+        assert_eq!(
+            reopened.resource(b"map.col"),
+            Some(&StageResourceDocument::Collision(collision))
+        );
+    }
+
+    #[test]
+    fn replace_model_and_collision_remain_replacement_only() {
+        let fixture = StageFixture::new("replacement-only");
+        let document = fixture.document();
+        let source = fs::read(&fixture.archive_path).unwrap();
+        let source_archive = SourceFreeStageArchive::parse(&source).unwrap();
+        let model = match source_archive.resource(b"map.bmd").unwrap() {
+            StageResourceDocument::Model(model) => model.clone(),
+            _ => panic!("fixture model has wrong kind"),
+        };
+        let mut model_edits = StageArchiveEdits::default();
+        model_edits.replace_model(b"missing.bmd".to_vec(), model);
+        let error = document
+            .build_stage_archive_with_edits(&model_edits)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("model resource missing.bmd was not found"),
+            "{error}"
+        );
+
+        let mut collision_edits = StageArchiveEdits::default();
+        collision_edits.replace_collision(b"missing.col".to_vec(), authored_collision(0, 0.0, 0));
+        let error = document
+            .build_stage_archive_with_edits(&collision_edits)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("collision resource missing.col was not found"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn collision_appends_preserve_retail_groups_and_remap_each_authored_index() {
+        let fixture = StageFixture::new("collision-appends");
+        let document = fixture.document();
+        let source = fs::read(&fixture.archive_path).unwrap();
+        let source_archive = SourceFreeStageArchive::parse(&source).unwrap();
+        let original = match source_archive.resource(b"map.col").unwrap() {
+            StageResourceDocument::Collision(collision) => collision.clone(),
+            _ => panic!("fixture collision has wrong kind"),
+        };
+        let first = authored_collision(0x4100, 20.0, 3);
+        let second = authored_collision(0x4200, 40.0, 7);
+        let mut edits = StageArchiveEdits::default();
+        edits.append_collision(b"map.col".to_vec(), first.clone());
+        edits.append_collision(b"map.col".to_vec(), second.clone());
+
+        let rebuilt = document.build_stage_archive_with_edits(&edits).unwrap();
+        let reopened = SourceFreeStageArchive::parse(&rebuilt).unwrap();
+        let collision = match reopened.resource(b"map.col").unwrap() {
+            StageResourceDocument::Collision(collision) => collision,
+            _ => panic!("rebuilt collision has wrong kind"),
+        };
+        assert_eq!(
+            &collision.vertices()[..original.vertices().len()],
+            original.vertices()
+        );
+        assert_eq!(
+            &collision.groups()[..original.groups().len()],
+            original.groups()
+        );
+        assert_eq!(collision.vertices().len(), 9);
+        assert_eq!(collision.groups().len(), 3);
+        assert_eq!(
+            collision.groups()[1].surface_type,
+            first.groups()[0].surface_type
+        );
+        assert_eq!(collision.groups()[1].triangles[0].vertex_indices, [3, 4, 5]);
+        assert_eq!(
+            collision.groups()[2].surface_type,
+            second.groups()[0].surface_type
+        );
+        assert_eq!(collision.groups()[2].triangles[0].vertex_indices, [6, 7, 8]);
+    }
+
+    #[test]
+    fn world_collision_append_preserves_duck_like_runtime_headroom() {
+        let fixture = StageFixture::new("world-collision-capacities");
+        let mut document = fixture.document();
+        install_world_collision_resources(&mut document);
+        let authored = duck_like_collision();
+        let config = MapCollisionRuntimeConfig {
+            grid_width: 60,
+            grid_height: 60,
+            triangle_capacity: 12_000,
+            list_capacity: 30_000,
+        };
+        assert_eq!(authored_collision_triangle_count(&authored).unwrap(), 4_212);
+        assert_eq!(
+            authored_collision_grid_link_count(&authored, config).unwrap(),
+            4_668
+        );
+
+        let mut edits = StageArchiveEdits::default();
+        edits.append_collision(WORLD_COLLISION_PATH.to_vec(), authored);
+        let rebuilt = document.build_stage_archive_with_edits(&edits).unwrap();
+        let reopened = SourceFreeStageArchive::parse(&rebuilt).unwrap();
+        assert_eq!(
+            world_map_collision_fields(&reopened),
+            [60, 60, 16_212, 34_668, 3_000]
+        );
+        let StageResourceDocument::Collision(collision) =
+            reopened.resource(WORLD_COLLISION_PATH).unwrap()
+        else {
+            panic!("rebuilt world collision has wrong kind");
+        };
+        assert_eq!(
+            collision
+                .groups()
+                .iter()
+                .map(|group| group.triangles.len())
+                .sum::<usize>(),
+            4_213
+        );
+        assert_eq!(reopened.encode().unwrap(), rebuilt);
+    }
+
+    #[test]
+    fn collision_grid_links_apply_wall_padding_to_bounds_and_cells() {
+        let authored = collision_with_triangle(
+            0,
+            [
+                [1_100.0, 0.0, 100.0],
+                [1_100.0, 100.0, 100.0],
+                [1_100.0, 0.0, 200.0],
+            ],
+        );
+        let config = MapCollisionRuntimeConfig {
+            grid_width: 4,
+            grid_height: 4,
+            triangle_capacity: 0,
+            list_capacity: 0,
+        };
+        let points = collision_triangle_points(&authored, [0, 1, 2], 0, 0).unwrap();
+
+        assert_eq!(
+            collision_plane_type(authored.groups()[0].surface_type, points.normal_y),
+            CollisionPlaneType::Wall
+        );
+        assert_eq!(
+            collision_grid_bounds(
+                points.points,
+                CollisionPlaneType::Wall,
+                2_048.0,
+                2_048.0,
+                4,
+                4,
+                0,
+                0,
+            )
+            .unwrap(),
+            Some([2, 2, 3, 2])
+        );
+        assert!(!polygon_is_in_grid(0.0, 0.0, 1_024.0, 1_024.0, points));
+        assert!(polygon_is_in_grid(
+            -COLLISION_WALL_PADDING,
+            -COLLISION_WALL_PADDING,
+            1_024.0 + COLLISION_WALL_PADDING,
+            1_024.0 + COLLISION_WALL_PADDING,
+            points,
+        ));
+        assert_eq!(
+            authored_collision_grid_link_count(&authored, config).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn collision_grid_links_negative_normal_roofs_across_the_full_bbox() {
+        let authored = collision_with_triangle(
+            0,
+            [
+                [-500.0, 0.0, -500.0],
+                [500.0, 0.0, -500.0],
+                [-500.0, 0.0, 500.0],
+            ],
+        );
+        let config = MapCollisionRuntimeConfig {
+            grid_width: 4,
+            grid_height: 4,
+            triangle_capacity: 0,
+            list_capacity: 0,
+        };
+        let points = collision_triangle_points(&authored, [0, 1, 2], 0, 0).unwrap();
+
+        assert!(points.normal_y < 0.0);
+        assert_eq!(
+            collision_plane_type(authored.groups()[0].surface_type, points.normal_y),
+            CollisionPlaneType::Roof
+        );
+        assert_eq!(
+            collision_grid_bounds(
+                points.points,
+                CollisionPlaneType::Roof,
+                2_048.0,
+                2_048.0,
+                4,
+                4,
+                0,
+                0,
+            )
+            .unwrap(),
+            Some([1, 1, 2, 2])
+        );
+        assert!(polygon_is_in_grid(0.0, 0.0, 1_024.0, 1_024.0, points));
+        assert_eq!(
+            authored_collision_grid_link_count(&authored, config).unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn collision_surface_0801_overrides_wall_classification_to_ground() {
+        let points = [
+            [1_100.0, 0.0, 100.0],
+            [1_100.0, 100.0, 100.0],
+            [1_100.0, 0.0, 200.0],
+        ];
+        let wall = collision_with_triangle(0, points);
+        let forced_ground = collision_with_triangle(0x0801, points);
+        let config = MapCollisionRuntimeConfig {
+            grid_width: 4,
+            grid_height: 4,
+            triangle_capacity: 0,
+            list_capacity: 0,
+        };
+        let triangle = collision_triangle_points(&forced_ground, [0, 1, 2], 0, 0).unwrap();
+
+        assert_eq!(triangle.normal_y, 0.0);
+        assert_eq!(
+            collision_plane_type(0x0801, triangle.normal_y),
+            CollisionPlaneType::Ground
+        );
+        assert_eq!(
+            authored_collision_grid_link_count(&wall, config).unwrap(),
+            2
+        );
+        assert_eq!(
+            authored_collision_grid_link_count(&forced_ground, config).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn collision_grid_bounds_clip_partial_triangles_and_reject_outside_ones() {
+        let partial = collision_with_triangle(
+            0,
+            [
+                [1_900.0, 0.0, 100.0],
+                [1_900.0, 0.0, 300.0],
+                [2_300.0, 0.0, 100.0],
+            ],
+        );
+        let outside = collision_with_triangle(
+            0,
+            [
+                [2_050.0, 0.0, 100.0],
+                [2_050.0, 0.0, 300.0],
+                [2_300.0, 0.0, 100.0],
+            ],
+        );
+        let config = MapCollisionRuntimeConfig {
+            grid_width: 4,
+            grid_height: 4,
+            triangle_capacity: 0,
+            list_capacity: 0,
+        };
+        let partial_points = collision_triangle_points(&partial, [0, 1, 2], 0, 0).unwrap();
+        let outside_points = collision_triangle_points(&outside, [0, 1, 2], 0, 0).unwrap();
+
+        assert_eq!(
+            collision_grid_bounds(
+                partial_points.points,
+                CollisionPlaneType::Ground,
+                2_048.0,
+                2_048.0,
+                4,
+                4,
+                0,
+                0,
+            )
+            .unwrap(),
+            Some([3, 2, 3, 2])
+        );
+        assert_eq!(
+            collision_grid_bounds(
+                outside_points.points,
+                CollisionPlaneType::Ground,
+                2_048.0,
+                2_048.0,
+                4,
+                4,
+                0,
+                0,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            authored_collision_grid_link_count(&partial, config).unwrap(),
+            1
+        );
+        assert_eq!(
+            authored_collision_grid_link_count(&outside, config).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn collision_grid_links_match_odd_runtime_extents_and_truncation() {
+        let boundary = collision_with_triangle(
+            0,
+            [
+                [2_048.0, 0.0, 0.0],
+                [2_048.0, 0.0, 10.0],
+                [2_050.0, 0.0, 0.0],
+            ],
+        );
+        let outside = collision_with_triangle(
+            0,
+            [
+                [2_048.25, 0.0, 0.0],
+                [2_048.25, 0.0, 10.0],
+                [2_050.0, 0.0, 0.0],
+            ],
+        );
+        let config = MapCollisionRuntimeConfig {
+            grid_width: 5,
+            grid_height: 3,
+            triangle_capacity: 0,
+            list_capacity: 0,
+        };
+        let boundary_points = collision_triangle_points(&boundary, [0, 1, 2], 0, 0).unwrap();
+
+        assert_eq!(
+            collision_grid_bounds(
+                boundary_points.points,
+                CollisionPlaneType::Ground,
+                2_048.0,
+                1_024.0,
+                5,
+                3,
+                0,
+                0,
+            )
+            .unwrap(),
+            Some([4, 1, 4, 1])
+        );
+        assert_eq!(checked_trunc_grid_index(-0.75, 0, 0).unwrap(), 0);
+        assert_eq!(checked_trunc_grid_index(-1.75, 0, 0).unwrap(), -1);
+        assert_eq!(
+            authored_collision_grid_link_count(&boundary, config).unwrap(),
+            1
+        );
+        assert_eq!(
+            authored_collision_grid_link_count(&outside, config).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn stale_and_non_world_collision_appends_do_not_change_map_capacities() {
+        let fixture = StageFixture::new("non-world-collision-capacities");
+        let mut document = fixture.document();
+        install_world_collision_resources(&mut document);
+        document
+            .stage_archive
+            .as_mut()
+            .unwrap()
+            .insert_resource(
+                b"mapobj/authored.col".to_vec(),
+                StageResourceDocument::Collision(authored_collision(0, 200.0, 1)),
+            )
+            .unwrap();
+
+        let mut edits = StageArchiveEdits::default();
+        edits.append_collision(b"map.col".to_vec(), authored_collision(0, 300.0, 2));
+        edits.append_collision(
+            b"mapobj/authored.col".to_vec(),
+            authored_collision(0, 400.0, 3),
+        );
+        let rebuilt = document.build_stage_archive_with_edits(&edits).unwrap();
+        let reopened = SourceFreeStageArchive::parse(&rebuilt).unwrap();
+        assert_eq!(
+            world_map_collision_fields(&reopened),
+            [60, 60, 12_000, 30_000, 3_000]
+        );
+    }
+
+    #[test]
+    fn world_collision_capacity_target_rejects_missing_ambiguous_and_wrong_fields() {
+        let authored = authored_collision(0, 100.0, 0);
+
+        let mut missing = world_collision_archive("missing-map-field");
+        world_map_fields_mut(&mut missing)
+            .retain(|field| field.name != COLLISION_LIST_CAPACITY_FIELD);
+        let error = preserve_world_collision_runtime_headroom(&mut missing, &authored)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("missing field 'collision_list_capacity'"),
+            "{error}"
+        );
+
+        let mut ambiguous = world_collision_archive("ambiguous-map-record");
+        let placement = match ambiguous.resource_mut(WORLD_SCENE_PATH).unwrap() {
+            StageResourceDocument::Placement(document) => document,
+            _ => panic!("world scene has wrong kind"),
+        };
+        let JDramaRecordPayload::Group { children, .. } = &mut placement.root.payload else {
+            panic!("world scene root is not a group");
+        };
+        children.push(children[0].clone());
+        let error = preserve_world_collision_runtime_headroom(&mut ambiguous, &authored)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("capacity target is ambiguous"), "{error}");
+
+        let mut wrong_type = world_collision_archive("wrong-map-field-type");
+        let fields = world_map_fields_mut(&mut wrong_type);
+        let field = fields
+            .iter_mut()
+            .find(|field| field.name == COLLISION_TRIANGLE_CAPACITY_FIELD)
+            .unwrap();
+        field.value = JDramaFieldValue::U32(12_000);
+        let error = preserve_world_collision_runtime_headroom(&mut wrong_type, &authored)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("collision_triangle_capacity") && error.contains("not typed i32"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn multiple_world_collision_appends_accumulate_capacity_deltas() {
+        let fixture = StageFixture::new("multiple-world-collision-appends");
+        let mut document = fixture.document();
+        install_world_collision_resources(&mut document);
+        let mut edits = StageArchiveEdits::default();
+        edits.append_collision(
+            WORLD_COLLISION_PATH.to_vec(),
+            authored_collision(0, 100.0, 1),
+        );
+        edits.append_collision(
+            WORLD_COLLISION_PATH.to_vec(),
+            authored_collision(0, 200.0, 2),
+        );
+
+        let rebuilt = document.build_stage_archive_with_edits(&edits).unwrap();
+        let reopened = SourceFreeStageArchive::parse(&rebuilt).unwrap();
+        assert_eq!(
+            world_map_collision_fields(&reopened),
+            [60, 60, 12_002, 30_002, 3_000]
+        );
+    }
+
+    #[test]
+    fn world_collision_capacity_overflow_is_rejected_atomically() {
+        let authored = authored_collision(0, 100.0, 0);
+
+        let mut triangle_overflow = world_collision_archive("triangle-capacity-overflow");
+        set_unique_i32_field(
+            world_map_fields_mut(&mut triangle_overflow),
+            COLLISION_TRIANGLE_CAPACITY_FIELD,
+            i32::MAX,
+        )
+        .unwrap();
+        let before = world_map_collision_fields(&triangle_overflow);
+        let error = preserve_world_collision_runtime_headroom(&mut triangle_overflow, &authored)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("collision_triangle_capacity"), "{error}");
+        assert_eq!(world_map_collision_fields(&triangle_overflow), before);
+
+        let mut list_overflow = world_collision_archive("list-capacity-overflow");
+        set_unique_i32_field(
+            world_map_fields_mut(&mut list_overflow),
+            COLLISION_LIST_CAPACITY_FIELD,
+            i32::MAX,
+        )
+        .unwrap();
+        let before = world_map_collision_fields(&list_overflow);
+        let error = preserve_world_collision_runtime_headroom(&mut list_overflow, &authored)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("collision_list_capacity"), "{error}");
+        assert_eq!(world_map_collision_fields(&list_overflow), before);
+    }
+
+    #[test]
+    fn collision_append_rejects_retail_signed_index_overflow() {
+        let existing = ColFile::new(
+            vec![ColVertex::new(0.0, 0.0, 0.0); i16::MAX as usize],
+            Vec::new(),
+        );
+        let authored = ColFile::new(
+            vec![ColVertex::new(1.0, 0.0, 0.0), ColVertex::new(2.0, 0.0, 0.0)],
+            vec![ColGroup {
+                surface_type: 0,
+                has_per_triangle_data: false,
+                triangles: vec![ColTriangle {
+                    vertex_indices: [0, 1, 1],
+                    attribute_0: 0,
+                    attribute_1: 0,
+                    data: None,
+                }],
+            }],
+        );
+        let error = append_collision_document(&existing, &authored, b"map.col")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("index 32768 exceeds the retail COL signed-index limit 32767"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn collision_append_accepts_retail_signed_index_maximum() {
+        let existing = ColFile::new(
+            vec![ColVertex::new(0.0, 0.0, 0.0); i16::MAX as usize],
+            Vec::new(),
+        );
+        let authored = ColFile::new(
+            vec![ColVertex::new(1.0, 0.0, 0.0)],
+            vec![ColGroup {
+                surface_type: 0,
+                has_per_triangle_data: false,
+                triangles: vec![ColTriangle {
+                    vertex_indices: [0, 0, 0],
+                    attribute_0: 0,
+                    attribute_1: 0,
+                    data: None,
+                }],
+            }],
+        );
+
+        let merged = append_collision_document(&existing, &authored, b"map.col").unwrap();
+        assert_eq!(
+            merged.groups()[0].triangles[0].vertex_indices,
+            [i16::MAX as u16; 3]
+        );
     }
 
     #[test]
@@ -838,6 +2316,183 @@ mod tests {
         }
     }
 
+    fn install_world_collision_resources(document: &mut StageDocument) {
+        let archive = document.stage_archive.as_mut().unwrap();
+        archive
+            .insert_resource(
+                WORLD_SCENE_PATH.to_vec(),
+                StageResourceDocument::Placement(world_map_scene_document()),
+            )
+            .unwrap();
+        archive
+            .insert_resource(
+                WORLD_COLLISION_PATH.to_vec(),
+                StageResourceDocument::Collision(authored_collision(0, 500.0, 0)),
+            )
+            .unwrap();
+    }
+
+    fn world_collision_archive(label: &str) -> SourceFreeStageArchive {
+        let fixture = StageFixture::new(label);
+        let mut document = fixture.document();
+        install_world_collision_resources(&mut document);
+        document.stage_archive.take().unwrap()
+    }
+
+    fn world_map_scene_document() -> JDramaDocument {
+        JDramaDocument {
+            root: JDramaRecord::new(
+                "NameRefGrp",
+                "root",
+                JDramaRecordPayload::Group {
+                    fields: Vec::new(),
+                    children: vec![JDramaRecord::new(
+                        "Map",
+                        "map",
+                        JDramaRecordPayload::Fields {
+                            fields: vec![
+                                JDramaField {
+                                    name: "translucent_group_count".to_string(),
+                                    value: JDramaFieldValue::U32(0),
+                                },
+                                JDramaField {
+                                    name: COLLISION_GRID_WIDTH_FIELD.to_string(),
+                                    value: JDramaFieldValue::I32(60),
+                                },
+                                JDramaField {
+                                    name: COLLISION_GRID_HEIGHT_FIELD.to_string(),
+                                    value: JDramaFieldValue::I32(60),
+                                },
+                                JDramaField {
+                                    name: COLLISION_TRIANGLE_CAPACITY_FIELD.to_string(),
+                                    value: JDramaFieldValue::I32(12_000),
+                                },
+                                JDramaField {
+                                    name: COLLISION_LIST_CAPACITY_FIELD.to_string(),
+                                    value: JDramaFieldValue::I32(30_000),
+                                },
+                                JDramaField {
+                                    name: COLLISION_WARP_CAPACITY_FIELD.to_string(),
+                                    value: JDramaFieldValue::I32(3_000),
+                                },
+                                JDramaField {
+                                    name: "warp_pair_count".to_string(),
+                                    value: JDramaFieldValue::U32(0),
+                                },
+                            ],
+                        },
+                    )
+                    .unwrap()],
+                },
+            )
+            .unwrap(),
+        }
+    }
+
+    fn world_map_fields_mut(archive: &mut SourceFreeStageArchive) -> &mut Vec<JDramaField> {
+        let placement = match archive.resource_mut(WORLD_SCENE_PATH).unwrap() {
+            StageResourceDocument::Placement(document) => document,
+            _ => panic!("world scene has wrong kind"),
+        };
+        let JDramaRecordPayload::Group { children, .. } = &mut placement.root.payload else {
+            panic!("world scene root is not a group");
+        };
+        let JDramaRecordPayload::Fields { fields } = &mut children[0].payload else {
+            panic!("Map record does not have fields");
+        };
+        fields
+    }
+
+    fn world_map_collision_fields(archive: &SourceFreeStageArchive) -> [i32; 5] {
+        let placement = match archive.resource(WORLD_SCENE_PATH).unwrap() {
+            StageResourceDocument::Placement(document) => document,
+            _ => panic!("world scene has wrong kind"),
+        };
+        let JDramaRecordPayload::Group { children, .. } = &placement.root.payload else {
+            panic!("world scene root is not a group");
+        };
+        let JDramaRecordPayload::Fields { fields } = &children[0].payload else {
+            panic!("Map record does not have fields");
+        };
+        [
+            unique_i32_field(fields, COLLISION_GRID_WIDTH_FIELD).unwrap(),
+            unique_i32_field(fields, COLLISION_GRID_HEIGHT_FIELD).unwrap(),
+            unique_i32_field(fields, COLLISION_TRIANGLE_CAPACITY_FIELD).unwrap(),
+            unique_i32_field(fields, COLLISION_LIST_CAPACITY_FIELD).unwrap(),
+            unique_i32_field(fields, COLLISION_WARP_CAPACITY_FIELD).unwrap(),
+        ]
+    }
+
+    fn duck_like_collision() -> ColFile {
+        let mut triangles = Vec::with_capacity(4_212);
+        triangles.extend((0..3_756).map(|_| ColTriangle {
+            vertex_indices: [0, 1, 2],
+            attribute_0: 0,
+            attribute_1: 0,
+            data: None,
+        }));
+        triangles.extend((0..456).map(|_| ColTriangle {
+            vertex_indices: [3, 4, 5],
+            attribute_0: 0,
+            attribute_1: 0,
+            data: None,
+        }));
+        ColFile::new(
+            vec![
+                ColVertex::new(100.0, 0.0, 100.0),
+                ColVertex::new(100.0, 0.0, 110.0),
+                ColVertex::new(110.0, 0.0, 100.0),
+                ColVertex::new(-10.0, 0.0, 100.0),
+                ColVertex::new(-10.0, 0.0, 110.0),
+                ColVertex::new(10.0, 0.0, 100.0),
+            ],
+            vec![ColGroup {
+                surface_type: 0,
+                has_per_triangle_data: false,
+                triangles,
+            }],
+        )
+    }
+
+    fn collision_with_triangle(surface_type: u16, points: [[f32; 3]; 3]) -> ColFile {
+        ColFile::new(
+            points
+                .into_iter()
+                .map(|[x, y, z]| ColVertex::new(x, y, z))
+                .collect(),
+            vec![ColGroup {
+                surface_type,
+                has_per_triangle_data: false,
+                triangles: vec![ColTriangle {
+                    vertex_indices: [0, 1, 2],
+                    attribute_0: 0,
+                    attribute_1: 0,
+                    data: None,
+                }],
+            }],
+        )
+    }
+
+    fn authored_collision(surface_type: u16, x: f32, attribute: u8) -> ColFile {
+        ColFile::new(
+            vec![
+                ColVertex::new(x, 0.0, 0.0),
+                ColVertex::new(x + 1.0, 0.0, 0.0),
+                ColVertex::new(x, 0.0, 1.0),
+            ],
+            vec![ColGroup {
+                surface_type,
+                has_per_triangle_data: false,
+                triangles: vec![ColTriangle {
+                    vertex_indices: [0, 1, 2],
+                    attribute_0: attribute,
+                    attribute_1: attribute.wrapping_add(1),
+                    data: None,
+                }],
+            }],
+        )
+    }
+
     fn fixture_archive() -> Vec<u8> {
         let placement = JDramaDocument {
             root: JDramaRecord::new(
@@ -982,6 +2637,46 @@ mod tests {
                 character_name: name.to_string(),
                 light_map: JDramaLightMap::default(),
                 fields: Vec::new(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn area_cylinder_record(name: &str) -> JDramaRecord {
+        JDramaRecord::new(
+            "AreaCylinder",
+            name,
+            JDramaRecordPayload::Fields {
+                fields: vec![
+                    JDramaField {
+                        name: "center".to_string(),
+                        value: JDramaFieldValue::Vec3F32([1.0, 2.0, 3.0]),
+                    },
+                    JDramaField {
+                        name: "authoring_vector".to_string(),
+                        value: JDramaFieldValue::Vec3F32([4.0, 5.0, 6.0]),
+                    },
+                    JDramaField {
+                        name: "cylinder_parameters".to_string(),
+                        value: JDramaFieldValue::Vec3F32([7.0, 8.0, 9.0]),
+                    },
+                    JDramaField {
+                        name: "authoring_character_name".to_string(),
+                        value: JDramaFieldValue::String("area character".to_string()),
+                    },
+                    JDramaField {
+                        name: "indexed_name_count".to_string(),
+                        value: JDramaFieldValue::U32(0),
+                    },
+                    JDramaField {
+                        name: "manager_group_name".to_string(),
+                        value: JDramaFieldValue::String("area manager".to_string()),
+                    },
+                    JDramaField {
+                        name: "raw_angle_hundredths".to_string(),
+                        value: JDramaFieldValue::I32(0),
+                    },
+                ],
             },
         )
         .unwrap()

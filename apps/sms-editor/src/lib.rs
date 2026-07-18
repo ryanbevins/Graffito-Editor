@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{
+    atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, TryRecvError},
     Arc,
 };
@@ -11,9 +12,9 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use sms_formats::{
     decode_bti_texture, discover_scene_archives, mount_scene_archive, parse_jdrama_object_records,
-    read_stage_asset_bytes, J3dAlphaCompare, J3dBillboard, J3dBillboardMode, J3dBlendMode, J3dFile,
-    J3dGeometryPreview, J3dJointAnimation, J3dJointTransformOverride, J3dMaterial, J3dMatrix34,
-    J3dPreparedAnimatedTriangles, J3dPreviewCombineMode, J3dTexturePatternAnimation,
+    read_stage_asset_bytes, ColFile, J3dAlphaCompare, J3dBillboard, J3dBillboardMode, J3dBlendMode,
+    J3dFile, J3dGeometryPreview, J3dJointAnimation, J3dJointTransformOverride, J3dMaterial,
+    J3dMatrix34, J3dPreparedAnimatedTriangles, J3dPreviewCombineMode, J3dTexturePatternAnimation,
     J3dTextureSrtAnimation, J3dTriangle, J3dZMode, JpaEffect, SceneArchiveInfo, StageAsset,
     StageAssetKind, SMS_ANIMATION_FRAMES_PER_SECOND, SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS,
     SMS_MAP_MODEL_LOAD_FLAGS, SMS_POLLUTION_MODEL_LOAD_FLAGS,
@@ -22,14 +23,16 @@ use sms_render::{
     gx_blend_compatibility, GxBlendCompatibility, RenderScene, RendererConfig, ViewportRenderer,
 };
 use sms_scene::{
-    AssetRef, AssetRole, SceneError, SceneObject, StageArchiveExportOutcome, StageDocument,
-    Transform, ValidationIssue, ValidationSeverity,
+    AssetRef, AssetRole, SceneError, SceneObject, StageDocument, StageResourceDocument, Transform,
+    ValidationIssue, ValidationSeverity,
 };
 use sms_schema::{ObjectDefinition, ObjectRegistry, ParticleBindingTarget, SchemaGenerator};
 
 mod camera;
 mod document_commands;
 mod gpu_viewport;
+mod managed_build;
+mod model_assets;
 mod outliner;
 mod project;
 mod project_ui;
@@ -37,6 +40,7 @@ mod scene_labels;
 mod ui_panels;
 mod viewport_ui;
 
+use model_assets::*;
 use outliner::*;
 use project::*;
 use project_ui::{path_display_row, NewProjectDraft};
@@ -193,7 +197,8 @@ enum BackgroundResult {
         result: Result<SceneScanResult, String>,
     },
     Open(Result<Box<LoadedStage>, String>),
-    Export(Result<StageArchiveExportOutcome, String>),
+    Build(Result<managed_build::ManagedGameBuildOutcome, String>),
+    BuildAndRun(Result<managed_build::ManagedGameBuildOutcome, String>),
 }
 
 mod preview_types;
@@ -223,6 +228,25 @@ fn validation_issues_for_preview(
                 "{} additional model asset failure(s) were omitted after the first {} details",
                 preview.failed_models - preview.model_failures.len(),
                 preview.model_failures.len()
+            ),
+        ));
+    }
+    for (index, failure) in preview.collision_failures.iter().enumerate() {
+        issues.push(ValidationIssue::warning(
+            format!("renderer-collision-preview-failed-{index}"),
+            format!(
+                "Collision preview failed for '{}': {}",
+                failure.asset_path, failure.error
+            ),
+        ));
+    }
+    if preview.failed_collision_files > preview.collision_failures.len() {
+        issues.push(ValidationIssue::warning(
+            "renderer-collision-preview-failures-truncated",
+            format!(
+                "{} additional collision asset failure(s) were omitted after the first {} details",
+                preview.failed_collision_files - preview.collision_failures.len(),
+                preview.collision_failures.len()
             ),
         ));
     }
@@ -314,6 +338,114 @@ fn record_model_preview_failure(
     }
 }
 
+#[derive(Default)]
+struct CollisionPreviewBuild {
+    triangles: Vec<CollisionPreviewTriangle>,
+    file_count: usize,
+    surface_types: BTreeSet<u16>,
+    failed_assets: BTreeSet<String>,
+    failures: Vec<PreviewModelFailure>,
+}
+
+impl CollisionPreviewBuild {
+    fn append_file(&mut self, collision: &ColFile) {
+        self.file_count += 1;
+        for group in collision.groups() {
+            self.surface_types.insert(group.surface_type);
+            for triangle in &group.triangles {
+                let [a, b, c] = triangle.vertex_indices;
+                let (Some(a), Some(b), Some(c)) = (
+                    collision.vertices().get(usize::from(a)),
+                    collision.vertices().get(usize::from(b)),
+                    collision.vertices().get(usize::from(c)),
+                ) else {
+                    continue;
+                };
+                self.triangles.push(CollisionPreviewTriangle {
+                    vertices: [a.position, b.position, c.position],
+                    surface_type: group.surface_type,
+                });
+            }
+        }
+    }
+
+    fn record_failure(&mut self, asset_path: &str, error: String) {
+        record_model_preview_failure(
+            &mut self.failed_assets,
+            &mut self.failures,
+            asset_path,
+            error,
+        );
+    }
+}
+
+fn normalized_collision_asset_id(path: &str) -> String {
+    path.replace('\\', "/").to_ascii_lowercase()
+}
+
+fn semantic_collision_asset_id(document: &StageDocument, raw_path: &[u8]) -> String {
+    let raw_path = String::from_utf8_lossy(raw_path).replace('\\', "/");
+    document.stage_archive_source_path.as_ref().map_or_else(
+        || normalized_collision_asset_id(&raw_path),
+        |source| {
+            normalized_collision_asset_id(&format!("{}!/{raw_path}", source.to_string_lossy()))
+        },
+    )
+}
+
+fn build_collision_preview(document: &StageDocument) -> CollisionPreviewBuild {
+    let mut preview = CollisionPreviewBuild::default();
+    let mut loaded_assets = BTreeSet::new();
+
+    if let Some(archive) = &document.stage_archive {
+        for resource in archive.resources() {
+            let StageResourceDocument::Collision(base_collision) = &resource.document else {
+                continue;
+            };
+            let asset_id = semantic_collision_asset_id(document, &resource.raw_path);
+            let collision = document
+                .archive_edits
+                .collisions
+                .iter()
+                .find(|edit| edit.raw_resource_path == resource.raw_path)
+                .map_or(base_collision, |edit| &edit.document);
+            preview.append_file(collision);
+            loaded_assets.insert(asset_id);
+        }
+    }
+
+    for edit in &document.archive_edits.collisions {
+        let asset_id = semantic_collision_asset_id(document, &edit.raw_resource_path);
+        if loaded_assets.insert(asset_id) {
+            preview.append_file(&edit.document);
+        }
+    }
+
+    for asset in document
+        .assets
+        .iter()
+        .filter(|asset| asset.kind == StageAssetKind::Collision)
+    {
+        let asset_path = asset.path.to_string_lossy().replace('\\', "/");
+        if !loaded_assets.insert(normalized_collision_asset_id(&asset_path)) {
+            continue;
+        }
+        let bytes = match read_stage_asset_bytes(&asset.path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                preview.record_failure(&asset_path, format!("read asset: {error}"));
+                continue;
+            }
+        };
+        match ColFile::parse(&bytes) {
+            Ok(collision) => preview.append_file(&collision),
+            Err(error) => preview.record_failure(&asset_path, format!("parse COL: {error}")),
+        }
+    }
+
+    preview
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum ObjectDelta {
     Insert {
@@ -351,7 +483,6 @@ struct SmsEditorApp {
     repo_root: String,
     base_root: String,
     project_root: String,
-    stage_export_path: String,
     stage_id: String,
     dolphin_path: String,
     game_path: String,
@@ -373,6 +504,39 @@ struct SmsEditorApp {
     palette_factory: Option<String>,
     object_filter: String,
     scene_filter: String,
+    content_browser_kind: ContentBrowserKind,
+    model_asset_filter: String,
+    model_folder_filter: Option<String>,
+    model_asset_rename_draft: String,
+    model_asset_move_draft: String,
+    new_model_folder_draft: String,
+    model_catalog_root: Option<PathBuf>,
+    model_catalog_entries: Vec<sms_authoring::CatalogAssetEntry>,
+    model_catalog_issues: Vec<String>,
+    model_asset_preview_cache: BTreeMap<AuthoredModelPreviewKey, Arc<AuthoredModelPreviewGeometry>>,
+    authored_model_preview_base: Option<AuthoredModelPreviewBase>,
+    selected_model_asset: Option<sms_authoring::AssetId>,
+    selected_model_document: Option<sms_authoring::ModelAssetDocument>,
+    saved_model_document: Option<sms_authoring::ModelAssetDocument>,
+    selected_model_material: usize,
+    selected_model_texture: usize,
+    model_editor_section: ModelEditorSection,
+    model_target_profile: ModelTargetProfile,
+    model_editor_error: Option<String>,
+    gx_json_draft: String,
+    texture_json_draft: String,
+    asset_dirty: bool,
+    asset_undo_stack: VecDeque<ModelAssetUndoRecord>,
+    asset_redo_stack: VecDeque<ModelAssetUndoRecord>,
+    model_import_options: sms_authoring::ModelImportOptions,
+    model_import_job: Option<ModelImportJob>,
+    model_instances: Vec<EditorModelInstance>,
+    model_instances_dirty: bool,
+    model_instance_undo_stack: VecDeque<ModelInstanceUndoRecord>,
+    model_instance_redo_stack: VecDeque<ModelInstanceUndoRecord>,
+    model_collision_override_template: Option<sms_authoring::CollisionSurface>,
+    selected_model_instance_id: Option<uuid::Uuid>,
+    placing_model_asset: Option<sms_authoring::AssetId>,
     last_scanned_base_root: String,
     pending_auto_refresh_root: Option<String>,
     last_auto_refresh_attempt_root: String,
@@ -417,6 +581,7 @@ struct SmsEditorApp {
     close_authorized: bool,
     background_receiver: Option<Receiver<BackgroundResult>>,
     background_label: Option<String>,
+    active_build_cancel: Option<Arc<AtomicBool>>,
     animation_started_at: Instant,
     last_skeletal_animation_tick: u64,
     level_transform_progress: f32,
@@ -493,7 +658,6 @@ impl Default for SmsEditorApp {
             repo_root,
             base_root,
             project_root,
-            stage_export_path: String::new(),
             stage_id,
             dolphin_path: launch
                 .dolphin_executable
@@ -524,6 +688,39 @@ impl Default for SmsEditorApp {
             palette_factory: None,
             object_filter: String::new(),
             scene_filter: String::new(),
+            content_browser_kind: ContentBrowserKind::default(),
+            model_asset_filter: String::new(),
+            model_folder_filter: None,
+            model_asset_rename_draft: String::new(),
+            model_asset_move_draft: String::new(),
+            new_model_folder_draft: String::new(),
+            model_catalog_root: None,
+            model_catalog_entries: Vec::new(),
+            model_catalog_issues: Vec::new(),
+            model_asset_preview_cache: BTreeMap::new(),
+            authored_model_preview_base: None,
+            selected_model_asset: None,
+            selected_model_document: None,
+            saved_model_document: None,
+            selected_model_material: 0,
+            selected_model_texture: 0,
+            model_editor_section: ModelEditorSection::default(),
+            model_target_profile: ModelTargetProfile::default(),
+            model_editor_error: None,
+            gx_json_draft: String::new(),
+            texture_json_draft: String::new(),
+            asset_dirty: false,
+            asset_undo_stack: VecDeque::new(),
+            asset_redo_stack: VecDeque::new(),
+            model_import_options: sms_authoring::ModelImportOptions::default(),
+            model_import_job: None,
+            model_instances: Vec::new(),
+            model_instances_dirty: false,
+            model_instance_undo_stack: VecDeque::new(),
+            model_instance_redo_stack: VecDeque::new(),
+            model_collision_override_template: None,
+            selected_model_instance_id: None,
+            placing_model_asset: None,
             last_scanned_base_root: String::new(),
             pending_auto_refresh_root: None,
             last_auto_refresh_attempt_root: String::new(),
@@ -568,6 +765,7 @@ impl Default for SmsEditorApp {
             close_authorized: false,
             background_receiver: None,
             background_label: None,
+            active_build_cancel: None,
             animation_started_at: Instant::now(),
             last_skeletal_animation_tick: u64::MAX,
             level_transform_progress: 0.0,
@@ -594,6 +792,7 @@ impl SmsEditorApp {
 impl eframe::App for SmsEditorApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_background_task(ctx);
+        self.poll_model_import(ctx);
         self.persist_camera_state_if_due();
         self.sync_window_title(ctx);
         let close_requested = ctx.input(|input| input.viewport().close_requested());
@@ -647,6 +846,7 @@ impl eframe::App for SmsEditorApp {
             return;
         }
         self.refresh_scene_browser_if_needed();
+        self.refresh_model_catalog();
 
         egui::Panel::top("toolbar")
             .default_size(34.0)
@@ -891,6 +1091,7 @@ impl SmsEditorApp {
             Some(Ok(result)) => {
                 self.background_receiver = None;
                 self.background_label = None;
+                self.active_build_cancel = None;
                 match result {
                     BackgroundResult::Schema(result) => match *result {
                         Ok(registry) => {
@@ -908,6 +1109,7 @@ impl SmsEditorApp {
                                 self.issues = document.validate();
                             }
                             self.registry = Some(registry);
+                            self.rebuild_model_preview_cache();
                             if self.document.is_some() {
                                 self.rebuild_model_preview_from_document();
                             }
@@ -951,21 +1153,44 @@ impl SmsEditorApp {
                         Ok(loaded) => self.apply_loaded_stage(*loaded),
                         Err(err) => self.log.push(format!("Open stage failed: {err}")),
                     },
-                    BackgroundResult::Export(result) => match result {
+                    BackgroundResult::Build(result) => match result {
                         Ok(outcome) => {
-                            let rebuild_kind = if outcome.changed {
-                                "with authored semantic changes"
-                            } else {
-                                "byte-identical to the imported archive"
-                            };
                             self.log.push(format!(
-                                "Exported {} bytes to '{}' ({rebuild_kind}; source '{}').",
-                                outcome.size_bytes,
-                                outcome.output_path.display(),
-                                outcome.source_path.display(),
+                                "Built runnable {}-byte stage at '{}' ({} independent copies, {} reused).",
+                                outcome.run.stage_size_bytes,
+                                outcome.run.stage_output_path.display(),
+                                outcome.run.copied_files,
+                                outcome.run.reused_files,
+                            ));
+                            self.log.push(format!(
+                                "Managed game directory: '{}'. The extracted base game was not modified.",
+                                outcome.run.run_root.display(),
                             ));
                         }
-                        Err(err) => self.log.push(format!("Stage archive export failed: {err}")),
+                        Err(err) if managed_build::is_cancelled_error(&err) => {
+                            self.log.push(format!("Game build cancelled: {err}"))
+                        }
+                        Err(err) => self.log.push(format!("Game build failed: {err}")),
+                    },
+                    BackgroundResult::BuildAndRun(result) => match result {
+                        Ok(outcome) => {
+                            self.log.push(format!(
+                                "Built runnable {}-byte stage at '{}' ({} independent copies, {} reused).",
+                                outcome.run.stage_size_bytes,
+                                outcome.run.stage_output_path.display(),
+                                outcome.run.copied_files,
+                                outcome.run.reused_files,
+                            ));
+                            self.log.push(format!(
+                                "Managed game directory: '{}'. The extracted base game was not modified.",
+                                outcome.run.run_root.display(),
+                            ));
+                            self.launch_managed_dolphin(&outcome.run);
+                        }
+                        Err(err) if managed_build::is_cancelled_error(&err) => {
+                            self.log.push(format!("Build and launch cancelled: {err}"))
+                        }
+                        Err(err) => self.log.push(format!("Build and launch failed: {err}")),
                     },
                 }
             }
@@ -975,6 +1200,7 @@ impl SmsEditorApp {
             Some(Err(TryRecvError::Disconnected)) => {
                 self.background_receiver = None;
                 self.background_label = None;
+                self.active_build_cancel = None;
                 self.log
                     .push("Background operation ended unexpectedly.".to_string());
             }
@@ -1060,6 +1286,12 @@ impl SmsEditorApp {
                 preview.actor_particles.len(),
                 preview.source_vertices
             ));
+            self.log.push(format!(
+                "Collision preview loaded {} file(s), {} triangle(s), and {} surface type(s).",
+                preview.collision_file_count,
+                preview.collision_triangles.len(),
+                preview.collision_surface_count
+            ));
         } else if !scene.model_paths.is_empty() {
             self.log
                 .push("Viewport preview could not decode BMD vertex data.".to_string());
@@ -1080,6 +1312,7 @@ impl SmsEditorApp {
         self.stage_id = document.stage_id.clone();
         self.document = Some(document);
         self.render_scene = Some(scene);
+        self.reset_authored_model_preview_base();
         self.model_preview = preview;
         self.animation_started_at = Instant::now();
         self.last_skeletal_animation_tick = u64::MAX;
@@ -1090,6 +1323,8 @@ impl SmsEditorApp {
         self.rebuild_gpu_viewport_scene();
         self.clear_viewport_preview_cache();
         self.selected_object_id = None;
+        self.selected_model_instance_id = None;
+        self.placing_model_asset = None;
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.undo_transaction = None;
@@ -1193,6 +1428,7 @@ impl SmsEditorApp {
         let mut object_model_indices = BTreeMap::new();
         let mut mirror_actor_positions = BTreeMap::new();
         let mut mirror_model_slots = BTreeMap::new();
+        let collision_preview = build_collision_preview(document);
 
         for asset in models {
             let asset_path = asset.path.to_string_lossy().replace('\\', "/");
@@ -2051,7 +2287,9 @@ impl SmsEditorApp {
 
         material_animation_bindings.resize_with(materials.len(), Vec::new);
 
-        if loaded_models == 0 || (points.is_empty() && triangles.is_empty()) {
+        if (loaded_models == 0 || (points.is_empty() && triangles.is_empty()))
+            && collision_preview.triangles.is_empty()
+        {
             if failed_model_assets.is_empty() {
                 return None;
             }
@@ -2068,6 +2306,15 @@ impl SmsEditorApp {
             if let Some((robust_min, robust_max)) = robust_preview_bounds(&triangles, &points) {
                 bounds_min = robust_min;
                 bounds_max = robust_max;
+            } else if let Some((collision_min, collision_max)) = robust_position_bounds(
+                &collision_preview
+                    .triangles
+                    .iter()
+                    .flat_map(|triangle| triangle.vertices)
+                    .collect::<Vec<_>>(),
+            ) {
+                bounds_min = collision_min;
+                bounds_max = collision_max;
             }
         }
 
@@ -2083,6 +2330,11 @@ impl SmsEditorApp {
         Some(ModelPreview {
             points,
             triangles,
+            collision_triangles: collision_preview.triangles,
+            collision_file_count: collision_preview.file_count,
+            collision_surface_count: collision_preview.surface_types.len(),
+            failed_collision_files: collision_preview.failed_assets.len(),
+            collision_failures: collision_preview.failures,
             textures,
             materials,
             texture_srt_animations,

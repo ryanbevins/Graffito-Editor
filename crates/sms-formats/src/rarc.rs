@@ -96,6 +96,504 @@ pub struct RarcEntryRecord {
     pub data: Option<Vec<u8>>,
 }
 
+/// High-level, source-free RARC tree builder.
+///
+/// Directories are inferred from slash-separated raw paths. The builder owns
+/// every file payload and regenerates node records, dot entries, hashes, file
+/// IDs, string slots, and aligned data offsets when [`RarcBuilder::build`] is
+/// called. This is intentionally separate from [`RarcDocument`], whose public
+/// record representation is also used by detached semantic stage documents
+/// after their child payloads have been consumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RarcBuilder {
+    root: RarcBuilderDirectory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RarcBuilderDirectory {
+    raw_name: Vec<u8>,
+    entries: Vec<RarcBuilderTreeEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RarcBuilderTreeEntry {
+    Directory(RarcBuilderDirectory),
+    File { raw_name: Vec<u8>, data: Vec<u8> },
+}
+
+#[derive(Debug)]
+struct FlatRarcDirectory {
+    raw_name: Vec<u8>,
+    parent_index: Option<usize>,
+    entries: Vec<FlatRarcEntry>,
+}
+
+#[derive(Debug)]
+enum FlatRarcEntry {
+    Directory {
+        raw_name: Vec<u8>,
+        node_index: usize,
+    },
+    File {
+        raw_name: Vec<u8>,
+        data: Vec<u8>,
+    },
+}
+
+impl RarcBuilder {
+    /// Creates an empty archive with the conventional stage-archive root.
+    pub fn new_scene() -> Self {
+        Self {
+            root: RarcBuilderDirectory {
+                raw_name: b"scene".to_vec(),
+                entries: Vec::new(),
+            },
+        }
+    }
+
+    /// Creates an empty archive with a caller-supplied raw root name.
+    pub fn new(raw_root_name: impl Into<Vec<u8>>) -> Result<Self> {
+        let raw_name = raw_root_name.into();
+        validate_rarc_name("builder root", 0, &raw_name)?;
+        if matches!(raw_name.as_slice(), b"." | b"..") {
+            return Err(unsupported_rarc("the RARC root name cannot be '.' or '..'"));
+        }
+        Ok(Self {
+            root: RarcBuilderDirectory {
+                raw_name,
+                entries: Vec::new(),
+            },
+        })
+    }
+
+    /// Reconstructs a high-level tree from a complete structural document.
+    /// Every file must still own its payload; detached semantic containers
+    /// should temporarily regenerate their typed child bytes first.
+    pub fn from_document(document: &RarcDocument) -> Result<Self> {
+        let mut canonical = document.clone();
+        canonical.canonicalize_layout()?;
+        let mut visited = vec![false; canonical.nodes.len()];
+        let root = builder_directory_from_node(&canonical, 0, 0, &mut visited)?;
+        if let Some(index) = visited.iter().position(|visited| !visited) {
+            return Err(unsupported_rarc(format!(
+                "directory node {index} is unreachable from the builder root"
+            )));
+        }
+        Ok(Self { root })
+    }
+
+    pub fn root_name(&self) -> &[u8] {
+        &self.root.raw_name
+    }
+
+    pub fn contains_file(&self, raw_path: &[u8]) -> bool {
+        let Ok(components) = rarc_builder_path_components(raw_path) else {
+            return false;
+        };
+        builder_file(&self.root, &components).is_some()
+    }
+
+    /// Inserts a new file, creating missing parent directories. Existing
+    /// files or a directory at the same path are rejected.
+    pub fn insert_file(&mut self, raw_path: &[u8], data: Vec<u8>) -> Result<()> {
+        let components = rarc_builder_path_components(raw_path)?;
+        let (leaf, parents) = components
+            .split_last()
+            .expect("validated RARC builder paths are non-empty");
+        let directory = builder_directory_mut(&mut self.root, parents, true)?;
+        if directory
+            .entries
+            .iter()
+            .any(|entry| entry.raw_name() == *leaf)
+        {
+            return Err(unsupported_rarc(format!(
+                "archive path {raw_path:02X?} already exists"
+            )));
+        }
+        directory.entries.push(RarcBuilderTreeEntry::File {
+            raw_name: leaf.to_vec(),
+            data,
+        });
+        Ok(())
+    }
+
+    /// Replaces an existing file and returns its previous payload.
+    pub fn replace_file(&mut self, raw_path: &[u8], data: Vec<u8>) -> Result<Vec<u8>> {
+        let components = rarc_builder_path_components(raw_path)?;
+        let (leaf, parents) = components
+            .split_last()
+            .expect("validated RARC builder paths are non-empty");
+        let directory = builder_directory_mut(&mut self.root, parents, false)?;
+        let entry = directory
+            .entries
+            .iter_mut()
+            .find(|entry| entry.raw_name() == *leaf)
+            .ok_or_else(|| {
+                unsupported_rarc(format!("archive file {raw_path:02X?} was not found"))
+            })?;
+        match entry {
+            RarcBuilderTreeEntry::File { data: current, .. } => {
+                Ok(std::mem::replace(current, data))
+            }
+            RarcBuilderTreeEntry::Directory(_) => Err(unsupported_rarc(format!(
+                "archive path {raw_path:02X?} is a directory"
+            ))),
+        }
+    }
+
+    /// Removes a file and prunes parent directories that become empty.
+    pub fn remove_file(&mut self, raw_path: &[u8]) -> Result<Vec<u8>> {
+        let components = rarc_builder_path_components(raw_path)?;
+        remove_builder_file(&mut self.root, &components).map(|(data, _)| data)
+    }
+
+    /// Builds a canonical structural document containing independently owned
+    /// file payloads. Repeated calls are deterministic.
+    pub fn build(&self) -> Result<RarcDocument> {
+        self.clone().into_document()
+    }
+
+    pub fn into_document(self) -> Result<RarcDocument> {
+        let mut directories = Vec::new();
+        flatten_rarc_directory(self.root, None, 0, &mut directories)?;
+        check_item_limit(
+            "archive node count",
+            directories.len(),
+            MAX_ARCHIVE_NODE_COUNT,
+        )?;
+
+        let mut nodes = Vec::with_capacity(directories.len());
+        let mut entries = Vec::new();
+        for directory in directories {
+            let first_entry_index = u32::try_from(entries.len()).map_err(|_| {
+                resource_limit("archive entry count", entries.len(), u32::MAX as usize)
+            })?;
+            let entry_count = directory.entries.len().checked_add(2).ok_or_else(|| {
+                resource_limit("directory entries", usize::MAX, u16::MAX as usize)
+            })?;
+            let entry_count = u16::try_from(entry_count)
+                .map_err(|_| resource_limit("directory entries", entry_count, u16::MAX as usize))?;
+            nodes.push(RarcNodeRecord {
+                node_type: [0; 4],
+                name_offset: 0,
+                name_hash: 0,
+                raw_name: directory.raw_name,
+                entry_count,
+                first_entry_index,
+            });
+
+            for entry in directory.entries {
+                match entry {
+                    FlatRarcEntry::Directory {
+                        raw_name,
+                        node_index,
+                    } => entries.push(RarcEntryRecord {
+                        file_id: u16::MAX,
+                        name_hash: 0,
+                        flags: RARC_DIRECTORY_FLAGS,
+                        name_offset: 0,
+                        raw_name,
+                        data_offset: u32::try_from(node_index).map_err(|_| {
+                            resource_limit("archive node index", node_index, u32::MAX as usize)
+                        })?,
+                        size: RARC_DIRECTORY_SIZE,
+                        reserved: 0,
+                        data: None,
+                    }),
+                    FlatRarcEntry::File { raw_name, data } => {
+                        entries.push(RarcEntryRecord {
+                            file_id: 0,
+                            name_hash: 0,
+                            flags: RARC_FILE_FLAGS,
+                            name_offset: 0,
+                            raw_name,
+                            data_offset: 0,
+                            size: 0,
+                            reserved: 0,
+                            data: Some(data),
+                        });
+                    }
+                }
+            }
+            let node_index = nodes.len() - 1;
+            entries.push(RarcEntryRecord {
+                file_id: u16::MAX,
+                name_hash: 0,
+                flags: RARC_DIRECTORY_FLAGS,
+                name_offset: 0,
+                raw_name: b".".to_vec(),
+                data_offset: node_index as u32,
+                size: RARC_DIRECTORY_SIZE,
+                reserved: 0,
+                data: None,
+            });
+            entries.push(RarcEntryRecord {
+                file_id: u16::MAX,
+                name_hash: 0,
+                flags: RARC_DIRECTORY_FLAGS,
+                name_offset: 0,
+                raw_name: b"..".to_vec(),
+                data_offset: directory
+                    .parent_index
+                    .map(|index| index as u32)
+                    .unwrap_or(u32::MAX),
+                size: RARC_DIRECTORY_SIZE,
+                reserved: 0,
+                data: None,
+            });
+        }
+
+        let mut document = RarcDocument {
+            layout: empty_rarc_layout(),
+            nodes,
+            entries,
+        };
+        document.canonicalize_layout()?;
+        Ok(document)
+    }
+}
+
+impl RarcBuilderTreeEntry {
+    fn raw_name(&self) -> &[u8] {
+        match self {
+            Self::Directory(directory) => &directory.raw_name,
+            Self::File { raw_name, .. } => raw_name,
+        }
+    }
+}
+
+fn rarc_builder_path_components(raw_path: &[u8]) -> Result<Vec<&[u8]>> {
+    let normalized = raw_path.strip_prefix(b"/").unwrap_or(raw_path);
+    check_item_limit(
+        "archive path bytes",
+        normalized.len(),
+        MAX_ARCHIVE_PATH_BYTES,
+    )?;
+    if normalized.is_empty() {
+        return Err(unsupported_rarc("archive file path cannot be empty"));
+    }
+    let components = normalized.split(|byte| *byte == b'/').collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        validate_rarc_name("builder path component", index, component)?;
+        if matches!(*component, b"." | b"..") {
+            return Err(unsupported_rarc(format!(
+                "archive path {raw_path:02X?} contains a traversal component"
+            )));
+        }
+    }
+    Ok(components)
+}
+
+fn builder_directory_mut<'a>(
+    directory: &'a mut RarcBuilderDirectory,
+    components: &[&[u8]],
+    create: bool,
+) -> Result<&'a mut RarcBuilderDirectory> {
+    let Some((component, remaining)) = components.split_first() else {
+        return Ok(directory);
+    };
+    let position = directory
+        .entries
+        .iter()
+        .position(|entry| entry.raw_name() == *component);
+    let position = match position {
+        Some(position) => position,
+        None if create => {
+            directory
+                .entries
+                .push(RarcBuilderTreeEntry::Directory(RarcBuilderDirectory {
+                    raw_name: component.to_vec(),
+                    entries: Vec::new(),
+                }));
+            directory.entries.len() - 1
+        }
+        None => {
+            return Err(unsupported_rarc(format!(
+                "archive directory component {component:02X?} was not found"
+            )));
+        }
+    };
+    let RarcBuilderTreeEntry::Directory(child) = &mut directory.entries[position] else {
+        return Err(unsupported_rarc(format!(
+            "archive path component {component:02X?} is a file"
+        )));
+    };
+    builder_directory_mut(child, remaining, create)
+}
+
+fn builder_file<'a>(directory: &'a RarcBuilderDirectory, components: &[&[u8]]) -> Option<&'a [u8]> {
+    let (component, remaining) = components.split_first()?;
+    let entry = directory
+        .entries
+        .iter()
+        .find(|entry| entry.raw_name() == *component)?;
+    match (entry, remaining.is_empty()) {
+        (RarcBuilderTreeEntry::File { data, .. }, true) => Some(data),
+        (RarcBuilderTreeEntry::Directory(child), false) => builder_file(child, remaining),
+        _ => None,
+    }
+}
+
+fn remove_builder_file(
+    directory: &mut RarcBuilderDirectory,
+    components: &[&[u8]],
+) -> Result<(Vec<u8>, bool)> {
+    let (component, remaining) = components
+        .split_first()
+        .expect("validated RARC builder paths are non-empty");
+    let position = directory
+        .entries
+        .iter()
+        .position(|entry| entry.raw_name() == *component)
+        .ok_or_else(|| {
+            unsupported_rarc(format!(
+                "archive path component {component:02X?} was not found"
+            ))
+        })?;
+
+    let data = if remaining.is_empty() {
+        match directory.entries.get(position) {
+            Some(RarcBuilderTreeEntry::File { .. }) => {}
+            Some(RarcBuilderTreeEntry::Directory(_)) => {
+                return Err(unsupported_rarc(format!(
+                    "archive path component {component:02X?} is a directory"
+                )));
+            }
+            None => unreachable!("the entry position was found above"),
+        }
+        let RarcBuilderTreeEntry::File { data, .. } = directory.entries.remove(position) else {
+            unreachable!("the entry kind was checked above");
+        };
+        data
+    } else {
+        let RarcBuilderTreeEntry::Directory(child) = &mut directory.entries[position] else {
+            return Err(unsupported_rarc(format!(
+                "archive path component {component:02X?} is a file"
+            )));
+        };
+        let (data, child_is_empty) = remove_builder_file(child, remaining)?;
+        if child_is_empty {
+            directory.entries.remove(position);
+        }
+        data
+    };
+    Ok((data, directory.entries.is_empty()))
+}
+
+fn builder_directory_from_node(
+    document: &RarcDocument,
+    node_index: usize,
+    depth: usize,
+    visited: &mut [bool],
+) -> Result<RarcBuilderDirectory> {
+    if depth > MAX_ARCHIVE_DIRECTORY_DEPTH {
+        return Err(resource_limit(
+            "archive directory depth",
+            depth,
+            MAX_ARCHIVE_DIRECTORY_DEPTH,
+        ));
+    }
+    let node = document
+        .nodes
+        .get(node_index)
+        .ok_or_else(|| invalid_offset(node_index, document.nodes.len()))?;
+    if std::mem::replace(&mut visited[node_index], true) {
+        return Err(unsupported_rarc(format!(
+            "directory node {node_index} is referenced more than once"
+        )));
+    }
+    let (start, end) = rarc_node_entry_range(node, document.entries.len())?;
+    let mut entries = Vec::with_capacity(node.entry_count.saturating_sub(2) as usize);
+    for entry in &document.entries[start..end] {
+        if matches!(entry.raw_name.as_slice(), b"." | b"..") {
+            continue;
+        }
+        if entry.is_directory() {
+            let child = builder_directory_from_node(
+                document,
+                entry.data_offset as usize,
+                depth + 1,
+                visited,
+            )?;
+            entries.push(RarcBuilderTreeEntry::Directory(child));
+        } else {
+            let data = entry.data.clone().ok_or_else(|| {
+                unsupported_rarc(format!(
+                    "file entry {node_index}:{:?} has no generated payload",
+                    entry.raw_name
+                ))
+            })?;
+            entries.push(RarcBuilderTreeEntry::File {
+                raw_name: entry.raw_name.clone(),
+                data,
+            });
+        }
+    }
+    Ok(RarcBuilderDirectory {
+        raw_name: node.raw_name.clone(),
+        entries,
+    })
+}
+
+fn flatten_rarc_directory(
+    directory: RarcBuilderDirectory,
+    parent_index: Option<usize>,
+    depth: usize,
+    output: &mut Vec<FlatRarcDirectory>,
+) -> Result<usize> {
+    if depth > MAX_ARCHIVE_DIRECTORY_DEPTH {
+        return Err(resource_limit(
+            "archive directory depth",
+            depth,
+            MAX_ARCHIVE_DIRECTORY_DEPTH,
+        ));
+    }
+    let index = output.len();
+    output.push(FlatRarcDirectory {
+        raw_name: directory.raw_name,
+        parent_index,
+        entries: Vec::new(),
+    });
+    for entry in directory.entries {
+        match entry {
+            RarcBuilderTreeEntry::Directory(child) => {
+                let raw_name = child.raw_name.clone();
+                let node_index = flatten_rarc_directory(child, Some(index), depth + 1, output)?;
+                output[index].entries.push(FlatRarcEntry::Directory {
+                    raw_name,
+                    node_index,
+                });
+            }
+            RarcBuilderTreeEntry::File { raw_name, data } => output[index]
+                .entries
+                .push(FlatRarcEntry::File { raw_name, data }),
+        }
+    }
+    Ok(index)
+}
+
+fn empty_rarc_layout() -> RarcLayout {
+    RarcLayout {
+        file_size: 0,
+        header_size: RARC_HEADER_SIZE,
+        data_offset: 0,
+        data_size: 0,
+        mram_data_size: 0,
+        aram_data_size: 0,
+        dvd_data_size: 0,
+        metadata_present: true,
+        node_offset: 0,
+        entry_offset: 0,
+        string_table_offset: 0,
+        string_table_size: 0,
+        next_free_file_id: 0,
+        sync_file_ids: RARC_SYNC_FILE_IDS,
+        info_reserved: [0; 5],
+        alignment: RARC_ALIGNMENT as u32,
+        padding_byte: RARC_PADDING_BYTE,
+    }
+}
+
 impl RarcEntryRecord {
     pub fn is_directory(&self) -> bool {
         (self.flags & 0x02) != 0
@@ -1943,6 +2441,92 @@ mod tests {
         assert_eq!(rarc_name_hash(b"."), 0x2E);
         assert_eq!(rarc_name_hash(b".."), 0xB8);
         assert_eq!(rarc_name_hash(b"scene"), 0x3410);
+    }
+
+    #[test]
+    fn high_level_builder_creates_a_deterministic_scene_tree() {
+        let mut builder = RarcBuilder::new_scene();
+        builder
+            .insert_file(b"map/map/map.bmd", b"model".to_vec())
+            .unwrap();
+        builder
+            .insert_file(b"map/map.col", b"collision".to_vec())
+            .unwrap();
+        builder
+            .insert_file(b"map/scene.bin", b"placement".to_vec())
+            .unwrap();
+
+        let document = builder.build().unwrap();
+        let first = document.to_bytes().unwrap();
+        let second = builder.build().unwrap().to_bytes().unwrap();
+        assert_eq!(first, second);
+        let reopened = RarcDocument::parse(&first).unwrap();
+        assert_eq!(reopened.nodes[0].raw_name, b"scene");
+        assert_eq!(
+            reopened.entry_by_raw_path(b"map/map/map.bmd").unwrap().data,
+            Some(b"model".to_vec())
+        );
+        assert_eq!(
+            reopened.entry_by_raw_path(b"map/map.col").unwrap().data,
+            Some(b"collision".to_vec())
+        );
+        assert_eq!(reopened.to_bytes().unwrap(), first);
+    }
+
+    #[test]
+    fn high_level_builder_replaces_removes_and_rehydrates_documents() {
+        let mut builder = RarcBuilder::new_scene();
+        builder
+            .insert_file(b"map/map.col", b"old".to_vec())
+            .unwrap();
+        assert_eq!(
+            builder
+                .replace_file(b"map/map.col", b"new".to_vec())
+                .unwrap(),
+            b"old"
+        );
+        builder
+            .insert_file(b"map/map/map.bmd", b"model".to_vec())
+            .unwrap();
+        let document = builder.build().unwrap();
+        let mut rebuilt = RarcBuilder::from_document(&document).unwrap();
+        assert!(rebuilt.contains_file(b"/map/map.col"));
+        assert_eq!(rebuilt.remove_file(b"map/map.col").unwrap(), b"new");
+        assert!(!rebuilt.contains_file(b"map/map.col"));
+        assert!(rebuilt.contains_file(b"map/map/map.bmd"));
+        let reopened = RarcDocument::parse(rebuilt.build().unwrap().to_bytes().unwrap()).unwrap();
+        assert!(reopened.entry_by_raw_path(b"map/map.col").is_none());
+        assert!(reopened.entry_by_raw_path(b"map/map/map.bmd").is_some());
+    }
+
+    #[test]
+    fn high_level_builder_rejects_conflicts_and_traversal() {
+        let mut builder = RarcBuilder::new_scene();
+        builder.insert_file(b"map/file.bin", Vec::new()).unwrap();
+        assert!(builder.insert_file(b"map/file.bin", Vec::new()).is_err());
+        assert!(builder
+            .insert_file(b"map/file.bin/child", Vec::new())
+            .is_err());
+        assert!(builder.insert_file(b"map/../file.bin", Vec::new()).is_err());
+        assert!(builder.insert_file(b"/", Vec::new()).is_err());
+        assert!(builder.remove_file(b"map").is_err());
+    }
+
+    #[test]
+    fn high_level_builder_encodes_an_empty_scene_root() {
+        let bytes = RarcBuilder::new_scene()
+            .build()
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let reopened = RarcDocument::parse(&bytes).unwrap();
+        assert_eq!(reopened.nodes.len(), 1);
+        assert_eq!(reopened.nodes[0].raw_name, b"scene");
+        assert_eq!(reopened.nodes[0].entry_count, 2);
+        assert!(RarcArchive::parse(&bytes)
+            .unwrap()
+            .file_entries()
+            .is_empty());
     }
 
     #[test]

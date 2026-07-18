@@ -264,6 +264,90 @@ fn viewport_markers_show_only_selection_outside_objects_mode() {
 }
 
 #[test]
+fn collision_preview_expands_col_groups_into_surface_typed_triangles() {
+    let collision = ColFile::new(
+        vec![
+            sms_formats::ColVertex::new(0.0, 0.0, 0.0),
+            sms_formats::ColVertex::new(100.0, 0.0, 0.0),
+            sms_formats::ColVertex::new(0.0, 0.0, 100.0),
+            sms_formats::ColVertex::new(100.0, 0.0, 100.0),
+        ],
+        vec![sms_formats::ColGroup {
+            surface_type: 0x0102,
+            has_per_triangle_data: false,
+            triangles: vec![
+                sms_formats::ColTriangle {
+                    vertex_indices: [0, 1, 2],
+                    attribute_0: 0,
+                    attribute_1: 0,
+                    data: None,
+                },
+                sms_formats::ColTriangle {
+                    vertex_indices: [1, 3, 2],
+                    attribute_0: 0,
+                    attribute_1: 0,
+                    data: None,
+                },
+            ],
+        }],
+    );
+    let mut preview = CollisionPreviewBuild::default();
+
+    preview.append_file(&collision);
+
+    assert_eq!(preview.file_count, 1);
+    assert_eq!(preview.triangles.len(), 2);
+    assert_eq!(preview.triangles[0].surface_type, 0x0102);
+    assert_eq!(
+        preview.triangles[1].vertices,
+        [[100.0, 0.0, 0.0], [100.0, 0.0, 100.0], [0.0, 0.0, 100.0]]
+    );
+    assert_eq!(preview.surface_types, BTreeSet::from([0x0102]));
+}
+
+#[test]
+fn collision_surface_colors_are_stable_and_distinguish_types() {
+    assert_eq!(
+        viewport_ui::collision_surface_color(0x0102),
+        viewport_ui::collision_surface_color(0x0102)
+    );
+    assert_ne!(
+        viewport_ui::collision_surface_color(0x0102),
+        viewport_ui::collision_surface_color(0x0103)
+    );
+}
+
+#[test]
+fn collision_framebuffer_draws_loaded_geometry() {
+    let mut preview = preview_for_texture_alpha(false, false);
+    preview.collision_triangles = vec![CollisionPreviewTriangle {
+        vertices: [
+            [-1_000.0, 0.0, -1_000.0],
+            [1_000.0, 0.0, -1_000.0],
+            [0.0, 0.0, 1_000.0],
+        ],
+        surface_type: 1,
+    }];
+    preview.collision_file_count = 1;
+    preview.collision_surface_count = 1;
+    let app = SmsEditorApp {
+        model_preview: Some(preview),
+        view_mode: ViewMode::Collision,
+        ..SmsEditorApp::default()
+    };
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+
+    let image = app.render_collision_framebuffer(rect).unwrap();
+    let background = viewport_framebuffer_background(image.size);
+
+    assert!(image
+        .pixels
+        .iter()
+        .zip(background.pixels)
+        .any(|(rendered, clear)| *rendered != clear));
+}
+
+#[test]
 fn viewport_mesh_picking_selects_the_object_away_from_its_origin_marker() {
     let mut object = SceneObject::new("obj-mesh", "Coin");
     object.transform.translation = [600.0, 0.0, 1000.0];
@@ -1416,6 +1500,11 @@ fn preview_for_texture_alpha(has_alpha: bool, has_translucent_alpha: bool) -> Mo
     ModelPreview {
         points: Vec::new(),
         triangles: Vec::new(),
+        collision_triangles: Vec::new(),
+        collision_file_count: 0,
+        collision_surface_count: 0,
+        failed_collision_files: 0,
+        collision_failures: Vec::new(),
         textures: vec![PreviewTexture {
             image: image.clone(),
             mips: vec![image],
@@ -1892,8 +1981,14 @@ fn reset_fruit_registry() -> ObjectRegistry {
                 |(resource_name, actor_type, _, _, _)| sms_schema::MapObjResourceDefinition {
                     resource_name: (*resource_name).to_string(),
                     actor_type: *actor_type,
+                    object_flags: 0,
+                    required_manager_name: "fixture map object manager".to_string(),
+                    has_hold_dependency: false,
+                    has_move_dependency: false,
+                    uses_resource_name_model_fallback: true,
                     primary_model: Some(format!("{resource_name}.bmd")),
                     load_flags: 0x1022_0000,
+                    collision_resources: Vec::new(),
                     source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
                 },
             )
@@ -2569,6 +2664,11 @@ fn updating_object_transform_moves_cached_preview_mesh() {
                 particle_color_mode: None,
                 particle_environment_color: None,
             }],
+            collision_triangles: Vec::new(),
+            collision_file_count: 0,
+            collision_surface_count: 0,
+            failed_collision_files: 0,
+            collision_failures: Vec::new(),
             textures: Vec::new(),
             materials: Vec::new(),
             texture_srt_animations: Vec::new(),
@@ -2777,36 +2877,48 @@ fn project_folder_inside_the_base_is_moved_to_a_safe_sibling() {
 }
 
 #[test]
-fn stage_archive_export_requires_an_explicit_output_path() {
+fn stage_build_requires_a_saved_sms_project() {
     let mut app = SmsEditorApp {
         document: Some(test_document(Vec::new())),
-        stage_export_path: "   ".to_string(),
         ..SmsEditorApp::default()
     };
 
-    app.export_stage_archive();
+    app.build_game();
 
     assert!(app.background_receiver.is_none());
     assert!(app
         .log
         .iter()
-        .any(|message| message.contains("export path is required")));
+        .any(|message| message.contains("requires a saved .sms project")));
 }
 
 #[test]
-fn completed_stage_archive_export_reports_the_external_output() {
+fn completed_stage_build_reports_the_managed_game_relative_output() {
     let (sender, receiver) = std::sync::mpsc::channel();
     sender
-        .send(BackgroundResult::Export(Ok(StageArchiveExportOutcome {
-            source_path: PathBuf::from("base/dolpic0.szs"),
-            output_path: PathBuf::from("mods/dolpic0.szs"),
-            size_bytes: 1234,
-            changed: false,
-        })))
+        .send(BackgroundResult::Build(Ok(
+            managed_build::ManagedGameBuildOutcome {
+                run: managed_build::ManagedRunMirrorOutcome {
+                    build_root: PathBuf::from("project.smsbuild"),
+                    run_root: PathBuf::from("project.smsbuild/run-root"),
+                    run_main_dol: PathBuf::from("project.smsbuild/run-root/sys/main.dol"),
+                    dolphin_user_dir: PathBuf::from("project.smsbuild/dolphin-user"),
+                    source_relative_path: PathBuf::from("files/data/scene/dolpic0.szs"),
+                    stage_output_path: PathBuf::from(
+                        "project.smsbuild/run-root/files/data/scene/dolpic0.szs",
+                    ),
+                    stage_size_bytes: 1234,
+                    stage_replaced: false,
+                    copied_files: 3,
+                    reused_files: 0,
+                    removed_entries: 0,
+                },
+            },
+        )))
         .unwrap();
     let mut app = SmsEditorApp {
         background_receiver: Some(receiver),
-        background_label: Some("Exporting stage archive".to_string()),
+        background_label: Some("Building managed game".to_string()),
         ..SmsEditorApp::default()
     };
 
@@ -2815,10 +2927,58 @@ fn completed_stage_archive_export_reports_the_external_output() {
     assert!(app.background_receiver.is_none());
     assert!(app.background_label.is_none());
     assert!(app.log.iter().any(|message| {
-        message.contains("1234 bytes")
-            && message.contains("mods/dolpic0.szs")
-            && message.contains("byte-identical")
+        message.contains("1234-byte")
+            && message.contains("project.smsbuild/run-root/files/data/scene/dolpic0.szs")
     }));
+    assert!(app.log.iter().any(|message| {
+        message.contains("Managed game directory") && message.contains("project.smsbuild/run-root")
+    }));
+    assert!(app
+        .log
+        .iter()
+        .any(|message| message.contains("extracted base game was not modified")));
+}
+
+#[test]
+fn managed_build_cancel_state_logs_once_and_clears_with_the_result() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut app = SmsEditorApp {
+        background_receiver: Some(receiver),
+        background_label: Some("Building managed game".to_string()),
+        active_build_cancel: Some(Arc::clone(&cancel)),
+        ..SmsEditorApp::default()
+    };
+
+    assert!(app.background_label.is_some());
+    assert!(app.active_build_cancel.is_some());
+    app.cancel_active_build();
+    app.cancel_active_build();
+
+    assert!(cancel.load(Ordering::Acquire));
+    assert_eq!(
+        app.log
+            .iter()
+            .filter(|message| message.starts_with("Cancelling managed game build"))
+            .count(),
+        1
+    );
+
+    sender
+        .send(BackgroundResult::Build(Err(format!(
+            "{}; test cancellation",
+            managed_build::MANAGED_BUILD_CANCELLED
+        ))))
+        .unwrap();
+    app.poll_background_task(&egui::Context::default());
+
+    assert!(app.background_receiver.is_none());
+    assert!(app.background_label.is_none());
+    assert!(app.active_build_cancel.is_none());
+    assert!(app
+        .log
+        .iter()
+        .any(|message| message.starts_with("Game build cancelled:")));
 }
 
 #[test]

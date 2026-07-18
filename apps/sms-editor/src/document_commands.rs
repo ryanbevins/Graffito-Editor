@@ -140,6 +140,7 @@ impl SmsEditorApp {
     }
 
     pub(super) fn save_project(&mut self) -> bool {
+        let had_selected_model_asset = self.selected_model_asset.is_some();
         if let Some(document) = &self.document {
             if !document_uses_selected_base(document, self.base_root.trim()) {
                 self.log.push(format!(
@@ -150,7 +151,7 @@ impl SmsEditorApp {
                 return false;
             }
         }
-        if let Some(document) = &mut self.document {
+        if let Some(document) = &self.document {
             self.issues = document.validate();
             if self
                 .issues
@@ -161,6 +162,16 @@ impl SmsEditorApp {
                     .push("Project save blocked by validation errors.".to_string());
                 return false;
             }
+        }
+        // Validate the stage and base ownership before committing any sibling
+        // model/instance files. This keeps a known-invalid stage from causing a
+        // partial project save that clears unrelated authoring dirty state.
+        if !self.save_selected_model_asset() {
+            return false;
+        }
+        if let Err(error) = self.save_model_instances() {
+            self.log.push(format!("Project save failed: {error}"));
+            return false;
         }
 
         let project_root = self.project_root.trim().to_string();
@@ -192,46 +203,182 @@ impl SmsEditorApp {
                 }
             },
             None => {
-                self.log.push("No stage open.".to_string());
-                false
+                if had_selected_model_asset {
+                    self.log
+                        .push("Saved model authoring content (no stage is open).".to_string());
+                    true
+                } else {
+                    self.log.push("No stage open.".to_string());
+                    false
+                }
             }
         };
-        if result {
-            self.persist_project_settings(false);
+        if result && self.current_project.is_some() {
+            self.persist_project_settings(false)
+        } else {
+            result
         }
-        result
     }
 
-    pub(super) fn export_stage_archive(&mut self) {
+    pub(super) fn build_game(&mut self) {
+        self.start_managed_stage_build(false);
+    }
+
+    pub(super) fn build_and_launch(&mut self) {
+        self.start_managed_stage_build(true);
+    }
+
+    fn start_managed_stage_build(&mut self, launch_after_build: bool) {
         if self.background_receiver.is_some() {
             self.log
                 .push("Another background operation is already running.".to_string());
             return;
         }
-        let output_path = self.stage_export_path.trim().to_string();
-        if output_path.is_empty() {
+        if launch_after_build && self.dolphin_path.trim().is_empty() {
             self.log
-                .push("Stage archive export path is required.".to_string());
+                .push("Build and launch requires a Dolphin executable.".to_string());
+            return;
+        }
+        if self.document.is_none() {
+            self.log.push("No stage open.".to_string());
+            return;
+        }
+        if self.current_project.is_none() {
+            self.log.push(
+                "Stage build requires a saved .sms project so the managed game build has a safe owned location."
+                    .to_string(),
+            );
+            return;
+        }
+        if !self.save_project() {
+            self.log
+                .push("Stage build stopped because the project could not be saved.".to_string());
             return;
         }
         let Some(document) = self.document.clone() else {
-            self.log.push("No stage open.".to_string());
+            self.log
+                .push("No stage open after project save.".to_string());
             return;
+        };
+        let Some(project) = self.current_project.clone() else {
+            self.log
+                .push("Project closed while preparing the game build.".to_string());
+            return;
+        };
+        let model_instances = self
+            .model_instances
+            .iter()
+            .filter(|instance| instance.stage_id.eq_ignore_ascii_case(&document.stage_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let model_instance_count = model_instances.len();
+        let Some(content_root) = self.model_content_root() else {
+            self.log
+                .push("Stage build blocked: project Content root is unavailable.".to_string());
+            return;
+        };
+        let model_assets = match Self::load_model_asset_snapshot(&content_root, &model_instances) {
+            Ok(model_assets) => model_assets,
+            Err(error) => {
+                self.log.push(format!(
+                    "Stage build blocked while snapshotting model assets: {error}"
+                ));
+                return;
+            }
         };
 
         let (sender, receiver) = mpsc::channel();
-        let task_path = output_path.clone();
+        let build_cancel = Arc::new(AtomicBool::new(false));
+        let task_cancel = Arc::clone(&build_cancel);
         thread::spawn(move || {
-            let result = document
-                .export_stage_archive_new(PathBuf::from(&task_path))
-                .map_err(|error| error.to_string());
-            let _ = sender.send(BackgroundResult::Export(result));
+            let result = managed_build::check_cancelled(&task_cancel)
+                .and_then(|()| {
+                    SmsEditorApp::stage_edits_with_model_instances_from_snapshot_cancellable(
+                        &model_assets,
+                        &model_instances,
+                        &document.archive_edits,
+                        document.stage_archive.as_ref(),
+                        document.registry.as_ref(),
+                        &task_cancel,
+                    )
+                })
+                .and_then(|edits| {
+                    managed_build::check_cancelled(&task_cancel)?;
+                    document
+                        .build_stage_archive_with_edits(&edits)
+                        .map_err(|error| error.to_string())
+                });
+            let result = result.and_then(|archive_bytes| {
+                managed_build::check_cancelled(&task_cancel)?;
+                managed_build::build_managed_game(&project, &document, &archive_bytes, &task_cancel)
+            });
+            if launch_after_build {
+                let _ = sender.send(BackgroundResult::BuildAndRun(result));
+            } else {
+                let _ = sender.send(BackgroundResult::Build(result));
+            }
         });
         self.background_receiver = Some(receiver);
-        self.background_label = Some("Exporting stage archive".to_string());
+        self.active_build_cancel = Some(build_cancel);
+        self.background_label = Some(if launch_after_build {
+            "Building and launching managed game".to_string()
+        } else {
+            "Building managed game".to_string()
+        });
         self.log.push(format!(
-            "Rebuilding stage archive from semantic documents into '{output_path}'..."
+            "Building stage from semantic documents and {} placed model instance(s) into the project's managed game directory{}...",
+            model_instance_count,
+            if launch_after_build {
+                ", then launching Dolphin"
+            } else {
+                ""
+            }
         ));
+    }
+
+    pub(super) fn cancel_active_build(&mut self) {
+        let Some(cancel) = &self.active_build_cancel else {
+            return;
+        };
+        if !cancel.swap(true, Ordering::AcqRel) {
+            self.log.push(
+                "Cancelling managed game build; the current file operation will finish or stop at its next checked chunk."
+                    .to_string(),
+            );
+        }
+    }
+
+    pub(super) fn launch_managed_dolphin(
+        &mut self,
+        outcome: &managed_build::ManagedRunMirrorOutcome,
+    ) {
+        if self.dolphin_path.trim().is_empty() {
+            self.log.push(
+                "Managed game build completed, but Dolphin executable is not configured."
+                    .to_string(),
+            );
+            return;
+        }
+
+        let mut command = Command::new(&self.dolphin_path);
+        command
+            .current_dir(&outcome.run_root)
+            .arg("-u")
+            .arg(&outcome.dolphin_user_dir)
+            .arg("-b")
+            .arg("-e")
+            .arg(&outcome.run_main_dol);
+
+        match command.spawn() {
+            Ok(_) => self.log.push(format!(
+                "Launched Dolphin with managed game '{}' and isolated user directory '{}'.",
+                outcome.run_main_dol.display(),
+                outcome.dolphin_user_dir.display()
+            )),
+            Err(err) => self
+                .log
+                .push(format!("Failed to launch managed Dolphin build: {err}")),
+        }
     }
 
     pub(super) fn launch_dolphin(&mut self) {
@@ -328,6 +475,9 @@ impl SmsEditorApp {
     }
 
     pub(super) fn delete_selected(&mut self) {
+        if self.delete_selected_model_instance() {
+            return;
+        }
         let Some(selected_id) = self.selected_object_id.clone() else {
             return;
         };
@@ -537,6 +687,17 @@ impl SmsEditorApp {
     }
 
     pub(super) fn undo(&mut self) {
+        if (self.selected_model_instance_id.is_some()
+            || (self.selected_object_id.is_none()
+                && self.selected_model_document.is_none()
+                && !self.model_instance_undo_stack.is_empty()))
+            && self.undo_model_instance()
+        {
+            return;
+        }
+        if self.selected_model_document.is_some() && self.undo_model_asset() {
+            return;
+        }
         if self.document.is_none() {
             return;
         }
@@ -555,6 +716,17 @@ impl SmsEditorApp {
     }
 
     pub(super) fn redo(&mut self) {
+        if (self.selected_model_instance_id.is_some()
+            || (self.selected_object_id.is_none()
+                && self.selected_model_document.is_none()
+                && !self.model_instance_redo_stack.is_empty()))
+            && self.redo_model_instance()
+        {
+            return;
+        }
+        if self.selected_model_document.is_some() && self.redo_model_asset() {
+            return;
+        }
         if self.document.is_none() {
             return;
         }
@@ -573,7 +745,7 @@ impl SmsEditorApp {
     }
 
     pub(super) fn is_dirty(&self) -> bool {
-        self.document_dirty
+        self.document_dirty || self.asset_dirty || self.model_instances_dirty
     }
 
     pub(super) fn unsaved_changes_dialog(&mut self, ctx: &egui::Context) {
@@ -590,7 +762,7 @@ impl SmsEditorApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.label("The current stage has changes that have not been saved.");
+                ui.label("The current stage or model asset has changes that have not been saved.");
                 ui.label(if self.pending_project_hub {
                     "Save the project before returning to the project hub?"
                 } else {
@@ -663,6 +835,7 @@ impl SmsEditorApp {
                 )
             });
         self.render_scene = render_scene;
+        self.reset_authored_model_preview_base();
         self.model_preview = model_preview;
         if let Some(document) = &self.document {
             self.issues = validation_issues_for_preview(document, self.model_preview.as_ref());
@@ -800,6 +973,7 @@ impl SmsEditorApp {
     }
 
     pub(super) fn rebuild_gpu_viewport_scene(&mut self) {
+        self.sync_authored_model_instance_preview();
         let Some(target_format) = self.gpu_target_format else {
             self.gpu_viewport = None;
             return;

@@ -11,6 +11,42 @@ const GIZMO_AXIS_LENGTH_PIXELS: f32 = 78.0;
 const GIZMO_RING_RADIUS_PIXELS: f32 = 64.0;
 const GIZMO_HIT_RADIUS_PIXELS: f32 = 10.0;
 
+pub(super) fn collision_surface_color(surface_type: u16) -> egui::Color32 {
+    const PALETTE: [[u8; 3]; 12] = [
+        [76, 184, 168],
+        [104, 164, 230],
+        [232, 176, 72],
+        [206, 112, 154],
+        [128, 194, 92],
+        [164, 125, 220],
+        [230, 112, 84],
+        [72, 172, 220],
+        [218, 204, 88],
+        [92, 196, 126],
+        [214, 132, 222],
+        [226, 142, 66],
+    ];
+    let mut hash = u32::from(surface_type);
+    hash ^= hash >> 7;
+    hash = hash.wrapping_mul(0x9e37_79b1);
+    let [r, g, b] = PALETTE[hash as usize % PALETTE.len()];
+    egui::Color32::from_rgb(r, g, b)
+}
+
+fn shaded_collision_color(triangle: &CollisionPreviewTriangle) -> egui::Color32 {
+    let base = collision_surface_color(triangle.surface_type);
+    let edge_a = vec3_sub(triangle.vertices[1], triangle.vertices[0]);
+    let edge_b = vec3_sub(triangle.vertices[2], triangle.vertices[0]);
+    let normal = vec3_normalize(vec3_cross(edge_a, edge_b));
+    let light = vec3_normalize([0.35, 0.85, 0.4]);
+    let shade = (0.68 + 0.32 * vec3_dot(normal, light).abs()).clamp(0.0, 1.0);
+    egui::Color32::from_rgb(
+        (f32::from(base.r()) * shade) as u8,
+        (f32::from(base.g()) * shade) as u8,
+        (f32::from(base.b()) * shade) as u8,
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 struct GizmoScreenAxis {
     start: egui::Pos2,
@@ -210,6 +246,13 @@ impl SmsEditorApp {
         rect: egui::Rect,
         response: &egui::Response,
     ) {
+        if let Some(payload) = response.dnd_release_payload::<ModelAssetDragPayload>() {
+            if let Some(pointer) = ui.input(|input| input.pointer.latest_pos()) {
+                let world = self.screen_to_world_floor(rect, pointer);
+                self.spawn_model_instance_at(payload.asset_id, world);
+            }
+            return;
+        }
         let secondary_down = ui.input(|input| input.pointer.secondary_down());
         let fly_navigation_active = secondary_down
             && (response.hovered() || response.dragged_by(egui::PointerButton::Secondary));
@@ -272,6 +315,11 @@ impl SmsEditorApp {
         if response.clicked() && self.hovered_gizmo_axis.is_none() && !gizmo_using_pointer {
             if let Some(pos) = response.interact_pointer_pos() {
                 if self.tool == EditorTool::Place {
+                    if let Some(asset_id) = self.placing_model_asset {
+                        let world = self.screen_to_world_floor(rect, pos);
+                        self.spawn_model_instance_at(asset_id, world);
+                        return;
+                    }
                     if let Some(factory) = self.palette_factory.clone() {
                         let world = self.screen_to_world_floor(rect, pos);
                         self.spawn_object_at(factory, world);
@@ -279,7 +327,27 @@ impl SmsEditorApp {
                     }
                 }
 
-                self.selected_object_id = self.object_at_screen_position(rect, pos);
+                if let Some(instance_id) = self.model_instance_at_screen_position(rect, pos) {
+                    if self.asset_dirty && !self.save_selected_model_asset() {
+                        return;
+                    }
+                    self.selected_model_instance_id = Some(instance_id);
+                    self.selected_object_id = None;
+                    self.selected_model_asset = None;
+                    self.selected_model_document = None;
+                    self.saved_model_document = None;
+                } else {
+                    if self.asset_dirty && !self.save_selected_model_asset() {
+                        return;
+                    }
+                    self.selected_model_instance_id = None;
+                    self.selected_object_id = self.object_at_screen_position(rect, pos);
+                    if self.selected_object_id.is_some() {
+                        self.selected_model_asset = None;
+                        self.selected_model_document = None;
+                        self.saved_model_document = None;
+                    }
+                }
             }
         }
     }
@@ -647,7 +715,7 @@ impl SmsEditorApp {
     ) {
         painter.add(egui::Shape::mesh(viewport_background_mesh(rect)));
 
-        if self.model_preview.is_some() {
+        if self.model_preview.is_some() || self.view_mode == ViewMode::Collision {
             self.paint_model_preview(ui.ctx(), painter, rect);
         } else {
             self.paint_stage_silhouette(painter, rect);
@@ -657,6 +725,7 @@ impl SmsEditorApp {
         if self.renderer.config().show_grid {
             self.paint_grid(painter, rect);
         }
+        self.paint_model_instances(painter, rect);
         self.paint_selected_object_outline(painter, rect);
 
         let projection = self.camera_projection(rect);
@@ -928,6 +997,21 @@ impl SmsEditorApp {
         painter: &egui::Painter,
         rect: egui::Rect,
     ) {
+        if self.view_mode == ViewMode::Collision {
+            if self.renderer.config().show_collision {
+                self.paint_collision_preview(ctx, painter, rect);
+            } else {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Collision display is disabled in Viewport settings.",
+                    egui::FontId::proportional(15.0),
+                    egui::Color32::from_rgb(224, 213, 178),
+                );
+            }
+            return;
+        }
+
         self.update_level_transformation(ctx);
         self.update_skeletal_animations();
         let has_triangles = self
@@ -988,6 +1072,82 @@ impl SmsEditorApp {
                 self.paint_preview_bounds(painter, rect, preview);
             }
         }
+    }
+
+    fn paint_collision_preview(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+    ) {
+        let Some(preview) = self.model_preview.as_ref() else {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "No collision geometry was found for this stage.",
+                egui::FontId::proportional(15.0),
+                egui::Color32::from_rgb(224, 213, 178),
+            );
+            return;
+        };
+        if preview.collision_triangles.is_empty() {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "No collision geometry was found for this stage.",
+                egui::FontId::proportional(15.0),
+                egui::Color32::from_rgb(224, 213, 178),
+            );
+            return;
+        }
+
+        let key = self.model_framebuffer_key(rect);
+        let needs_render = self.model_framebuffer.is_none() || self.model_framebuffer_key != key;
+        if needs_render {
+            if let Some(image) = self.render_collision_framebuffer(rect) {
+                if let Some(handle) = &mut self.model_framebuffer {
+                    handle.set(image, egui::TextureOptions::LINEAR);
+                } else {
+                    self.model_framebuffer = Some(ctx.load_texture(
+                        "sms-collision-framebuffer",
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+                self.model_framebuffer_key = key;
+            }
+        }
+
+        if let Some(handle) = &self.model_framebuffer {
+            painter.image(
+                handle.id(),
+                rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+
+        let label = format!(
+            "Collision | {} triangle(s) | {} surface type(s)",
+            preview.collision_triangles.len(),
+            preview.collision_surface_count
+        );
+        let label_pos = rect.left_top() + egui::vec2(10.0, 10.0);
+        let galley = painter.layout_no_wrap(
+            label,
+            egui::FontId::monospace(12.0),
+            egui::Color32::from_rgb(226, 236, 232),
+        );
+        let label_rect = egui::Rect::from_min_size(
+            label_pos - egui::vec2(6.0, 4.0),
+            galley.size() + egui::vec2(12.0, 8.0),
+        );
+        painter.rect_filled(
+            label_rect,
+            4.0,
+            egui::Color32::from_rgba_unmultiplied(12, 17, 19, 210),
+        );
+        painter.galley(label_pos, galley, egui::Color32::WHITE);
     }
 
     pub(super) fn update_level_transformation(&mut self, ctx: &egui::Context) {
@@ -1504,11 +1664,55 @@ impl SmsEditorApp {
         Some(image)
     }
 
+    pub(super) fn render_collision_framebuffer(
+        &self,
+        rect: egui::Rect,
+    ) -> Option<egui::ColorImage> {
+        let preview = self.model_preview.as_ref()?;
+        if preview.collision_triangles.is_empty() || rect.width() < 2.0 || rect.height() < 2.0 {
+            return None;
+        }
+
+        let size = framebuffer_size_for_rect(rect);
+        let mut image = viewport_framebuffer_background(size);
+        let mut depth = vec![f32::INFINITY; size[0] * size[1]];
+        let mut projected_triangles = Vec::new();
+
+        for triangle in &preview.collision_triangles {
+            let Some(screen) = project_triangle_to_framebuffer(self, rect, size, triangle.vertices)
+            else {
+                continue;
+            };
+            if !projected_triangle_overlaps_frame(screen, size) {
+                continue;
+            }
+            let color = shaded_collision_color(triangle);
+            rasterize_preview_triangle(
+                &mut image, &mut depth, screen, None, None, [color; 3], true, None, false,
+            );
+            projected_triangles.push(screen);
+        }
+
+        let edge_color = egui::Color32::from_rgb(24, 31, 33);
+        for screen in projected_triangles {
+            for [start, end] in [
+                [screen[0], screen[1]],
+                [screen[1], screen[2]],
+                [screen[2], screen[0]],
+            ] {
+                rasterize_depth_tested_segment(&mut image, &depth, start, end, edge_color);
+            }
+        }
+
+        Some(image)
+    }
+
     pub(super) fn model_framebuffer_key(&self, rect: egui::Rect) -> Option<ModelFramebufferKey> {
         let preview = self.model_preview.as_ref()?;
         let camera = self.renderer.camera();
         Some(ModelFramebufferKey {
             stage_id: self.stage_id.clone(),
+            view_mode: self.view_mode,
             size: framebuffer_size_for_rect(rect),
             camera_focus: camera.focus.map(f32::to_bits),
             camera_yaw: camera.yaw_degrees.to_bits(),
@@ -1519,6 +1723,7 @@ impl SmsEditorApp {
             triangle_count: preview.triangles.len(),
             texture_count: preview.textures.len(),
             source_triangles: preview.source_triangles,
+            collision_triangle_count: preview.collision_triangles.len(),
         })
     }
 

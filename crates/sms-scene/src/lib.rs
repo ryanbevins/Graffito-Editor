@@ -18,18 +18,26 @@ use sms_schema::{
 };
 use thiserror::Error;
 
+mod blank_stage;
 mod project_store;
 mod stage_archive;
 mod stage_export;
 mod validation;
 
+pub use blank_stage::{
+    BlankStageBootstrapKind, BlankStageBootstrapManifest, BlankStageBootstrapRequirement,
+    BlankStageBootstrapResource, BlankStagePreset, BlankStageTargetMetadata,
+    BLANK_STAGE_BOOTSTRAP_REQUIREMENTS, BLANK_STAGE_PRESET_VERSION,
+    DEFAULT_BLANK_STAGE_TARGET_SLOT,
+};
 pub use stage_archive::{
-    SourceFreeStageArchive, StageCompression, StageObjectPlacement, StageResource,
+    SourceFreeStageArchive, StageCompression, StageObjectPlacement, StageOrigin, StageResource,
     StageResourceDocument,
 };
 pub use stage_export::{
-    StageArchiveEdits, StageArchiveExportOutcome, StageCollisionEdit, StageModelEdit,
-    StagePlacementInsert,
+    StageArchiveEdits, StageArchiveExportOutcome, StageCollisionEdit, StageCollisionEditMode,
+    StageModelEdit, StageModelEditMode, StagePlacementInsert, StageResourceEdit,
+    StageResourceEditMode,
 };
 
 #[derive(Debug, Error)]
@@ -2751,8 +2759,14 @@ mod tests {
             .push(sms_schema::MapObjResourceDefinition {
                 resource_name: "WoodBox".to_string(),
                 actor_type: 0x4000_0003,
+                object_flags: 0,
+                required_manager_name: "fixture map object manager".to_string(),
+                has_hold_dependency: false,
+                has_move_dependency: false,
+                uses_resource_name_model_fallback: false,
                 primary_model: Some("kibako.bmd".to_string()),
                 load_flags: 0x1022_0000,
+                collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
             });
         let assets = vec![
@@ -2799,8 +2813,14 @@ mod tests {
             map_obj_resources: vec![sms_schema::MapObjResourceDefinition {
                 resource_name: "DokanGate".to_string(),
                 actor_type: 0x4000_0084,
+                object_flags: 0,
+                required_manager_name: "fixture map object manager".to_string(),
+                has_hold_dependency: false,
+                has_move_dependency: false,
+                uses_resource_name_model_fallback: false,
                 primary_model: Some("efDokanGate.bmd".to_string()),
                 load_flags: 0x1122_0000,
+                collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
             }],
             map_static_models: vec![sms_schema::MapStaticModelDefinition {
@@ -2834,8 +2854,14 @@ mod tests {
             map_obj_resources: vec![sms_schema::MapObjResourceDefinition {
                 resource_name: "MapSmoke".to_string(),
                 actor_type: 0x4000_0004,
+                object_flags: 0,
+                required_manager_name: "fixture map object manager".to_string(),
+                has_hold_dependency: false,
+                has_move_dependency: false,
+                uses_resource_name_model_fallback: false,
                 primary_model: None,
                 load_flags: 0x1022_0000,
+                collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
             }],
             ..ObjectRegistry::default()
@@ -2862,8 +2888,14 @@ mod tests {
             map_obj_resources: vec![sms_schema::MapObjResourceDefinition {
                 resource_name: "SurfGesoRed".to_string(),
                 actor_type: 0x4000_0005,
+                object_flags: 0,
+                required_manager_name: "fixture map object manager".to_string(),
+                has_hold_dependency: false,
+                has_move_dependency: false,
+                uses_resource_name_model_fallback: false,
                 primary_model: None,
                 load_flags: 0x1022_0000,
+                collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
             }],
             map_obj_model_overrides: vec![sms_schema::MapObjModelOverrideDefinition {
@@ -2948,8 +2980,14 @@ mod tests {
             map_obj_resources: vec![sms_schema::MapObjResourceDefinition {
                 resource_name: "WoodBox".to_string(),
                 actor_type: 0x4000_0003,
+                object_flags: 0,
+                required_manager_name: "fixture map object manager".to_string(),
+                has_hold_dependency: false,
+                has_move_dependency: false,
+                uses_resource_name_model_fallback: false,
                 primary_model: Some("kibako.bmd".to_string()),
                 load_flags: 0x1022_0000,
+                collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
             }],
             ..ObjectRegistry::default()
@@ -2982,8 +3020,14 @@ mod tests {
             .push(sms_schema::MapObjResourceDefinition {
                 resource_name: "MareGate".to_string(),
                 actor_type: 0x4000_0006,
+                object_flags: 0,
+                required_manager_name: "fixture map object manager".to_string(),
+                has_hold_dependency: false,
+                has_move_dependency: false,
+                uses_resource_name_model_fallback: false,
                 primary_model: Some("wrong_map_obj_model.bmd".to_string()),
                 load_flags: 0x1022_0000,
+                collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
             });
         registry
@@ -3048,8 +3092,14 @@ mod tests {
             map_obj_resources: vec![sms_schema::MapObjResourceDefinition {
                 resource_name: "WoodBox".to_string(),
                 actor_type: 0x4000_0003,
+                object_flags: 0,
+                required_manager_name: "fixture map object manager".to_string(),
+                has_hold_dependency: false,
+                has_move_dependency: false,
+                uses_resource_name_model_fallback: false,
                 primary_model: Some("kibako.bmd".to_string()),
                 load_flags: 0x1022_0000,
+                collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
             }],
             ..ObjectRegistry::default()

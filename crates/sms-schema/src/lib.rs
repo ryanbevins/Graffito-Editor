@@ -84,6 +84,8 @@ pub enum SchemaExtractor {
     NpcInitData,
     NpcRootColors,
     StageNames,
+    CollisionSurfaces,
+    CollisionLimits,
 }
 
 impl std::fmt::Display for SchemaExtractor {
@@ -108,6 +110,8 @@ impl std::fmt::Display for SchemaExtractor {
             Self::NpcInitData => "NPC initialization",
             Self::NpcRootColors => "NPC root color",
             Self::StageNames => "stage name",
+            Self::CollisionSurfaces => "collision surface",
+            Self::CollisionLimits => "collision runtime limit",
         };
         formatter.write_str(name)
     }
@@ -158,6 +162,12 @@ pub struct ObjectRegistry {
     pub enemy_material_colors: Vec<EnemyMaterialTevColorDefinition>,
     #[serde(default)]
     pub map_obj_flags: Vec<MapObjFlagDefinition>,
+    /// Collision type and property-flag names extracted from `BGTypeBits`.
+    #[serde(default)]
+    pub collision_surfaces: Vec<CollisionSurfaceDefinition>,
+    /// Stack-backed transform capacity used by moving map collision.
+    #[serde(default)]
+    pub moving_collision_vertex_limit: Option<u16>,
 }
 
 impl ObjectRegistry {
@@ -385,6 +395,30 @@ pub struct MapObjResourceDefinition {
     /// Exact runtime actor type stored in `TMapObjData::unk4`.
     #[serde(default)]
     pub actor_type: u32,
+    /// Exact `TMapObjData::unk34` behavior flags copied into
+    /// `TMapObjBase::unkF8` before model and collision initialization.
+    #[serde(default)]
+    pub object_flags: u32,
+    /// Exact `TMapObjData::unk8` name passed to
+    /// `TNameRefGen::search<TLiveManager>` before the actor is registered.
+    ///
+    /// An empty value is retained only for compatibility with registries
+    /// serialized before this dependency was exposed; source-free stock-slot
+    /// authoring must reject such entries instead of guessing a manager.
+    #[serde(default)]
+    pub required_manager_name: String,
+    /// True when `TMapObjData::mHold` points at compiled hold-model/joint data.
+    /// Replacing only the primary BMD cannot satisfy this dependency.
+    #[serde(default)]
+    pub has_hold_dependency: bool,
+    /// True when `TMapObjData::mMove` points at compiled BCK/joint motion data.
+    /// Replacing only the primary BMD cannot satisfy this dependency.
+    #[serde(default)]
+    pub has_move_dependency: bool,
+    /// True only when the compiled table has no animation-info entry and
+    /// `TMapObjBase::makeMActors` therefore loads `<resource_name>.bmd`.
+    #[serde(default)]
+    pub uses_resource_name_model_fallback: bool,
     /// Primary BMD passed to `TMapObjBase::initMActor`, or `None` when actor count is zero.
     pub primary_model: Option<String>,
     /// Effective `TMActorKeeper::mModelLoaderFlags` selected from `TMapObjData::unk34`.
@@ -392,7 +426,21 @@ pub struct MapObjResourceDefinition {
     /// The default preserves registries serialized before this field was exposed.
     #[serde(default = "default_map_obj_model_load_flags")]
     pub load_flags: u32,
+    /// Exact collision basenames and loader flags selected by this stock slot.
+    #[serde(default)]
+    pub collision_resources: Vec<MapObjCollisionResourceDefinition>,
     pub source_file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapObjCollisionResourceDefinition {
+    pub resource_name: String,
+    pub flags: u16,
+    /// Low two flag bits passed to `TMapCollisionManager::createCollision`.
+    pub collision_kind: u8,
+    /// Present for moving collision, whose transformed vertices use a fixed stack array.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_vertices: Option<u16>,
 }
 
 fn default_map_obj_model_load_flags() -> u32 {
@@ -464,6 +512,19 @@ pub struct MapObjFlagDefinition {
     pub area_flutter_speeds: Vec<MapObjFlagAreaSpeed>,
     pub phase_wrap_degrees: u32,
     pub stage_archive_table_path: String,
+    pub source_file: String,
+}
+
+/// A named value accepted in the COL triangle type field.
+///
+/// Property flags are kept alongside concrete types because Sunshine composes
+/// them into the same raw `u16` value. Consumers must preserve unknown raw
+/// values even when no decomp-authored name is available.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollisionSurfaceDefinition {
+    pub name: String,
+    pub value: u16,
+    pub is_property_flag: bool,
     pub source_file: String,
 }
 
@@ -660,6 +721,7 @@ impl SchemaGenerator {
         self.scan_params_and_assets(&sources, &mut registry)?;
         self.scan_map_static_models(&sources, &mut registry)?;
         self.scan_map_obj_flags(&sources, &mut registry)?;
+        self.scan_collision_surfaces(&sources, &mut registry)?;
         self.scan_particle_bindings(&sources, &mut registry)?;
         self.scan_npc_resource_bindings(&sources, &mut registry)?;
         self.scan_npc_init_data(&sources, &mut registry)?;
@@ -969,6 +1031,22 @@ impl SchemaGenerator {
                     detail: format!("failed to extract map-object resources: {detail}"),
                 }
             })?;
+        let collision_limit_path = "src/Map/MapMakeData.cpp";
+        let collision_limit =
+            extract_moving_collision_vertex_limit(sources.required(collision_limit_path)?.text())
+                .ok_or_else(|| SchemaError::ExtractionDrift {
+                extractor: SchemaExtractor::CollisionLimits,
+                source_path: self.repo_root.join(collision_limit_path),
+                expected: "fixed moving-collision vertex transform capacity",
+            })?;
+        registry.moving_collision_vertex_limit = Some(collision_limit);
+        for resource in &mut registry.map_obj_resources {
+            for collision in &mut resource.collision_resources {
+                if collision.collision_kind == 1 {
+                    collision.max_vertices = Some(collision_limit);
+                }
+            }
+        }
         ensure_extracted(
             SchemaExtractor::MapObjResources,
             self.repo_root.join(relative_path),
@@ -1297,6 +1375,22 @@ impl SchemaGenerator {
         }
         registry.map_obj_flags.push(definition);
         Ok(())
+    }
+
+    fn scan_collision_surfaces(
+        &self,
+        sources: &SourceInventory,
+        registry: &mut ObjectRegistry,
+    ) -> Result<()> {
+        let source_path = "include/Map/MapData.hpp";
+        let source = sources.required(source_path)?.text();
+        registry.collision_surfaces = extract_collision_surfaces(source, source_path);
+        ensure_extracted(
+            SchemaExtractor::CollisionSurfaces,
+            self.repo_root.join(source_path),
+            registry.collision_surfaces.len(),
+            "BGTypeBits collision types and property flags",
+        )
     }
 
     fn scan_npc_init_data(
@@ -2516,6 +2610,65 @@ fn extract_model_data_tables(
     tables
 }
 
+fn extract_collision_surfaces(text: &str, source_file: &str) -> Vec<CollisionSurfaceDefinition> {
+    let declaration = Regex::new(r"enum\s+BGTypeBits\s*\{")
+        .expect("valid BGTypeBits declaration regex")
+        .find(text);
+    let Some(declaration) = declaration else {
+        return Vec::new();
+    };
+    let Some(body) = braced_body(text, declaration.end() - 1) else {
+        return Vec::new();
+    };
+    let block_comments = Regex::new(r"(?s)/\*.*?\*/").expect("valid block-comment regex");
+    let line_comments = Regex::new(r"//[^\r\n]*").expect("valid line-comment regex");
+    let without_comments = block_comments.replace_all(body, " ");
+    let without_comments = line_comments.replace_all(&without_comments, " ");
+    let name_re = Regex::new(r"^([A-Za-z_][A-Za-z0-9_]*)$").expect("valid identifier regex");
+
+    let mut symbols = BTreeMap::new();
+    let mut definitions = Vec::new();
+    for entry in without_comments.split(',') {
+        let Some((raw_name, raw_expression)) = entry.split_once('=') else {
+            continue;
+        };
+        let name = raw_name.split_whitespace().last().unwrap_or_default();
+        if !name_re.is_match(name) {
+            continue;
+        }
+        let Some(value) = parse_cpp_u32_expression(raw_expression.trim(), &symbols) else {
+            continue;
+        };
+        symbols.insert(name.to_string(), value);
+        if !(name.starts_with("BG_TYPE_") || name.starts_with("BG_PROPERTY_FLAG_")) {
+            continue;
+        }
+        let Ok(value) = u16::try_from(value) else {
+            continue;
+        };
+        definitions.push(CollisionSurfaceDefinition {
+            name: name.to_string(),
+            value,
+            is_property_flag: name.starts_with("BG_PROPERTY_FLAG_"),
+            source_file: source_file.to_string(),
+        });
+    }
+    definitions
+}
+
+fn extract_moving_collision_vertex_limit(text: &str) -> Option<u16> {
+    let array_re = Regex::new(r"\bVec\s+[A-Za-z_][A-Za-z0-9_]*\s*\[\s*([0-9]+)\s*\]")
+        .expect("valid moving-collision stack-array regex");
+    let values = array_re
+        .captures_iter(text)
+        .filter_map(|captures| captures[1].parse::<u16>().ok())
+        .collect::<BTreeSet<_>>();
+    match values.into_iter().collect::<Vec<_>>().as_slice() {
+        [value] => Some(*value),
+        _ => None,
+    }
+}
+
 fn extract_cpp_u32_constants(text: &str) -> BTreeMap<String, u32> {
     let constant_re = Regex::new(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0[xX][0-9A-Fa-f]+|[0-9]+)")
         .expect("valid numeric constant regex");
@@ -3305,6 +3458,16 @@ fn dedup_registry(registry: &mut ObjectRegistry) -> Result<()> {
         .map_obj_flags
         .dedup_by(|a, b| a.factory_name == b.factory_name);
 
+    registry.collision_surfaces.sort_by(|a, b| {
+        a.value
+            .cmp(&b.value)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.source_file.cmp(&b.source_file))
+    });
+    registry
+        .collision_surfaces
+        .dedup_by(|a, b| a.name == b.name && a.value == b.value);
+
     registry.particle_resources.sort_by(|a, b| {
         a.effect_id
             .cmp(&b.effect_id)
@@ -3388,6 +3551,25 @@ fn validate_registry(registry: &ObjectRegistry) -> Result<()> {
         return Err(SchemaError::RegistryInvariant {
             detail: "object registry is empty".to_string(),
         });
+    }
+
+    let mut collision_surface_values = BTreeMap::new();
+    for surface in &registry.collision_surfaces {
+        if surface.source_file.is_empty() {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!("collision surface {} has no provenance", surface.name),
+            });
+        }
+        if let Some(previous) = collision_surface_values.insert(&surface.name, surface.value) {
+            if previous != surface.value {
+                return Err(SchemaError::RegistryInvariant {
+                    detail: format!(
+                        "collision surface {} resolves to conflicting values {previous:#06x} and {:#06x}",
+                        surface.name, surface.value
+                    ),
+                });
+            }
+        }
     }
 
     let objects = registry
@@ -4653,9 +4835,29 @@ mod tests {
         assert!(!first.is_map_obj_factory("MapObjFlag"));
         assert_eq!(
             first
+                .collision_surfaces
+                .iter()
+                .find(|surface| surface.name == "BG_TYPE_SHADED_WET_GROUND")
+                .map(|surface| surface.value),
+            Some(0x4004)
+        );
+        assert_eq!(
+            first
                 .find_map_obj_resource("FixtureMapObj")
                 .and_then(|resource| resource.primary_model.as_deref()),
             Some("FixturePrimary.bmd")
+        );
+        let fixture_resource = first.find_map_obj_resource("FixtureMapObj").unwrap();
+        assert_eq!(first.moving_collision_vertex_limit, Some(350));
+        assert_eq!(fixture_resource.collision_resources.len(), 1);
+        assert_eq!(
+            fixture_resource.collision_resources[0].resource_name,
+            "FixturePrimary"
+        );
+        assert_eq!(fixture_resource.collision_resources[0].collision_kind, 1);
+        assert_eq!(
+            fixture_resource.collision_resources[0].max_vertices,
+            Some(350)
         );
         let shared = first
             .find_map_obj_model_override("SharedFixture", "SharedFixture")
@@ -4682,6 +4884,36 @@ mod tests {
                 ..
             } if source_path.ends_with("MarNameRefGen_BossEnemy.cpp")
         ));
+    }
+
+    #[test]
+    fn collision_surface_extractor_resolves_symbolic_compositions() {
+        let definitions = extract_collision_surfaces(
+            r#"
+                enum BGTypeBits {
+                    BG_TYPE_WET_GROUND = 0x4,
+                    BG_PROPERTY_FLAG_SHADOW = 0x4000,
+                    BG_PROPERTY_FLAG_CAMERA_WONT_CLIP = 0x8000,
+                    BG_TYPE_SHADED_WET_GROUND
+                        = BG_TYPE_WET_GROUND | BG_PROPERTY_FLAG_SHADOW,
+                    BG_TYPE_CAM_NOCLIP_SHADED_WET_GROUND
+                        = BG_TYPE_WET_GROUND | BG_PROPERTY_FLAG_SHADOW
+                          | BG_PROPERTY_FLAG_CAMERA_WONT_CLIP, // 0xC004
+                };
+            "#,
+            "include/Map/MapData.hpp",
+        );
+        let by_name = definitions
+            .iter()
+            .map(|definition| (definition.name.as_str(), definition))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(by_name["BG_TYPE_SHADED_WET_GROUND"].value, 0x4004);
+        assert_eq!(
+            by_name["BG_TYPE_CAM_NOCLIP_SHADED_WET_GROUND"].value,
+            0xC004
+        );
+        assert!(by_name["BG_PROPERTY_FLAG_SHADOW"].is_property_flag);
+        assert!(!by_name["BG_TYPE_WET_GROUND"].is_property_flag);
     }
 
     #[test]
@@ -4722,8 +4954,14 @@ mod tests {
         let resource = MapObjResourceDefinition {
             resource_name: "WoodBox".to_string(),
             actor_type: 0x4000_0003,
+            object_flags: 0,
+            required_manager_name: "map object manager".to_string(),
+            has_hold_dependency: false,
+            has_move_dependency: false,
+            uses_resource_name_model_fallback: true,
             primary_model: Some("kibako.bmd".to_string()),
             load_flags: 0x1022_0000,
+            collision_resources: Vec::new(),
             source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
         };
         let mut registry = ObjectRegistry {
@@ -4766,6 +5004,11 @@ mod tests {
         )
         .expect("deserialize pre-loader-flags schema");
         assert_eq!(resource.actor_type, 0);
+        assert_eq!(resource.object_flags, 0);
+        assert!(resource.required_manager_name.is_empty());
+        assert!(!resource.has_hold_dependency);
+        assert!(!resource.has_move_dependency);
+        assert!(!resource.uses_resource_name_model_fallback);
         assert_eq!(resource.load_flags, 0x1022_0000);
 
         let map_static: MapStaticModelDefinition = toml::from_str(
@@ -4849,6 +5092,40 @@ mod tests {
                 .count(),
             27
         );
+        let normal_block = registry
+            .find_map_obj_resource("NormalBlock")
+            .expect("decomp stock NormalBlock slot");
+        assert_eq!(
+            normal_block.primary_model.as_deref(),
+            Some("NormalBlock.bmd")
+        );
+        assert_eq!(normal_block.load_flags, 0x1022_0000);
+        assert_eq!(
+            normal_block.required_manager_name,
+            "地形オブジェマネージャー"
+        );
+        assert_eq!(normal_block.collision_resources.len(), 1);
+        assert_eq!(
+            normal_block.collision_resources[0],
+            MapObjCollisionResourceDefinition {
+                resource_name: "NormalBlock".to_string(),
+                flags: 1,
+                collision_kind: 1,
+                max_vertices: Some(350),
+            }
+        );
+        let z_turn_disk = registry
+            .find_map_obj_resource("zTurnDisk")
+            .expect("decomp stock zTurnDisk slot");
+        assert!(z_turn_disk.uses_resource_name_model_fallback);
+        assert_eq!(z_turn_disk.primary_model.as_deref(), Some("zTurnDisk.bmd"));
+        assert!(!z_turn_disk.has_hold_dependency);
+        assert!(z_turn_disk.has_move_dependency);
+        let wood_barrel = registry
+            .find_map_obj_resource("wood_barrel")
+            .expect("decomp stock wood_barrel slot");
+        assert!(wood_barrel.has_hold_dependency);
+        assert!(!wood_barrel.has_move_dependency);
         assert_eq!(
             registry
                 .map_obj_resources
@@ -5050,6 +5327,19 @@ mod tests {
     fn complete_generator_fixture() -> SchemaFixture {
         let fixture = SchemaFixture::new("complete");
         fixture.write(
+            "include/Map/MapData.hpp",
+            r#"
+                enum BGTypeBits {
+                    BG_TYPE_WET_GROUND = 0x4,
+                    BG_TYPE_WATER = 0x100,
+                    BG_PROPERTY_FLAG_SHADOW = 0x4000,
+                    BG_PROPERTY_FLAG_CAMERA_WONT_CLIP = 0x8000,
+                    BG_TYPE_SHADED_WET_GROUND
+                        = BG_TYPE_WET_GROUND | BG_PROPERTY_FLAG_SHADOW,
+                };
+            "#,
+        );
+        fixture.write(
             "include/JSystem/J3D/J3DGraphLoader/J3DModelLoaderFlags.hpp",
             "J3DMLF_Test = 0x10000000;",
         );
@@ -5097,6 +5387,12 @@ mod tests {
         fixture.write(
             "src/MoveBG/MapObjInit.cpp",
             r#"
+                static const TMapObjCollisionData fixture_collision_data[] = {
+                    { "FixturePrimary", 1 },
+                };
+                static const TMapObjCollisionInfo fixture_collision_info = {
+                    1, 1, fixture_collision_data,
+                };
                 static const TMapObjAnimData fixture_anim_data[] = {
                     { "FixturePrimary.bmd", nullptr, 0, nullptr, nullptr },
                 };
@@ -5105,17 +5401,17 @@ mod tests {
                 };
                 static const TMapObjAnimDataInfo no_data_anim_info = { 0, 0, nullptr };
                 static TMapObjData fixture_data = {
-                    "FixtureMapObj", 0x40000001, nullptr, nullptr, &fixture_anim_info,
-                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    "FixtureMapObj", 0x40000001, "fixture map object manager", nullptr, &fixture_anim_info,
+                    nullptr, &fixture_collision_info, nullptr, nullptr, nullptr, nullptr, nullptr,
                     0.0f, 0x00000000, 0,
                 };
                 static TMapObjData shared_fixture_data = {
-                    "SharedFixture", 0x40000002, nullptr, nullptr, &no_data_anim_info,
+                    "SharedFixture", 0x40000002, "fixture map object manager", nullptr, &no_data_anim_info,
                     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                     0.0f, 0x00008000, 0,
                 };
                 static TMapObjData nozzle_box_data = {
-                    "NozzleBox", 0x40000003, nullptr, nullptr, nullptr,
+                    "NozzleBox", 0x40000003, "fixture map object manager", nullptr, nullptr,
                     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                     0.0f, 0x00000000, 0,
                 };
@@ -5145,6 +5441,10 @@ mod tests {
                     unkF8 = mMapObjData->unk34;
                 }
             "#,
+        );
+        fixture.write(
+            "src/Map/MapMakeData.cpp",
+            "void TMapCollisionBase::update() { Vec transformed[350]; }",
         );
         fixture.write(
             "src/MoveBG/SharedFixture.cpp",

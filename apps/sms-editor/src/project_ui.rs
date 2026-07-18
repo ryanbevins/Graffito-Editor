@@ -360,26 +360,6 @@ impl SmsEditorApp {
         }
     }
 
-    pub(super) fn choose_stage_export_path(&mut self) {
-        let mut dialog = FileDialog::new()
-            .set_title("Export Rebuilt Stage Archive")
-            .add_filter("Sunshine stage archive", &["szs", "arc"])
-            .set_file_name(format!(
-                "{}.szs",
-                if self.stage_id.trim().is_empty() {
-                    "stage"
-                } else {
-                    self.stage_id.trim()
-                }
-            ));
-        if let Some(parent) = existing_dialog_directory(&self.stage_export_path) {
-            dialog = dialog.set_directory(parent);
-        }
-        if let Some(path) = dialog.save_file() {
-            self.stage_export_path = path.to_string_lossy().into_owned();
-        }
-    }
-
     pub(super) fn choose_dolphin_executable(&mut self) {
         let mut dialog = FileDialog::new()
             .set_title("Choose Dolphin Emulator")
@@ -604,6 +584,7 @@ impl SmsEditorApp {
         self.project_hub_error = None;
         self.show_project_hub = false;
         self.reset_open_stage_state();
+        self.force_refresh_model_catalog();
         self.pending_auto_refresh_root = Some(self.base_root.clone());
         self.log
             .push(format!("Opened project '{}'.", self.project_name_draft));
@@ -656,15 +637,33 @@ impl SmsEditorApp {
     }
 
     fn reset_open_stage_state(&mut self) {
+        self.cancel_model_import();
         self.document = None;
         self.render_scene = None;
         self.scene_archives.clear();
         self.model_preview = None;
+        self.authored_model_preview_base = None;
         self.gpu_viewport = None;
         self.model_framebuffer = None;
         self.model_framebuffer_key = None;
         self.issues.clear();
         self.selected_object_id = None;
+        self.model_catalog_root = None;
+        self.model_catalog_entries.clear();
+        self.model_catalog_issues.clear();
+        self.model_asset_preview_cache.clear();
+        self.selected_model_asset = None;
+        self.selected_model_document = None;
+        self.saved_model_document = None;
+        self.selected_model_instance_id = None;
+        self.model_instances.clear();
+        self.model_instances_dirty = false;
+        self.model_instance_undo_stack.clear();
+        self.model_instance_redo_stack.clear();
+        self.placing_model_asset = None;
+        self.asset_dirty = false;
+        self.asset_undo_stack.clear();
+        self.asset_redo_stack.clear();
         self.saved_objects.clear();
         self.document_dirty = false;
         self.undo_stack.clear();

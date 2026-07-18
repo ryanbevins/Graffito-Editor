@@ -77,14 +77,17 @@ may be missing or visually incorrect.
 - Place schema-discovered objects and duplicate or delete existing objects
 - Edit translation, rotation, and scale through the inspector and viewport
   gizmos, with snapping support
+- Import rigid `.gltf` and `.glb` models into native project-owned model assets,
+  edit their GX materials and collision settings, and place typed instances
 - Use undo and redo for the currently supported object operations
 - Inspect raw and decoded object parameters
 - Run basic document validation and review load or validation issues in the UI
 
 General parameter editing is not implemented yet; the inspector currently
-displays most decoded parameters rather than writing them back. Terrain, model
-topology, textures, materials, and other retail asset content also cannot be
-authored in the editor.
+displays most decoded parameters rather than writing them back. Imported rigid
+model authoring is available, but general editing of retail terrain topology,
+textures, materials, animation, and other retail asset content remains
+incomplete.
 
 ### Development and diagnostic tooling
 
@@ -98,6 +101,8 @@ The `sms-cli` package currently provides commands to:
 - validate a parsed stage document;
 - run a strict source-free stage-archive rebuild audit to an external path;
 - apply a saved object overlay to a new rebuilt stage archive outside the base tree;
+- import glTF/GLB models, compile native model assets to standalone BMD/COL,
+  and create blank-stage archives;
 - import a stage into a standalone typed document and rebuild it without the
   retail archive;
 - save an editor-project overlay; and
@@ -106,18 +111,26 @@ The `sms-cli` package currently provides commands to:
 Run `cargo run -p sms-cli -- --help` to see the current command list and
 arguments.
 
-## Saved Projects Are Not Mods
+`create-blank-stage` generates small source-free proxy BMDs for the required
+coin, bottle, NormalBlock, and JuiceBlock manager closure unless an explicit
+`--proxy-asset` is supplied. It rejects a Yaz0/RARC payload above the editor's
+12 MiB blank-stage safety budget before writing output, leaving headroom in
+Sunshine's 24 MiB MEM1.
+
+## Projects, Model Export, and Managed Builds
 
 The desktop editor uses a versioned, human-readable `project-name.sms` file as
 the identity of a project. It records the project name, extracted base-game
-root, managed project-data location, last opened stage, schema source, and
-optional Dolphin launch paths. The launch hub stores only a recent-project
-index and reopens these descriptors; it does not duplicate project content.
+root, managed project-data and build locations, last opened stage, schema
+source, and optional Dolphin launch paths. The launch hub stores only a
+recent-project index and reopens these descriptors; it does not duplicate
+project content.
 
 Each `.sms` descriptor points to a separate managed data folder containing:
 
-- `sms-project.toml`; and
-- JSON scene overlays under `files/editor/stages/`.
+- `sms-project.toml`;
+- JSON scene overlays under `files/editor/stages/`; and
+- native model assets and managed blobs under `Content/`.
 
 The CLI's `export-project` command continues to operate directly on this managed
 data folder. Existing folder-only projects can be wrapped in a `.sms` descriptor
@@ -129,9 +142,57 @@ This output records the editor's current object representation and typed archive
 edits. The stage's semantic archive is freshly imported from the configured base
 root when the stage opens; it is not cached in the project. Saving a project does
 **not** rewrite retail `scene.bin`, patch a game image, or produce files that
-Dolphin can run as a mod. The separate **Export Stage** action rebuilds a new
-RARC/Yaz0 archive outside the extracted base tree. The Dolphin launch helper only
-starts the user-supplied game and does not apply either output.
+Dolphin can run as a mod. Building is a separate, explicit action.
+
+### Placed-model export modes
+
+The recommended **Separate runtime object** mode keeps the retail terrain BMD
+untouched. Each distinct model asset is compiled to its own
+`mapobj/sms_<asset-uuid>/default.bmd` resource inside the stage RARC. The build
+also adds a matching `ObjChara` record to `map/tables.bin` and one transformed
+`SmJ3DAct` actor per placed instance to `map/scene.bin`. If `map/tables.bin` is
+absent, the editor creates a typed one. Enabled static collision is transformed
+and appended to `map/map.col`; it is world collision rather than moving
+per-actor collision, and existing retail collision groups remain intact. The
+exporter expands the typed `Map` triangle and grid-list capacities by the exact
+authored footprint so retail runtime and moving collision keep their original
+headroom, and rejects merged COL indices beyond Sunshine's signed 16-bit limit.
+Standalone actors are validated with `SmJ3DAct`'s exact `0x00240000` loader
+flags and a conservative 12 MiB BMD / 8 MiB TEX1 safety budget for Sunshine's
+24 MiB MEM1. The compiler keeps every source-free texture in the editable
+asset but emits only textures referenced by GX material slots.
+
+**Bake as map terrain** is an explicit destructive mode. It replaces
+`map/map/map.bmd` with the selected authored terrain instances instead of
+creating standalone actors. Enabled collision is still appended to the world
+COL. Use this only when replacing the stage terrain model is intentional.
+
+**Replace verified stock MapObjBase** is a separate constrained workflow, not
+an arbitrary-name actor path. It requires an exact decomp-derived stock resource
+slot whose compiled model fallback, loader flags, collision resources, and
+vertex limits are compatible with the authored asset. Shared/global resource
+conflicts and unsupported slot layouts are rejected rather than guessed. The
+slot's exact decomp-derived `TMapObjData::unk8` manager must already exist in
+the open scene, and slots with compiled `mHold` model/joint or `mMove`
+BCK/joint dependencies are excluded because replacing only their BMD/COL would
+leave those dependencies unsatisfied.
+
+### Build Game and Build & Launch
+
+**Build Game** saves the project, rebuilds the stage from semantic documents,
+and prepares `<managed-build-root>/run-root/` as a complete runnable extracted
+game directory. Every base file is copied independently, then the rebuilt stage
+is atomically installed at its exact game-relative path.
+The managed build root defaults to a `.smsbuild` sibling of the `.sms`
+descriptor and is protected by a project-identity marker.
+
+**Build & Launch** performs that same build and then launches its `sys/main.dol`
+in Dolphin with the isolated `<managed-build-root>/dolphin-user/` directory.
+Subsequent builds reuse byte-identical independent copies and replace changed
+files atomically.
+
+Both workflows reject build locations that overlap the extracted base game or
+managed project data. The extracted base remains read-only.
 
 The experimental `rebuild-stage` CLI command audits the binary authoring
 pipeline. It imports every stage resource into typed documents, discards the
@@ -140,17 +201,14 @@ only after a byte-identical second rebuild. It refuses output inside the
 extracted base tree and rejects unsupported resource kinds instead of copying
 payloads through.
 
-The `export-stage` command and desktop **Export Stage** action create a new
-external archive from the semantic archive imported when the stage was opened.
-Typed transform, deletion, duplicate, model, collision, and complete JDrama
-insertion edits are applied before every resource and container layer is
+Managed builds use the semantic archive imported when the stage was opened.
+Typed transform, deletion, duplicate, resource, model, collision, and complete
+JDrama insertion edits are applied before every resource and container layer is
 rebuilt. Source-less palette objects and unmodeled parameter changes are
-rejected instead of producing incomplete placement streams. Existing outputs
-and every destination inside the extracted base tree are refused. Model geometry
-is canonically relaid out when it is replaced. Version 3 editor projects persist
-typed edits, while the semantic baseline is freshly imported when the stage is
-opened. Export uses that in-memory import and never rereads the retail archive
-path.
+rejected instead of producing incomplete placement streams. Model geometry is
+canonically relaid out when compiled. Version 3 editor projects persist typed
+edits, while the semantic baseline is freshly imported when the stage opens;
+the build uses that in-memory import and never rereads the retail archive path.
 
 For a detached workflow, `import-stage-document` first proves an exact rebuild
 and then creates a standalone typed JSON document whose RARC payload slots are

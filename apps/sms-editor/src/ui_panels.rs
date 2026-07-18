@@ -39,21 +39,38 @@ impl SmsEditorApp {
                     ui.close();
                     self.save_project();
                 }
-                let export_enabled = self.document.is_some()
-                    && !self.stage_export_path.trim().is_empty()
+                let build_enabled = self.document.is_some()
+                    && self.current_project.is_some()
                     && self.background_receiver.is_none();
                 if ui
-                    .add_enabled(export_enabled, egui::Button::new("Export Stage"))
+                    .add_enabled(build_enabled, egui::Button::new("Build Game"))
                     .on_hover_text(
-                        "Create a new rebuilt stage archive at the explicit external path",
+                        "Build a complete runnable game directory with the level and its separate authored BMD resources installed",
                     )
                     .clicked()
                 {
                     ui.close();
-                    self.export_stage_archive();
+                    self.build_game();
+                }
+                if ui
+                    .add_enabled(
+                        build_enabled && !self.dolphin_path.trim().is_empty(),
+                        egui::Button::new("Build & Launch"),
+                    )
+                    .on_hover_text(
+                        "Prepare an isolated runnable game mirror, install the authored level, and launch it in Dolphin",
+                    )
+                    .clicked()
+                {
+                    ui.close();
+                    self.build_and_launch();
                 }
                 ui.separator();
-                if ui.button("Launch").clicked() {
+                if ui
+                    .button("Launch Configured Game (legacy)")
+                    .on_hover_text("Launch the separately configured ISO, RVZ, GCM, WBFS, or DOL without deploying this project")
+                    .clicked()
+                {
                     ui.close();
                     self.launch_dolphin();
                 }
@@ -103,8 +120,28 @@ impl SmsEditorApp {
                 if self.is_dirty() {
                     ui.colored_label(egui::Color32::from_rgb(245, 190, 90), "Unsaved changes");
                 }
-                if let Some(label) = &self.background_label {
+                if let Some(label) = self.background_label.clone() {
                     ui.label(label);
+                    if let Some(cancel_requested) = self
+                        .active_build_cancel
+                        .as_ref()
+                        .map(|cancel| cancel.load(Ordering::Acquire))
+                    {
+                        if ui
+                            .add_enabled(
+                                !cancel_requested,
+                                egui::Button::new("Cancel").small(),
+                            )
+                            .on_hover_text(if cancel_requested {
+                                "Cancellation requested"
+                            } else {
+                                "Cancel this managed game build"
+                            })
+                            .clicked()
+                        {
+                            self.cancel_active_build();
+                        }
+                    }
                     ui.spinner();
                 }
             });
@@ -176,6 +213,10 @@ impl SmsEditorApp {
                     .clicked()
                 {
                     self.view_mode = mode;
+                    if mode == ViewMode::Collision {
+                        self.renderer.config_mut().show_collision = true;
+                    }
+                    self.clear_viewport_preview_cache();
                 }
             }
 
@@ -349,28 +390,38 @@ impl SmsEditorApp {
                 );
             }
         }
-        let choose_export = path_display_row(
-            ui,
-            "Stage Export",
-            &self.stage_export_path,
-            "Choose...",
-            self.document.is_some(),
+        let managed_build_root = self
+            .current_project
+            .as_ref()
+            .map(|project| project.managed_build_root().to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Create or open a .sms project".to_string());
+        path_display_row(ui, "Managed Build", &managed_build_root, "Managed", false);
+        ui.small(
+            "Build Game creates a complete independent runnable game directory and writes the rebuilt level at its exact game-relative path. Authored models remain separate BMD resources inside the stage archive; the extracted base game is never changed.",
         );
-        if choose_export {
-            self.choose_stage_export_path();
+        if let Some(document) = &self.document {
+            ui.horizontal(|ui| {
+                ui.label("Stage");
+                ui.monospace(&document.stage_id);
+            });
+        } else {
+            labeled_text(ui, "Stage", &mut self.stage_id);
         }
-        if !self.stage_export_path.is_empty() && ui.small_button("Clear export path").clicked() {
-            self.stage_export_path.clear();
-        }
-        labeled_text(ui, "Stage", &mut self.stage_id);
 
         ui.separator();
         ui.heading("Viewport");
-        {
+        let collision_visibility_changed = {
             let config = self.renderer.config_mut();
             ui.checkbox(&mut config.show_grid, "Grid");
-            ui.checkbox(&mut config.show_collision, "Collision");
+            let changed = ui
+                .checkbox(&mut config.show_collision, "Collision")
+                .on_hover_text("Show collision geometry in Collision view")
+                .changed();
             ui.checkbox(&mut config.show_object_bounds, "Object bounds");
+            changed
+        };
+        if collision_visibility_changed {
+            self.clear_viewport_preview_cache();
         }
         let environment_changed = ui
             .checkbox(&mut self.show_environment_meshes, "Water")
@@ -467,6 +518,10 @@ impl SmsEditorApp {
         ui.heading("Dolphin");
         let choose_dolphin =
             path_display_row(ui, "Executable", &self.dolphin_path, "Browse...", true);
+        ui.small(
+            "Build & Launch uses the managed runnable mirror above and its own isolated Dolphin user directory.",
+        );
+        ui.label("Legacy external launch (optional)");
         let choose_game = path_display_row(ui, "Game", &self.game_path, "Browse...", true);
         let choose_user_dir =
             path_display_row(ui, "User Dir", &self.dolphin_user_dir, "Browse...", true);
@@ -513,6 +568,26 @@ impl SmsEditorApp {
     }
 
     pub(super) fn content_browser_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut self.content_browser_kind,
+                ContentBrowserKind::Stages,
+                "Stages",
+            );
+            ui.selectable_value(
+                &mut self.content_browser_kind,
+                ContentBrowserKind::Models,
+                "Model Assets",
+            );
+        });
+        ui.separator();
+        match self.content_browser_kind {
+            ContentBrowserKind::Stages => self.stage_content_browser_panel(ui),
+            ContentBrowserKind::Models => self.model_content_browser_panel(ui),
+        }
+    }
+
+    fn stage_content_browser_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Content Browser");
             ui.add_space(8.0);
@@ -686,10 +761,18 @@ impl SmsEditorApp {
                 .document
                 .as_ref()
                 .map_or(0, |document| document.objects.len());
+            let model_instance_count = self
+                .model_instances
+                .iter()
+                .filter(|instance| instance.stage_id.eq_ignore_ascii_case(&self.stage_id))
+                .count();
             ui.label(
-                egui::RichText::new(format!("{object_count} objects"))
-                    .small()
-                    .color(egui::Color32::GRAY),
+                egui::RichText::new(format!(
+                    "{object_count} objects / {} model instances",
+                    model_instance_count
+                ))
+                .small()
+                .color(egui::Color32::GRAY),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -740,7 +823,36 @@ impl SmsEditorApp {
         ui.separator();
 
         let mut clicked_id = None;
+        let mut clicked_model_instance = None;
+        let model_instances = self
+            .model_instances
+            .iter()
+            .filter(|instance| instance.stage_id.eq_ignore_ascii_case(&self.stage_id))
+            .cloned()
+            .collect::<Vec<_>>();
         egui::ScrollArea::vertical().show(ui, |ui| {
+            if !model_instances.is_empty() {
+                egui::CollapsingHeader::new("Authored Model Instances")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for instance in &model_instances {
+                            if ui
+                                .selectable_label(
+                                    self.selected_model_instance_id
+                                        == Some(instance.placement.instance_id),
+                                    format!(
+                                        "{}  ({})",
+                                        instance.placement.name, instance.placement.instance_id
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                clicked_model_instance = Some(instance.placement.instance_id);
+                            }
+                        }
+                    });
+                ui.separator();
+            }
             let Some(tree) = tree.as_ref() else {
                 ui.add_space(16.0);
                 ui.vertical_centered(|ui| {
@@ -764,11 +876,36 @@ impl SmsEditorApp {
             }
         });
         if let Some(id) = clicked_id {
+            if self.asset_dirty && !self.save_selected_model_asset() {
+                return;
+            }
             self.selected_object_id = Some(id);
+            self.selected_model_instance_id = None;
+            self.selected_model_asset = None;
+            self.selected_model_document = None;
+            self.saved_model_document = None;
+        }
+        if let Some(id) = clicked_model_instance {
+            if self.asset_dirty && !self.save_selected_model_asset() {
+                return;
+            }
+            self.selected_model_instance_id = Some(id);
+            self.selected_object_id = None;
+            self.selected_model_asset = None;
+            self.selected_model_document = None;
+            self.saved_model_document = None;
         }
     }
 
     pub(super) fn inspector_panel(&mut self, ui: &mut egui::Ui) {
+        if self.selected_model_instance_id.is_some() {
+            self.model_instance_inspector_panel(ui);
+            return;
+        }
+        if self.selected_model_document.is_some() {
+            self.model_asset_inspector_panel(ui);
+            return;
+        }
         let selected = self.selected_object().cloned();
         if let Some(object) = selected {
             ui.heading(&object.factory_name);

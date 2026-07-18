@@ -12,9 +12,10 @@
 use serde::{Deserialize, Serialize};
 use sms_formats::{
     BasFile, BmgFile, BmpFile, BtiFile, ColFile, FormatError, J3dAnimationRebuildDocument,
-    J3dAnimationSection, J3dRebuildDocument, JDramaDocument, JDramaRecord, JDramaRecordPayload,
-    JDramaTransform, JpaxDocument, MarioRecordBundle, MarkerTextFile, PrmFile, RalDocument,
-    RarcArchive, RarcDocument, ReplayLinkDocument, SpcDocument, Yaz0Document, YmpDocument,
+    J3dAnimationSection, J3dRebuildDocument, JDramaDocument, JDramaField, JDramaFieldValue,
+    JDramaRecord, JDramaRecordPayload, JDramaTransform, JpaxDocument, MarioRecordBundle,
+    MarkerTextFile, PrmFile, RalDocument, RarcArchive, RarcBuilder, RarcDocument,
+    ReplayLinkDocument, SpcDocument, Yaz0Document, YmpDocument,
 };
 
 use crate::{Result, SceneError};
@@ -40,6 +41,22 @@ pub struct SourceFreeStageArchive {
     archive: RarcDocument,
     compression: Option<StageCompression>,
     resources: Vec<StageResource>,
+    #[serde(default)]
+    origin: StageOrigin,
+}
+
+/// Editor provenance for a detached stage archive. The binary RARC format has
+/// no field for this metadata, so a binary reimport is correctly classified as
+/// imported while semantic project documents retain their authored target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StageOrigin {
+    #[default]
+    ImportedArchive,
+    Blank {
+        target_slot: String,
+        preset_version: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +104,25 @@ pub enum StageResourceDocument {
 }
 
 impl SourceFreeStageArchive {
+    /// Creates an empty source-free stage archive with the canonical `scene`
+    /// RARC root. Blank-stage authoring defaults to the dedicated `test11`
+    /// target; callers may replace the provenance metadata before persistence.
+    pub fn new() -> Result<Self> {
+        Self::new_for_blank("test11", 1)
+    }
+
+    pub fn new_for_blank(target_slot: impl Into<String>, preset_version: u32) -> Result<Self> {
+        Ok(Self {
+            archive: RarcBuilder::new_scene().build()?,
+            compression: None,
+            resources: Vec::new(),
+            origin: StageOrigin::Blank {
+                target_slot: target_slot.into(),
+                preset_version,
+            },
+        })
+    }
+
     /// Imports a RARC or Yaz0-wrapped RARC and consumes every file payload.
     ///
     /// This constructor succeeds only when every child has a semantic writer.
@@ -138,7 +174,24 @@ impl SourceFreeStageArchive {
             archive,
             compression,
             resources,
+            origin: StageOrigin::ImportedArchive,
         })
+    }
+
+    pub fn origin(&self) -> &StageOrigin {
+        &self.origin
+    }
+
+    pub fn set_origin(&mut self, origin: StageOrigin) {
+        self.origin = origin;
+    }
+
+    pub fn compression(&self) -> Option<StageCompression> {
+        self.compression
+    }
+
+    pub fn set_compression(&mut self, compression: Option<StageCompression>) {
+        self.compression = compression;
     }
 
     pub fn resources(&self) -> &[StageResource] {
@@ -206,8 +259,113 @@ impl SourceFreeStageArchive {
             .map(|resource| &mut resource.document)
     }
 
-    /// Enumerates every placed actor using semantic tree paths rather than
-    /// offsets into the discarded import buffer.
+    /// Inserts a typed resource and any missing RARC directories as one
+    /// transaction. Existing semantic resources are regenerated only in a
+    /// temporary builder; the committed container remains payload-free.
+    pub fn insert_resource(
+        &mut self,
+        raw_path: impl Into<Vec<u8>>,
+        document: StageResourceDocument,
+    ) -> Result<()> {
+        let raw_path = normalize_resource_path(raw_path.into())?;
+        if self.resource(&raw_path).is_some() {
+            return Err(unsupported_stage_resource(format!(
+                "resource {} already exists",
+                display_raw_path(&raw_path)
+            )));
+        }
+        validate_resource_path_kind(&raw_path, &document)?;
+        let bytes = encode_resource(&document).map_err(|source| SceneError::StageResource {
+            path: display_raw_path(&raw_path),
+            source,
+        })?;
+
+        let mut builder = self.hydrated_builder()?;
+        builder.insert_file(&raw_path, bytes)?;
+        let mut archive = builder.into_document()?;
+        detach_rarc_payloads(&mut archive);
+
+        let mut resources = self.resources.clone();
+        resources.push(StageResource { raw_path, document });
+        self.archive = archive;
+        self.resources = resources;
+        Ok(())
+    }
+
+    /// Replaces an existing typed resource without changing its archive path.
+    pub fn replace_resource(
+        &mut self,
+        raw_path: &[u8],
+        document: StageResourceDocument,
+    ) -> Result<StageResourceDocument> {
+        let raw_path = normalize_resource_path(raw_path.to_vec())?;
+        validate_resource_path_kind(&raw_path, &document)?;
+        // Prove the replacement can be encoded before mutating the archive.
+        encode_resource(&document).map_err(|source| SceneError::StageResource {
+            path: display_raw_path(&raw_path),
+            source,
+        })?;
+        let resource = self
+            .resources
+            .iter_mut()
+            .find(|resource| resource.raw_path == raw_path)
+            .ok_or_else(|| {
+                unsupported_stage_resource(format!(
+                    "resource {} was not found",
+                    display_raw_path(&raw_path)
+                ))
+            })?;
+        Ok(std::mem::replace(&mut resource.document, document))
+    }
+
+    /// Removes a typed resource and prunes newly empty archive directories.
+    pub fn remove_resource(&mut self, raw_path: &[u8]) -> Result<StageResourceDocument> {
+        let raw_path = normalize_resource_path(raw_path.to_vec())?;
+        let resource_index = self
+            .resources
+            .iter()
+            .position(|resource| resource.raw_path == raw_path)
+            .ok_or_else(|| {
+                unsupported_stage_resource(format!(
+                    "resource {} was not found",
+                    display_raw_path(&raw_path)
+                ))
+            })?;
+        let mut builder = self.hydrated_builder()?;
+        builder.remove_file(&raw_path)?;
+        let mut archive = builder.into_document()?;
+        detach_rarc_payloads(&mut archive);
+
+        let mut resources = self.resources.clone();
+        let removed = resources.remove(resource_index).document;
+        self.archive = archive;
+        self.resources = resources;
+        Ok(removed)
+    }
+
+    fn hydrated_builder(&self) -> Result<RarcBuilder> {
+        self.validate_detached_state()?;
+        let mut archive = self.archive.clone();
+        for resource in &self.resources {
+            let bytes = encode_resource(&resource.document).map_err(|source| {
+                SceneError::StageResource {
+                    path: display_raw_path(&resource.raw_path),
+                    source,
+                }
+            })?;
+            archive.set_file_data(&resource.raw_path, bytes)?;
+        }
+        Ok(RarcBuilder::from_document(&archive)?)
+    }
+
+    /// Enumerates every transform-editable placement using semantic tree paths
+    /// rather than offsets into the discarded import buffer.
+    ///
+    /// Most placements use the common `TActor` stream. A small set of
+    /// decomp-verified authoring records (currently `AreaCylinder` and
+    /// `Generator`) serialize the same three-vector editor transform as typed
+    /// fields instead. Those records must participate in reconciliation too,
+    /// otherwise a valid source-free address would appear to be missing.
     pub fn object_placements(&self) -> Vec<StageObjectPlacement> {
         let mut placements = Vec::new();
         for resource in &self.resources {
@@ -223,6 +381,183 @@ impl SourceFreeStageArchive {
         placements
     }
 
+    /// Finds one semantic JDrama group by type and, for an `IdxGroup`, its
+    /// typed `group_index` field. Type matching ignores namespace prefixes,
+    /// and the returned path is a recursive child-index path with `[]`
+    /// identifying the placement root. Ambiguous matches are rejected rather
+    /// than silently selecting a stage-dependent sibling.
+    pub fn find_group_record_path(
+        &self,
+        raw_resource_path: &[u8],
+        type_name: &str,
+        group_index: Option<u32>,
+    ) -> Result<Option<Vec<usize>>> {
+        let raw_resource_path = normalize_resource_path(raw_resource_path.to_vec())?;
+        let document = match self.resource(&raw_resource_path) {
+            Some(StageResourceDocument::Placement(document)) => document,
+            Some(_) => {
+                return Err(unsupported_stage_object(format!(
+                    "{} is not a placement resource",
+                    display_raw_path(&raw_resource_path)
+                )));
+            }
+            None => {
+                return Err(unsupported_stage_object(format!(
+                    "placement resource {} was not found",
+                    display_raw_path(&raw_resource_path)
+                )));
+            }
+        };
+
+        let mut matches = Vec::new();
+        collect_group_record_paths(
+            &document.root,
+            type_name,
+            group_index,
+            &mut Vec::new(),
+            &mut matches,
+        );
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(matches.pop()),
+            count => Err(unsupported_stage_object(format!(
+                "group type '{}'{} is ambiguous in {} ({count} matches)",
+                semantic_type_name(type_name),
+                group_index
+                    .map(|index| format!(" with group_index {index}"))
+                    .unwrap_or_default(),
+                display_raw_path(&raw_resource_path)
+            ))),
+        }
+    }
+
+    /// Finds one semantic JDrama group by its exact runtime name and type.
+    ///
+    /// Type matching ignores namespace prefixes, while the name comparison is
+    /// deliberately exact because `TNameRef::searchF` verifies both the
+    /// Shift-JIS key and the case-sensitive record name at runtime.
+    pub fn find_named_group_record_path(
+        &self,
+        raw_resource_path: &[u8],
+        type_name: &str,
+        name: &str,
+    ) -> Result<Option<Vec<usize>>> {
+        let raw_resource_path = normalize_resource_path(raw_resource_path.to_vec())?;
+        let document = match self.resource(&raw_resource_path) {
+            Some(StageResourceDocument::Placement(document)) => document,
+            Some(_) => {
+                return Err(unsupported_stage_object(format!(
+                    "{} is not a placement resource",
+                    display_raw_path(&raw_resource_path)
+                )));
+            }
+            None => {
+                return Err(unsupported_stage_object(format!(
+                    "placement resource {} was not found",
+                    display_raw_path(&raw_resource_path)
+                )));
+            }
+        };
+
+        let mut matches = Vec::new();
+        collect_named_group_record_paths(
+            &document.root,
+            type_name,
+            name,
+            &mut Vec::new(),
+            &mut matches,
+        );
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(matches.pop()),
+            count => Err(unsupported_stage_object(format!(
+                "group type '{}' named {name:?} is ambiguous in {} ({count} matches)",
+                semantic_type_name(type_name),
+                display_raw_path(&raw_resource_path)
+            ))),
+        }
+    }
+
+    /// Finds an indexed group only when it occupies one unique runtime slot
+    /// directly beneath its owning group.
+    ///
+    /// `TStrategy::load` assigns each direct `IdxGroup` child into an array by
+    /// `group_index`; a later child with the same index silently replaces the
+    /// earlier pointer. Requiring both an exact name and a unique owner/index
+    /// slot prevents authored records from targeting a group that the runtime
+    /// never schedules.
+    pub fn find_unique_owned_indexed_group_record_path(
+        &self,
+        raw_resource_path: &[u8],
+        type_name: &str,
+        name: &str,
+        group_index: u32,
+        owner_type_name: &str,
+    ) -> Result<Option<Vec<usize>>> {
+        let raw_resource_path = normalize_resource_path(raw_resource_path.to_vec())?;
+        let document = match self.resource(&raw_resource_path) {
+            Some(StageResourceDocument::Placement(document)) => document,
+            Some(_) => {
+                return Err(unsupported_stage_object(format!(
+                    "{} is not a placement resource",
+                    display_raw_path(&raw_resource_path)
+                )));
+            }
+            None => {
+                return Err(unsupported_stage_object(format!(
+                    "placement resource {} was not found",
+                    display_raw_path(&raw_resource_path)
+                )));
+            }
+        };
+
+        let mut named_matches = Vec::new();
+        let mut slot_matches = Vec::new();
+        let mut target_matches = Vec::new();
+        collect_owned_indexed_group_record_paths(
+            &document.root,
+            None,
+            type_name,
+            name,
+            group_index,
+            owner_type_name,
+            &mut Vec::new(),
+            &mut named_matches,
+            &mut slot_matches,
+            &mut target_matches,
+        );
+
+        if named_matches.is_empty() {
+            return Ok(None);
+        }
+        if named_matches.len() != 1 {
+            return Err(unsupported_stage_object(format!(
+                "group type '{}' named {name:?} is ambiguous in {} ({} matches)",
+                semantic_type_name(type_name),
+                display_raw_path(&raw_resource_path),
+                named_matches.len()
+            )));
+        }
+        if target_matches.is_empty() {
+            return Err(unsupported_stage_object(format!(
+                "group type '{}' named {name:?} in {} is not a direct child of '{}' with group_index {group_index}",
+                semantic_type_name(type_name),
+                display_raw_path(&raw_resource_path),
+                semantic_type_name(owner_type_name)
+            )));
+        }
+        if slot_matches.len() != 1 || target_matches.len() != 1 {
+            return Err(unsupported_stage_object(format!(
+                "'{}' has {} direct '{}' children with group_index {group_index} in {}; the runtime slot for {name:?} must be unique",
+                semantic_type_name(owner_type_name),
+                slot_matches.len(),
+                semantic_type_name(type_name),
+                display_raw_path(&raw_resource_path)
+            )));
+        }
+        Ok(target_matches.pop())
+    }
+
     pub fn set_object_transform(
         &mut self,
         raw_resource_path: &[u8],
@@ -231,18 +566,13 @@ impl SourceFreeStageArchive {
     ) -> Result<()> {
         let document = self.placement_document_mut(raw_resource_path)?;
         let record = jdrama_record_mut(&mut document.root, record_path)?;
-        let JDramaRecordPayload::Actor {
-            transform: current, ..
-        } = &mut record.payload
-        else {
-            return Err(unsupported_stage_object(format!(
-                "record {} in {} is not an actor",
+        set_editable_record_transform(record, transform).ok_or_else(|| {
+            unsupported_stage_object(format!(
+                "record {} in {} has no typed transform mapping",
                 display_record_path(record_path),
                 display_raw_path(raw_resource_path)
-            )));
-        };
-        *current = transform;
-        Ok(())
+            ))
+        })
     }
 
     /// Adds a fully typed actor or group under a semantic JDrama group.
@@ -414,19 +744,65 @@ impl SourceFreeStageArchive {
     }
 }
 
+fn normalize_resource_path(mut raw_path: Vec<u8>) -> Result<Vec<u8>> {
+    if raw_path.first() == Some(&b'/') {
+        raw_path.remove(0);
+    }
+    if raw_path.is_empty()
+        || raw_path.contains(&0)
+        || raw_path
+            .split(|byte| *byte == b'/')
+            .any(|component| component.is_empty() || matches!(component, b"." | b".."))
+    {
+        return Err(unsupported_stage_resource(format!(
+            "invalid or traversal-capable archive path {raw_path:02X?}"
+        )));
+    }
+    Ok(raw_path)
+}
+
+fn validate_resource_path_kind(raw_path: &[u8], document: &StageResourceDocument) -> Result<()> {
+    if document_matches_path(raw_path, document) {
+        Ok(())
+    } else {
+        Err(SceneError::StageResource {
+            path: display_raw_path(raw_path),
+            source: FormatError::Unsupported {
+                format: "source-free stage asset",
+                message: "semantic document kind does not match its archive path".to_string(),
+            },
+        })
+    }
+}
+
+fn detach_rarc_payloads(archive: &mut RarcDocument) {
+    for entry in &mut archive.entries {
+        if !entry.is_directory() {
+            entry.take_file_data();
+        }
+    }
+}
+
+fn unsupported_stage_resource(message: impl Into<String>) -> SceneError {
+    SceneError::Format(FormatError::Unsupported {
+        format: "stage archive resource",
+        message: message.into(),
+    })
+}
+
 fn collect_object_placements(
     raw_resource_path: &[u8],
     record: &JDramaRecord,
     path: &mut Vec<usize>,
     placements: &mut Vec<StageObjectPlacement>,
 ) {
-    if let JDramaRecordPayload::Actor { transform, .. } = &record.payload {
+    if let Some(transform) = editable_record_transform(record) {
         placements.push(StageObjectPlacement {
             raw_resource_path: raw_resource_path.to_vec(),
             record_path: path.clone(),
             type_name: record.type_name.clone(),
             name: record.name.clone(),
-            transform: *transform,
+            transform,
         });
     }
     if let JDramaRecordPayload::Group { children, .. } = &record.payload {
@@ -436,6 +812,176 @@ fn collect_object_placements(
             path.pop();
         }
     }
+}
+
+fn editable_record_transform(record: &JDramaRecord) -> Option<JDramaTransform> {
+    match &record.payload {
+        JDramaRecordPayload::Actor { transform, .. } => Some(*transform),
+        JDramaRecordPayload::Fields { fields } => {
+            let names = typed_field_transform_names(&record.type_name)?;
+            Some(JDramaTransform {
+                translation: vec3_field(fields, names.0)?,
+                rotation: vec3_field(fields, names.1)?,
+                scale: vec3_field(fields, names.2)?,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn set_editable_record_transform(
+    record: &mut JDramaRecord,
+    transform: JDramaTransform,
+) -> Option<()> {
+    let typed_names = typed_field_transform_names(&record.type_name);
+    match &mut record.payload {
+        JDramaRecordPayload::Actor {
+            transform: current, ..
+        } => {
+            *current = transform;
+            Some(())
+        }
+        JDramaRecordPayload::Fields { fields } => {
+            let names = typed_names?;
+            set_vec3_field(fields, names.0, transform.translation)?;
+            set_vec3_field(fields, names.1, transform.rotation)?;
+            set_vec3_field(fields, names.2, transform.scale)?;
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+fn typed_field_transform_names(
+    type_name: &str,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    match semantic_type_name(type_name) {
+        "AreaCylinder" => Some(("center", "authoring_vector", "cylinder_parameters")),
+        "Generator" => Some(("position", "rotation", "authoring_vector")),
+        _ => None,
+    }
+}
+
+fn vec3_field(fields: &[JDramaField], name: &str) -> Option<[f32; 3]> {
+    fields.iter().find_map(|field| {
+        (field.name == name)
+            .then_some(&field.value)
+            .and_then(|value| match value {
+                JDramaFieldValue::Vec3F32(value) => Some(*value),
+                _ => None,
+            })
+    })
+}
+
+fn set_vec3_field(fields: &mut [JDramaField], name: &str, value: [f32; 3]) -> Option<()> {
+    let field = fields.iter_mut().find(|field| field.name == name)?;
+    let JDramaFieldValue::Vec3F32(current) = &mut field.value else {
+        return None;
+    };
+    *current = value;
+    Some(())
+}
+
+fn collect_group_record_paths(
+    record: &JDramaRecord,
+    type_name: &str,
+    group_index: Option<u32>,
+    path: &mut Vec<usize>,
+    matches: &mut Vec<Vec<usize>>,
+) {
+    let JDramaRecordPayload::Group { fields, children } = &record.payload else {
+        return;
+    };
+    let type_matches = semantic_type_name(&record.type_name) == semantic_type_name(type_name);
+    let index_matches = group_index.is_none_or(|expected| {
+        semantic_type_name(&record.type_name) == "IdxGroup"
+            && fields.iter().any(|field| {
+                field.name == "group_index" && field.value == JDramaFieldValue::U32(expected)
+            })
+    });
+    if type_matches && index_matches {
+        matches.push(path.clone());
+    }
+    for (index, child) in children.iter().enumerate() {
+        path.push(index);
+        collect_group_record_paths(child, type_name, group_index, path, matches);
+        path.pop();
+    }
+}
+
+fn collect_named_group_record_paths(
+    record: &JDramaRecord,
+    type_name: &str,
+    name: &str,
+    path: &mut Vec<usize>,
+    matches: &mut Vec<Vec<usize>>,
+) {
+    let JDramaRecordPayload::Group { children, .. } = &record.payload else {
+        return;
+    };
+    if semantic_type_name(&record.type_name) == semantic_type_name(type_name) && record.name == name
+    {
+        matches.push(path.clone());
+    }
+    for (index, child) in children.iter().enumerate() {
+        path.push(index);
+        collect_named_group_record_paths(child, type_name, name, path, matches);
+        path.pop();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_owned_indexed_group_record_paths(
+    record: &JDramaRecord,
+    parent_type_name: Option<&str>,
+    type_name: &str,
+    name: &str,
+    group_index: u32,
+    owner_type_name: &str,
+    path: &mut Vec<usize>,
+    named_matches: &mut Vec<Vec<usize>>,
+    slot_matches: &mut Vec<Vec<usize>>,
+    target_matches: &mut Vec<Vec<usize>>,
+) {
+    let JDramaRecordPayload::Group { fields, children } = &record.payload else {
+        return;
+    };
+    let type_matches = semantic_type_name(&record.type_name) == semantic_type_name(type_name);
+    let name_matches = type_matches && record.name == name;
+    let index_matches = fields.iter().any(|field| {
+        field.name == "group_index" && field.value == JDramaFieldValue::U32(group_index)
+    });
+    let owner_matches = parent_type_name
+        .is_some_and(|parent| semantic_type_name(parent) == semantic_type_name(owner_type_name));
+    if name_matches {
+        named_matches.push(path.clone());
+    }
+    if type_matches && index_matches && owner_matches {
+        slot_matches.push(path.clone());
+        if name_matches {
+            target_matches.push(path.clone());
+        }
+    }
+    for (index, child) in children.iter().enumerate() {
+        path.push(index);
+        collect_owned_indexed_group_record_paths(
+            child,
+            Some(&record.type_name),
+            type_name,
+            name,
+            group_index,
+            owner_type_name,
+            path,
+            named_matches,
+            slot_matches,
+            target_matches,
+        );
+        path.pop();
+    }
+}
+
+fn semantic_type_name(type_name: &str) -> &str {
+    type_name.rsplit("::").next().unwrap_or(type_name)
 }
 
 fn jdrama_record_mut<'a>(
@@ -476,7 +1022,10 @@ fn unsupported_stage_object(message: impl Into<String>) -> SceneError {
     })
 }
 
-fn parse_resource(raw_path: &[u8], payload: &[u8]) -> sms_formats::Result<StageResourceDocument> {
+pub(crate) fn parse_resource(
+    raw_path: &[u8],
+    payload: &[u8],
+) -> sms_formats::Result<StageResourceDocument> {
     let lower = raw_path
         .iter()
         .map(|byte| byte.to_ascii_lowercase())
@@ -639,7 +1188,7 @@ mod tests {
     use sms_formats::{
         ColGroup, ColTriangle, ColVertex, J3dPaddingSpan, J3dRebuildDocument, J3dRebuildSection,
         J3dRebuildSectionData, J3dScalarArray, J3dVertexArray, J3dVertexArrayAttribute,
-        J3dVertexAttributeFormat, J3dVertexSection, JDramaLightMap, JDramaRecord,
+        J3dVertexAttributeFormat, J3dVertexSection, JDramaField, JDramaLightMap, JDramaRecord,
         JDramaRecordPayload, JDramaTransform, JpaxLayout, PrmEntry, PrmValue, RarcEntryRecord,
         RarcLayout, RarcNodeRecord,
     };
@@ -805,6 +1354,96 @@ mod tests {
     }
 
     #[test]
+    fn new_source_free_archive_has_a_detached_scene_root() {
+        let archive = SourceFreeStageArchive::new().unwrap();
+        assert_eq!(
+            archive.origin(),
+            &StageOrigin::Blank {
+                target_slot: "test11".to_string(),
+                preset_version: 1,
+            }
+        );
+        assert!(archive.resources().is_empty());
+        assert_eq!(archive.archive.nodes.len(), 1);
+        assert_eq!(archive.archive.nodes[0].raw_name, b"scene");
+        assert!(archive
+            .archive
+            .entries
+            .iter()
+            .all(|entry| entry.data.is_none()));
+
+        let encoded = archive.encode().unwrap();
+        let reopened = SourceFreeStageArchive::parse(&encoded).unwrap();
+        assert_eq!(reopened.origin(), &StageOrigin::ImportedArchive);
+        assert!(reopened.resources().is_empty());
+        assert_eq!(reopened.encode().unwrap(), encoded);
+    }
+
+    #[test]
+    fn typed_resource_insert_replace_and_remove_are_transactional() {
+        let source = fixture_archive(false);
+        let mut archive = SourceFreeStageArchive::parse(&source).unwrap();
+        let authored = StageResourceDocument::Parameters(PrmFile {
+            entries: vec![PrmEntry {
+                name: "mSize".to_string(),
+                value: PrmValue::from_f32(1.0),
+            }],
+        });
+        archive
+            .insert_resource(b"mapobj/authored.prm".to_vec(), authored.clone())
+            .unwrap();
+        assert_eq!(archive.resource(b"mapobj/authored.prm"), Some(&authored));
+        assert!(archive
+            .archive
+            .entries
+            .iter()
+            .all(|entry| entry.data.is_none()));
+
+        let replacement = StageResourceDocument::Parameters(PrmFile {
+            entries: vec![PrmEntry {
+                name: "mSize".to_string(),
+                value: PrmValue::from_f32(2.0),
+            }],
+        });
+        assert_eq!(
+            archive
+                .replace_resource(b"mapobj/authored.prm", replacement.clone())
+                .unwrap(),
+            authored
+        );
+        let removed = archive.remove_resource(b"effect.jpa").unwrap();
+        assert!(matches!(removed, StageResourceDocument::Particle(_)));
+
+        let encoded = archive.encode().unwrap();
+        let reopened = SourceFreeStageArchive::parse(&encoded).unwrap();
+        assert_eq!(
+            reopened.resource(b"mapobj/authored.prm"),
+            Some(&replacement)
+        );
+        assert!(reopened.resource(b"effect.jpa").is_none());
+        assert_eq!(reopened.encode().unwrap(), encoded);
+    }
+
+    #[test]
+    fn resource_mutation_rejects_conflicts_kind_mismatches_and_traversal() {
+        let source = fixture_archive(false);
+        let mut archive = SourceFreeStageArchive::parse(&source).unwrap();
+        let parameter = StageResourceDocument::Parameters(PrmFile {
+            entries: Vec::new(),
+        });
+        assert!(archive
+            .insert_resource(b"map.col".to_vec(), parameter.clone())
+            .is_err());
+        assert!(archive
+            .insert_resource(b"../authored.prm".to_vec(), parameter.clone())
+            .is_err());
+        assert!(archive
+            .insert_resource(b"authored.col".to_vec(), parameter)
+            .is_err());
+        assert_eq!(archive.encode().unwrap(), source);
+    }
+
+    #[test]
     fn geometry_collision_and_placement_edits_survive_a_fresh_reimport() {
         let source = fixture_archive(true);
         let mut archive = SourceFreeStageArchive::parse(&source).unwrap();
@@ -944,6 +1583,273 @@ mod tests {
         assert_eq!(removed.name, "inserted");
         let reopened_again = SourceFreeStageArchive::parse(&reopened.encode().unwrap()).unwrap();
         assert_eq!(reopened_again.object_placements().len(), 1);
+    }
+
+    #[test]
+    fn semantic_group_lookup_is_recursive_namespaced_and_index_aware() {
+        let source = fixture_archive(false);
+        let mut archive = SourceFreeStageArchive::parse(&source).unwrap();
+        let indexed = JDramaRecord::new(
+            "JDrama::IdxGroup",
+            "indexed",
+            JDramaRecordPayload::Group {
+                fields: vec![JDramaField {
+                    name: "group_index".to_string(),
+                    value: JDramaFieldValue::U32(7),
+                }],
+                children: Vec::new(),
+            },
+        )
+        .unwrap();
+        let nested = JDramaRecord::new(
+            "JDrama::GroupObj",
+            "nested",
+            JDramaRecordPayload::Group {
+                fields: Vec::new(),
+                children: vec![indexed],
+            },
+        )
+        .unwrap();
+        let root = JDramaRecord::new(
+            "JDrama::Strategy",
+            "root",
+            JDramaRecordPayload::Group {
+                fields: Vec::new(),
+                children: vec![nested],
+            },
+        )
+        .unwrap();
+        archive
+            .replace_resource(
+                b"scene.bin",
+                StageResourceDocument::Placement(JDramaDocument { root }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            archive
+                .find_group_record_path(b"scene.bin", "Strategy", None)
+                .unwrap(),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            archive
+                .find_group_record_path(b"scene.bin", "JDrama::IdxGroup", Some(7))
+                .unwrap(),
+            Some(vec![0, 0])
+        );
+        assert_eq!(
+            archive
+                .find_named_group_record_path(b"scene.bin", "IdxGroup", "indexed")
+                .unwrap(),
+            Some(vec![0, 0])
+        );
+        assert_eq!(
+            archive
+                .find_named_group_record_path(b"scene.bin", "IdxGroup", "missing")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            archive
+                .find_group_record_path(b"scene.bin", "IdxGroup", Some(8))
+                .unwrap(),
+            None
+        );
+
+        let rebuilt = archive.encode().unwrap();
+        let mut reopened = SourceFreeStageArchive::parse(&rebuilt).unwrap();
+        assert_eq!(
+            reopened
+                .find_group_record_path(b"scene.bin", "IdxGroup", Some(7))
+                .unwrap(),
+            Some(vec![0, 0])
+        );
+        assert_eq!(
+            reopened
+                .find_named_group_record_path(b"scene.bin", "JDrama::IdxGroup", "indexed")
+                .unwrap(),
+            Some(vec![0, 0])
+        );
+        let document = match reopened.resource_mut(b"scene.bin").unwrap() {
+            StageResourceDocument::Placement(document) => document,
+            _ => panic!("scene.bin has the wrong semantic kind"),
+        };
+        let JDramaRecordPayload::Group { children, .. } = &mut document.root.payload else {
+            panic!("fixture root is not a group");
+        };
+        children.push(
+            JDramaRecord::new(
+                "Strategy",
+                "ambiguous",
+                JDramaRecordPayload::Group {
+                    fields: Vec::new(),
+                    children: Vec::new(),
+                },
+            )
+            .unwrap(),
+        );
+        let error = reopened
+            .find_group_record_path(b"scene.bin", "JDrama::Strategy", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ambiguous"), "{error}");
+
+        let document = match reopened.resource_mut(b"scene.bin").unwrap() {
+            StageResourceDocument::Placement(document) => document,
+            _ => panic!("scene.bin has the wrong semantic kind"),
+        };
+        let JDramaRecordPayload::Group { children, .. } = &mut document.root.payload else {
+            panic!("fixture root is not a group");
+        };
+        children.push(
+            JDramaRecord::new(
+                "IdxGroup",
+                "indexed",
+                JDramaRecordPayload::Group {
+                    fields: vec![JDramaField {
+                        name: "group_index".to_string(),
+                        value: JDramaFieldValue::U32(9),
+                    }],
+                    children: Vec::new(),
+                },
+            )
+            .unwrap(),
+        );
+        let error = reopened
+            .find_named_group_record_path(b"scene.bin", "IdxGroup", "indexed")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("named \"indexed\""), "{error}");
+        assert!(error.contains("ambiguous"), "{error}");
+    }
+
+    #[test]
+    fn owned_indexed_group_lookup_requires_the_unique_runtime_slot() {
+        let source = fixture_archive(false);
+        let mut archive = SourceFreeStageArchive::parse(&source).unwrap();
+        let indexed_group = |name: &str, index: u32| {
+            JDramaRecord::new(
+                "JDrama::IdxGroup",
+                name,
+                JDramaRecordPayload::Group {
+                    fields: vec![JDramaField {
+                        name: "group_index".to_string(),
+                        value: JDramaFieldValue::U32(index),
+                    }],
+                    children: Vec::new(),
+                },
+            )
+            .unwrap()
+        };
+        let replace_strategy = |archive: &mut SourceFreeStageArchive,
+                                children: Vec<JDramaRecord>| {
+            let root = JDramaRecord::new(
+                "JDrama::Strategy",
+                "strategy",
+                JDramaRecordPayload::Group {
+                    fields: Vec::new(),
+                    children,
+                },
+            )
+            .unwrap();
+            archive
+                .replace_resource(
+                    b"scene.bin",
+                    StageResourceDocument::Placement(JDramaDocument { root }),
+                )
+                .unwrap();
+        };
+
+        replace_strategy(&mut archive, vec![indexed_group("マップグループ", 0)]);
+        assert_eq!(
+            archive
+                .find_unique_owned_indexed_group_record_path(
+                    b"scene.bin",
+                    "IdxGroup",
+                    "マップグループ",
+                    0,
+                    "Strategy",
+                )
+                .unwrap(),
+            Some(vec![0])
+        );
+
+        replace_strategy(&mut archive, vec![indexed_group("マップグループ", 1)]);
+        let wrong_index = archive
+            .find_unique_owned_indexed_group_record_path(
+                b"scene.bin",
+                "IdxGroup",
+                "マップグループ",
+                0,
+                "Strategy",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_index.contains("group_index 0"), "{wrong_index}");
+
+        let outside = JDramaRecord::new(
+            "GroupObj",
+            "root",
+            JDramaRecordPayload::Group {
+                fields: Vec::new(),
+                children: vec![
+                    indexed_group("マップグループ", 0),
+                    JDramaRecord::new(
+                        "Strategy",
+                        "strategy",
+                        JDramaRecordPayload::Group {
+                            fields: Vec::new(),
+                            children: Vec::new(),
+                        },
+                    )
+                    .unwrap(),
+                ],
+            },
+        )
+        .unwrap();
+        archive
+            .replace_resource(
+                b"scene.bin",
+                StageResourceDocument::Placement(JDramaDocument { root: outside }),
+            )
+            .unwrap();
+        let outside_strategy = archive
+            .find_unique_owned_indexed_group_record_path(
+                b"scene.bin",
+                "IdxGroup",
+                "マップグループ",
+                0,
+                "Strategy",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            outside_strategy.contains("direct child"),
+            "{outside_strategy}"
+        );
+
+        replace_strategy(
+            &mut archive,
+            vec![
+                indexed_group("マップグループ", 0),
+                indexed_group("duplicate runtime slot", 0),
+            ],
+        );
+        let duplicate_slot = archive
+            .find_unique_owned_indexed_group_record_path(
+                b"scene.bin",
+                "IdxGroup",
+                "マップグループ",
+                0,
+                "Strategy",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            duplicate_slot.contains("must be unique"),
+            "{duplicate_slot}"
+        );
     }
 
     #[test]

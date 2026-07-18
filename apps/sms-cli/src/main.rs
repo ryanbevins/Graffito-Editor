@@ -1,13 +1,28 @@
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
-use sms_formats::{
-    discover_scene_archives, read_stage_asset_bytes, J3dFile, J3dTriangle, StageAssetKind,
+use clap::{Parser, Subcommand, ValueEnum};
+use sms_authoring::{
+    import_model, merge_model_instances, CollisionDocument, CollisionGroup, CollisionImportOptions,
+    CollisionNodeSelection, CollisionSource, CollisionSurface, ImportedAlphaMode,
+    ModelAssetCatalog, ModelAssetDocument, ModelImportOptions, ModelInstanceExportMode,
+    ModelInstancePlacement, ModelMaterial, ModelMesh, ModelNode, ModelPrimitive, NodePurpose,
+    ResolvedModelInstance, SourcePbrMetadata, TargetLoaderProfile,
 };
-use sms_scene::{SourceFreeStageArchive, StageDocument};
+use sms_formats::{
+    discover_scene_archives, parse_jdrama_scenario_archive_entries, read_stage_asset_bytes,
+    validate_materials_for_loader, GxDiagnosticSeverity, J3dFile, J3dTriangle, JDramaDocument,
+    JDramaField, JDramaFieldValue, JDramaLightMap, JDramaRecord, JDramaRecordPayload,
+    JDramaTransform, StageAssetKind,
+};
+use sms_scene::{
+    BlankStageBootstrapManifest, BlankStageBootstrapResource, BlankStagePreset,
+    SourceFreeStageArchive, StageDocument, StageResourceDocument,
+    BLANK_STAGE_BOOTSTRAP_REQUIREMENTS, DEFAULT_BLANK_STAGE_TARGET_SLOT,
+};
 use sms_schema::SchemaGenerator;
 
 #[derive(Debug, Parser)]
@@ -18,8 +33,120 @@ struct Args {
     command: Commands,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ModelCollisionMode {
+    Render,
+    Embedded,
+    Separate,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LoaderProfileArg {
+    Full,
+    SunshineMap,
+    SunshineObject,
+    SunshinePollution,
+    Custom,
+}
+
+impl LoaderProfileArg {
+    fn resolve(self, custom_flags: Option<u32>) -> Result<TargetLoaderProfile> {
+        match (self, custom_flags) {
+            (Self::Full, None) => Ok(TargetLoaderProfile::Full),
+            (Self::SunshineMap, None) => Ok(TargetLoaderProfile::SunshineMap),
+            (Self::SunshineObject, None) => Ok(TargetLoaderProfile::SunshineObject),
+            (Self::SunshinePollution, None) => Ok(TargetLoaderProfile::SunshinePollution),
+            (Self::Custom, Some(flags)) => Ok(TargetLoaderProfile::Custom(flags)),
+            (Self::Custom, None) => bail!("--loader-flags is required for the custom profile"),
+            (_, Some(_)) => bail!("--loader-flags is only valid with --loader-profile custom"),
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Import a project-authored glTF/GLB into a source-free native model asset.
+    ImportModel {
+        #[arg(long)]
+        input: PathBuf,
+        /// New `.smsmodel` output. Existing files are never replaced.
+        #[arg(long)]
+        asset_out: PathBuf,
+        /// Optionally compile a standalone canonical BMD3 at the same time.
+        #[arg(long)]
+        bmd_out: Option<PathBuf>,
+        /// Optionally compile Sunshine COL at the same time.
+        #[arg(long)]
+        col_out: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = ModelCollisionMode::Render)]
+        collision: ModelCollisionMode,
+        /// Separate collision glTF/GLB, required with `--collision separate`.
+        #[arg(long)]
+        collision_file: Option<PathBuf>,
+        #[arg(long, default_value = "COL_")]
+        collision_prefix: String,
+        #[arg(long, default_value_t = 100.0)]
+        units_per_meter: f32,
+        /// Confirm intentionally unmapped PBR inputs before compiled output is emitted.
+        #[arg(long, default_value_t = false)]
+        acknowledge_warnings: bool,
+    },
+    /// Compile a source-free native model asset to standalone BMD3 and optional COL.
+    CompileModelAsset {
+        #[arg(long)]
+        asset: PathBuf,
+        #[arg(long)]
+        bmd_out: PathBuf,
+        #[arg(long)]
+        col_out: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = LoaderProfileArg::SunshineMap)]
+        loader_profile: LoaderProfileArg,
+        /// Exact loader flags for `--loader-profile custom` (decimal or 0x-prefixed).
+        #[arg(long, value_parser = parse_u32_auto)]
+        loader_flags: Option<u32>,
+        #[arg(long, default_value_t = false)]
+        acknowledge_warnings: bool,
+    },
+    /// Validate and optionally emit files for a decomp-verified stock resource slot.
+    ValidateStockReplacement {
+        /// Neighboring Sunshine decompilation root used to derive the stock table.
+        #[arg(long, default_value = "..")]
+        repo_root: PathBuf,
+        #[arg(long)]
+        asset: PathBuf,
+        /// Exact, case-sensitive `TMapObjData` resource identity.
+        #[arg(long)]
+        resource: String,
+        /// Optional new external BMD output. Existing files are never replaced.
+        #[arg(long)]
+        bmd_out: Option<PathBuf>,
+        /// Optional new external COL output. Existing files are never replaced.
+        #[arg(long)]
+        col_out: Option<PathBuf>,
+        /// Acknowledge that stock resources can be shared globally and that loader warnings apply.
+        #[arg(long, default_value_t = false)]
+        acknowledge_warnings: bool,
+    },
+    /// Build a source-free external Yaz0 stage archive for an existing stage slot.
+    CreateBlankStage {
+        /// Extracted base root, used to verify the target mapping and no-write boundary.
+        #[arg(long)]
+        base_root: PathBuf,
+        /// Native world model asset with collision.
+        #[arg(long)]
+        asset: PathBuf,
+        /// Optional authored proxy asset. When omitted, small source-free built-in proxies are generated.
+        #[arg(long)]
+        proxy_asset: Option<PathBuf>,
+        #[arg(long, default_value = DEFAULT_BLANK_STAGE_TARGET_SLOT)]
+        target_slot: String,
+        /// New external `.szs` output. Existing files are never replaced.
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = false)]
+        acknowledge_warnings: bool,
+    },
     /// Extract a disc image with nodtool.
     Extract {
         #[arg(long)]
@@ -116,6 +243,7 @@ enum Commands {
         out: PathBuf,
     },
     /// Apply a saved editor object overlay and create a rebuilt external stage archive.
+    #[command(alias = "export-project-stage")]
     ExportStage {
         #[arg(long)]
         base_root: PathBuf,
@@ -124,6 +252,9 @@ enum Commands {
         /// Optional SMS Editor project whose object overlay should be applied.
         #[arg(long)]
         project_root: Option<PathBuf>,
+        /// Project Content directory containing `.sms-model-instances.json` and `.smsmodel` assets.
+        #[arg(long)]
+        model_content_root: Option<PathBuf>,
         /// Existing output directory plus a new archive filename; never the base tree.
         #[arg(long)]
         out: PathBuf,
@@ -250,6 +381,71 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
+        Commands::ImportModel {
+            input,
+            asset_out,
+            bmd_out,
+            col_out,
+            collision,
+            collision_file,
+            collision_prefix,
+            units_per_meter,
+            acknowledge_warnings,
+        } => import_model_command(
+            input,
+            asset_out,
+            bmd_out,
+            col_out,
+            collision,
+            collision_file,
+            collision_prefix,
+            units_per_meter,
+            acknowledge_warnings,
+        ),
+        Commands::CompileModelAsset {
+            asset,
+            bmd_out,
+            col_out,
+            loader_profile,
+            loader_flags,
+            acknowledge_warnings,
+        } => compile_model_asset_command(
+            asset,
+            bmd_out,
+            col_out,
+            loader_profile.resolve(loader_flags)?,
+            acknowledge_warnings,
+        ),
+        Commands::ValidateStockReplacement {
+            repo_root,
+            asset,
+            resource,
+            bmd_out,
+            col_out,
+            acknowledge_warnings,
+        } => validate_stock_replacement_command(
+            repo_root,
+            asset,
+            resource,
+            bmd_out,
+            col_out,
+            acknowledge_warnings,
+        ),
+        Commands::CreateBlankStage {
+            base_root,
+            asset,
+            proxy_asset,
+            target_slot,
+            out,
+            acknowledge_warnings,
+        } => create_blank_stage_command(
+            base_root,
+            asset,
+            proxy_asset,
+            target_slot,
+            out,
+            acknowledge_warnings,
+        ),
         Commands::Extract {
             image,
             out,
@@ -393,7 +589,7 @@ fn main() -> Result<()> {
             stage,
             project_root,
         } => {
-            let mut document = StageDocument::open(base_root, stage)?;
+            let mut document = StageDocument::open(base_root, &stage)?;
             document.load_project_folder(&project_root)?;
             let outcome = document.save_project_folder(project_root)?;
             for warning in &outcome.warnings {
@@ -415,9 +611,10 @@ fn main() -> Result<()> {
             base_root,
             stage,
             project_root,
+            model_content_root,
             out,
         } => {
-            let mut document = StageDocument::open(base_root, stage)?;
+            let mut document = StageDocument::open(base_root, &stage)?;
             if let Some(project_root) = project_root {
                 document.load_project_folder(&project_root)?;
                 if document.loaded_project.is_none() {
@@ -427,7 +624,16 @@ fn main() -> Result<()> {
                     );
                 }
             }
-            let outcome = document.export_stage_archive_new(out)?;
+            let (edits, placed_model_instances) = match model_content_root.as_ref() {
+                Some(content_root) => project_stage_edits_with_models(
+                    content_root,
+                    &stage,
+                    &document.archive_edits,
+                    document.stage_archive.as_ref(),
+                )?,
+                None => (document.archive_edits.clone(), 0),
+            };
+            let outcome = document.export_stage_archive_with_edits_new(out, &edits)?;
             println!(
                 "{}",
                 serde_json::json!({
@@ -437,6 +643,8 @@ fn main() -> Result<()> {
                     "changed": outcome.changed,
                     "second_rebuild_stable": true,
                     "source_buffers_retained": false,
+                    "placed_model_instances": placed_model_instances,
+                    "model_content_root": model_content_root,
                 })
             );
             Ok(())
@@ -527,6 +735,920 @@ fn write_create_new_synced(path: &std::path::Path, bytes: &[u8]) -> Result<PathB
     file.sync_all()
         .with_context(|| format!("sync output {}", output.display()))?;
     Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn import_model_command(
+    input: PathBuf,
+    asset_out: PathBuf,
+    bmd_out: Option<PathBuf>,
+    col_out: Option<PathBuf>,
+    collision_mode: ModelCollisionMode,
+    collision_file: Option<PathBuf>,
+    collision_prefix: String,
+    units_per_meter: f32,
+    acknowledge_warnings: bool,
+) -> Result<()> {
+    if !units_per_meter.is_finite() || units_per_meter <= 0.0 {
+        bail!("--units-per-meter must be finite and greater than zero");
+    }
+    if collision_mode != ModelCollisionMode::Separate && collision_file.is_some() {
+        bail!("--collision-file is only valid with --collision separate");
+    }
+    let mut options = ModelImportOptions::default();
+    options.coordinate_conversion.units_per_meter = units_per_meter;
+    options.collision = match collision_mode {
+        ModelCollisionMode::Render => CollisionSource::RenderGeometry {
+            surface: Default::default(),
+        },
+        ModelCollisionMode::Embedded => CollisionSource::EmbeddedNodes {
+            prefix: collision_prefix,
+            selected_nodes: Default::default(),
+            surfaces_by_node: Default::default(),
+            default_surface: Default::default(),
+        },
+        ModelCollisionMode::Separate => {
+            let path = collision_file
+                .context("--collision-file is required when --collision separate is selected")?;
+            CollisionSource::SeparateFile {
+                path,
+                options: CollisionImportOptions {
+                    coordinate_conversion: options.coordinate_conversion,
+                    node_selection: CollisionNodeSelection::AllGeometry,
+                    ..CollisionImportOptions::default()
+                },
+            }
+        }
+        ModelCollisionMode::None => CollisionSource::None,
+    };
+
+    let imported = import_model(&input, &options)
+        .with_context(|| format!("import project-authored model {}", input.display()))?;
+    require_acknowledged_diagnostics(&imported.asset, acknowledge_warnings)?;
+    let bounds = imported.asset.converted_bounds()?;
+    let native = imported.asset.to_native_bytes()?;
+    let bmd = bmd_out
+        .as_ref()
+        .map(|_| imported.asset.compile_bmd())
+        .transpose()?;
+    let col = col_out
+        .as_ref()
+        .map(|_| imported.asset.compile_col())
+        .transpose()?;
+
+    let mut outputs = vec![asset_out.clone()];
+    outputs.extend(bmd_out.iter().cloned());
+    outputs.extend(col_out.iter().cloned());
+    preflight_new_outputs(&outputs)?;
+    let native_path = write_create_new_synced(&asset_out, &native)?;
+    let bmd_path = match (bmd_out.as_ref(), bmd.as_ref()) {
+        (Some(path), Some(bytes)) => Some(write_create_new_synced(path, bytes)?),
+        _ => None,
+    };
+    let col_path = match (col_out.as_ref(), col.as_ref()) {
+        (Some(path), Some(bytes)) => Some(write_create_new_synced(path, bytes)?),
+        _ => None,
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "source": input,
+            "native_asset": native_path,
+            "bmd": bmd_path,
+            "col": col_path,
+            "node_count": imported.asset.nodes.len(),
+            "mesh_count": imported.asset.meshes.len(),
+            "material_count": imported.asset.materials.len(),
+            "texture_count": imported.asset.textures.len(),
+            "collision_group_count": imported.asset.collision.as_ref().map(|collision| collision.groups.len()).unwrap_or(0),
+            "converted_bounds": bounds,
+            "diagnostics": imported.diagnostics,
+            "source_gltf_retained": false,
+            "reimport_recipe_retained": false,
+        }))?
+    );
+    Ok(())
+}
+
+fn compile_model_asset_command(
+    asset_path: PathBuf,
+    bmd_out: PathBuf,
+    col_out: Option<PathBuf>,
+    profile: TargetLoaderProfile,
+    acknowledge_warnings: bool,
+) -> Result<()> {
+    let asset = load_model_asset(&asset_path)?;
+    require_acknowledged_diagnostics(&asset, acknowledge_warnings)?;
+    let materials = asset
+        .materials
+        .iter()
+        .map(|material| material.gx.clone())
+        .collect::<Vec<_>>();
+    let loader_diagnostics = validate_materials_for_loader(&materials, profile);
+    let bmd = asset.compile_bmd()?;
+    let col = col_out.as_ref().map(|_| asset.compile_col()).transpose()?;
+    let mut outputs = vec![bmd_out.clone()];
+    outputs.extend(col_out.iter().cloned());
+    preflight_new_outputs(&outputs)?;
+    let bmd_path = write_create_new_synced(&bmd_out, &bmd)?;
+    let col_path = match (col_out.as_ref(), col.as_ref()) {
+        (Some(path), Some(bytes)) => Some(write_create_new_synced(path, bytes)?),
+        _ => None,
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "source": asset_path,
+            "bmd": bmd_path,
+            "col": col_path,
+            "loader_profile": profile,
+            "loader_flags": profile.flags(),
+            "loader_diagnostics": loader_diagnostics,
+            "bmd_size_bytes": bmd.len(),
+            "col_size_bytes": col.as_ref().map(Vec::len),
+            "source_free": true,
+        }))?
+    );
+    Ok(())
+}
+
+fn validate_stock_replacement_command(
+    repo_root: PathBuf,
+    asset_path: PathBuf,
+    resource_name: String,
+    bmd_out: Option<PathBuf>,
+    col_out: Option<PathBuf>,
+    acknowledge_warnings: bool,
+) -> Result<()> {
+    let registry = SchemaGenerator::new(&repo_root)
+        .generate()
+        .with_context(|| format!("derive stock resource table from {}", repo_root.display()))?;
+    let slot = registry
+        .find_map_obj_resource(&resource_name)
+        .with_context(|| {
+            format!(
+                "stock resource {resource_name:?} was not found in the decomp-derived table (names are case-sensitive)"
+            )
+        })?;
+    if slot.has_hold_dependency {
+        bail!(
+            "stock resource {resource_name:?} has compiled TMapObjData::mHold model/joint dependencies and cannot be replaced by a standalone primary BMD/COL"
+        );
+    }
+    if slot.has_move_dependency {
+        bail!(
+            "stock resource {resource_name:?} has compiled TMapObjData::mMove BCK/joint dependencies and cannot be replaced by a standalone primary BMD/COL"
+        );
+    }
+    let primary_model = slot.primary_model.as_ref().with_context(|| {
+        format!("stock resource {resource_name:?} does not instantiate a model")
+    })?;
+
+    let asset = load_model_asset(&asset_path)?;
+    require_acknowledged_diagnostics(&asset, acknowledge_warnings)?;
+    let materials = asset
+        .materials
+        .iter()
+        .map(|material| material.gx.clone())
+        .collect::<Vec<_>>();
+    let profile = TargetLoaderProfile::Custom(slot.load_flags);
+    let loader_diagnostics = validate_materials_for_loader(&materials, profile);
+    let loader_has_errors = loader_diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == GxDiagnosticSeverity::Error);
+    if loader_has_errors {
+        bail!("the authored GX state is invalid for stock resource {resource_name:?}");
+    }
+
+    let shared_resource_names = registry
+        .map_obj_resources
+        .iter()
+        .filter(|candidate| candidate.primary_model.as_ref() == Some(primary_model))
+        .map(|candidate| candidate.resource_name.clone())
+        .collect::<Vec<_>>();
+    let collision_vertex_count = asset
+        .collision
+        .as_ref()
+        .map(|collision| collision.vertices.len());
+    let mut collision_limits = Vec::new();
+    for collision in &slot.collision_resources {
+        if let (Some(limit), Some(actual)) = (collision.max_vertices, collision_vertex_count) {
+            if actual > usize::from(limit) {
+                bail!(
+                    "stock collision {} permits at most {limit} vertices, but the asset has {actual}",
+                    collision.resource_name
+                );
+            }
+        }
+        collision_limits.push(serde_json::json!({
+            "resource": collision.resource_name,
+            "flags": collision.flags,
+            "collision_kind": collision.collision_kind,
+            "max_vertices": collision.max_vertices,
+            "asset_vertices": collision_vertex_count,
+        }));
+    }
+    if !slot.collision_resources.is_empty() && asset.collision.is_none() {
+        bail!("stock resource {resource_name:?} requires collision, but the asset has none");
+    }
+    if col_out.is_some() && slot.collision_resources.is_empty() {
+        bail!("stock resource {resource_name:?} has no decomp-verified collision slot");
+    }
+
+    let has_warnings = !loader_diagnostics.is_empty() || !shared_resource_names.is_empty();
+    let emits_output = bmd_out.is_some() || col_out.is_some();
+    if emits_output && has_warnings && !acknowledge_warnings {
+        bail!(
+            "stock replacement can affect shared/global users and has target diagnostics; inspect the report first, then rerun with --acknowledge-warnings"
+        );
+    }
+
+    let bmd = bmd_out.as_ref().map(|_| asset.compile_bmd()).transpose()?;
+    let col = col_out.as_ref().map(|_| asset.compile_col()).transpose()?;
+    let mut outputs = Vec::new();
+    outputs.extend(bmd_out.iter().cloned());
+    outputs.extend(col_out.iter().cloned());
+    preflight_new_outputs(&outputs)?;
+    let bmd_path = match (bmd_out.as_ref(), bmd.as_ref()) {
+        (Some(path), Some(bytes)) => Some(write_create_new_synced(path, bytes)?),
+        _ => None,
+    };
+    let col_path = match (col_out.as_ref(), col.as_ref()) {
+        (Some(path), Some(bytes)) => Some(write_create_new_synced(path, bytes)?),
+        _ => None,
+    };
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "source": asset_path,
+            "stock_resource": resource_name,
+            "required_scene_manager": slot.required_manager_name,
+            "primary_model": primary_model,
+            "loader_flags": slot.load_flags,
+            "loader_diagnostics": loader_diagnostics,
+            "collision_slots": collision_limits,
+            "shared_resource_names": shared_resource_names,
+            "shared_or_global_replacement_warning": true,
+            "bmd": bmd_path,
+            "col": col_path,
+            "source_free": true,
+        }))?
+    );
+    Ok(())
+}
+
+fn create_blank_stage_command(
+    base_root: PathBuf,
+    asset_path: PathBuf,
+    proxy_asset_path: Option<PathBuf>,
+    target_slot: String,
+    out: PathBuf,
+    acknowledge_warnings: bool,
+) -> Result<()> {
+    if !target_slot_is_mapped(&base_root, &target_slot)? {
+        bail!(
+            "target slot {target_slot:?} is not present in stageArc.bin under {}",
+            base_root.display()
+        );
+    }
+    let world = load_model_asset(&asset_path)?;
+    require_acknowledged_diagnostics(&world, acknowledge_warnings)?;
+    let proxy = proxy_asset_path
+        .as_ref()
+        .map(|proxy_path| load_model_asset(proxy_path))
+        .transpose()?;
+    if let Some(proxy) = &proxy {
+        require_acknowledged_diagnostics(proxy, acknowledge_warnings)?;
+    }
+
+    let world_model = world.compile_bmd_document()?;
+    let world_collision = world
+        .collision
+        .as_ref()
+        .context("blank-stage world asset must contain collision")?
+        .to_col_file()?;
+    let shared_proxy_bmd = proxy
+        .as_ref()
+        .map(ModelAssetDocument::compile_bmd)
+        .transpose()?;
+    let shared_proxy_col = match &proxy {
+        Some(proxy) => Some(
+            proxy
+                .collision
+                .as_ref()
+                .context("blank-stage proxy asset must contain NormalBlock collision")?
+                .to_col_bytes()?,
+        ),
+        None => None,
+    };
+    let bootstrap_resources = BLANK_STAGE_BOOTSTRAP_REQUIREMENTS
+        .map(|requirement| -> Result<BlankStageBootstrapResource> {
+            let bytes = match requirement.kind {
+                sms_scene::BlankStageBootstrapKind::Model => match &shared_proxy_bmd {
+                    Some(bytes) => bytes.clone(),
+                    None => built_in_blank_stage_proxy(requirement.raw_path).compile_bmd()?,
+                },
+                sms_scene::BlankStageBootstrapKind::Collision => match &shared_proxy_col {
+                    Some(bytes) => bytes.clone(),
+                    None => built_in_blank_stage_proxy(requirement.raw_path)
+                        .collision
+                        .as_ref()
+                        .expect("the built-in bootstrap proxy always has collision")
+                        .to_col_bytes()?,
+                },
+            };
+            Ok(BlankStageBootstrapResource {
+                raw_path: requirement.raw_path.to_vec(),
+                bytes,
+            })
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    let bootstrap = BlankStageBootstrapManifest::from_authored_bytes(bootstrap_resources)?;
+    let preset = BlankStagePreset {
+        target_slot: target_slot.clone(),
+        ..BlankStagePreset::default()
+    };
+    let metadata = preset.target_metadata()?;
+    let archive = preset.build(world_model, world_collision, bootstrap)?;
+    let encoded = archive.encode()?;
+    let declared_size = yaz0_declared_size(&encoded)
+        .context("blank-stage output did not encode as a canonical Yaz0 stream")?;
+    validate_blank_stage_rarc_size(declared_size)?;
+    let reopened = SourceFreeStageArchive::parse(&encoded)?;
+    if reopened.encode()? != encoded {
+        bail!("blank-stage semantic reopen was not byte-stable");
+    }
+    let output = write_create_new_external_synced(&base_root, &out, &encoded)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "world_asset": asset_path,
+            "proxy_asset": proxy_asset_path,
+            "proxy_source": if proxy.is_some() { "native_asset" } else { "built_in_authored" },
+            "output": output,
+            "target": metadata,
+            "size_bytes": encoded.len(),
+            "decompressed_size_bytes": declared_size,
+            "compression": "yaz0",
+            "semantic_reopen_stable": true,
+            "retail_assets_copied": false,
+            "base_game_modified": false,
+        }))?
+    );
+    Ok(())
+}
+
+fn yaz0_declared_size(bytes: &[u8]) -> Option<u32> {
+    (bytes.len() >= 16 && bytes.get(..4) == Some(b"Yaz0")).then(|| {
+        u32::from_be_bytes(
+            bytes[4..8]
+                .try_into()
+                .expect("the header length was checked"),
+        )
+    })
+}
+
+fn validate_blank_stage_rarc_size(declared_size: u32) -> Result<()> {
+    const BLANK_STAGE_RARC_SAFETY_BUDGET: u32 = 12 * 1024 * 1024;
+    if declared_size > BLANK_STAGE_RARC_SAFETY_BUDGET {
+        bail!(
+            "blank-stage RARC expands to {declared_size} bytes, exceeding the editor's {}-byte safety budget for Sunshine's 24 MiB MEM1; use smaller world/proxy models",
+            BLANK_STAGE_RARC_SAFETY_BUDGET
+        );
+    }
+    Ok(())
+}
+
+fn built_in_blank_stage_proxy(raw_path: &[u8]) -> ModelAssetDocument {
+    let (name, color) = match raw_path {
+        b"mapobj/coin.bmd" => ("coin_proxy", [255, 214, 54, 255]),
+        b"mapobj/bottle_large.bmd" => ("bottle_proxy", [80, 176, 255, 255]),
+        b"mapobj/juiceblock.bmd" => ("juice_block_proxy", [255, 145, 45, 255]),
+        b"mapobj/normalblock.bmd" | b"mapobj/normalblock.col" => {
+            ("normal_block_proxy", [188, 188, 196, 255])
+        }
+        _ => ("bootstrap_proxy", [220, 80, 220, 255]),
+    };
+    let positions = vec![
+        [-50.0, -50.0, -50.0],
+        [50.0, -50.0, -50.0],
+        [50.0, -50.0, 50.0],
+        [-50.0, -50.0, 50.0],
+        [-50.0, 50.0, -50.0],
+        [50.0, 50.0, -50.0],
+        [50.0, 50.0, 50.0],
+        [-50.0, 50.0, 50.0],
+    ];
+    let normal = 0.577_350_26;
+    let normals = vec![
+        [-normal, -normal, -normal],
+        [normal, -normal, -normal],
+        [normal, -normal, normal],
+        [-normal, -normal, normal],
+        [-normal, normal, -normal],
+        [normal, normal, -normal],
+        [normal, normal, normal],
+        [-normal, normal, normal],
+    ];
+    let triangles = vec![
+        [0, 1, 2],
+        [0, 2, 3],
+        [4, 6, 5],
+        [4, 7, 6],
+        [0, 5, 1],
+        [0, 4, 5],
+        [1, 6, 2],
+        [1, 5, 6],
+        [2, 7, 3],
+        [2, 6, 7],
+        [3, 4, 0],
+        [3, 7, 4],
+    ];
+    let mut gx = sms_formats::GxMaterial {
+        name: format!("{name}_material"),
+        cull_mode: 2,
+        color_channel_count: 1,
+        material_colors: [Some(color), None],
+        color_channels: [
+            Some(sms_formats::GxColorChannel::default()),
+            Some(sms_formats::GxColorChannel::default()),
+            None,
+            None,
+        ],
+        ..sms_formats::GxMaterial::default()
+    };
+    gx.tev_orders[0] = Some(sms_formats::GxTevOrder {
+        tex_coord: None,
+        tex_map: None,
+        color_channel: 4,
+    });
+    if let Some(stage) = &mut gx.tev_stages[0] {
+        stage.color_inputs = [10, 15, 15, 15];
+        stage.alpha_inputs = [5, 7, 7, 7];
+    }
+
+    let mut asset = ModelAssetDocument::new(name);
+    asset.scene_roots = vec![0];
+    asset.nodes.push(ModelNode {
+        name: "root".to_string(),
+        parent: None,
+        children: Vec::new(),
+        mesh: Some(0),
+        purpose: NodePurpose::Render,
+        local_transform: [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+    });
+    asset.meshes.push(ModelMesh {
+        name: "proxy_cube".to_string(),
+        primitives: vec![ModelPrimitive {
+            positions: positions.clone(),
+            normals,
+            tangents: Vec::new(),
+            tex_coords: Vec::new(),
+            colors: Vec::new(),
+            indices: triangles.iter().flatten().copied().collect(),
+            material: Some(0),
+        }],
+    });
+    asset.materials.push(ModelMaterial {
+        gx,
+        source_base_color: color.map(|channel| f32::from(channel) / 255.0),
+        base_color_texture: None,
+        vertex_color_set: None,
+        source_double_sided: false,
+        source_alpha_mode: ImportedAlphaMode::Opaque,
+        source_pbr: SourcePbrMetadata {
+            metallic_factor: 0.0,
+            roughness_factor: 1.0,
+            has_metallic_roughness_texture: false,
+            has_normal_texture: false,
+            has_occlusion_texture: false,
+            emissive_factor: [0.0; 3],
+            has_emissive_texture: false,
+        },
+    });
+    asset.collision = Some(CollisionDocument {
+        vertices: positions,
+        groups: vec![CollisionGroup {
+            name: "proxy_collision".to_string(),
+            surface: CollisionSurface::default(),
+            triangles,
+        }],
+    });
+    asset
+}
+
+fn load_model_asset(path: &std::path::Path) -> Result<ModelAssetDocument> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("read native model asset {}", path.display()))?;
+    match ModelAssetDocument::from_native_bytes(&bytes) {
+        Ok(document) => Ok(document),
+        Err(native_error) => {
+            let canonical = std::fs::canonicalize(path)
+                .with_context(|| format!("canonicalize model asset {}", path.display()))?;
+            for content_root in canonical.ancestors().skip(1) {
+                if !content_root.join(".sms-assets").is_dir() {
+                    continue;
+                }
+                let relative = canonical.strip_prefix(content_root).with_context(|| {
+                    format!(
+                        "resolve catalog asset {} under {}",
+                        canonical.display(),
+                        content_root.display()
+                    )
+                })?;
+                return ModelAssetCatalog::open_content_root(content_root)
+                    .and_then(|catalog| catalog.load_asset_path(relative))
+                    .with_context(|| format!("load catalog model asset {}", canonical.display()));
+            }
+            Err(native_error).with_context(|| {
+                format!(
+                    "parse native model asset {} (no managed Content catalog was found)",
+                    path.display()
+                )
+            })
+        }
+    }
+}
+
+fn require_acknowledged_diagnostics(asset: &ModelAssetDocument, acknowledged: bool) -> Result<()> {
+    let required = asset.unacknowledged_required_diagnostics();
+    if !acknowledged && !required.is_empty() {
+        let codes = required
+            .iter()
+            .map(|diagnostic| format!("{:?}", diagnostic.code))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "model has acknowledgement-required diagnostics ({codes}); inspect them and rerun with --acknowledge-warnings"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ProjectModelInstanceManifest {
+    format_version: u32,
+    #[serde(default)]
+    instances: Vec<ProjectModelInstance>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ProjectModelInstance {
+    #[serde(default)]
+    stage_id: String,
+    placement: ModelInstancePlacement,
+}
+
+fn load_project_model_instances(
+    content_root: &std::path::Path,
+    stage: &str,
+) -> Result<Vec<ProjectModelInstance>> {
+    let manifest_path = content_root.join(".sms-model-instances.json");
+    let bytes = std::fs::read(&manifest_path)
+        .with_context(|| format!("read model-instance manifest {}", manifest_path.display()))?;
+    let manifest: ProjectModelInstanceManifest = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse model-instance manifest {}", manifest_path.display()))?;
+    if manifest.format_version != 1 {
+        bail!(
+            "unsupported model-instance manifest version {}; expected 1",
+            manifest.format_version
+        );
+    }
+    Ok(manifest
+        .instances
+        .into_iter()
+        .filter(|instance| instance.stage_id.eq_ignore_ascii_case(stage))
+        .collect())
+}
+
+fn project_stage_edits_with_models(
+    content_root: &std::path::Path,
+    stage: &str,
+    base: &sms_scene::StageArchiveEdits,
+    archive: Option<&SourceFreeStageArchive>,
+) -> Result<(sms_scene::StageArchiveEdits, usize)> {
+    let instances = load_project_model_instances(content_root, stage)?;
+    let instance_count = instances.len();
+    if instances.is_empty() {
+        return Ok((base.clone(), 0));
+    }
+    let catalog = ModelAssetCatalog::open_content_root(content_root)
+        .with_context(|| format!("open model catalog {}", content_root.display()))?;
+    let mut assets = BTreeMap::<sms_authoring::AssetId, ModelAssetDocument>::new();
+    let mut separate = Vec::new();
+    let mut map_terrain = Vec::new();
+    for instance in instances {
+        let asset = if let Some(asset) = assets.get(&instance.placement.asset_id) {
+            asset.clone()
+        } else {
+            let asset = catalog
+                .load_asset(instance.placement.asset_id)
+                .with_context(|| {
+                    format!(
+                        "resolve model instance {} asset {}",
+                        instance.placement.instance_id, instance.placement.asset_id
+                    )
+                })?;
+            assets.insert(instance.placement.asset_id, asset.clone());
+            asset
+        };
+        let unacknowledged = asset.unacknowledged_required_diagnostics();
+        if !unacknowledged.is_empty() {
+            let codes = unacknowledged
+                .iter()
+                .map(|diagnostic| format!("{:?}", diagnostic.code))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "model instance {} has unacknowledged import diagnostics ({codes})",
+                instance.placement.instance_id
+            );
+        }
+        let resolved = ResolvedModelInstance {
+            placement: instance.placement,
+            asset,
+        };
+        match resolved.placement.export_mode {
+            ModelInstanceExportMode::SeparateRuntimeObject => separate.push(resolved),
+            ModelInstanceExportMode::MapTerrain => map_terrain.push(resolved),
+            ModelInstanceExportMode::StockMapObjBase => {
+                let selected = resolved.placement.stock_map_obj_resource.trim();
+                let detail = if selected.is_empty() {
+                    "no stock resource slot was selected".to_string()
+                } else {
+                    format!("slot {selected:?} has not been decomp-validated for this asset")
+                };
+                bail!(
+                    "model instance {} cannot export through Stock MapObjBase: {detail}; arbitrary resource keys are unsafe because Sunshine resolves MapObjBase resources through a compiled registry",
+                    resolved.placement.instance_id
+                );
+            }
+        }
+    }
+
+    let mut edits = base.clone();
+    if !separate.is_empty() {
+        let archive = archive.context(
+            "separate runtime-object export requires the open source-free stage archive so map/scene.bin and map/tables.bin can be edited semantically",
+        )?;
+        let scene_parent = cli_runtime_actor_parent_path(archive)?;
+
+        let mut separate_assets = BTreeMap::new();
+        for resolved in &separate {
+            separate_assets
+                .entry(resolved.placement.asset_id)
+                .or_insert_with(|| resolved.asset.clone());
+        }
+        let mut characters = Vec::with_capacity(separate_assets.len());
+        for (asset_id, asset) in separate_assets {
+            let resource_key = cli_runtime_resource_key(asset_id);
+            let model = asset
+                .compile_bmd_document()
+                .with_context(|| format!("compile separate runtime BMD3 for asset {asset_id}"))?;
+            edits.upsert_model(
+                format!("mapobj/{resource_key}/default.bmd").into_bytes(),
+                model,
+            );
+            characters.push(cli_runtime_obj_chara_record(asset_id, &resource_key)?);
+        }
+
+        if archive.resource(b"map/tables.bin").is_some() {
+            let tables_parent = archive
+                .find_group_record_path(b"map/tables.bin", "NameRefGrp", None)?
+                .context("map/tables.bin has no unambiguous NameRefGrp root")?;
+            for character in characters {
+                edits.insert_placement(
+                    b"map/tables.bin".to_vec(),
+                    tables_parent.clone(),
+                    character,
+                );
+            }
+        } else {
+            let root = JDramaRecord::new(
+                "NameRefGrp",
+                "SMS authored model characters",
+                JDramaRecordPayload::Group {
+                    fields: Vec::new(),
+                    children: characters,
+                },
+            )?;
+            edits.insert_resource(
+                b"map/tables.bin".to_vec(),
+                StageResourceDocument::Placement(JDramaDocument { root }),
+            );
+        }
+
+        for resolved in &separate {
+            edits.insert_placement(
+                b"map/scene.bin".to_vec(),
+                scene_parent.clone(),
+                cli_runtime_sm_j3d_actor_record(&resolved.placement)?,
+            );
+        }
+    }
+
+    if !map_terrain.is_empty() {
+        let merged = merge_model_instances("AuthoredMapTerrain", &map_terrain)?;
+        edits.replace_model(b"map/map/map.bmd".to_vec(), merged.compile_bmd_document()?);
+    }
+
+    let collision_instances = separate
+        .iter()
+        .chain(map_terrain.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    if !collision_instances.is_empty() {
+        let merged = merge_model_instances("AuthoredInstanceCollision", &collision_instances)?;
+        let collision = merged
+            .collision
+            .as_ref()
+            .map(|collision| collision.to_col_file())
+            .transpose()?;
+        if let Some(collision) = collision {
+            edits.append_collision(b"map/map.col".to_vec(), collision);
+        }
+    }
+    Ok((edits, instance_count))
+}
+
+fn cli_runtime_resource_key(asset_id: sms_authoring::AssetId) -> String {
+    format!("sms_{}", asset_id.as_uuid().simple())
+}
+
+const SMS_RUNTIME_MAP_GROUP_TYPE: &str = "IdxGroup";
+const SMS_RUNTIME_MAP_GROUP_NAME: &str = "マップグループ";
+const SMS_RUNTIME_MAP_GROUP_INDEX: u32 = 0;
+const SMS_RUNTIME_MAP_GROUP_OWNER_TYPE: &str = "Strategy";
+
+fn cli_runtime_actor_parent_path(archive: &SourceFreeStageArchive) -> Result<Vec<usize>> {
+    archive
+        .find_unique_owned_indexed_group_record_path(
+            b"map/scene.bin",
+            SMS_RUNTIME_MAP_GROUP_TYPE,
+            SMS_RUNTIME_MAP_GROUP_NAME,
+            SMS_RUNTIME_MAP_GROUP_INDEX,
+            SMS_RUNTIME_MAP_GROUP_OWNER_TYPE,
+        )
+        .context("locate Sunshine's scheduled runtime map group in map/scene.bin")?
+        .with_context(|| {
+            format!(
+                "map/scene.bin has no {SMS_RUNTIME_MAP_GROUP_TYPE} group named {SMS_RUNTIME_MAP_GROUP_NAME:?} in the unique {SMS_RUNTIME_MAP_GROUP_OWNER_TYPE} group_index {SMS_RUNTIME_MAP_GROUP_INDEX} slot; authored SmJ3DAct actors would never be scheduled for calc, entry, and viewCalc"
+            )
+        })
+}
+
+fn cli_runtime_character_name(asset_id: sms_authoring::AssetId) -> String {
+    format!("{}_character", cli_runtime_resource_key(asset_id))
+}
+
+fn cli_runtime_obj_chara_record(
+    asset_id: sms_authoring::AssetId,
+    resource_key: &str,
+) -> Result<JDramaRecord> {
+    Ok(JDramaRecord::new(
+        "ObjChara",
+        cli_runtime_character_name(asset_id),
+        JDramaRecordPayload::Fields {
+            fields: vec![JDramaField {
+                name: "resource_folder".to_string(),
+                value: JDramaFieldValue::String(format!("/scene/mapObj/{resource_key}")),
+            }],
+        },
+    )?)
+}
+
+fn cli_runtime_sm_j3d_actor_record(placement: &ModelInstancePlacement) -> Result<JDramaRecord> {
+    Ok(JDramaRecord::new(
+        "SmJ3DAct",
+        format!("sms_instance_{}", placement.instance_id.simple()),
+        JDramaRecordPayload::Actor {
+            transform: cli_runtime_transform(placement.transform)?,
+            character_name: cli_runtime_character_name(placement.asset_id),
+            light_map: JDramaLightMap::default(),
+            fields: Vec::new(),
+        },
+    )?)
+}
+
+fn cli_runtime_transform(matrix: [[f32; 4]; 4]) -> Result<JDramaTransform> {
+    if matrix.iter().flatten().any(|value| !value.is_finite()) {
+        bail!("runtime model transform contains a non-finite value");
+    }
+    let mut scale = [0.0; 3];
+    let mut rotation = [[0.0; 3]; 3];
+    for column in 0..3 {
+        scale[column] =
+            (matrix[column][0].powi(2) + matrix[column][1].powi(2) + matrix[column][2].powi(2))
+                .sqrt();
+        let divisor = scale[column].max(f32::EPSILON);
+        for row in 0..3 {
+            rotation[column][row] = matrix[column][row] / divisor;
+        }
+    }
+    let y = (-rotation[0][2]).clamp(-1.0, 1.0).asin();
+    let cosine_y = y.cos();
+    let (x, z) = if cosine_y.abs() > 0.000_01 {
+        (
+            rotation[1][2].atan2(rotation[2][2]),
+            rotation[0][1].atan2(rotation[0][0]),
+        )
+    } else {
+        ((-rotation[2][1]).atan2(rotation[1][1]), 0.0)
+    };
+    Ok(JDramaTransform {
+        translation: [matrix[3][0], matrix[3][1], matrix[3][2]],
+        rotation: [x.to_degrees(), y.to_degrees(), z.to_degrees()],
+        scale,
+    })
+}
+
+fn preflight_new_outputs(paths: &[PathBuf]) -> Result<()> {
+    let mut resolved = std::collections::BTreeSet::new();
+    for path in paths {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .context("every output must include an existing parent directory")?;
+        if !parent.is_dir() {
+            bail!("output parent does not exist: {}", parent.display());
+        }
+        let file_name = path.file_name().context("output must include a filename")?;
+        let candidate = std::fs::canonicalize(parent)
+            .with_context(|| format!("canonicalize output parent {}", parent.display()))?
+            .join(file_name);
+        if !resolved.insert(candidate.clone()) {
+            bail!("multiple outputs resolve to {}", candidate.display());
+        }
+        if candidate.exists() {
+            bail!("output already exists: {}", candidate.display());
+        }
+    }
+    Ok(())
+}
+
+fn parse_u32_auto(value: &str) -> std::result::Result<u32, String> {
+    let value = value.trim();
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16).map_err(|error| error.to_string())
+    } else {
+        value.parse::<u32>().map_err(|error| error.to_string())
+    }
+}
+
+fn target_slot_is_mapped(base_root: &std::path::Path, target_slot: &str) -> Result<bool> {
+    let candidate_directories = [
+        base_root.join("files/data"),
+        base_root.join("data"),
+        base_root.to_path_buf(),
+    ];
+    let mut stage_arc = None;
+    for directory in candidate_directories {
+        if !directory.is_dir() {
+            continue;
+        }
+        stage_arc = std::fs::read_dir(&directory)?
+            .filter_map(std::result::Result::ok)
+            .find(|entry| {
+                entry.path().is_file()
+                    && entry
+                        .file_name()
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case("stageArc.bin")
+            })
+            .map(|entry| entry.path());
+        if stage_arc.is_some() {
+            break;
+        }
+    }
+    let stage_arc = stage_arc.with_context(|| {
+        format!(
+            "could not locate data/stageArc.bin under {}",
+            base_root.display()
+        )
+    })?;
+    let bytes = std::fs::read(&stage_arc)
+        .with_context(|| format!("read stage mapping {}", stage_arc.display()))?;
+    let entries = parse_jdrama_scenario_archive_entries(&bytes)
+        .with_context(|| format!("parse stage mapping {}", stage_arc.display()))?;
+    Ok(entries.iter().any(|entry| {
+        let name = entry.archive_name.replace('\\', "/");
+        let file_name = name.rsplit('/').next().unwrap_or(&name);
+        let stem = file_name
+            .strip_suffix(".szs")
+            .or_else(|| file_name.strip_suffix(".arc"))
+            .unwrap_or(file_name);
+        stem.eq_ignore_ascii_case(target_slot)
+    }))
 }
 
 fn write_create_new_external_synced(
@@ -1043,6 +2165,367 @@ mod tests {
     use super::*;
 
     #[test]
+    fn built_in_blank_stage_proxies_are_small_deterministic_and_reparseable() {
+        let mut model_sizes = Vec::new();
+        for requirement in BLANK_STAGE_BOOTSTRAP_REQUIREMENTS {
+            let proxy = built_in_blank_stage_proxy(requirement.raw_path);
+            let primitive = &proxy.meshes[0].primitives[0];
+            for triangle in primitive.indices.chunks_exact(3) {
+                let vertices = [
+                    primitive.positions[triangle[0] as usize],
+                    primitive.positions[triangle[1] as usize],
+                    primitive.positions[triangle[2] as usize],
+                ];
+                let normals = [
+                    primitive.normals[triangle[0] as usize],
+                    primitive.normals[triangle[1] as usize],
+                    primitive.normals[triangle[2] as usize],
+                ];
+                let face = triangle_normal(vertices);
+                let average_normal = [
+                    normals.iter().map(|normal| normal[0]).sum::<f32>(),
+                    normals.iter().map(|normal| normal[1]).sum::<f32>(),
+                    normals.iter().map(|normal| normal[2]).sum::<f32>(),
+                ];
+                let winding_dot = face
+                    .iter()
+                    .zip(average_normal)
+                    .map(|(face, normal)| face * normal)
+                    .sum::<f32>();
+                assert!(
+                    winding_dot > 0.0,
+                    "{} must retain canonical outward authoring and COL winding",
+                    String::from_utf8_lossy(requirement.raw_path)
+                );
+            }
+            match requirement.kind {
+                sms_scene::BlankStageBootstrapKind::Model => {
+                    let first = proxy.compile_bmd().unwrap();
+                    let second = proxy.compile_bmd().unwrap();
+                    assert_eq!(first, second);
+                    assert!(first.len() < 64 * 1024, "{}", first.len());
+                    assert_eq!(
+                        sms_formats::J3dRebuildDocument::parse(&first)
+                            .unwrap()
+                            .to_bytes()
+                            .unwrap(),
+                        first
+                    );
+                    let preview = J3dFile::parse(first.clone())
+                        .unwrap()
+                        .geometry_preview()
+                        .unwrap();
+                    for triangle in preview.triangles {
+                        let face = triangle_normal(triangle.vertices);
+                        let normals = triangle.normals.expect("proxy BMD retains normals");
+                        let average_normal = [
+                            normals.iter().map(|normal| normal[0]).sum::<f32>(),
+                            normals.iter().map(|normal| normal[1]).sum::<f32>(),
+                            normals.iter().map(|normal| normal[2]).sum::<f32>(),
+                        ];
+                        let winding_dot = face
+                            .iter()
+                            .zip(average_normal)
+                            .map(|(face, normal)| face * normal)
+                            .sum::<f32>();
+                        assert!(
+                            winding_dot < 0.0,
+                            "{} must emit Sunshine/GX clockwise runtime winding",
+                            String::from_utf8_lossy(requirement.raw_path)
+                        );
+                    }
+                    model_sizes.push(first.len());
+                }
+                sms_scene::BlankStageBootstrapKind::Collision => {
+                    let bytes = proxy.collision.as_ref().unwrap().to_col_bytes().unwrap();
+                    assert_eq!(
+                        sms_formats::ColFile::parse(&bytes)
+                            .unwrap()
+                            .to_bytes()
+                            .unwrap(),
+                        bytes
+                    );
+                }
+            }
+        }
+        assert_eq!(model_sizes.len(), 4);
+        assert!(model_sizes.into_iter().sum::<usize>() < 256 * 1024);
+    }
+
+    #[test]
+    fn yaz0_declared_size_reads_only_canonical_headers() {
+        let mut bytes = [0_u8; 16];
+        bytes[..4].copy_from_slice(b"Yaz0");
+        bytes[4..8].copy_from_slice(&0x0056_b300_u32.to_be_bytes());
+        assert_eq!(yaz0_declared_size(&bytes), Some(0x0056_b300));
+        bytes[0] = b'X';
+        assert_eq!(yaz0_declared_size(&bytes), None);
+        assert_eq!(yaz0_declared_size(&bytes[..15]), None);
+    }
+
+    #[test]
+    fn blank_stage_rarc_budget_rejects_archives_that_cannot_fit_mem1() {
+        validate_blank_stage_rarc_size(12 * 1024 * 1024).unwrap();
+        let error = validate_blank_stage_rarc_size(28_467_200).unwrap_err();
+        assert!(error.to_string().contains("24 MiB MEM1"), "{error}");
+        assert!(error.to_string().contains("12"), "{error}");
+    }
+
+    #[test]
+    fn model_authoring_commands_parse_explicit_outputs_and_profiles() {
+        let import = Args::try_parse_from([
+            "sms-cli",
+            "import-model",
+            "--input",
+            "fixture/model.gltf",
+            "--asset-out",
+            "Content/model.smsmodel",
+            "--bmd-out",
+            "out/model.bmd",
+            "--collision",
+            "embedded",
+        ])
+        .unwrap();
+        assert!(matches!(
+            import.command,
+            Commands::ImportModel {
+                collision: ModelCollisionMode::Embedded,
+                bmd_out: Some(_),
+                ..
+            }
+        ));
+
+        let compile = Args::try_parse_from([
+            "sms-cli",
+            "compile-model-asset",
+            "--asset",
+            "Content/model.smsmodel",
+            "--bmd-out",
+            "out/model.bmd",
+            "--loader-profile",
+            "custom",
+            "--loader-flags",
+            "0x10220000",
+        ])
+        .unwrap();
+        assert!(matches!(
+            compile.command,
+            Commands::CompileModelAsset {
+                loader_profile: LoaderProfileArg::Custom,
+                loader_flags: Some(0x1022_0000),
+                ..
+            }
+        ));
+
+        let stock = Args::try_parse_from([
+            "sms-cli",
+            "validate-stock-replacement",
+            "--repo-root",
+            "../sms",
+            "--asset",
+            "Content/block.smsmodel",
+            "--resource",
+            "NormalBlock",
+            "--bmd-out",
+            "out/NormalBlock.bmd",
+        ])
+        .unwrap();
+        assert!(matches!(
+            stock.command,
+            Commands::ValidateStockReplacement {
+                resource,
+                bmd_out: Some(_),
+                ..
+            } if resource == "NormalBlock"
+        ));
+    }
+
+    #[test]
+    fn fixture_import_and_native_recompile_are_byte_identical() {
+        let temporary = tempfile::tempdir().unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../crates/sms-authoring/tests/fixtures/gltf/valid/minimal-external/model.gltf",
+        );
+        let asset = temporary.path().join("fixture.smsmodel");
+        let first_bmd = temporary.path().join("first.bmd");
+        let first_col = temporary.path().join("first.col");
+        import_model_command(
+            fixture,
+            asset.clone(),
+            Some(first_bmd.clone()),
+            Some(first_col.clone()),
+            ModelCollisionMode::Render,
+            None,
+            "COL_".to_string(),
+            100.0,
+            false,
+        )
+        .unwrap();
+
+        let second_bmd = temporary.path().join("second.bmd");
+        let second_col = temporary.path().join("second.col");
+        compile_model_asset_command(
+            asset,
+            second_bmd.clone(),
+            Some(second_col.clone()),
+            TargetLoaderProfile::SunshineMap,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(first_bmd).unwrap(),
+            std::fs::read(second_bmd).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(first_col).unwrap(),
+            std::fs::read(second_col).unwrap()
+        );
+    }
+
+    #[test]
+    fn project_stage_model_manifest_exports_separate_runtime_asset_by_default() {
+        let temporary = tempfile::tempdir().unwrap();
+        let content = temporary.path().join("Content");
+        let catalog = ModelAssetCatalog::open_content_root(&content).unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../crates/sms-authoring/tests/fixtures/gltf/valid/minimal-external/model.gltf",
+        );
+        let asset = import_model(fixture, &ModelImportOptions::default())
+            .unwrap()
+            .asset;
+        let entry = catalog.create_asset("world.smsmodel", &asset).unwrap();
+        assert_eq!(
+            load_model_asset(&content.join(&entry.relative_path)).unwrap(),
+            asset
+        );
+        let placement = ModelInstancePlacement::new(entry.id, "WorldPart");
+        std::fs::write(
+            content.join(".sms-model-instances.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "format_version": 1,
+                "instances": [{
+                    "stage_id": "test11",
+                    "placement": placement,
+                    "local_bounds": [[-50.0, -50.0, -50.0], [50.0, 50.0, 50.0]]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let archive = cli_runtime_export_test_archive();
+        let runtime_parent = cli_runtime_actor_parent_path(&archive).unwrap();
+        let (edits, count) = project_stage_edits_with_models(
+            &content,
+            "test11",
+            &sms_scene::StageArchiveEdits::default(),
+            Some(&archive),
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(edits.models.len(), 1);
+        assert_eq!(
+            edits.models[0].raw_resource_path,
+            format!("mapobj/{}/default.bmd", cli_runtime_resource_key(entry.id)).into_bytes()
+        );
+        assert!(edits
+            .models
+            .iter()
+            .all(|edit| edit.raw_resource_path != b"map/map/map.bmd"));
+        assert_eq!(edits.resources[0].raw_resource_path, b"map/tables.bin");
+        assert_eq!(edits.placement_inserts.len(), 1);
+        assert_eq!(edits.placement_inserts[0].record.type_name, "SmJ3DAct");
+        assert_eq!(
+            edits.placement_inserts[0].parent_record_path,
+            runtime_parent
+        );
+        assert_eq!(edits.collisions[0].raw_resource_path, b"map/map.col");
+    }
+
+    fn cli_runtime_export_test_archive() -> SourceFreeStageArchive {
+        cli_runtime_export_test_archive_with_map_groups(1)
+    }
+
+    fn cli_runtime_export_test_archive_with_map_groups(
+        map_group_count: usize,
+    ) -> SourceFreeStageArchive {
+        let map_groups = (0..map_group_count)
+            .map(|_| {
+                JDramaRecord::new(
+                    SMS_RUNTIME_MAP_GROUP_TYPE,
+                    SMS_RUNTIME_MAP_GROUP_NAME,
+                    JDramaRecordPayload::Group {
+                        fields: vec![JDramaField {
+                            name: "group_index".to_string(),
+                            value: JDramaFieldValue::U32(0),
+                        }],
+                        children: Vec::new(),
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+        let strategy = JDramaRecord::new(
+            "Strategy",
+            "strategy",
+            JDramaRecordPayload::Group {
+                fields: Vec::new(),
+                children: map_groups,
+            },
+        )
+        .unwrap();
+        let mar_scene = JDramaRecord::new(
+            "MarScene",
+            "normal scene",
+            JDramaRecordPayload::Group {
+                fields: vec![JDramaField {
+                    name: "light_map".to_string(),
+                    value: JDramaFieldValue::LightMap(JDramaLightMap::default()),
+                }],
+                children: vec![strategy],
+            },
+        )
+        .unwrap();
+        let root = JDramaRecord::new(
+            "GroupObj",
+            "whole scene",
+            JDramaRecordPayload::Group {
+                fields: Vec::new(),
+                children: vec![mar_scene],
+            },
+        )
+        .unwrap();
+        let mut archive = SourceFreeStageArchive::new().unwrap();
+        archive
+            .insert_resource(
+                b"map/scene.bin".to_vec(),
+                StageResourceDocument::Placement(JDramaDocument { root }),
+            )
+            .unwrap();
+        archive
+    }
+
+    #[test]
+    fn runtime_actor_parent_requires_one_exact_scheduled_map_group() {
+        let missing =
+            cli_runtime_actor_parent_path(&cli_runtime_export_test_archive_with_map_groups(0))
+                .unwrap_err()
+                .to_string();
+        assert!(missing.contains("IdxGroup"), "{missing}");
+        assert!(missing.contains(SMS_RUNTIME_MAP_GROUP_NAME), "{missing}");
+        assert!(missing.contains("never be scheduled"), "{missing}");
+
+        let ambiguous =
+            cli_runtime_actor_parent_path(&cli_runtime_export_test_archive_with_map_groups(2))
+                .unwrap_err();
+        let ambiguous = format!("{ambiguous:#}");
+        assert!(ambiguous.contains("ambiguous"), "{ambiguous}");
+        assert!(
+            ambiguous.contains(SMS_RUNTIME_MAP_GROUP_NAME),
+            "{ambiguous}"
+        );
+    }
+
+    #[test]
     fn export_project_command_uses_explicit_project_root() {
         let args = Args::try_parse_from([
             "sms-cli",
@@ -1105,6 +2588,8 @@ mod tests {
             "dolpic0",
             "--project-root",
             "project",
+            "--model-content-root",
+            "project-data/Content",
             "--out",
             "mod/dolpic0.szs",
         ])
@@ -1116,10 +2601,12 @@ mod tests {
                 base_root,
                 stage,
                 project_root: Some(project_root),
+                model_content_root: Some(model_content_root),
                 out,
             } if base_root == std::path::Path::new("base")
                 && stage == "dolpic0"
                 && project_root == std::path::Path::new("project")
+                && model_content_root == std::path::Path::new("project-data/Content")
                 && out == std::path::Path::new("mod/dolpic0.szs")
         ));
     }
