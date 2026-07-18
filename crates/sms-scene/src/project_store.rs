@@ -490,11 +490,25 @@ fn reattach_overlay_source_records(
     overlay_objects: &mut [super::SceneObject],
 ) -> Result<()> {
     let mut base_records = BTreeMap::new();
+    let mut base_placements = BTreeMap::new();
     for object in base_objects {
         let Some(source) = object.source.as_ref() else {
             continue;
         };
         base_records.insert(source_record_key(source)?, object);
+        if let Some(placement) = object.placement.as_ref() {
+            let key = (placement.address().clone(), source_record_path_key(source)?);
+            match base_placements.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(object));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    // Never use a semantic placement fallback when the base
+                    // document itself contains an ambiguous address.
+                    entry.insert(None);
+                }
+            }
+        }
     }
 
     for object in overlay_objects {
@@ -502,7 +516,15 @@ fn reattach_overlay_source_records(
             continue;
         };
         let key = source_record_key(source)?;
-        let Some(base_object) = base_records.get(&key) else {
+        let base_object = base_records.get(&key).copied().or_else(|| {
+            let placement = object.placement.as_ref()?;
+            let path = source_record_path_key(source).ok()?;
+            base_placements
+                .get(&(placement.address().clone(), path))
+                .copied()
+                .flatten()
+        });
+        let Some(base_object) = base_object else {
             return Err(SceneError::ProjectOverlaySourceMismatch {
                 object_id: object.id.clone(),
                 source_path: source.path.clone(),
@@ -581,6 +603,14 @@ fn reattach_overlay_source_records(
 fn source_record_key(
     source: &sms_formats::SourceLocation,
 ) -> Result<(String, Option<u64>, Option<u64>)> {
+    Ok((
+        source_record_path_key(source)?,
+        source.offset,
+        source.length,
+    ))
+}
+
+fn source_record_path_key(source: &sms_formats::SourceLocation) -> Result<String> {
     let path = source.path.to_string_lossy().replace('\\', "/");
     let normalized_path = if let Some((archive_path, internal_path)) = path.split_once("!/") {
         format!(
@@ -590,7 +620,7 @@ fn source_record_key(
     } else {
         normalized_absolute_for_comparison(&source.path)?
     };
-    Ok((normalized_path, source.offset, source.length))
+    Ok(normalized_path)
 }
 
 fn validate_loaded_project(

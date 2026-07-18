@@ -2915,6 +2915,53 @@ mod tests {
     }
 
     #[test]
+    fn project_overlay_reload_reattaches_shifted_source_by_semantic_placement() {
+        let root = unique_test_project_root("shifted-source-record-round-trip");
+        let source_root = unique_test_project_root("shifted-source-record-source");
+        fs::create_dir_all(&source_root).unwrap();
+        let archive_path = source_root.join("stage.szs");
+        fs::write(&archive_path, []).unwrap();
+        let source_path = PathBuf::from(format!(
+            "{}!/map/scene.bin",
+            fs::canonicalize(&archive_path).unwrap().display()
+        ));
+        let address = PlacementAddress {
+            raw_resource_path: b"map/scene.bin".to_vec(),
+            record_path: vec![5, 2, 4, 0],
+        };
+
+        let mut saved_object = SceneObject::new("retail-object", "Pollution");
+        saved_object.source = Some(SourceLocation {
+            path: source_path.clone(),
+            offset: Some(2_390),
+            length: Some(90),
+        });
+        saved_object.placement = Some(PlacementBinding::Existing(address.clone()));
+        saved_object.transform.translation[0] = 42.0;
+        let mut saved = empty_document("test01");
+        saved.objects = vec![saved_object];
+        saved.save_project_folder(&root).unwrap();
+
+        let refreshed_source = SourceLocation {
+            path: source_path,
+            offset: Some(2_512),
+            length: Some(90),
+        };
+        let mut base_object = SceneObject::new("retail-object", "Pollution");
+        base_object.source = Some(refreshed_source.clone());
+        base_object.placement = Some(PlacementBinding::Existing(address));
+        let mut reopened = empty_document("test01");
+        reopened.objects = vec![base_object];
+
+        assert!(reopened.load_project_folder(&root).unwrap());
+        assert_eq!(reopened.objects[0].source, Some(refreshed_source));
+        assert_eq!(reopened.objects[0].transform.translation[0], 42.0);
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(source_root).unwrap();
+    }
+
+    #[test]
     fn version_two_project_sources_migrate_to_semantic_existing_and_clone_bindings() {
         let root = unique_test_project_root("v2-placement-migration");
         let source_root = unique_test_project_root("v2-placement-source");
