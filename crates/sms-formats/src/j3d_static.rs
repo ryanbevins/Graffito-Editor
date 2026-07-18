@@ -59,6 +59,17 @@ pub struct StaticModel {
 /// Compiles an authoring model into a canonical, source-free J3D2 `bmd3`.
 pub fn compile_static_bmd3(model: &StaticModel) -> Result<J3dRebuildDocument> {
     validate_static_model(model)?;
+    // J3DMaterial is also the runtime hierarchy node that owns one shape and
+    // one `next` link. Reusing a MAT3 material index for multiple SHP1 shapes
+    // makes J3DJoint::addMesh link that material to itself, so Sunshine loops
+    // forever while walking the joint's material list. Keep authored material
+    // state shared in StaticModel, but instantiate one runtime material per
+    // shape in the compiled BMD.
+    let runtime_materials = model
+        .meshes
+        .iter()
+        .map(|mesh| model.materials[mesh.material_index as usize].clone())
+        .collect::<Vec<_>>();
     let attributes = used_attributes(model);
     let mut global_vertices = Vec::new();
     let mut mesh_ranges = Vec::with_capacity(model.meshes.len());
@@ -75,7 +86,7 @@ pub fn compile_static_bmd3(model: &StaticModel) -> Result<J3dRebuildDocument> {
     let draw_matrices = rigid_draw_matrix_section();
     let joints = joint_section(&model.root_joint_name, bounds)?;
     let shapes = shape_section(model, &mesh_ranges, &attributes)?;
-    let materials = compile_material_section(&model.materials)?;
+    let materials = compile_material_section(&runtime_materials)?;
     let textures = compile_texture_section(&model.textures)?;
 
     let mut document = J3dRebuildDocument {
@@ -295,10 +306,10 @@ fn information_section(model: &StaticModel) -> Result<J3dRebuildSection> {
         node_type: 1,
         index: 0,
     });
-    for (shape_index, mesh) in model.meshes.iter().enumerate() {
+    for (shape_index, _) in model.meshes.iter().enumerate() {
         hierarchy.push(J3dHierarchyCommand {
             node_type: 0x11,
-            index: mesh.material_index,
+            index: shape_index as u16,
         });
         hierarchy.push(J3dHierarchyCommand {
             node_type: 0x12,
@@ -802,6 +813,65 @@ mod tests {
         assert_eq!(reopened.to_bytes().unwrap(), first);
         let preview = J3dFile::parse(first).unwrap().geometry_preview().unwrap();
         assert_eq!(preview.triangles.len(), 1);
+    }
+
+    #[test]
+    fn each_shape_gets_a_distinct_runtime_material_node() {
+        let mut model = triangle_model();
+        let mut second_mesh = model.meshes[0].clone();
+        second_mesh.name = "second_triangle".to_string();
+        model.meshes.push(second_mesh);
+
+        let document = compile_static_bmd3(&model).unwrap();
+        let reopened = J3dRebuildDocument::parse(document.to_bytes().unwrap()).unwrap();
+        let information = reopened
+            .sections
+            .iter()
+            .find_map(|section| match &section.data {
+                J3dRebuildSectionData::Information(information) => Some(information),
+                _ => None,
+            })
+            .expect("compiled BMD3 has INF1");
+        let material_shape_pairs = information
+            .hierarchy
+            .windows(2)
+            .filter_map(|commands| {
+                (commands[0].node_type == 0x11 && commands[1].node_type == 0x12)
+                    .then_some((commands[0].index, commands[1].index))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(material_shape_pairs, [(0, 0), (1, 1)]);
+
+        let shapes = reopened
+            .sections
+            .iter()
+            .find_map(|section| match &section.data {
+                J3dRebuildSectionData::Shapes(shapes) => Some(shapes),
+                _ => None,
+            })
+            .expect("compiled BMD3 has SHP1");
+        assert_eq!(shapes.shape_count, 2);
+
+        let materials = reopened
+            .sections
+            .iter()
+            .find_map(|section| match &section.data {
+                J3dRebuildSectionData::Materials(materials) => Some(materials),
+                _ => None,
+            })
+            .expect("compiled BMD3 has MAT3");
+        assert_eq!(materials.material_count, 2);
+        assert_eq!(materials.material_init_records.len(), 2);
+        assert_eq!(
+            materials.material_init_records[0],
+            materials.material_init_records[1]
+        );
+        let remap = materials
+            .tables
+            .iter()
+            .find(|table| table.kind == crate::J3dMaterialTableKind::MaterialRemap)
+            .expect("compiled MAT3 has a material remap");
+        assert_eq!(remap.allocation, J3dScalarArray::Unsigned16(vec![0, 1]));
     }
 
     #[test]
