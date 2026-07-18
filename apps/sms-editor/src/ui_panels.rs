@@ -14,6 +14,20 @@ impl SmsEditorApp {
                     ui.close();
                     self.request_project_hub();
                 }
+                if ui
+                    .add_enabled(
+                        self.current_project.is_some()
+                            && self.background_receiver.is_none(),
+                        egui::Button::new("New Stage..."),
+                    )
+                    .on_hover_text(
+                        "Create an empty source-free stage with a new project-owned runtime slot",
+                    )
+                    .clicked()
+                {
+                    ui.close();
+                    self.request_new_stage();
+                }
                 ui.separator();
                 if ui
                     .add_enabled(
@@ -591,6 +605,16 @@ impl SmsEditorApp {
         ui.horizontal(|ui| {
             ui.heading("Content Browser");
             ui.add_space(8.0);
+            if ui
+                .add_enabled(
+                    self.current_project.is_some() && self.background_receiver.is_none(),
+                    egui::Button::new("+ New Stage").small(),
+                )
+                .on_hover_text("Create an empty authored stage with a new runtime slot")
+                .clicked()
+            {
+                self.request_new_stage();
+            }
             ui.label("Search");
             ui.add(
                 egui::TextEdit::singleline(&mut self.scene_filter)
@@ -697,6 +721,7 @@ impl SmsEditorApp {
     pub(super) fn palette_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Object Palette");
         ui.text_edit_singleline(&mut self.object_filter);
+        ui.small("Drag a class into the viewport, or use Add at the camera focus.");
         ui.add_space(4.0);
 
         let mut chosen: Option<String> = None;
@@ -726,15 +751,30 @@ impl SmsEditorApp {
             for object in entries {
                 ui.horizontal(|ui| {
                     let selected = self.palette_factory.as_deref() == Some(&object.factory_name);
-                    if ui
+                    let placeable = self.can_spawn_factory(&object.factory_name);
+                    let response = ui
                         .selectable_label(selected, &object.factory_name)
-                        .on_hover_text(format!("{} / {}", object.category, object.class_name))
-                        .clicked()
-                    {
+                        .on_hover_text(if placeable {
+                            format!(
+                                "{} / {}\nDrag into the viewport to create a typed placement.",
+                                object.category, object.class_name
+                            )
+                        } else {
+                            format!(
+                                "{} / {}\nThis stage has no typed constructor or existing instance to clone.",
+                                object.category, object.class_name
+                            )
+                        });
+                    if placeable {
+                        response.dnd_set_drag_payload(ObjectPaletteDragPayload {
+                            factory_name: object.factory_name.clone(),
+                        });
+                    }
+                    if placeable && response.clicked() {
                         chosen = Some(object.factory_name.clone());
                     }
                     if ui
-                        .add_enabled(self.document.is_some(), egui::Button::new("Add"))
+                        .add_enabled(placeable, egui::Button::new("Add"))
                         .clicked()
                     {
                         spawn_now = Some(object.factory_name.clone());
@@ -900,10 +940,12 @@ impl SmsEditorApp {
     pub(super) fn inspector_panel(&mut self, ui: &mut egui::Ui) {
         if self.selected_model_instance_id.is_some() {
             self.model_instance_inspector_panel(ui);
+            self.stage_lighting_panel(ui);
             return;
         }
         if self.selected_model_document.is_some() {
             self.model_asset_inspector_panel(ui);
+            self.stage_lighting_panel(ui);
             return;
         }
         let selected = self.selected_object().cloned();
@@ -970,6 +1012,52 @@ impl SmsEditorApp {
                 ui.label("No stage open.");
             }
         }
+        self.stage_lighting_panel(ui);
+    }
+
+    fn stage_lighting_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(mut lighting) = self
+            .document
+            .as_ref()
+            .map(|document| document.lighting.clone())
+        else {
+            return;
+        };
+        if lighting.lights.is_empty() && lighting.ambients.is_empty() {
+            return;
+        }
+
+        ui.separator();
+        let mut changed = false;
+        egui::CollapsingHeader::new("Stage Lighting")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.small(
+                    "These are the ordered typed LightAry and AmbAry records used by Sunshine. Changes are stored with this scene and work on authored or retail-derived stages.",
+                );
+                for (index, light) in lighting.lights.iter_mut().enumerate() {
+                    let name = light.name.as_deref().unwrap_or("Unnamed light");
+                    egui::CollapsingHeader::new(format!("Light {} - {name}", index + 1))
+                        .id_salt(("stage-light", index))
+                        .show(ui, |ui| {
+                            ui.label("Position / direction source");
+                            changed |= vector_drag(ui, &mut light.position, 100.0).changed;
+                            ui.label("Color");
+                            changed |= rgba8_drag(ui, &mut light.color);
+                        });
+                }
+                for (index, ambient) in lighting.ambients.iter_mut().enumerate() {
+                    let name = ambient.name.as_deref().unwrap_or("Unnamed ambient");
+                    egui::CollapsingHeader::new(format!("Ambient {} - {name}", index + 1))
+                        .id_salt(("stage-ambient", index))
+                        .show(ui, |ui| {
+                            changed |= rgba8_drag(ui, &mut ambient.color);
+                        });
+                }
+            });
+        if changed {
+            self.update_stage_lighting(lighting);
+        }
     }
 
     pub(super) fn issues_panel(&mut self, ui: &mut egui::Ui) {
@@ -1018,4 +1106,21 @@ fn tool_shortcut(tool: EditorTool) -> &'static str {
         EditorTool::Scale => "R",
         EditorTool::Place => "Object Palette",
     }
+}
+
+fn rgba8_drag(ui: &mut egui::Ui, color: &mut [u8; 4]) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        for (channel, label) in color.iter_mut().zip(["R", "G", "B", "A"]) {
+            changed |= ui
+                .add(
+                    egui::DragValue::new(channel)
+                        .range(0..=255)
+                        .speed(1.0)
+                        .prefix(format!("{label} ")),
+                )
+                .changed();
+        }
+    });
+    changed
 }

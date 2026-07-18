@@ -6,7 +6,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
-use sms_formats::{parse_jdrama_scenario_archive_entries, JDramaScenarioArchiveEntry};
+use sms_formats::{
+    parse_jdrama_document, parse_jdrama_scenario_archive_entries, JDramaScenarioArchiveEntry,
+};
 use sms_scene::StageDocument;
 
 use crate::direct_boot::{patch_sms_direct_boot_dol, RuntimeStageTarget};
@@ -19,6 +21,8 @@ const MANAGED_BUILD_MARKER_VERSION: u32 = 1;
 const MOD_ROOT_NAME: &str = "mod-root";
 const RUN_ROOT_NAME: &str = "run-root";
 const MAX_MARKER_BYTES: u64 = 64 * 1024;
+const MAX_RUNTIME_STAGE_TABLE_BYTES: u64 = 16 * 1024 * 1024;
+const PROJECT_RUNTIME_STAGE_TABLE_PATH: &[&str] = &["files", "data", "stageArc.bin"];
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) const MANAGED_BUILD_CANCELLED: &str = "Managed game build cancelled";
@@ -316,6 +320,96 @@ fn resolve_runtime_stage_target(
     ))
 }
 
+/// Reads the project-owned runtime table when present, otherwise the selected
+/// release's retail table. The project copy is the durable source of authored
+/// runtime slots; neither path is ever opened for modification here.
+pub(super) fn read_effective_runtime_stage_table(project: &OpenProject) -> Result<Vec<u8>, String> {
+    project
+        .descriptor
+        .validate_locations(&project.descriptor_path)?;
+    let project_table = PROJECT_RUNTIME_STAGE_TABLE_PATH
+        .iter()
+        .fold(project.data_root(), |path, component| path.join(component));
+    match read_runtime_stage_table_file(
+        &project_table,
+        "project runtime stage archive table",
+        true,
+    )? {
+        Some(bytes) => Ok(bytes),
+        None => {
+            let base_table = find_case_insensitive_path(
+                &project.descriptor.base_game_root,
+                &["files", "data", "stageArc.bin"],
+                "runtime stage archive table",
+            )?;
+            read_runtime_stage_table_file(&base_table, "runtime stage archive table", false)?
+                .ok_or_else(|| {
+                    format!(
+                        "Runtime stage archive table disappeared while reading '{}'",
+                        base_table.display()
+                    )
+                })
+        }
+    }
+}
+
+fn read_runtime_stage_table_file(
+    path: &Path,
+    description: &str,
+    optional: bool,
+) -> Result<Option<Vec<u8>>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if optional && error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect {description} '{}': {error}",
+                path.display()
+            ));
+        }
+    };
+    reject_link_or_reparse(&metadata, path, description)?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "{description} is not a regular file: {}",
+            path.display()
+        ));
+    }
+    if metadata.len() > MAX_RUNTIME_STAGE_TABLE_BYTES {
+        return Err(format!(
+            "{description} '{}' is larger than {MAX_RUNTIME_STAGE_TABLE_BYTES} bytes",
+            path.display()
+        ));
+    }
+    let bytes = fs::read(path)
+        .map_err(|error| format!("Could not read {description} '{}': {error}", path.display()))?;
+    let document = parse_jdrama_document(&bytes).map_err(|error| {
+        format!(
+            "Could not parse {description} '{}': {error}",
+            path.display()
+        )
+    })?;
+    let rebuilt = document.to_bytes().map_err(|error| {
+        format!(
+            "Could not rebuild {description} '{}' semantically: {error}",
+            path.display()
+        )
+    })?;
+    if rebuilt != bytes {
+        return Err(format!(
+            "{description} '{}' is not a byte-exact typed JDrama document",
+            path.display()
+        ));
+    }
+    parse_jdrama_scenario_archive_entries(&bytes).map_err(|error| {
+        format!(
+            "Could not locate the runtime area/scenario registry in {description} '{}': {error}",
+            path.display()
+        )
+    })?;
+    Ok(Some(bytes))
+}
+
 fn runtime_archive_stem(archive_name: &str) -> Option<&str> {
     let file_name = archive_name
         .rsplit(['/', '\\'])
@@ -466,6 +560,9 @@ fn prepare_managed_run_mirror_from_source_with_cancel(
     }
     check_cancelled(cancelled)?;
 
+    install_project_runtime_stage_table(project, &run_root, &mut stats, cancelled)?;
+    check_cancelled(cancelled)?;
+
     let run_main_dol = run_root.join(&main_relative);
     let main_metadata = fs::symlink_metadata(&run_main_dol).map_err(|error| {
         format!(
@@ -521,6 +618,41 @@ fn prepare_managed_run_mirror_from_source_with_cancel(
         reused_files: stats.reused_files,
         removed_entries: stats.removed_entries,
     })
+}
+
+fn install_project_runtime_stage_table(
+    project: &OpenProject,
+    run_root: &Path,
+    stats: &mut MirrorStats,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    let source = PROJECT_RUNTIME_STAGE_TABLE_PATH
+        .iter()
+        .fold(project.data_root(), |path, component| path.join(component));
+    let Some(bytes) =
+        read_runtime_stage_table_file(&source, "project runtime stage archive table", true)?
+    else {
+        return Ok(());
+    };
+    check_cancelled(cancelled)?;
+    let destination = PROJECT_RUNTIME_STAGE_TABLE_PATH
+        .iter()
+        .fold(run_root.to_path_buf(), |path, component| {
+            path.join(component)
+        });
+    let reused =
+        atomic_write_if_changed_with_cancel(&destination, &bytes, cancelled).map_err(|error| {
+            format!(
+                "Could not install project runtime stage archive table '{}': {error}",
+                destination.display()
+            )
+        })?;
+    if reused {
+        stats.reused_files += 1;
+    } else {
+        stats.copied_files += 1;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1624,6 +1756,62 @@ mod tests {
         }
     }
 
+    fn runtime_stage_table_bytes() -> Vec<u8> {
+        use sms_formats::{
+            JDramaDocument, JDramaField, JDramaFieldValue, JDramaRecord, JDramaRecordPayload,
+            SMS_AUTHORED_RUNTIME_CARRIER_AREAS,
+        };
+
+        let areas = (0_u8..55)
+            .map(|area_index| {
+                let archive_name = if SMS_AUTHORED_RUNTIME_CARRIER_AREAS.contains(&area_index) {
+                    "none.arc".to_string()
+                } else {
+                    format!("retail{area_index}.arc")
+                };
+                let scenario = JDramaRecord::new(
+                    "ScenarioArchiveName",
+                    format!("scenario {area_index} 0"),
+                    JDramaRecordPayload::Fields {
+                        fields: vec![JDramaField {
+                            name: "archive_name".to_string(),
+                            value: JDramaFieldValue::String(archive_name),
+                        }],
+                    },
+                )
+                .unwrap();
+                JDramaRecord::new(
+                    "ScenarioArchiveNameTable",
+                    format!("area {area_index}"),
+                    JDramaRecordPayload::Group {
+                        fields: Vec::new(),
+                        children: vec![scenario],
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+        let table = JDramaRecord::new(
+            "ScenarioArchiveNamesInStage",
+            "runtime stages",
+            JDramaRecordPayload::Group {
+                fields: Vec::new(),
+                children: areas,
+            },
+        )
+        .unwrap();
+        let root = JDramaRecord::new(
+            "NameRefGrp",
+            "root",
+            JDramaRecordPayload::Group {
+                fields: Vec::new(),
+                children: vec![table],
+            },
+        )
+        .unwrap();
+        JDramaDocument { root }.to_bytes().unwrap()
+    }
+
     fn file_hash(path: &Path) -> u64 {
         let mut hasher = DefaultHasher::new();
         fs::read(path).unwrap().hash(&mut hasher);
@@ -1678,6 +1866,63 @@ mod tests {
         )
         .unwrap_err();
         assert!(too_large.contains("does not fit"));
+    }
+
+    #[test]
+    fn project_runtime_table_adds_a_new_slot_to_the_run_mirror_and_direct_boot_resolution() {
+        let fixture = fixture();
+        let base_table_path = fixture.base_root.join("files/data/stageArc.bin");
+        let base_table = runtime_stage_table_bytes();
+        fs::write(&base_table_path, &base_table).unwrap();
+        assert_eq!(
+            read_effective_runtime_stage_table(&fixture.project).unwrap(),
+            base_table
+        );
+
+        let authored =
+            sms_formats::append_jdrama_scenario_archive_slot(&base_table, "myNewStage.arc")
+                .unwrap();
+        let project_table_path = fixture.data_root.join("files/data/stageArc.bin");
+        fs::create_dir_all(project_table_path.parent().unwrap()).unwrap();
+        fs::write(&project_table_path, &authored.bytes).unwrap();
+        assert_eq!(
+            read_effective_runtime_stage_table(&fixture.project).unwrap(),
+            authored.bytes
+        );
+
+        let virtual_source = fixture.base_root.join("files/data/scene/myNewStage.szs");
+        assert!(!virtual_source.exists());
+        let run = prepare_managed_run_mirror_from_source(
+            &fixture.project,
+            &fixture.base_root,
+            &virtual_source,
+            b"authored-new-stage",
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(run.run_root.join("files/data/stageArc.bin")).unwrap(),
+            authored.bytes
+        );
+        assert_eq!(fs::read(&base_table_path).unwrap(), base_table);
+        assert_eq!(
+            fs::read(&run.stage_output_path).unwrap(),
+            b"authored-new-stage"
+        );
+        assert!(
+            !virtual_source.exists(),
+            "extracted base must remain read-only"
+        );
+        let run_entries = parse_jdrama_scenario_archive_entries(
+            &fs::read(run.run_root.join("files/data/stageArc.bin")).unwrap(),
+        )
+        .unwrap();
+        let (target, contexts) =
+            resolve_runtime_stage_target(&run_entries, &run.source_relative_path).unwrap();
+        assert_eq!(contexts, 1);
+        assert_eq!(target.area_index, 17);
+        assert_eq!(target.scenario_index, 1);
+        assert_eq!(target.archive_name, "myNewStage.arc");
     }
 
     #[test]

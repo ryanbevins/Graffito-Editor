@@ -2741,6 +2741,36 @@ fn dirty_state_tracks_saved_object_content() {
 }
 
 #[test]
+fn object_edits_do_not_clear_unsaved_lighting_changes() {
+    let object = SceneObject::new("obj-1", "coin");
+    let mut app = SmsEditorApp {
+        document: Some(test_document(vec![object.clone()])),
+        saved_objects: vec![object],
+        ..SmsEditorApp::default()
+    };
+
+    app.document
+        .as_mut()
+        .unwrap()
+        .lighting
+        .ambients
+        .push(sms_formats::JDramaAmbient {
+            name: Some("Object ambient".to_string()),
+            color: [32, 48, 64, 255],
+        });
+    app.document_dirty = true;
+
+    app.mutate_document("Moved object", |document| {
+        document.objects[0].transform.translation[0] = 25.0;
+    });
+    app.undo();
+
+    assert!(app.is_dirty());
+    assert_eq!(app.document.as_ref().unwrap().objects, app.saved_objects);
+    assert_ne!(app.document.as_ref().unwrap().lighting, app.saved_lighting);
+}
+
+#[test]
 fn project_save_uses_the_same_trimmed_project_path_as_project_load() {
     let root = std::env::temp_dir().join(format!(
         "sms-editor-app-save-path-{}-{}",

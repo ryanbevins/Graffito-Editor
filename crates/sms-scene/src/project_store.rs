@@ -307,6 +307,23 @@ pub(super) fn load_project_overlay(
         });
     }
 
+    let relative_baseline = document.authored_stage_baseline_path()?;
+    let baseline_is_managed = manifest
+        .changed_files
+        .iter()
+        .any(|path| project_relative_key(path) == project_relative_key(&relative_baseline));
+    if baseline_is_managed {
+        let baseline_path = project_root.join("files").join(&relative_baseline);
+        let archive = super::SourceFreeStageArchive::from_semantic_json(&read_file_bounded(
+            &baseline_path,
+            MAX_PROJECT_STAGE_BASELINE_BYTES,
+        )?)?;
+        // The authored baseline is authoritative for object addresses and
+        // resource bytes. It must be validated and installed before the scene
+        // overlay is reattached.
+        document.replace_with_authored_archive(archive)?;
+    }
+
     let relative_overlay = document.editor_overlay_path()?;
     let overlay_is_managed = manifest
         .changed_files
@@ -323,7 +340,7 @@ pub(super) fn load_project_overlay(
             revision: manifest.revision,
             project_fingerprint,
         });
-        return Ok(false);
+        return Ok(baseline_is_managed);
     }
 
     let overlay_path = project_root.join("files").join(&relative_overlay);
@@ -361,8 +378,110 @@ pub(super) fn load_project_overlay(
     };
     document.objects = overlay.objects;
     document.archive_edits = overlay.archive_edits;
+    if let Some(lighting) = overlay.lighting {
+        document.lighting = lighting;
+    }
     document.loaded_project = Some(loaded_project);
     Ok(true)
+}
+
+pub(super) fn load_authored_stage_baseline(
+    base_root: &Path,
+    stage_id: &str,
+    project_root: &Path,
+) -> Result<Option<super::SourceFreeStageArchive>> {
+    super::validate_stage_id(stage_id)?;
+    let Some(manifest) = inspect_existing_project(project_root)? else {
+        return Ok(None);
+    };
+    let manifest_base = normalized_absolute_for_comparison(&manifest.base_path)?;
+    let document_base = normalized_absolute_for_comparison(base_root)?;
+    if manifest_base != document_base {
+        return Err(SceneError::ProjectBaseMismatch {
+            path: project_root.join("sms-project.toml"),
+            manifest_base: manifest.base_path,
+            open_base: base_root.to_path_buf(),
+        });
+    }
+
+    let relative_path = authored_stage_baseline_relative_path(stage_id);
+    if !manifest
+        .changed_files
+        .iter()
+        .any(|path| project_relative_key(path) == project_relative_key(&relative_path))
+    {
+        return Ok(None);
+    }
+    let archive = super::SourceFreeStageArchive::from_semantic_json(&read_file_bounded(
+        &project_root.join("files").join(relative_path),
+        MAX_PROJECT_STAGE_BASELINE_BYTES,
+    )?)?;
+    super::validate_authored_archive_target(&archive, stage_id)?;
+    Ok(Some(archive))
+}
+
+pub(super) fn discover_authored_stage_ids(project_root: &Path) -> Result<Vec<String>> {
+    let Some(manifest) = inspect_existing_project(project_root)? else {
+        return Ok(Vec::new());
+    };
+    let mut stage_ids = Vec::new();
+    for relative_path in &manifest.changed_files {
+        let Some(stage_id) = authored_stage_id_from_baseline_path(relative_path)? else {
+            continue;
+        };
+        let archive = super::SourceFreeStageArchive::from_semantic_json(&read_file_bounded(
+            &project_root.join("files").join(relative_path),
+            MAX_PROJECT_STAGE_BASELINE_BYTES,
+        )?)?;
+        super::validate_authored_archive_target(&archive, &stage_id)?;
+        stage_ids.push(stage_id);
+    }
+    stage_ids.sort_by_key(|stage_id| stage_id.to_ascii_lowercase());
+    stage_ids.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    Ok(stage_ids)
+}
+
+fn authored_stage_baseline_relative_path(stage_id: &str) -> PathBuf {
+    PathBuf::from("editor")
+        .join("stages")
+        .join(format!("{stage_id}.stage.json"))
+}
+
+fn authored_stage_id_from_baseline_path(path: &Path) -> Result<Option<String>> {
+    let components = path.components().collect::<Vec<_>>();
+    let [Component::Normal(editor), Component::Normal(stages), Component::Normal(file_name)] =
+        components.as_slice()
+    else {
+        return Ok(None);
+    };
+    let Some(editor) = editor.to_str() else {
+        return Err(SceneError::UnsupportedProjectManifest {
+            path: path.to_path_buf(),
+            reason: "authored stage path contains non-UTF-8 components".to_string(),
+        });
+    };
+    let Some(stages) = stages.to_str() else {
+        return Err(SceneError::UnsupportedProjectManifest {
+            path: path.to_path_buf(),
+            reason: "authored stage path contains non-UTF-8 components".to_string(),
+        });
+    };
+    if !editor.eq_ignore_ascii_case("editor") || !stages.eq_ignore_ascii_case("stages") {
+        return Ok(None);
+    }
+    let Some(file_name) = file_name.to_str() else {
+        return Err(SceneError::UnsupportedProjectManifest {
+            path: path.to_path_buf(),
+            reason: "authored stage filename is not valid UTF-8".to_string(),
+        });
+    };
+    let lowercase = file_name.to_ascii_lowercase();
+    let Some(prefix_len) = lowercase.strip_suffix(".stage.json").map(str::len) else {
+        return Ok(None);
+    };
+    let stage_id = file_name[..prefix_len].to_string();
+    super::validate_stage_id(&stage_id)?;
+    Ok(Some(stage_id))
 }
 
 fn reattach_overlay_source_records(
@@ -507,6 +626,7 @@ enum ProjectEntryFingerprint {
 }
 
 const MAX_PROJECT_OVERLAY_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PROJECT_STAGE_BASELINE_BYTES: u64 = 512 * 1024 * 1024;
 
 fn snapshot_project_root(project_root: &Path) -> Result<ProjectSnapshot> {
     let root_metadata = match fs::symlink_metadata(project_root) {

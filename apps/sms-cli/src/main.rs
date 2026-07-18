@@ -6,22 +6,20 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use sms_authoring::{
-    import_model, merge_model_instances, CollisionDocument, CollisionGroup, CollisionImportOptions,
-    CollisionNodeSelection, CollisionSource, CollisionSurface, ImportedAlphaMode,
-    ModelAssetCatalog, ModelAssetDocument, ModelImportOptions, ModelInstanceExportMode,
-    ModelInstancePlacement, ModelMaterial, ModelMesh, ModelNode, ModelPrimitive, NodePurpose,
-    ResolvedModelInstance, SourcePbrMetadata, TargetLoaderProfile,
+    built_in_blank_stage_proxy, import_model, merge_model_instances, CollisionImportOptions,
+    CollisionNodeSelection, CollisionSource, ModelAssetCatalog, ModelAssetDocument,
+    ModelImportOptions, ModelInstanceExportMode, ModelInstancePlacement, ResolvedModelInstance,
+    TargetLoaderProfile,
 };
 use sms_formats::{
-    discover_scene_archives, parse_jdrama_scenario_archive_entries, read_stage_asset_bytes,
-    validate_materials_for_loader, GxDiagnosticSeverity, J3dFile, J3dTriangle, JDramaDocument,
-    JDramaField, JDramaFieldValue, JDramaLightMap, JDramaRecord, JDramaRecordPayload,
-    JDramaTransform, StageAssetKind,
+    discover_scene_archives, read_stage_asset_bytes, validate_materials_for_loader,
+    GxDiagnosticSeverity, J3dFile, J3dTriangle, JDramaDocument, JDramaField, JDramaFieldValue,
+    JDramaLightMap, JDramaRecord, JDramaRecordPayload, JDramaTransform, StageAssetKind,
 };
 use sms_scene::{
     BlankStageBootstrapManifest, BlankStageBootstrapResource, BlankStagePreset,
     SourceFreeStageArchive, StageDocument, StageResourceDocument,
-    BLANK_STAGE_BOOTSTRAP_REQUIREMENTS, DEFAULT_BLANK_STAGE_TARGET_SLOT,
+    BLANK_STAGE_BOOTSTRAP_REQUIREMENTS,
 };
 use sms_schema::SchemaGenerator;
 
@@ -128,24 +126,26 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         acknowledge_warnings: bool,
     },
-    /// Build a source-free external Yaz0 stage archive for an existing stage slot.
+    /// Build an empty source-free stage archive for a new authored runtime id.
     CreateBlankStage {
-        /// Extracted base root, used to verify the target mapping and no-write boundary.
+        /// Extracted base root, used only to enforce the no-write boundary.
         #[arg(long)]
         base_root: PathBuf,
-        /// Native world model asset with collision.
-        #[arg(long)]
-        asset: PathBuf,
-        /// Optional authored proxy asset. When omitted, small source-free built-in proxies are generated.
-        #[arg(long)]
-        proxy_asset: Option<PathBuf>,
-        #[arg(long, default_value = DEFAULT_BLANK_STAGE_TARGET_SLOT)]
-        target_slot: String,
+        /// New stage archive id. The managed release must author its stageArc.bin mapping.
+        #[arg(long = "stage-id", alias = "target-slot")]
+        stage_id: String,
         /// New external `.szs` output. Existing files are never replaced.
         #[arg(long)]
         out: PathBuf,
-        #[arg(long, default_value_t = false)]
-        acknowledge_warnings: bool,
+    },
+    /// Upgrade one project-owned authored stage to the current runtime shell.
+    UpgradeAuthoredProjectStage {
+        #[arg(long)]
+        base_root: PathBuf,
+        #[arg(long)]
+        project_root: PathBuf,
+        #[arg(long)]
+        stage: String,
     },
     /// Extract a disc image with nodtool.
     Extract {
@@ -433,19 +433,39 @@ fn main() -> Result<()> {
         ),
         Commands::CreateBlankStage {
             base_root,
-            asset,
-            proxy_asset,
-            target_slot,
+            stage_id,
             out,
-            acknowledge_warnings,
-        } => create_blank_stage_command(
+        } => create_blank_stage_command(base_root, stage_id, out),
+        Commands::UpgradeAuthoredProjectStage {
             base_root,
-            asset,
-            proxy_asset,
-            target_slot,
-            out,
-            acknowledge_warnings,
-        ),
+            project_root,
+            stage,
+        } => {
+            let mut document =
+                StageDocument::open_authored_project_stage(base_root, &stage, &project_root)
+                    .with_context(|| format!("open authored project stage '{stage}'"))?;
+            let outcome = document
+                .save_project_folder(&project_root)
+                .with_context(|| format!("save upgraded authored project stage '{stage}'"))?;
+            for warning in &outcome.warnings {
+                eprintln!(
+                    "save warning (recovery path {}): {}",
+                    warning.recovery_path.display(),
+                    warning.message
+                );
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "stage": stage,
+                    "project_root": project_root,
+                    "preset_version": sms_scene::BLANK_STAGE_PRESET_VERSION,
+                    "runtime_shell_upgraded": true,
+                    "project_revision": outcome.manifest.revision,
+                })
+            );
+            Ok(())
+        }
         Commands::Extract {
             image,
             out,
@@ -998,65 +1018,20 @@ fn validate_stock_replacement_command(
     Ok(())
 }
 
-fn create_blank_stage_command(
-    base_root: PathBuf,
-    asset_path: PathBuf,
-    proxy_asset_path: Option<PathBuf>,
-    target_slot: String,
-    out: PathBuf,
-    acknowledge_warnings: bool,
-) -> Result<()> {
-    if !target_slot_is_mapped(&base_root, &target_slot)? {
-        bail!(
-            "target slot {target_slot:?} is not present in stageArc.bin under {}",
-            base_root.display()
-        );
-    }
-    let world = load_model_asset(&asset_path)?;
-    require_acknowledged_diagnostics(&world, acknowledge_warnings)?;
-    let proxy = proxy_asset_path
-        .as_ref()
-        .map(|proxy_path| load_model_asset(proxy_path))
-        .transpose()?;
-    if let Some(proxy) = &proxy {
-        require_acknowledged_diagnostics(proxy, acknowledge_warnings)?;
-    }
-
-    let world_model = world.compile_bmd_document()?;
-    let world_collision = world
-        .collision
-        .as_ref()
-        .context("blank-stage world asset must contain collision")?
-        .to_col_file()?;
-    let shared_proxy_bmd = proxy
-        .as_ref()
-        .map(ModelAssetDocument::compile_bmd)
-        .transpose()?;
-    let shared_proxy_col = match &proxy {
-        Some(proxy) => Some(
-            proxy
-                .collision
-                .as_ref()
-                .context("blank-stage proxy asset must contain NormalBlock collision")?
-                .to_col_bytes()?,
-        ),
-        None => None,
-    };
+fn create_blank_stage_command(base_root: PathBuf, stage_id: String, out: PathBuf) -> Result<()> {
     let bootstrap_resources = BLANK_STAGE_BOOTSTRAP_REQUIREMENTS
         .map(|requirement| -> Result<BlankStageBootstrapResource> {
             let bytes = match requirement.kind {
-                sms_scene::BlankStageBootstrapKind::Model => match &shared_proxy_bmd {
-                    Some(bytes) => bytes.clone(),
-                    None => built_in_blank_stage_proxy(requirement.raw_path).compile_bmd()?,
-                },
-                sms_scene::BlankStageBootstrapKind::Collision => match &shared_proxy_col {
-                    Some(bytes) => bytes.clone(),
-                    None => built_in_blank_stage_proxy(requirement.raw_path)
+                sms_scene::BlankStageBootstrapKind::Model => {
+                    built_in_blank_stage_proxy(requirement.raw_path).compile_bmd()?
+                }
+                sms_scene::BlankStageBootstrapKind::Collision => {
+                    built_in_blank_stage_proxy(requirement.raw_path)
                         .collision
                         .as_ref()
                         .expect("the built-in bootstrap proxy always has collision")
-                        .to_col_bytes()?,
-                },
+                        .to_col_bytes()?
+                }
             };
             Ok(BlankStageBootstrapResource {
                 raw_path: requirement.raw_path.to_vec(),
@@ -1067,11 +1042,11 @@ fn create_blank_stage_command(
         .collect::<Result<Vec<_>>>()?;
     let bootstrap = BlankStageBootstrapManifest::from_authored_bytes(bootstrap_resources)?;
     let preset = BlankStagePreset {
-        target_slot: target_slot.clone(),
+        target_slot: stage_id.clone(),
         ..BlankStagePreset::default()
     };
     let metadata = preset.target_metadata()?;
-    let archive = preset.build(world_model, world_collision, bootstrap)?;
+    let archive = preset.build(bootstrap)?;
     let encoded = archive.encode()?;
     let declared_size = yaz0_declared_size(&encoded)
         .context("blank-stage output did not encode as a canonical Yaz0 stream")?;
@@ -1084,15 +1059,19 @@ fn create_blank_stage_command(
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
-            "world_asset": asset_path,
-            "proxy_asset": proxy_asset_path,
-            "proxy_source": if proxy.is_some() { "native_asset" } else { "built_in_authored" },
+            "stage_id": stage_id,
+            "world_content": "empty_scene_authoring_baseline",
+            "mario_placement": "not_authored",
+            "skybox": "not_authored",
+            "lighting": "neutral_editable_runtime_baseline",
+            "bootstrap_source": "built_in_authored",
             "output": output,
             "target": metadata,
             "size_bytes": encoded.len(),
             "decompressed_size_bytes": declared_size,
             "compression": "yaz0",
             "semantic_reopen_stable": true,
+            "stage_table_entry_required": true,
             "retail_assets_copied": false,
             "base_game_modified": false,
         }))?
@@ -1114,134 +1093,11 @@ fn validate_blank_stage_rarc_size(declared_size: u32) -> Result<()> {
     const BLANK_STAGE_RARC_SAFETY_BUDGET: u32 = 12 * 1024 * 1024;
     if declared_size > BLANK_STAGE_RARC_SAFETY_BUDGET {
         bail!(
-            "blank-stage RARC expands to {declared_size} bytes, exceeding the editor's {}-byte safety budget for Sunshine's 24 MiB MEM1; use smaller world/proxy models",
+            "blank-stage RARC expands to {declared_size} bytes, exceeding the editor's {}-byte safety budget for Sunshine's 24 MiB MEM1; reduce the authored bootstrap resources",
             BLANK_STAGE_RARC_SAFETY_BUDGET
         );
     }
     Ok(())
-}
-
-fn built_in_blank_stage_proxy(raw_path: &[u8]) -> ModelAssetDocument {
-    let (name, color) = match raw_path {
-        b"mapobj/coin.bmd" => ("coin_proxy", [255, 214, 54, 255]),
-        b"mapobj/bottle_large.bmd" => ("bottle_proxy", [80, 176, 255, 255]),
-        b"mapobj/juiceblock.bmd" => ("juice_block_proxy", [255, 145, 45, 255]),
-        b"mapobj/normalblock.bmd" | b"mapobj/normalblock.col" => {
-            ("normal_block_proxy", [188, 188, 196, 255])
-        }
-        _ => ("bootstrap_proxy", [220, 80, 220, 255]),
-    };
-    let positions = vec![
-        [-50.0, -50.0, -50.0],
-        [50.0, -50.0, -50.0],
-        [50.0, -50.0, 50.0],
-        [-50.0, -50.0, 50.0],
-        [-50.0, 50.0, -50.0],
-        [50.0, 50.0, -50.0],
-        [50.0, 50.0, 50.0],
-        [-50.0, 50.0, 50.0],
-    ];
-    let normal = 0.577_350_26;
-    let normals = vec![
-        [-normal, -normal, -normal],
-        [normal, -normal, -normal],
-        [normal, -normal, normal],
-        [-normal, -normal, normal],
-        [-normal, normal, -normal],
-        [normal, normal, -normal],
-        [normal, normal, normal],
-        [-normal, normal, normal],
-    ];
-    let triangles = vec![
-        [0, 1, 2],
-        [0, 2, 3],
-        [4, 6, 5],
-        [4, 7, 6],
-        [0, 5, 1],
-        [0, 4, 5],
-        [1, 6, 2],
-        [1, 5, 6],
-        [2, 7, 3],
-        [2, 6, 7],
-        [3, 4, 0],
-        [3, 7, 4],
-    ];
-    let mut gx = sms_formats::GxMaterial {
-        name: format!("{name}_material"),
-        cull_mode: 2,
-        color_channel_count: 1,
-        material_colors: [Some(color), None],
-        color_channels: [
-            Some(sms_formats::GxColorChannel::default()),
-            Some(sms_formats::GxColorChannel::default()),
-            None,
-            None,
-        ],
-        ..sms_formats::GxMaterial::default()
-    };
-    gx.tev_orders[0] = Some(sms_formats::GxTevOrder {
-        tex_coord: None,
-        tex_map: None,
-        color_channel: 4,
-    });
-    if let Some(stage) = &mut gx.tev_stages[0] {
-        stage.color_inputs = [10, 15, 15, 15];
-        stage.alpha_inputs = [5, 7, 7, 7];
-    }
-
-    let mut asset = ModelAssetDocument::new(name);
-    asset.scene_roots = vec![0];
-    asset.nodes.push(ModelNode {
-        name: "root".to_string(),
-        parent: None,
-        children: Vec::new(),
-        mesh: Some(0),
-        purpose: NodePurpose::Render,
-        local_transform: [
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ],
-    });
-    asset.meshes.push(ModelMesh {
-        name: "proxy_cube".to_string(),
-        primitives: vec![ModelPrimitive {
-            positions: positions.clone(),
-            normals,
-            tangents: Vec::new(),
-            tex_coords: Vec::new(),
-            colors: Vec::new(),
-            indices: triangles.iter().flatten().copied().collect(),
-            material: Some(0),
-        }],
-    });
-    asset.materials.push(ModelMaterial {
-        gx,
-        source_base_color: color.map(|channel| f32::from(channel) / 255.0),
-        base_color_texture: None,
-        vertex_color_set: None,
-        source_double_sided: false,
-        source_alpha_mode: ImportedAlphaMode::Opaque,
-        source_pbr: SourcePbrMetadata {
-            metallic_factor: 0.0,
-            roughness_factor: 1.0,
-            has_metallic_roughness_texture: false,
-            has_normal_texture: false,
-            has_occlusion_texture: false,
-            emissive_factor: [0.0; 3],
-            has_emissive_texture: false,
-        },
-    });
-    asset.collision = Some(CollisionDocument {
-        vertices: positions,
-        groups: vec![CollisionGroup {
-            name: "proxy_collision".to_string(),
-            surface: CollisionSurface::default(),
-            triangles,
-        }],
-    });
-    asset
 }
 
 fn load_model_asset(path: &std::path::Path) -> Result<ModelAssetDocument> {
@@ -1344,6 +1200,7 @@ fn project_stage_edits_with_models(
     let mut assets = BTreeMap::<sms_authoring::AssetId, ModelAssetDocument>::new();
     let mut separate = Vec::new();
     let mut map_terrain = Vec::new();
+    let mut skybox = Vec::new();
     for instance in instances {
         let asset = if let Some(asset) = assets.get(&instance.placement.asset_id) {
             asset.clone()
@@ -1378,6 +1235,7 @@ fn project_stage_edits_with_models(
         match resolved.placement.export_mode {
             ModelInstanceExportMode::SeparateRuntimeObject => separate.push(resolved),
             ModelInstanceExportMode::MapTerrain => map_terrain.push(resolved),
+            ModelInstanceExportMode::Skybox => skybox.push(resolved),
             ModelInstanceExportMode::StockMapObjBase => {
                 let selected = resolved.placement.stock_map_obj_resource.trim();
                 let detail = if selected.is_empty() {
@@ -1457,6 +1315,41 @@ fn project_stage_edits_with_models(
     if !map_terrain.is_empty() {
         let merged = merge_model_instances("AuthoredMapTerrain", &map_terrain)?;
         edits.replace_model(b"map/map/map.bmd".to_vec(), merged.compile_bmd_document()?);
+    }
+
+    if skybox.len() > 1 {
+        bail!(
+            "stage export has {} authored skybox instances; Sunshine resolves one map/map/sky.bmd",
+            skybox.len()
+        );
+    }
+    if let Some(resolved) = skybox.first() {
+        edits.upsert_model(
+            b"map/map/sky.bmd".to_vec(),
+            resolved.asset.compile_bmd_document()?,
+        );
+        let archive = archive.context(
+            "skybox export requires the open source-free stage archive so the typed Sky actor can be verified",
+        )?;
+        let has_sky_actor = archive.object_placements().iter().any(|placement| {
+            placement
+                .type_name
+                .rsplit("::")
+                .next()
+                .is_some_and(|type_name| type_name == "Sky")
+        });
+        if !has_sky_actor {
+            let sky_group = archive
+                .find_group_record_path(b"map/scene.bin", "IdxGroup", Some(1))?
+                .context("map/scene.bin has no unambiguous IdxGroup 1 sky group")?;
+            edits.insert_placement(
+                b"map/scene.bin".to_vec(),
+                sky_group,
+                sms_scene::blank_stage_sky_record(cli_runtime_transform(
+                    resolved.placement.transform,
+                )?)?,
+            );
+        }
     }
 
     let collision_instances = separate
@@ -1603,52 +1496,6 @@ fn parse_u32_auto(value: &str) -> std::result::Result<u32, String> {
     } else {
         value.parse::<u32>().map_err(|error| error.to_string())
     }
-}
-
-fn target_slot_is_mapped(base_root: &std::path::Path, target_slot: &str) -> Result<bool> {
-    let candidate_directories = [
-        base_root.join("files/data"),
-        base_root.join("data"),
-        base_root.to_path_buf(),
-    ];
-    let mut stage_arc = None;
-    for directory in candidate_directories {
-        if !directory.is_dir() {
-            continue;
-        }
-        stage_arc = std::fs::read_dir(&directory)?
-            .filter_map(std::result::Result::ok)
-            .find(|entry| {
-                entry.path().is_file()
-                    && entry
-                        .file_name()
-                        .to_string_lossy()
-                        .eq_ignore_ascii_case("stageArc.bin")
-            })
-            .map(|entry| entry.path());
-        if stage_arc.is_some() {
-            break;
-        }
-    }
-    let stage_arc = stage_arc.with_context(|| {
-        format!(
-            "could not locate data/stageArc.bin under {}",
-            base_root.display()
-        )
-    })?;
-    let bytes = std::fs::read(&stage_arc)
-        .with_context(|| format!("read stage mapping {}", stage_arc.display()))?;
-    let entries = parse_jdrama_scenario_archive_entries(&bytes)
-        .with_context(|| format!("parse stage mapping {}", stage_arc.display()))?;
-    Ok(entries.iter().any(|entry| {
-        let name = entry.archive_name.replace('\\', "/");
-        let file_name = name.rsplit('/').next().unwrap_or(&name);
-        let stem = file_name
-            .strip_suffix(".szs")
-            .or_else(|| file_name.strip_suffix(".arc"))
-            .unwrap_or(file_name);
-        stem.eq_ignore_ascii_case(target_slot)
-    }))
 }
 
 fn write_create_new_external_synced(
@@ -2165,6 +2012,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn blank_stage_cli_authors_a_new_empty_id_without_retail_mapping_or_content_inputs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let base_root = temporary.path().join("base");
+        std::fs::create_dir_all(&base_root).unwrap();
+        let output = temporary.path().join("custom_stage0.szs");
+
+        create_blank_stage_command(base_root, "custom_stage0".to_string(), output.clone()).unwrap();
+
+        let encoded = std::fs::read(output).unwrap();
+        let archive = SourceFreeStageArchive::parse(&encoded).unwrap();
+        assert_eq!(archive.encode().unwrap(), encoded);
+        assert!(archive.resource(b"map/map/map.bmd").is_some());
+        assert!(archive.resource(b"map/map.col").is_some());
+        assert!(archive
+            .object_placements()
+            .iter()
+            .all(|placement| !matches!(placement.type_name.as_str(), "Mario" | "Sky")));
+    }
+
+    #[test]
+    fn blank_stage_cli_help_surface_requires_only_base_id_and_output() {
+        let parsed = Args::try_parse_from([
+            "sms-cli",
+            "create-blank-stage",
+            "--base-root",
+            "base",
+            "--stage-id",
+            "custom_stage0",
+            "--out",
+            "custom_stage0.szs",
+        ])
+        .unwrap();
+        let Commands::CreateBlankStage {
+            base_root,
+            stage_id,
+            out,
+        } = parsed.command
+        else {
+            panic!("wrong command parsed")
+        };
+        assert_eq!(base_root, PathBuf::from("base"));
+        assert_eq!(stage_id, "custom_stage0");
+        assert_eq!(out, PathBuf::from("custom_stage0.szs"));
+    }
+
+    #[test]
     fn built_in_blank_stage_proxies_are_small_deterministic_and_reparseable() {
         let mut model_sizes = Vec::new();
         for requirement in BLANK_STAGE_BOOTSTRAP_REQUIREMENTS {
@@ -2574,6 +2467,32 @@ mod tests {
             } if base_root == std::path::Path::new("base")
                 && stage == "dolpic0"
                 && out == std::path::Path::new("mod/dolpic0.szs")
+        ));
+    }
+
+    #[test]
+    fn authored_project_stage_upgrade_requires_explicit_project_identity() {
+        let args = Args::try_parse_from([
+            "sms-cli",
+            "upgrade-authored-project-stage",
+            "--base-root",
+            "base",
+            "--project-root",
+            "project",
+            "--stage",
+            "test01",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            args.command,
+            Commands::UpgradeAuthoredProjectStage {
+                base_root,
+                project_root,
+                stage,
+            } if base_root == std::path::Path::new("base")
+                && project_root == std::path::Path::new("project")
+                && stage == "test01"
         ));
     }
 

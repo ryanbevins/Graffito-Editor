@@ -55,12 +55,14 @@ pub use j3d_anim_rebuild::*;
 pub use j3d_rebuild::*;
 pub use j3d_static::*;
 pub use jdrama::{
-    effective_npc_parts_mask, encode_jdrama_document, jdrama_key_code, parse_jdrama_document,
-    parse_jdrama_object_records, parse_jdrama_scenario_archive_entries, JDramaAmbient,
-    JDramaCubeGeneralInfo, JDramaDocument, JDramaField, JDramaFieldValue, JDramaLight,
-    JDramaLightMap, JDramaLightMapEntry, JDramaMapEventBuilding, JDramaMapEventSinkParams,
-    JDramaNpcParams, JDramaObjectRecord, JDramaRecord, JDramaRecordPayload,
-    JDramaScenarioArchiveEntry, JDramaTransform,
+    append_jdrama_scenario_archive_slot, effective_npc_parts_mask, encode_jdrama_document,
+    ensure_jdrama_scenario_archive_slot, jdrama_key_code, parse_jdrama_document,
+    parse_jdrama_object_records, parse_jdrama_scenario_archive_areas,
+    parse_jdrama_scenario_archive_entries, JDramaAmbient, JDramaCubeGeneralInfo, JDramaDocument,
+    JDramaField, JDramaFieldValue, JDramaLight, JDramaLightMap, JDramaLightMapEntry,
+    JDramaMapEventBuilding, JDramaMapEventSinkParams, JDramaNpcParams, JDramaObjectRecord,
+    JDramaRecord, JDramaRecordPayload, JDramaScenarioArchiveArea, JDramaScenarioArchiveEntry,
+    JDramaScenarioArchiveWriteOutcome, JDramaTransform, SMS_AUTHORED_RUNTIME_CARRIER_AREAS,
 };
 pub use jpa::{
     JpaBaseShape, JpaChildShape, JpaColorAnimation, JpaColorKey, JpaEffect, JpaEmitter,
@@ -77,7 +79,7 @@ pub use rarc::{
 pub use raw::{RawFile, RawFormat};
 pub use stage_assets::{
     discover_scene_archives, extract_archive_file, mount_scene_archive, read_stage_asset_bytes,
-    scan_stage_assets, SceneArchiveInfo, StageAsset, StageAssetKind,
+    scan_common_stage_assets, scan_stage_assets, SceneArchiveInfo, StageAsset, StageAssetKind,
 };
 pub use stage_misc::*;
 pub use yaz0::{decode_yaz0, encode_yaz0, encode_yaz0_with_reserved, Yaz0Document, Yaz0File};

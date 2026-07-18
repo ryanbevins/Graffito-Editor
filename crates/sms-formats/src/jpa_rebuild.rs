@@ -268,6 +268,97 @@ pub struct JpaxTextureImage {
 }
 
 impl JpaxDocument {
+    /// Builds a complete source-free effect that registers safely but emits no
+    /// particles. This is useful for runtime-required effect slots whose
+    /// visual effect is intentionally absent from authored content.
+    pub fn authored_noop() -> Self {
+        Self {
+            blocks: vec![
+                JpaxBlock::Dynamics(JpaxDynamicsBlock {
+                    scale: [1.0; 3],
+                    translation: [0.0; 3],
+                    rotation: [0; 3],
+                    volume_type: 0,
+                    emit_interval: 0,
+                    volume_subdivision: 1,
+                    spawn_rate: 0.0,
+                    spawn_rate_random: 0,
+                    max_frame: 0,
+                    start_frame: 0,
+                    volume_size: 0,
+                    volume_yaw_sweep: 0,
+                    volume_min_radius: 0,
+                    base_lifetime: 1,
+                    lifetime_random: 0,
+                    base_weight: 0,
+                    weight_random: 0,
+                    initial_velocity_random: 0,
+                    momentum_random: 0,
+                    base_air_resistance: 0,
+                    air_resistance_random: 0,
+                    initial_velocity: [0.0; 4],
+                    initial_moment: 0.0,
+                    // The runtime normalizes this vector even when the spawn
+                    // rate is zero, so it must remain nonzero.
+                    direction: [0, 0, i16::MAX],
+                    direction_spread: 0,
+                    emit_flags: 0,
+                    keyframe_mask: 0,
+                }),
+                JpaxBlock::BaseShape(JpaxBaseShapeBlock {
+                    allocation_size: 0xa0,
+                    parameter_offsets: [0; 6],
+                    texture_indices_offset: 0,
+                    primary_colors_offset: 0,
+                    environment_colors_offset: 0,
+                    base_size_y: 0.0,
+                    base_size_x: 0.0,
+                    loop_offset: 0,
+                    color_animation_flags: 0,
+                    texture_animation_flags: 0,
+                    particle_type: 0,
+                    direction_type: 0,
+                    rotation_type: 0,
+                    color_combine_mode: 0,
+                    alpha_combine_mode: 0,
+                    reserved_32_34: [0; 3],
+                    blend_mode: 0,
+                    source_blend_factor: 0,
+                    destination_blend_factor: 0,
+                    blend_operation: 0,
+                    alpha_compare_0: 0,
+                    alpha_reference_0: 0,
+                    alpha_operation: 0,
+                    alpha_compare_1: 0,
+                    alpha_reference_1: 0,
+                    z_compare_location_flags: 0,
+                    z_compare_enable: 0,
+                    z_compare_function: 0,
+                    z_update_enable: 0,
+                    draw_flags_42: 0,
+                    draw_flags_43: 0,
+                    shape_flags: 0,
+                    texture_key_flags: 0,
+                    texture_animation_mode: 0,
+                    texture_index: 0,
+                    color_animation_max_frame: 0,
+                    color_animation_mode: 0,
+                    primary_color_flags: 0,
+                    environment_color_flags: 0,
+                    primary_color: [0; 4],
+                    environment_color: [0; 4],
+                    texture_transform: [0; 11],
+                    texture_animation_random_mask: 0,
+                    texture_indices: Vec::new(),
+                    primary_colors: Vec::new(),
+                    environment_colors: Vec::new(),
+                }),
+            ],
+            layout: JpaxLayout::Standard,
+            trailing_zero_padding: 0,
+        }
+    }
+
     pub fn parse(bytes: impl AsRef<[u8]>) -> Result<Self> {
         let bytes = bytes.as_ref();
         require_len(FORMAT, bytes, HEADER_SIZE)?;
@@ -1573,6 +1664,17 @@ mod tests {
             panic!("expected dynamics block");
         };
         assert_eq!(dynamics.scale[0], 2.5);
+    }
+
+    #[test]
+    fn authored_noop_effect_is_complete_deterministic_and_source_free() {
+        let document = JpaxDocument::authored_noop();
+        let first = document.encode().unwrap();
+        let second = document.encode().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(JpaxDocument::parse(&first).unwrap(), document);
+        assert!(matches!(document.blocks[0], JpaxBlock::Dynamics(_)));
+        assert!(matches!(document.blocks[1], JpaxBlock::BaseShape(_)));
     }
 
     #[test]

@@ -259,6 +259,25 @@ impl SourceFreeStageArchive {
             .map(|resource| &mut resource.document)
     }
 
+    /// Rebuilds one semantic child resource without encoding the surrounding
+    /// RARC/Yaz0 container. This is the detached-archive equivalent of reading
+    /// an `archive.szs!/path` asset and never consults the imported source file.
+    pub fn resource_bytes(&self, raw_path: &[u8]) -> Result<Option<Vec<u8>>> {
+        let Some(resource) = self
+            .resources
+            .iter()
+            .find(|resource| resource.raw_path == raw_path)
+        else {
+            return Ok(None);
+        };
+        encode_resource(&resource.document)
+            .map(Some)
+            .map_err(|source| SceneError::StageResource {
+                path: display_raw_path(&resource.raw_path),
+                source,
+            })
+    }
+
     /// Inserts a typed resource and any missing RARC directories as one
     /// transaction. Existing semantic resources are regenerated only in a
     /// temporary builder; the committed container remains payload-free.

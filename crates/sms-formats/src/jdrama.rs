@@ -63,6 +63,37 @@ pub struct JDramaScenarioArchiveEntry {
     pub archive_name: String,
 }
 
+/// One outer runtime area from `stageArc.bin`, including reserved empty
+/// carriers whose scenario zero points at `none.arc`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JDramaScenarioArchiveArea {
+    pub area_index: u32,
+    pub name: String,
+    pub archive_names: Vec<String>,
+}
+
+/// Result of authoring one runtime stage slot into `stageArc.bin`.
+///
+/// Sunshine stores its runtime stage registry as a nested JDrama tree. The
+/// executable has several fixed 61-element area tables, so authored slots use
+/// scenarios in decomp-verified reserved carrier areas and never grow the
+/// outer area array.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JDramaScenarioArchiveWriteOutcome {
+    pub bytes: Vec<u8>,
+    pub entry: JDramaScenarioArchiveEntry,
+    /// `false` only when [`ensure_jdrama_scenario_archive_slot`] found the
+    /// exact, unique mapping already present and returned the input unchanged.
+    pub inserted: bool,
+}
+
+/// Runtime areas reserved by retail as a single `none.arc` scenario.
+///
+/// `shineStageTable` in the neighboring decomp covers only areas 0 through 60;
+/// these four carriers are within that bound, map to a valid shine stage, are
+/// outside the extra-stage range, and have no area-specific setup behavior.
+pub const SMS_AUTHORED_RUNTIME_CARRIER_AREAS: [u8; 4] = [17, 18, 53, 54];
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct JDramaCubeGeneralInfo {
     pub center: [f32; 3],
@@ -1883,6 +1914,411 @@ pub fn parse_jdrama_scenario_archive_entries(
     })
 }
 
+/// Parses the complete outer runtime table, retaining empty/reserved areas
+/// which the flat entry parser necessarily omits.
+pub fn parse_jdrama_scenario_archive_areas(bytes: &[u8]) -> Result<Vec<JDramaScenarioArchiveArea>> {
+    let document = JDramaDocument::parse(bytes)?;
+    let mut table_paths = Vec::new();
+    collect_scenario_archive_table_paths(&document.root, &mut Vec::new(), &mut table_paths);
+    if table_paths.len() != 1 {
+        return Err(FormatError::Unsupported {
+            format: FORMAT,
+            message: format!(
+                "expected exactly one ScenarioArchiveNamesInStage table, found {}",
+                table_paths.len()
+            ),
+        });
+    }
+    let table = jdrama_record_at_path(&document.root, &table_paths[0]).ok_or_else(|| {
+        FormatError::Unsupported {
+            format: FORMAT,
+            message: "runtime scenario archive table path became invalid".to_string(),
+        }
+    })?;
+    let JDramaRecordPayload::Group {
+        children: area_records,
+        ..
+    } = &table.payload
+    else {
+        return Err(FormatError::Unsupported {
+            format: FORMAT,
+            message: "ScenarioArchiveNamesInStage is not a JDrama group".to_string(),
+        });
+    };
+    area_records
+        .iter()
+        .enumerate()
+        .map(|(area_index, area)| {
+            if semantic_type_name(&area.type_name) != "ScenarioArchiveNameTable" {
+                return Err(FormatError::Unsupported {
+                    format: FORMAT,
+                    message: format!(
+                        "runtime area {area_index} has unexpected type {:?}",
+                        area.type_name
+                    ),
+                });
+            }
+            let JDramaRecordPayload::Group { children, .. } = &area.payload else {
+                return Err(FormatError::Unsupported {
+                    format: FORMAT,
+                    message: format!("runtime area {area_index} is not a JDrama group"),
+                });
+            };
+            let archive_names = children
+                .iter()
+                .enumerate()
+                .map(|(scenario_index, scenario)| {
+                    scenario_archive_name(scenario)
+                        .map(str::to_owned)
+                        .ok_or_else(|| FormatError::Unsupported {
+                            format: FORMAT,
+                            message: format!(
+                                "runtime area {area_index} scenario {scenario_index} is not a ScenarioArchiveName record"
+                            ),
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(JDramaScenarioArchiveArea {
+                area_index: area_index as u32,
+                name: area.name.clone(),
+                archive_names,
+            })
+        })
+        .collect()
+}
+
+/// Appends a genuinely new runtime scenario to a reserved carrier area in
+/// `stageArc.bin`.
+///
+/// Existing areas and scenarios are rebuilt byte-for-byte through the typed
+/// JDrama document. The outer area array is never enlarged: the retail
+/// executable indexes several fixed 61-element tables by area without bounds
+/// checks. Each carrier retains scenario zero (`none.arc`) and supplies
+/// scenarios 1 through 255 for authored stages.
+pub fn append_jdrama_scenario_archive_slot(
+    bytes: &[u8],
+    archive_name: &str,
+) -> Result<JDramaScenarioArchiveWriteOutcome> {
+    author_jdrama_scenario_archive_slot(bytes, archive_name, false)
+}
+
+/// Ensures that a unique authored runtime slot exists for `archive_name`.
+///
+/// This is the idempotent form used when reconciling managed build output. If
+/// exactly one matching archive is already present in a reserved carrier, the
+/// original bytes are returned unchanged. Retail or ambiguous duplicate
+/// mappings are rejected.
+pub fn ensure_jdrama_scenario_archive_slot(
+    bytes: &[u8],
+    archive_name: &str,
+) -> Result<JDramaScenarioArchiveWriteOutcome> {
+    author_jdrama_scenario_archive_slot(bytes, archive_name, true)
+}
+
+fn author_jdrama_scenario_archive_slot(
+    bytes: &[u8],
+    archive_name: &str,
+    allow_existing: bool,
+) -> Result<JDramaScenarioArchiveWriteOutcome> {
+    let requested_stem = validate_authored_runtime_archive_name(archive_name)?;
+    let existing = parse_jdrama_scenario_archive_entries(bytes)?;
+    let matching = existing
+        .iter()
+        .filter(|entry| {
+            runtime_archive_stem(&entry.archive_name)
+                .is_some_and(|stem| stem.eq_ignore_ascii_case(requested_stem))
+        })
+        .collect::<Vec<_>>();
+    let mut document = JDramaDocument::parse(bytes)?;
+    let mut table_paths = Vec::new();
+    collect_scenario_archive_table_paths(&document.root, &mut Vec::new(), &mut table_paths);
+    if table_paths.len() != 1 {
+        return Err(FormatError::Unsupported {
+            format: FORMAT,
+            message: format!(
+                "expected exactly one ScenarioArchiveNamesInStage table, found {}",
+                table_paths.len()
+            ),
+        });
+    }
+    let table =
+        jdrama_record_at_path_mut(&mut document.root, &table_paths[0]).ok_or_else(|| {
+            FormatError::Unsupported {
+                format: FORMAT,
+                message: "runtime scenario archive table path became invalid".to_string(),
+            }
+        })?;
+    let JDramaRecordPayload::Group {
+        children: areas, ..
+    } = &mut table.payload
+    else {
+        return Err(FormatError::Unsupported {
+            format: FORMAT,
+            message: "ScenarioArchiveNamesInStage is not a JDrama group".to_string(),
+        });
+    };
+    let minimum_areas = usize::from(
+        *SMS_AUTHORED_RUNTIME_CARRIER_AREAS
+            .iter()
+            .max()
+            .expect("carrier list is non-empty"),
+    ) + 1;
+    if areas.len() < minimum_areas || areas.len() > 61 {
+        return Err(FormatError::Unsupported {
+            format: FORMAT,
+            message: format!(
+                "runtime area table has {} areas; reserved carriers require {minimum_areas}..=61",
+                areas.len()
+            ),
+        });
+    }
+    for &area_index in &SMS_AUTHORED_RUNTIME_CARRIER_AREAS {
+        validate_authored_runtime_carrier(areas, area_index)?;
+    }
+    if !matching.is_empty() {
+        if allow_existing
+            && matching.len() == 1
+            && u8::try_from(matching[0].area_index)
+                .ok()
+                .is_some_and(|area| SMS_AUTHORED_RUNTIME_CARRIER_AREAS.contains(&area))
+            && (1..=u32::from(u8::MAX)).contains(&matching[0].scenario_index)
+        {
+            return Ok(JDramaScenarioArchiveWriteOutcome {
+                bytes: bytes.to_vec(),
+                entry: matching[0].clone(),
+                inserted: false,
+            });
+        }
+        return Err(FormatError::Unsupported {
+            format: FORMAT,
+            message: format!(
+                "runtime archive stem {requested_stem:?} is already mapped by {} stageArc.bin entr{}",
+                matching.len(),
+                if matching.len() == 1 { "y" } else { "ies" }
+            ),
+        });
+    }
+    let area_index = SMS_AUTHORED_RUNTIME_CARRIER_AREAS
+        .iter()
+        .copied()
+        .find(|area_index| {
+            let Some(area) = areas.get(usize::from(*area_index)) else {
+                return false;
+            };
+            let JDramaRecordPayload::Group { children, .. } = &area.payload else {
+                return false;
+            };
+            children.len() <= usize::from(u8::MAX)
+        })
+        .ok_or_else(|| FormatError::ResourceLimit {
+            format: FORMAT,
+            resource: "authored runtime slots",
+            requested: SMS_AUTHORED_RUNTIME_CARRIER_AREAS.len() * usize::from(u8::MAX) + 1,
+            limit: SMS_AUTHORED_RUNTIME_CARRIER_AREAS.len() * usize::from(u8::MAX),
+        })?;
+    let JDramaRecordPayload::Group {
+        children: scenarios,
+        ..
+    } = &mut areas[usize::from(area_index)].payload
+    else {
+        unreachable!("carrier validation proved a group payload")
+    };
+    let scenario_index = u8::try_from(scenarios.len()).map_err(|_| FormatError::ResourceLimit {
+        format: FORMAT,
+        resource: "runtime scenario index",
+        requested: scenarios.len(),
+        limit: u8::MAX as usize,
+    })?;
+    let scenario = JDramaRecord::new(
+        "ScenarioArchiveName",
+        format!("SMS Editor {requested_stem}"),
+        JDramaRecordPayload::Fields {
+            fields: vec![field(
+                "archive_name",
+                JDramaFieldValue::String(archive_name.to_string()),
+            )],
+        },
+    )?;
+    scenarios.push(scenario);
+
+    let output = document.to_bytes()?;
+    let entry = JDramaScenarioArchiveEntry {
+        area_index: u32::from(area_index),
+        scenario_index: u32::from(scenario_index),
+        archive_name: archive_name.to_string(),
+    };
+    let rebuilt_entries = parse_jdrama_scenario_archive_entries(&output)?;
+    if !rebuilt_entries.contains(&entry) {
+        return Err(FormatError::Unsupported {
+            format: FORMAT,
+            message: "authored runtime slot did not survive semantic rebuild".to_string(),
+        });
+    }
+    Ok(JDramaScenarioArchiveWriteOutcome {
+        bytes: output,
+        entry,
+        inserted: true,
+    })
+}
+
+fn validate_authored_runtime_carrier(areas: &[JDramaRecord], area_index: u8) -> Result<()> {
+    let area = areas
+        .get(usize::from(area_index))
+        .ok_or_else(|| FormatError::Unsupported {
+            format: FORMAT,
+            message: format!("runtime carrier area {area_index} is missing"),
+        })?;
+    if semantic_type_name(&area.type_name) != "ScenarioArchiveNameTable" {
+        return Err(FormatError::Unsupported {
+            format: FORMAT,
+            message: format!(
+                "runtime carrier area {area_index} has unexpected type {:?}",
+                area.type_name
+            ),
+        });
+    }
+    let JDramaRecordPayload::Group { children, .. } = &area.payload else {
+        return Err(FormatError::Unsupported {
+            format: FORMAT,
+            message: format!("runtime carrier area {area_index} is not a JDrama group"),
+        });
+    };
+    let Some(scenario_zero) = children.first() else {
+        return Err(FormatError::Unsupported {
+            format: FORMAT,
+            message: format!("runtime carrier area {area_index} has no reserved scenario zero"),
+        });
+    };
+    if scenario_archive_name(scenario_zero)
+        .is_none_or(|name| !name.eq_ignore_ascii_case("none.arc"))
+    {
+        return Err(FormatError::Unsupported {
+            format: FORMAT,
+            message: format!(
+                "runtime carrier area {area_index} scenario zero must remain none.arc"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn scenario_archive_name(record: &JDramaRecord) -> Option<&str> {
+    if semantic_type_name(&record.type_name) != "ScenarioArchiveName" {
+        return None;
+    }
+    let JDramaRecordPayload::Fields { fields } = &record.payload else {
+        return None;
+    };
+    match fields.as_slice() {
+        [JDramaField {
+            value: JDramaFieldValue::String(archive_name),
+            ..
+        }] => Some(archive_name),
+        _ => None,
+    }
+}
+
+fn validate_authored_runtime_archive_name(archive_name: &str) -> Result<&str> {
+    if archive_name.contains(['/', '\\', '\0']) {
+        return Err(FormatError::Unsupported {
+            format: FORMAT,
+            message: format!("runtime archive must be a plain filename: {archive_name:?}"),
+        });
+    }
+    let path = std::path::Path::new(archive_name);
+    let extension = path.extension().and_then(|value| value.to_str());
+    if !extension.is_some_and(|value| value.eq_ignore_ascii_case("arc")) {
+        return Err(FormatError::Unsupported {
+            format: FORMAT,
+            message: format!("runtime archive must use the .arc extension: {archive_name:?}"),
+        });
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| FormatError::Unsupported {
+            format: FORMAT,
+            message: format!("runtime archive has no filename stem: {archive_name:?}"),
+        })?;
+    if !stem
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        return Err(FormatError::Unsupported {
+            format: FORMAT,
+            message: format!(
+                "runtime archive stem must contain only ASCII letters, digits, '_' or '-': {stem:?}"
+            ),
+        });
+    }
+    // Prove every emitted JDrama string can be represented before mutating
+    // the semantic tree.
+    encode_shift_jis(archive_name)?;
+    Ok(stem)
+}
+
+fn runtime_archive_stem(archive_name: &str) -> Option<&str> {
+    let file_name = archive_name
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())?;
+    let stem = file_name
+        .rsplit_once('.')
+        .map_or(file_name, |(stem, extension)| {
+            if extension.eq_ignore_ascii_case("arc") || extension.eq_ignore_ascii_case("szs") {
+                stem
+            } else {
+                file_name
+            }
+        });
+    (!stem.is_empty()).then_some(stem)
+}
+
+fn collect_scenario_archive_table_paths(
+    record: &JDramaRecord,
+    path: &mut Vec<usize>,
+    matches: &mut Vec<Vec<usize>>,
+) {
+    if semantic_type_name(&record.type_name) == "ScenarioArchiveNamesInStage" {
+        matches.push(path.clone());
+    }
+    let JDramaRecordPayload::Group { children, .. } = &record.payload else {
+        return;
+    };
+    for (index, child) in children.iter().enumerate() {
+        path.push(index);
+        collect_scenario_archive_table_paths(child, path, matches);
+        path.pop();
+    }
+}
+
+fn jdrama_record_at_path_mut<'a>(
+    mut record: &'a mut JDramaRecord,
+    path: &[usize],
+) -> Option<&'a mut JDramaRecord> {
+    for index in path {
+        let JDramaRecordPayload::Group { children, .. } = &mut record.payload else {
+            return None;
+        };
+        record = children.get_mut(*index)?;
+    }
+    Some(record)
+}
+
+fn jdrama_record_at_path<'a>(
+    mut record: &'a JDramaRecord,
+    path: &[usize],
+) -> Option<&'a JDramaRecord> {
+    for index in path {
+        let JDramaRecordPayload::Group { children, .. } = &record.payload else {
+            return None;
+        };
+        record = children.get(*index)?;
+    }
+    Some(record)
+}
+
 fn name_ref_record_layout(
     bytes: &[u8],
     offset: usize,
@@ -2818,6 +3254,180 @@ mod tests {
         assert_eq!(entries[1].scenario_index, 1);
         assert_eq!(entries[2].area_index, 1);
         assert_eq!(entries[2].archive_name, "second0.arc");
+    }
+
+    fn authored_runtime_table(first_carrier_custom_scenarios: usize) -> Vec<u8> {
+        let leaf = |name: String, archive: String| {
+            let mut payload = Vec::new();
+            put_len_string(&mut payload, archive.as_bytes());
+            name_ref_record("ScenarioArchiveName", &name, &payload)
+        };
+        let areas = (0..55)
+            .map(|area_index| {
+                let is_carrier =
+                    SMS_AUTHORED_RUNTIME_CARRIER_AREAS.contains(&u8::try_from(area_index).unwrap());
+                let mut scenarios = vec![leaf(
+                    format!("scenario {area_index} 0"),
+                    if is_carrier {
+                        "none.arc".to_string()
+                    } else {
+                        format!("retail{area_index}.arc")
+                    },
+                )];
+                if area_index == usize::from(SMS_AUTHORED_RUNTIME_CARRIER_AREAS[0]) {
+                    scenarios.extend((1..=first_carrier_custom_scenarios).map(|scenario_index| {
+                        leaf(
+                            format!("authored {scenario_index}"),
+                            format!("authored{scenario_index}.arc"),
+                        )
+                    }));
+                }
+                name_ref_array(
+                    "ScenarioArchiveNameTable",
+                    &format!("area {area_index}"),
+                    &scenarios,
+                )
+            })
+            .collect::<Vec<_>>();
+        let outer = name_ref_array("ScenarioArchiveNamesInStage", "runtime stages", &areas);
+        name_ref_array("NameRefGrp", "root", &[outer])
+    }
+
+    #[test]
+    fn authors_a_new_reserved_carrier_scenario_without_replacing_retail_slots() {
+        let source = authored_runtime_table(0);
+        let before = parse_jdrama_scenario_archive_areas(&source).unwrap();
+
+        let authored = append_jdrama_scenario_archive_slot(&source, "myStage.arc").unwrap();
+        assert!(authored.inserted);
+        assert_eq!(authored.entry.area_index, 17);
+        assert_eq!(authored.entry.scenario_index, 1);
+        assert_eq!(authored.entry.archive_name, "myStage.arc");
+        let after = parse_jdrama_scenario_archive_areas(&authored.bytes).unwrap();
+        assert_eq!(after.len(), before.len(), "outer area count must not grow");
+        for area_index in 0..after.len() {
+            if area_index == 17 {
+                assert_eq!(after[area_index].archive_names[0], "none.arc");
+                assert_eq!(after[area_index].archive_names[1], "myStage.arc");
+            } else {
+                assert_eq!(after[area_index], before[area_index]);
+            }
+        }
+    }
+
+    #[test]
+    fn ensuring_an_authored_runtime_slot_is_byte_idempotent() {
+        let source = authored_runtime_table(0);
+        let authored = append_jdrama_scenario_archive_slot(&source, "existing.arc").unwrap();
+
+        let ensured = ensure_jdrama_scenario_archive_slot(&authored.bytes, "EXISTING.ARC").unwrap();
+        assert!(!ensured.inserted);
+        assert_eq!(ensured.bytes, authored.bytes);
+        assert_eq!(ensured.entry.area_index, 17);
+        assert_eq!(ensured.entry.scenario_index, 1);
+    }
+
+    #[test]
+    fn appending_rejects_duplicate_runtime_archive_stems() {
+        let source = authored_runtime_table(0);
+
+        let error = append_jdrama_scenario_archive_slot(&source, "Retail0.arc")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already mapped"), "{error}");
+        let ensure_error = ensure_jdrama_scenario_archive_slot(&source, "Retail0.arc")
+            .unwrap_err()
+            .to_string();
+        assert!(ensure_error.contains("already mapped"), "{ensure_error}");
+    }
+
+    #[test]
+    fn authored_slot_allocation_rejects_an_incompatible_carrier_baseline() {
+        let source = authored_runtime_table(0);
+        let mut document = JDramaDocument::parse(&source).unwrap();
+        let mut paths = Vec::new();
+        collect_scenario_archive_table_paths(&document.root, &mut Vec::new(), &mut paths);
+        let table = jdrama_record_at_path_mut(&mut document.root, &paths[0]).unwrap();
+        let JDramaRecordPayload::Group {
+            children: areas, ..
+        } = &mut table.payload
+        else {
+            unreachable!()
+        };
+        let JDramaRecordPayload::Group {
+            children: scenarios,
+            ..
+        } = &mut areas[17].payload
+        else {
+            unreachable!()
+        };
+        let JDramaRecordPayload::Fields { fields } = &mut scenarios[0].payload else {
+            unreachable!()
+        };
+        fields[0].value = JDramaFieldValue::String("occupied.arc".to_string());
+        let incompatible = document.to_bytes().unwrap();
+
+        let error = append_jdrama_scenario_archive_slot(&incompatible, "newStage.arc")
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("scenario zero must remain none.arc"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn full_reserved_carrier_spills_into_the_next_safe_area() {
+        let source = authored_runtime_table(255);
+
+        let authored = append_jdrama_scenario_archive_slot(&source, "spill.arc").unwrap();
+
+        assert_eq!(authored.entry.area_index, 18);
+        assert_eq!(authored.entry.scenario_index, 1);
+        assert_eq!(
+            parse_jdrama_scenario_archive_areas(&authored.bytes).unwrap()[18].archive_names,
+            ["none.arc", "spill.arc"]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SMS_BASE_ROOT with extracted retail data/stageArc.bin"]
+    fn retail_stage_arc_authors_a_source_free_reserved_scenario() {
+        let base_root = std::env::var_os("SMS_BASE_ROOT")
+            .map(std::path::PathBuf::from)
+            .expect("set SMS_BASE_ROOT to the extracted game's root");
+        let path = base_root.join("files/data/stageArc.bin");
+        let source = std::fs::read(&path).expect("read retail stageArc.bin");
+        let document = JDramaDocument::parse(&source).expect("typed stageArc.bin parse");
+        assert_eq!(
+            document.to_bytes().expect("typed stageArc.bin rebuild"),
+            source,
+            "retail stageArc.bin must be source-free byte exact before editing"
+        );
+        let before = parse_jdrama_scenario_archive_entries(&source).unwrap();
+        let areas = parse_jdrama_scenario_archive_areas(&source).unwrap();
+        assert_eq!(areas.len(), 61);
+        for area_index in SMS_AUTHORED_RUNTIME_CARRIER_AREAS {
+            assert_eq!(areas[usize::from(area_index)].archive_names, ["none.arc"]);
+        }
+
+        let authored =
+            append_jdrama_scenario_archive_slot(&source, "smsEditorRuntimeTest.arc").unwrap();
+        let after = parse_jdrama_scenario_archive_entries(&authored.bytes).unwrap();
+        assert_eq!(after.len(), before.len() + 1);
+        for entry in before {
+            assert!(after.contains(&entry), "retail mapping changed: {entry:?}");
+        }
+        assert!(after.contains(&authored.entry));
+        assert_eq!(authored.entry.area_index, 17);
+        assert_eq!(authored.entry.scenario_index, 1);
+
+        let ensured =
+            ensure_jdrama_scenario_archive_slot(&authored.bytes, "smsEditorRuntimeTest.arc")
+                .unwrap();
+        assert!(!ensured.inserted);
+        assert_eq!(ensured.bytes, authored.bytes);
     }
 
     #[test]

@@ -1577,9 +1577,9 @@ mod tests {
         let patched = patch_sms_direct_boot_dol(
             &source,
             &RuntimeStageTarget {
-                area_index: 2,
-                scenario_index: 0,
-                archive_name: "dolpic0.arc".to_string(),
+                area_index: 17,
+                scenario_index: 1,
+                archive_name: "smsEditorRuntimeTest.arc".to_string(),
             },
         )
         .unwrap_or_else(|error| panic!("{}: {error}", path.display()));

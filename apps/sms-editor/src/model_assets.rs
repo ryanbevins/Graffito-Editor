@@ -18,7 +18,8 @@ use sms_authoring::{
 use sms_formats::{
     validate_materials_for_loader, ColFile, GxDiagnosticSeverity, GxMaterialDiagnostic,
     J3dRebuildDocument, JDramaDocument, JDramaField, JDramaFieldValue, JDramaLightMap,
-    JDramaRecord, JDramaRecordPayload, JDramaTransform, SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS,
+    JDramaRecord, JDramaRecordPayload, JDramaTransform, SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS,
+    SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS,
 };
 use sms_scene::{SourceFreeStageArchive, StageResourceDocument, Transform};
 use sms_schema::ObjectRegistry;
@@ -84,6 +85,7 @@ fn model_instance_loader_flags(
     match placement.export_mode {
         ModelInstanceExportMode::SeparateRuntimeObject => Ok(SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS),
         ModelInstanceExportMode::MapTerrain => Ok(SMS_MAP_MODEL_LOAD_FLAGS),
+        ModelInstanceExportMode::Skybox => Ok(SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS),
         ModelInstanceExportMode::StockMapObjBase => {
             let selected = placement.stock_map_obj_resource.trim();
             if selected.is_empty() {
@@ -119,6 +121,20 @@ fn model_instance_preview_key(
         asset_id: instance.placement.asset_id,
         loader_flags: model_instance_loader_flags(&instance.placement, registry)?,
     })
+}
+
+fn should_default_to_map_terrain(
+    authored_blank_stage: bool,
+    asset_has_collision: bool,
+    stage_id: &str,
+    instances: &[EditorModelInstance],
+) -> bool {
+    authored_blank_stage
+        && asset_has_collision
+        && !instances.iter().any(|instance| {
+            instance.stage_id.eq_ignore_ascii_case(stage_id)
+                && instance.placement.export_mode == ModelInstanceExportMode::MapTerrain
+        })
 }
 
 fn loader_diagnostics_for_document(
@@ -1056,6 +1072,14 @@ impl SmsEditorApp {
         self.placing_model_asset = Some(id);
         self.tool = EditorTool::Place;
         self.palette_factory = None;
+        let label = self
+            .model_catalog_entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .map_or_else(|| id.to_string(), |entry| entry.name.clone());
+        self.log.push(format!(
+            "Placing model '{label}': click in the viewport to choose its position."
+        ));
     }
 
     pub(super) fn spawn_model_instance_at(&mut self, id: AssetId, position: [f32; 3]) {
@@ -1080,8 +1104,34 @@ impl SmsEditorApp {
             return;
         };
         let bounds = model_document_bounds(&document).unwrap_or([[-50.0; 3], [50.0; 3]]);
-        self.cache_model_preview(id, SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS, &document);
-        let mut placement = ModelInstancePlacement::new(id, document.name);
+        let mut placement = ModelInstancePlacement::new(id, document.name.clone());
+        let authored_blank_stage = self
+            .document
+            .as_ref()
+            .and_then(|document| document.stage_archive.as_ref())
+            .is_some_and(|archive| {
+                matches!(archive.origin(), sms_scene::StageOrigin::Blank { .. })
+            });
+        let first_authored_stage_model = authored_blank_stage
+            && !self
+                .model_instances
+                .iter()
+                .any(|instance| instance.stage_id.eq_ignore_ascii_case(&self.stage_id));
+        if should_default_to_map_terrain(
+            authored_blank_stage,
+            document.collision.is_some(),
+            &self.stage_id,
+            &self.model_instances,
+        ) {
+            placement.export_mode = ModelInstanceExportMode::MapTerrain;
+            self.log.push(
+                "The first collision-bearing model in this authored stage was assigned as map terrain."
+                .to_string(),
+            );
+        }
+        let preview_loader_flags = model_instance_loader_flags(&placement, self.registry.as_ref())
+            .unwrap_or(SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS);
+        self.cache_model_preview(id, preview_loader_flags, &document);
         placement.transform = transform_to_matrix(Transform {
             translation: position,
             ..Transform::default()
@@ -1105,6 +1155,13 @@ impl SmsEditorApp {
         }
         self.rebuild_gpu_viewport_scene();
         self.clear_viewport_preview_cache();
+        self.log.push(format!(
+            "Placed model '{}' at {:.1}, {:.1}, {:.1}.",
+            document.name, position[0], position[1], position[2]
+        ));
+        if first_authored_stage_model {
+            self.frame_selected_model_instance();
+        }
     }
 
     pub(super) fn selected_model_instance(&self) -> Option<&EditorModelInstance> {
@@ -1112,6 +1169,40 @@ impl SmsEditorApp {
         self.model_instances
             .iter()
             .find(|instance| instance.placement.instance_id == id)
+    }
+
+    pub(super) fn frame_selected_model_instance(&mut self) -> bool {
+        let Some(instance) = self.selected_model_instance().cloned() else {
+            return false;
+        };
+        let corners = transformed_bounds_corners(&instance);
+        let mut minimum = [f32::INFINITY; 3];
+        let mut maximum = [f32::NEG_INFINITY; 3];
+        for corner in corners {
+            for axis in 0..3 {
+                minimum[axis] = minimum[axis].min(corner[axis]);
+                maximum[axis] = maximum[axis].max(corner[axis]);
+            }
+        }
+        if minimum
+            .into_iter()
+            .chain(maximum)
+            .any(|value| !value.is_finite())
+        {
+            return false;
+        }
+        let focus = std::array::from_fn(|axis| (minimum[axis] + maximum[axis]) * 0.5);
+        let extent = std::array::from_fn::<_, 3, _>(|axis| maximum[axis] - minimum[axis]);
+        let radius =
+            (extent[0] * extent[0] + extent[1] * extent[1] + extent[2] * extent[2]).sqrt() * 0.5;
+        self.stop_camera_fly();
+        let camera = self.renderer.camera_mut();
+        camera.focus = focus;
+        camera.distance = (radius * 2.8).clamp(250.0, 600_000.0);
+        self.viewport_pan = egui::Vec2::ZERO;
+        self.viewport_zoom = 1.0;
+        self.queue_camera_state_save();
+        true
     }
 
     pub(super) fn update_selected_model_instance(&mut self, updated: EditorModelInstance) {
@@ -1647,6 +1738,7 @@ impl SmsEditorApp {
         let mut separate = Vec::new();
         let mut stock = Vec::new();
         let mut map_terrain = Vec::new();
+        let mut skybox = Vec::new();
         for instance in instances {
             check_model_export_cancelled(cancelled)?;
             let asset = assets
@@ -1678,6 +1770,7 @@ impl SmsEditorApp {
                 ModelInstanceExportMode::SeparateRuntimeObject => separate.push(resolved),
                 ModelInstanceExportMode::MapTerrain => map_terrain.push(resolved),
                 ModelInstanceExportMode::StockMapObjBase => stock.push(resolved),
+                ModelInstanceExportMode::Skybox => skybox.push(resolved),
             }
         }
 
@@ -1989,6 +2082,55 @@ impl SmsEditorApp {
             edits.replace_model(b"map/map/map.bmd".to_vec(), model);
         }
 
+        if skybox.len() > 1 {
+            return Err(format!(
+                "stage export has {} authored skybox instances; Sunshine's TSky resolves one stage-global map/map/sky.bmd resource",
+                skybox.len()
+            ));
+        }
+        if let Some(resolved) = skybox.first() {
+            check_model_export_cancelled(cancelled)?;
+            validate_instance_loader_compatibility(
+                &resolved.placement,
+                &resolved.asset,
+                SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS,
+                "TSky",
+            )?;
+            let model = resolved.asset.compile_bmd_document().map_err(|error| {
+                format!(
+                    "could not compile authored skybox BMD3 for asset {}: {error}",
+                    resolved.placement.asset_id
+                )
+            })?;
+            edits.upsert_model(b"map/map/sky.bmd".to_vec(), model);
+
+            let archive = archive.ok_or_else(|| {
+                "skybox export requires the open source-free stage archive so the typed Sky actor can be verified"
+                    .to_string()
+            })?;
+            let has_sky_actor = archive.object_placements().iter().any(|placement| {
+                placement
+                    .type_name
+                    .rsplit("::")
+                    .next()
+                    .is_some_and(|type_name| type_name == "Sky")
+            });
+            if !has_sky_actor {
+                let sky_group = archive
+                    .find_group_record_path(b"map/scene.bin", "IdxGroup", Some(1))
+                    .map_err(|error| format!("could not locate the typed sky group: {error}"))?
+                    .ok_or_else(|| {
+                        "map/scene.bin has no unambiguous IdxGroup with group_index 1 for TSky insertion"
+                            .to_string()
+                    })?;
+                edits.insert_placement(
+                    b"map/scene.bin".to_vec(),
+                    sky_group,
+                    authored_sky_record(&resolved.placement)?,
+                );
+            }
+        }
+
         let collision_instances = separate
             .iter()
             .chain(map_terrain.iter())
@@ -2095,7 +2237,7 @@ impl SmsEditorApp {
             .cloned()
             .collect::<Vec<_>>();
         let mut select = None;
-        let mut arm = None;
+        let mut place_at_focus = None;
         ui.columns(2, |columns| {
             columns[0].set_min_width(150.0);
             columns[0].set_max_width(220.0);
@@ -2176,7 +2318,7 @@ impl SmsEditorApp {
                             }
                             response.context_menu(|ui| {
                                 if ui.button("Place in Viewport").clicked() {
-                                    arm = Some(entry.id);
+                                    place_at_focus = Some(entry.id);
                                     ui.close();
                                 }
                             });
@@ -2197,8 +2339,8 @@ impl SmsEditorApp {
         if let Some(id) = select {
             self.select_model_asset(id);
         }
-        if let Some(id) = arm {
-            self.arm_model_placement(id);
+        if let Some(id) = place_at_focus {
+            self.spawn_model_instance_at(id, self.default_spawn_position());
         }
     }
 
@@ -2968,6 +3110,7 @@ impl SmsEditorApp {
             ModelInstanceExportMode::SeparateRuntimeObject => "Separate runtime object",
             ModelInstanceExportMode::StockMapObjBase => "Stock MapObjBase slot",
             ModelInstanceExportMode::MapTerrain => "Bake as map terrain",
+            ModelInstanceExportMode::Skybox => "Stage skybox",
         })
         .show_ui(ui, |ui| {
             changed |= ui
@@ -2998,6 +3141,16 @@ impl SmsEditorApp {
                 )
                 .on_hover_text(
                     "Replaces map/map/map.bmd with authored instances. Use only when intentionally replacing the stage terrain model.",
+                )
+                .changed();
+            changed |= ui
+                .selectable_value(
+                    &mut instance.placement.export_mode,
+                    ModelInstanceExportMode::Skybox,
+                    "Stage skybox",
+                )
+                .on_hover_text(
+                    "Authors map/map/sky.bmd and ensures the scene has the typed TSky actor that consumes it.",
                 )
                 .changed();
         });
@@ -3088,6 +3241,11 @@ impl SmsEditorApp {
                 ui.colored_label(
                     egui::Color32::from_rgb(244, 142, 105),
                     "Destructive export: replaces map/map/map.bmd rather than adding a runtime object.",
+                );
+            }
+            ModelInstanceExportMode::Skybox => {
+                ui.small(
+                    "Authors this model as the stage-global TSky resource. Collision is not exported for skybox instances.",
                 );
             }
         }
@@ -3281,6 +3439,22 @@ fn runtime_sm_j3d_actor_record(placement: &ModelInstancePlacement) -> Result<JDr
         },
     )
     .map_err(|error| format!("could not author runtime SmJ3DAct record: {error}"))
+}
+
+fn authored_sky_record(placement: &ModelInstancePlacement) -> Result<JDramaRecord, String> {
+    let transform = matrix_to_transform(placement.transform);
+    if !transform.is_finite() {
+        return Err(format!(
+            "skybox instance {} contains a non-finite runtime transform",
+            placement.instance_id
+        ));
+    }
+    sms_scene::blank_stage_sky_record(JDramaTransform {
+        translation: transform.translation,
+        rotation: transform.rotation_degrees,
+        scale: transform.scale,
+    })
+    .map_err(|error| format!("could not author typed TSky record: {error}"))
 }
 
 fn stock_map_obj_base_record(
@@ -3649,6 +3823,11 @@ pub(super) fn append_authored_model_instances(
             (texture_base, material_base)
         });
         let transform = matrix_to_transform(instance.placement.transform);
+        let render_layer = if instance.placement.export_mode == ModelInstanceExportMode::Skybox {
+            PreviewRenderLayer::Sky
+        } else {
+            PreviewRenderLayer::Main
+        };
         let packet_base = next_packet_index;
         next_packet_index += geometry
             .preview
@@ -3679,7 +3858,7 @@ pub(super) fn append_authored_model_instances(
                     .filter(|index| *index < preview.materials.len()),
                 packet_index: packet_base + triangle.packet_index,
                 model_index: next_model_index,
-                render_layer: PreviewRenderLayer::Main,
+                render_layer,
                 color: triangle.color,
                 vertex_colors: triangle.vertex_colors,
                 combine_mode: triangle.combine_mode,
@@ -3931,6 +4110,83 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_collision_model_defaults_to_authored_map_terrain_only_once() {
+        assert!(should_default_to_map_terrain(true, true, "custom0", &[]));
+        assert!(!should_default_to_map_terrain(false, true, "custom0", &[]));
+        assert!(!should_default_to_map_terrain(true, false, "custom0", &[]));
+
+        let mut placement = ModelInstancePlacement::new(AssetId::new(), "world");
+        placement.export_mode = ModelInstanceExportMode::MapTerrain;
+        let instances = [EditorModelInstance {
+            stage_id: "custom0".to_string(),
+            placement,
+            local_bounds: [[-1.0; 3], [1.0; 3]],
+        }];
+        assert!(!should_default_to_map_terrain(
+            true, true, "custom0", &instances
+        ));
+        assert!(should_default_to_map_terrain(
+            true, true, "custom1", &instances
+        ));
+    }
+
+    #[test]
+    fn first_authored_stage_model_is_placed_as_terrain_and_framed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let content = temporary.path().join("Content");
+        let catalog = ModelAssetCatalog::open_content_root(&content).unwrap();
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../crates/sms-authoring/tests/fixtures/gltf/valid/minimal-external/model.gltf",
+        );
+        let mut options = sms_authoring::ModelImportOptions::default();
+        options.coordinate_conversion.units_per_meter = 100_000.0;
+        let imported = sms_authoring::import_model(source, &options).unwrap().asset;
+        let entry = catalog
+            .create_asset("Geometry/large-terrain.smsmodel", &imported)
+            .unwrap();
+
+        let mut app = SmsEditorApp::default();
+        app.project_root = temporary.path().to_string_lossy().into_owned();
+        app.stage_id = "custom0".to_string();
+        app.document = Some(StageDocument {
+            stage_id: app.stage_id.clone(),
+            base_root: temporary.path().to_path_buf(),
+            assets: Vec::new(),
+            objects: Vec::new(),
+            changed_files: BTreeMap::new(),
+            stage_archive: Some(SourceFreeStageArchive::new_for_blank("custom0", 1).unwrap()),
+            stage_archive_source_path: None,
+            archive_edits: sms_scene::StageArchiveEdits::default(),
+            registry: None,
+            load_issues: Vec::new(),
+            lighting: sms_scene::StageLighting::default(),
+            actor_previews: BTreeMap::new(),
+            loaded_project: None,
+        });
+        app.renderer.camera_mut().distance = 2_500.0;
+
+        app.spawn_model_instance_at(entry.id, [0.0, 0.0, 0.0]);
+
+        assert_eq!(app.model_instances.len(), 1);
+        assert_eq!(
+            app.model_instances[0].placement.export_mode,
+            ModelInstanceExportMode::MapTerrain
+        );
+        assert_eq!(
+            app.selected_model_instance_id,
+            Some(app.model_instances[0].placement.instance_id)
+        );
+        assert!(app.renderer.camera().distance > 2_500.0);
+        assert!(app
+            .model_asset_preview_cache
+            .contains_key(&AuthoredModelPreviewKey {
+                asset_id: entry.id,
+                loader_flags: SMS_MAP_MODEL_LOAD_FLAGS,
+            }));
+        assert!(content.join(MODEL_INSTANCE_MANIFEST_NAME).is_file());
+    }
 
     #[test]
     fn opaque_material_preset_restores_solid_pixel_and_depth_state() {
@@ -4301,6 +4557,15 @@ mod tests {
             SMS_MAP_MODEL_LOAD_FLAGS
         );
 
+        placement.export_mode = ModelInstanceExportMode::Skybox;
+        instance.placement = placement.clone();
+        assert_eq!(
+            model_instance_preview_key(&instance, Some(&registry))
+                .unwrap()
+                .loader_flags,
+            SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS
+        );
+
         placement.export_mode = ModelInstanceExportMode::StockMapObjBase;
         placement.stock_map_obj_resource = "VerifiedBlock".to_string();
         instance.placement = placement;
@@ -4345,6 +4610,47 @@ mod tests {
         assert_eq!(edits.models[0].raw_resource_path, b"map/map/map.bmd");
         assert_eq!(edits.collisions.len(), 1);
         assert_eq!(edits.collisions[0].raw_resource_path, b"map/map.col");
+    }
+
+    #[test]
+    fn skybox_mode_authors_global_model_and_typed_sky_actor_without_collision() {
+        let temporary = tempfile::tempdir().unwrap();
+        let content = temporary.path().join("Content");
+        let catalog = ModelAssetCatalog::open_content_root(&content).unwrap();
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../crates/sms-authoring/tests/fixtures/gltf/valid/minimal-external/model.gltf",
+        );
+        let imported =
+            sms_authoring::import_model(source, &sms_authoring::ModelImportOptions::default())
+                .unwrap()
+                .asset;
+        let entry = catalog
+            .create_asset("Environment/sky.smsmodel", &imported)
+            .unwrap();
+        let mut placement = ModelInstancePlacement::new(entry.id, "AuthoredSky");
+        placement.export_mode = ModelInstanceExportMode::Skybox;
+        let instance = EditorModelInstance {
+            stage_id: "custom0".to_string(),
+            placement,
+            local_bounds: model_document_bounds(&imported).unwrap(),
+        };
+
+        let edits = SmsEditorApp::stage_edits_with_model_instances_for_archive(
+            &content,
+            &[instance],
+            &sms_scene::StageArchiveEdits::default(),
+            Some(&runtime_export_test_archive()),
+        )
+        .unwrap();
+        assert_eq!(edits.models.len(), 1);
+        assert_eq!(edits.models[0].raw_resource_path, b"map/map/sky.bmd");
+        assert!(edits.collisions.is_empty());
+        assert_eq!(edits.placement_inserts.len(), 1);
+        assert_eq!(edits.placement_inserts[0].record.type_name, "Sky");
+        assert_eq!(
+            edits.placement_inserts[0].raw_resource_path,
+            b"map/scene.bin"
+        );
     }
 
     #[test]
@@ -5182,6 +5488,18 @@ mod tests {
             },
         )
         .unwrap();
+        let sky_group = JDramaRecord::new(
+            "IdxGroup",
+            "sky group",
+            JDramaRecordPayload::Group {
+                fields: vec![JDramaField {
+                    name: "group_index".to_string(),
+                    value: JDramaFieldValue::U32(1),
+                }],
+                children: Vec::new(),
+            },
+        )
+        .unwrap();
         let strategy = JDramaRecord::new(
             "Strategy",
             "strategy",
@@ -5189,6 +5507,7 @@ mod tests {
                 fields: Vec::new(),
                 children: {
                     let mut children = vec![map_group; map_group_count];
+                    children.push(sky_group);
                     children.push(object_group);
                     children
                 },

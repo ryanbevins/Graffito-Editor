@@ -638,6 +638,7 @@ impl SmsEditorApp {
 
     fn reset_open_stage_state(&mut self) {
         self.cancel_model_import();
+        self.new_stage_draft = None;
         self.document = None;
         self.render_scene = None;
         self.scene_archives.clear();
@@ -665,6 +666,7 @@ impl SmsEditorApp {
         self.asset_undo_stack.clear();
         self.asset_redo_stack.clear();
         self.saved_objects.clear();
+        self.saved_lighting = StageLighting::default();
         self.document_dirty = false;
         self.undo_stack.clear();
         self.redo_stack.clear();

@@ -319,6 +319,7 @@ impl StageDocument {
         let baseline = archive.encode()?;
 
         apply_resource_edits(&mut archive, edits)?;
+        reconcile_scene_lighting(&mut archive, &self.lighting)?;
         let inserted_placement_roots = apply_placement_inserts(&mut archive, edits)?;
         reconcile_scene_objects(&mut archive, &self.objects, &inserted_placement_roots)?;
         let rebuilt = archive.encode()?;
@@ -336,6 +337,143 @@ impl StageDocument {
             changed,
         })
     }
+}
+
+fn reconcile_scene_lighting(
+    archive: &mut SourceFreeStageArchive,
+    lighting: &crate::StageLighting,
+) -> Result<()> {
+    if lighting.lights.is_empty() && lighting.ambients.is_empty() {
+        return Ok(());
+    }
+    let Some(StageResourceDocument::Placement(document)) = archive.resource_mut(WORLD_SCENE_PATH)
+    else {
+        return Err(stage_export_error(
+            "the archive has no typed map/scene.bin for authored lighting",
+        ));
+    };
+    let mut light_index = 0_usize;
+    let mut ambient_index = 0_usize;
+    reconcile_lighting_record(
+        &mut document.root,
+        lighting,
+        &mut light_index,
+        &mut ambient_index,
+    )?;
+    if light_index != lighting.lights.len() || ambient_index != lighting.ambients.len() {
+        return Err(stage_export_error(format!(
+            "authored lighting count does not match map/scene.bin ({} of {} lights, {} of {} ambients)",
+            light_index,
+            lighting.lights.len(),
+            ambient_index,
+            lighting.ambients.len()
+        )));
+    }
+    Ok(())
+}
+
+fn reconcile_lighting_record(
+    record: &mut JDramaRecord,
+    lighting: &crate::StageLighting,
+    light_index: &mut usize,
+    ambient_index: &mut usize,
+) -> Result<()> {
+    let short_type = record
+        .type_name
+        .rsplit("::")
+        .next()
+        .unwrap_or(&record.type_name);
+    match short_type {
+        "Light" => {
+            let authored = lighting.lights.get(*light_index).ok_or_else(|| {
+                stage_export_error(format!(
+                    "map/scene.bin contains more typed lights than the authored scene (first extra: {:?})",
+                    record.name
+                ))
+            })?;
+            if authored
+                .name
+                .as_deref()
+                .is_some_and(|name| name != record.name)
+            {
+                return Err(stage_export_error(format!(
+                    "authored light order drifted: expected {:?}, found {:?}",
+                    authored.name, record.name
+                )));
+            }
+            set_typed_lighting_field(
+                record,
+                "position",
+                JDramaFieldValue::Vec3F32(authored.position),
+            )?;
+            set_typed_lighting_field(
+                record,
+                "color",
+                JDramaFieldValue::ColorRgba8(authored.color),
+            )?;
+            *light_index += 1;
+        }
+        "AmbColor" => {
+            let authored = lighting.ambients.get(*ambient_index).ok_or_else(|| {
+                stage_export_error(format!(
+                    "map/scene.bin contains more typed ambients than the authored scene (first extra: {:?})",
+                    record.name
+                ))
+            })?;
+            if authored
+                .name
+                .as_deref()
+                .is_some_and(|name| name != record.name)
+            {
+                return Err(stage_export_error(format!(
+                    "authored ambient order drifted: expected {:?}, found {:?}",
+                    authored.name, record.name
+                )));
+            }
+            set_typed_lighting_field(
+                record,
+                "color",
+                JDramaFieldValue::ColorRgba8(authored.color),
+            )?;
+            *ambient_index += 1;
+        }
+        _ => {}
+    }
+    if let JDramaRecordPayload::Group { children, .. } = &mut record.payload {
+        for child in children {
+            reconcile_lighting_record(child, lighting, light_index, ambient_index)?;
+        }
+    }
+    Ok(())
+}
+
+fn set_typed_lighting_field(
+    record: &mut JDramaRecord,
+    field_name: &str,
+    value: JDramaFieldValue,
+) -> Result<()> {
+    let fields = match &mut record.payload {
+        JDramaRecordPayload::Fields { fields }
+        | JDramaRecordPayload::Actor { fields, .. }
+        | JDramaRecordPayload::Group { fields, .. } => fields,
+        JDramaRecordPayload::Empty => {
+            return Err(stage_export_error(format!(
+                "typed lighting record {:?} has no fields",
+                record.name
+            )));
+        }
+    };
+    let field = fields
+        .iter_mut()
+        .find(|field| field.name == field_name)
+        .ok_or_else(|| {
+            stage_export_error(format!(
+                "typed lighting record {:?} has no {field_name} field",
+                record.name
+            ))
+        })?;
+    field.value = value;
+    Ok(())
 }
 
 struct BuiltStageArchive {
@@ -1295,7 +1433,7 @@ fn is_editor_placement_resource(raw_path: &[u8]) -> bool {
     lower == b"scene.bin" || lower == b"map/scene.bin" || lower.ends_with(b"/map/scene.bin")
 }
 
-fn exact_stage_archive_path(base_root: &Path, stage_id: &str) -> Result<PathBuf> {
+pub(crate) fn exact_stage_archive_path(base_root: &Path, stage_id: &str) -> Result<PathBuf> {
     let matches = discover_scene_archives(base_root)?
         .into_iter()
         .filter(|archive| archive.stage_id.eq_ignore_ascii_case(stage_id))
@@ -1392,12 +1530,103 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use sms_formats::{
-        ColGroup, ColTriangle, ColVertex, JDramaDocument, JDramaField, JDramaFieldValue,
-        JDramaLightMap, PrmEntry, PrmFile, PrmValue, RarcDocument, RarcEntryRecord, RarcLayout,
-        RarcNodeRecord,
+        ColGroup, ColTriangle, ColVertex, JDramaAmbient, JDramaDocument, JDramaField,
+        JDramaFieldValue, JDramaLight, JDramaLightMap, PrmEntry, PrmFile, PrmValue, RarcDocument,
+        RarcEntryRecord, RarcLayout, RarcNodeRecord,
     };
 
     use crate::{PlacementBinding, Transform};
+
+    #[test]
+    fn authored_stage_lighting_rewrites_typed_records_by_stable_order_and_name() {
+        let light = JDramaRecord::new(
+            "Light",
+            "Object key",
+            JDramaRecordPayload::Fields {
+                fields: vec![
+                    JDramaField {
+                        name: "position".to_string(),
+                        value: JDramaFieldValue::Vec3F32([1.0, 2.0, 3.0]),
+                    },
+                    JDramaField {
+                        name: "color".to_string(),
+                        value: JDramaFieldValue::ColorRgba8([4, 5, 6, 7]),
+                    },
+                    JDramaField {
+                        name: "range".to_string(),
+                        value: JDramaFieldValue::F32(50.0),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let ambient = JDramaRecord::new(
+            "AmbColor",
+            "Object ambient",
+            JDramaRecordPayload::Fields {
+                fields: vec![JDramaField {
+                    name: "color".to_string(),
+                    value: JDramaFieldValue::ColorRgba8([8, 9, 10, 11]),
+                }],
+            },
+        )
+        .unwrap();
+        let root = JDramaRecord::new(
+            "GroupObj",
+            "scene",
+            JDramaRecordPayload::Group {
+                fields: Vec::new(),
+                children: vec![light, ambient],
+            },
+        )
+        .unwrap();
+        let mut archive = SourceFreeStageArchive::new().unwrap();
+        archive
+            .insert_resource(
+                WORLD_SCENE_PATH.to_vec(),
+                StageResourceDocument::Placement(JDramaDocument { root }),
+            )
+            .unwrap();
+        let lighting = crate::StageLighting {
+            lights: vec![JDramaLight {
+                name: Some("Object key".to_string()),
+                position: [100.0, 200.0, 300.0],
+                color: [20, 30, 40, 50],
+            }],
+            ambients: vec![JDramaAmbient {
+                name: Some("Object ambient".to_string()),
+                color: [60, 70, 80, 90],
+            }],
+        };
+
+        reconcile_scene_lighting(&mut archive, &lighting).unwrap();
+        let StageResourceDocument::Placement(scene) = archive.resource(WORLD_SCENE_PATH).unwrap()
+        else {
+            panic!("scene resource was not typed placement");
+        };
+        let JDramaRecordPayload::Group { children, .. } = &scene.root.payload else {
+            panic!("scene root was not a group");
+        };
+        let JDramaRecordPayload::Fields { fields } = &children[0].payload else {
+            panic!("light was not typed fields");
+        };
+        assert_eq!(
+            fields[0].value,
+            JDramaFieldValue::Vec3F32([100.0, 200.0, 300.0])
+        );
+        assert_eq!(
+            fields[1].value,
+            JDramaFieldValue::ColorRgba8([20, 30, 40, 50])
+        );
+        assert_eq!(fields[2].value, JDramaFieldValue::F32(50.0));
+        let JDramaRecordPayload::Fields { fields } = &children[1].payload else {
+            panic!("ambient was not typed fields");
+        };
+        assert_eq!(
+            fields[0].value,
+            JDramaFieldValue::ColorRgba8([60, 70, 80, 90])
+        );
+    }
 
     #[test]
     fn object_transform_delete_and_typed_clone_survive_reimport() {

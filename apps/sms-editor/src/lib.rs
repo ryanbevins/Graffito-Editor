@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -10,11 +10,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+#[cfg(test)]
+use sms_formats::read_stage_asset_bytes;
 use sms_formats::{
     decode_bti_texture, discover_scene_archives, mount_scene_archive, parse_jdrama_object_records,
-    read_stage_asset_bytes, ColFile, J3dAlphaCompare, J3dBillboard, J3dBillboardMode, J3dBlendMode,
-    J3dFile, J3dGeometryPreview, J3dJointAnimation, J3dJointTransformOverride, J3dMaterial,
-    J3dMatrix34, J3dPreparedAnimatedTriangles, J3dPreviewCombineMode, J3dTexturePatternAnimation,
+    ColFile, J3dAlphaCompare, J3dBillboard, J3dBillboardMode, J3dBlendMode, J3dFile,
+    J3dGeometryPreview, J3dJointAnimation, J3dJointTransformOverride, J3dMaterial, J3dMatrix34,
+    J3dPreparedAnimatedTriangles, J3dPreviewCombineMode, J3dTexturePatternAnimation,
     J3dTextureSrtAnimation, J3dTriangle, J3dZMode, JpaEffect, SceneArchiveInfo, StageAsset,
     StageAssetKind, SMS_ANIMATION_FRAMES_PER_SECOND, SMS_DEFAULT_OBJECT_MODEL_LOAD_FLAGS,
     SMS_MAP_MODEL_LOAD_FLAGS, SMS_POLLUTION_MODEL_LOAD_FLAGS,
@@ -23,8 +25,8 @@ use sms_render::{
     gx_blend_compatibility, GxBlendCompatibility, RenderScene, RendererConfig, ViewportRenderer,
 };
 use sms_scene::{
-    AssetRef, AssetRole, SceneError, SceneObject, StageDocument, StageResourceDocument, Transform,
-    ValidationIssue, ValidationSeverity,
+    AssetRef, AssetRole, SceneError, SceneObject, StageDocument, StageLighting,
+    StageResourceDocument, Transform, ValidationIssue, ValidationSeverity,
 };
 use sms_schema::{ObjectDefinition, ObjectRegistry, ParticleBindingTarget, SchemaGenerator};
 
@@ -38,6 +40,7 @@ mod outliner;
 mod project;
 mod project_ui;
 mod scene_labels;
+mod stage_creation;
 mod ui_panels;
 mod viewport_ui;
 
@@ -46,6 +49,7 @@ use outliner::*;
 use project::*;
 use project_ui::{path_display_row, NewProjectDraft};
 use scene_labels::*;
+use stage_creation::{insert_authored_scene_archive, NewStageDraft};
 
 const VIEWPORT_NEAR_CLIP: f32 = 8.0;
 
@@ -76,6 +80,11 @@ enum EditorTool {
     Rotate,
     Scale,
     Place,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectPaletteDragPayload {
+    factory_name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,12 +207,21 @@ enum BackgroundResult {
         result: Result<SceneScanResult, String>,
     },
     Open(Result<Box<LoadedStage>, String>),
+    CreateStage(Result<Box<LoadedStage>, String>),
     Build(Result<managed_build::ManagedGameBuildOutcome, String>),
     BuildAndRun(Result<managed_build::ManagedGameLaunchOutcome, String>),
 }
 
 mod preview_types;
 use preview_types::*;
+
+fn stage_document_differs_from_saved(
+    document: &StageDocument,
+    saved_objects: &[SceneObject],
+    saved_lighting: &StageLighting,
+) -> bool {
+    document.objects != saved_objects || document.lighting != *saved_lighting
+}
 
 fn validation_issues_for_preview(
     document: &StageDocument,
@@ -431,7 +449,7 @@ fn build_collision_preview(document: &StageDocument) -> CollisionPreviewBuild {
         if !loaded_assets.insert(normalized_collision_asset_id(&asset_path)) {
             continue;
         }
-        let bytes = match read_stage_asset_bytes(&asset.path) {
+        let bytes = match document.read_asset_bytes(&asset.path) {
             Ok(bytes) => bytes,
             Err(error) => {
                 preview.record_failure(&asset_path, format!("read asset: {error}"));
@@ -480,6 +498,7 @@ struct SmsEditorApp {
     show_project_hub: bool,
     project_hub_error: Option<String>,
     new_project_draft: Option<NewProjectDraft>,
+    new_stage_draft: Option<NewStageDraft>,
     project_name_draft: String,
     repo_root: String,
     base_root: String,
@@ -572,6 +591,7 @@ struct SmsEditorApp {
     gizmo_drag: Option<GizmoDrag>,
     next_object_serial: u32,
     saved_objects: Vec<SceneObject>,
+    saved_lighting: StageLighting,
     document_dirty: bool,
     undo_stack: VecDeque<ObjectUndoRecord>,
     redo_stack: VecDeque<ObjectUndoRecord>,
@@ -656,6 +676,7 @@ impl Default for SmsEditorApp {
             show_project_hub,
             project_hub_error,
             new_project_draft: None,
+            new_stage_draft: None,
             repo_root,
             base_root,
             project_root,
@@ -756,6 +777,7 @@ impl Default for SmsEditorApp {
             gizmo_drag: None,
             next_object_serial: 1,
             saved_objects: Vec::new(),
+            saved_lighting: StageLighting::default(),
             document_dirty: false,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
@@ -872,6 +894,7 @@ impl eframe::App for SmsEditorApp {
             self.commit_undo_transaction("Updated transform");
         }
         self.project_settings_window(root_ui.ctx());
+        self.new_stage_dialog(root_ui.ctx());
         self.issues_window(root_ui.ctx());
         self.unsaved_changes_dialog(root_ui.ctx());
     }
@@ -968,24 +991,36 @@ impl SmsEditorApp {
         let (sender, receiver) = mpsc::channel();
         let task_base_root = base_root.clone();
         let repo_root = self.repo_root.trim().to_string();
+        let project_root = self.project_root.trim().to_string();
         thread::spawn(move || {
-            let result = discover_scene_archives(PathBuf::from(&task_base_root))
-                .map_err(|err| err.to_string())
-                .map(|archives| {
-                    let (labels, label_warning) = match load_scene_archive_labels(
-                        PathBuf::from(&task_base_root).as_path(),
-                        PathBuf::from(&repo_root).as_path(),
-                        &archives,
-                    ) {
-                        Ok(labels) => (labels, None),
-                        Err(error) => (BTreeMap::new(), Some(error)),
-                    };
-                    SceneScanResult {
-                        archives,
-                        labels,
-                        label_warning,
+            let result = (|| -> Result<SceneScanResult, String> {
+                let mut archives = discover_scene_archives(PathBuf::from(&task_base_root))
+                    .map_err(|error| error.to_string())?;
+                if !project_root.is_empty() {
+                    let authored = sms_scene::discover_authored_project_stage_ids(&project_root)
+                        .map_err(|error| error.to_string())?;
+                    for stage_id in authored {
+                        insert_authored_scene_archive(
+                            &mut archives,
+                            Path::new(&task_base_root),
+                            &stage_id,
+                        );
                     }
-                });
+                }
+                let (labels, label_warning) = match load_scene_archive_labels(
+                    PathBuf::from(&task_base_root).as_path(),
+                    PathBuf::from(&repo_root).as_path(),
+                    &archives,
+                ) {
+                    Ok(labels) => (labels, None),
+                    Err(error) => (BTreeMap::new(), Some(error)),
+                };
+                Ok(SceneScanResult {
+                    archives,
+                    labels,
+                    label_warning,
+                })
+            })();
             let _ = sender.send(BackgroundResult::Scan {
                 base_root: task_base_root,
                 result,
@@ -1034,8 +1069,21 @@ impl SmsEditorApp {
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let result = (|| -> Result<Box<LoadedStage>, String> {
-                let archives = discover_scene_archives(PathBuf::from(&base_root))
+                let mut archives = discover_scene_archives(PathBuf::from(&base_root))
                     .map_err(|err| err.to_string())?;
+                let authored_stage_ids = if project_root.is_empty() {
+                    Vec::new()
+                } else {
+                    sms_scene::discover_authored_project_stage_ids(&project_root)
+                        .map_err(|error| error.to_string())?
+                };
+                for authored_stage_id in &authored_stage_ids {
+                    insert_authored_scene_archive(
+                        &mut archives,
+                        Path::new(&base_root),
+                        authored_stage_id,
+                    );
+                }
                 let (scene_labels, scene_label_warning) = match load_scene_archive_labels(
                     PathBuf::from(&base_root).as_path(),
                     PathBuf::from(&repo_root).as_path(),
@@ -1052,12 +1100,31 @@ impl SmsEditorApp {
                         Err(err) => (None, Some(err.to_string())),
                     }
                 };
-                let mut document = StageDocument::open(PathBuf::from(&base_root), stage_id)
-                    .map_err(|err| err.to_string())?;
                 let requested_project_root = project_root;
-                let project_selection =
-                    load_project_for_stage(&mut document, &requested_project_root)
-                        .map_err(|err| err.to_string())?;
+                let (mut document, project_selection) = if authored_stage_ids
+                    .iter()
+                    .any(|authored| authored.eq_ignore_ascii_case(&stage_id))
+                {
+                    let document = StageDocument::open_authored_project_stage(
+                        PathBuf::from(&base_root),
+                        stage_id,
+                        PathBuf::from(&requested_project_root),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    (
+                        document,
+                        ProjectLoadSelection {
+                            project_root: requested_project_root.clone(),
+                            warning: None,
+                        },
+                    )
+                } else {
+                    let mut document = StageDocument::open(PathBuf::from(&base_root), stage_id)
+                        .map_err(|error| error.to_string())?;
+                    let selection = load_project_for_stage(&mut document, &requested_project_root)
+                        .map_err(|error| error.to_string())?;
+                    (document, selection)
+                };
                 if let Some(registry) = registry.clone() {
                     document = document.with_registry(registry);
                 }
@@ -1106,7 +1173,11 @@ impl SmsEditorApp {
                                     &registry,
                                 );
                                 document.set_registry(registry.clone());
-                                self.document_dirty = document.objects != self.saved_objects;
+                                self.document_dirty = stage_document_differs_from_saved(
+                                    document,
+                                    &self.saved_objects,
+                                    &self.saved_lighting,
+                                );
                                 self.issues = document.validate();
                             }
                             self.registry = Some(registry);
@@ -1153,6 +1224,43 @@ impl SmsEditorApp {
                     BackgroundResult::Open(result) => match result {
                         Ok(loaded) => self.apply_loaded_stage(*loaded),
                         Err(err) => self.log.push(format!("Open stage failed: {err}")),
+                    },
+                    BackgroundResult::CreateStage(result) => match result {
+                        Ok(loaded) => {
+                            let target = loaded.document.stage_id.clone();
+                            let runtime_slot = loaded
+                                .document
+                                .changed_files
+                                .get(Path::new("data/stageArc.bin"))
+                                .and_then(|bytes| {
+                                    sms_formats::parse_jdrama_scenario_archive_entries(bytes).ok()
+                                })
+                                .and_then(|entries| {
+                                    entries.into_iter().find(|entry| {
+                                        entry
+                                            .archive_name
+                                            .eq_ignore_ascii_case(&format!("{target}.arc"))
+                                    })
+                                });
+                            self.stage_id = target.clone();
+                            self.apply_loaded_stage(*loaded);
+                            self.persist_project_settings(false);
+                            if let Some(runtime_slot) = runtime_slot {
+                                self.log.push(format!(
+                                    "Created source-free stage '{target}' in new runtime slot area {}, scenario {}.",
+                                    runtime_slot.area_index, runtime_slot.scenario_index
+                                ));
+                            } else {
+                                self.log.push(format!(
+                                    "Created and saved source-free stage '{target}' with a new project runtime slot."
+                                ));
+                            }
+                            self.log.push(
+                                "Author the scene by dropping terrain and Mario into the viewport, then set the skybox role and Stage Lighting before runtime testing."
+                                    .to_string(),
+                            );
+                        }
+                        Err(err) => self.log.push(format!("Create stage failed: {err}")),
                     },
                     BackgroundResult::Build(result) => match result {
                         Ok(outcome) => {
@@ -1333,6 +1441,7 @@ impl SmsEditorApp {
             ));
         }
         self.saved_objects = document.objects.clone();
+        self.saved_lighting = document.lighting.clone();
         self.document_dirty = false;
         self.stage_id = document.stage_id.clone();
         self.document = Some(document);
@@ -1463,7 +1572,7 @@ impl SmsEditorApp {
                 continue;
             }
             let is_sky = model_render_layer == PreviewRenderLayer::Sky;
-            let bytes = match read_stage_asset_bytes(&asset.path) {
+            let bytes = match document.read_asset_bytes(&asset.path) {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     record_model_preview_failure(
@@ -1835,7 +1944,7 @@ impl SmsEditorApp {
                 if failed_model_assets.contains(&normalized_preview_asset_path(&model_path)) {
                     continue;
                 }
-                let bytes = match read_stage_asset_bytes(&model_path) {
+                let bytes = match document.read_asset_bytes(&model_path) {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         record_model_preview_failure(
@@ -2096,7 +2205,7 @@ impl SmsEditorApp {
                     if failed_model_assets.contains(&accessory_cache_key) {
                         continue;
                     }
-                    let bytes = match read_stage_asset_bytes(&asset.path) {
+                    let bytes = match document.read_asset_bytes(&asset.path) {
                         Ok(bytes) => bytes,
                         Err(error) => {
                             record_model_preview_failure(
@@ -3735,7 +3844,7 @@ fn mirror_cubes(document: &StageDocument) -> Vec<PreviewMirrorCube> {
                 .to_ascii_lowercase()
                 .ends_with("/map/tables.bin")
     }) {
-        let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+        let Ok(bytes) = document.read_asset_bytes(&asset.path) else {
             continue;
         };
         let Ok(records) = parse_jdrama_object_records(&bytes) else {
@@ -3923,7 +4032,7 @@ fn active_pollution_layer_count(document: &StageDocument) -> usize {
                 .to_ascii_lowercase()
                 .ends_with("/map/ymap.ymp")
         })
-        .and_then(|asset| read_stage_asset_bytes(&asset.path).ok())
+        .and_then(|asset| document.read_asset_bytes(&asset.path).ok())
         .and_then(|bytes| pollution_layer_count_from_bytes(&bytes))
         .unwrap_or(0) as usize
 }

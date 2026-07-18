@@ -120,6 +120,98 @@ fn replace_object_delta(objects: &mut [SceneObject], id: &str, replacement: Scen
     }
 }
 
+fn ensure_authored_mario_placement(
+    document: &mut StageDocument,
+    translation: [f32; 3],
+) -> Result<sms_scene::PlacementAddress, String> {
+    let used_addresses = document
+        .objects
+        .iter()
+        .filter_map(|object| {
+            object
+                .placement
+                .as_ref()
+                .map(|binding| binding.address().clone())
+        })
+        .collect::<BTreeSet<_>>();
+    let archive = document
+        .stage_archive
+        .as_mut()
+        .ok_or_else(|| "the stage has no detached semantic archive".to_string())?;
+    if !matches!(archive.origin(), sms_scene::StageOrigin::Blank { .. }) {
+        return Err(
+            "new typed Mario construction is currently limited to authored stages; existing stages can duplicate their typed Mario record"
+                .to_string(),
+        );
+    }
+    let transform = sms_formats::JDramaTransform {
+        translation,
+        rotation: [0.0; 3],
+        scale: [1.0; 3],
+    };
+    if let Some(placement) = archive.object_placements().into_iter().find(|placement| {
+        placement
+            .type_name
+            .rsplit("::")
+            .next()
+            .is_some_and(|type_name| type_name == "Mario")
+            && !used_addresses.contains(&sms_scene::PlacementAddress {
+                raw_resource_path: placement.raw_resource_path.clone(),
+                record_path: placement.record_path.clone(),
+            })
+    }) {
+        archive
+            .set_object_transform(
+                &placement.raw_resource_path,
+                &placement.record_path,
+                transform,
+            )
+            .map_err(|error| error.to_string())?;
+        return Ok(sms_scene::PlacementAddress {
+            raw_resource_path: placement.raw_resource_path,
+            record_path: placement.record_path,
+        });
+    }
+
+    let parent_path = archive
+        .find_group_record_path(b"map/scene.bin", "IdxGroup", Some(6))
+        .map_err(|error| format!("could not locate the typed player group: {error}"))?
+        .ok_or_else(|| {
+            "map/scene.bin has no unambiguous IdxGroup with group_index 6 for Mario".to_string()
+        })?;
+    let record =
+        sms_scene::blank_stage_mario_record(transform).map_err(|error| error.to_string())?;
+    let record_path = archive
+        .insert_placement_record(b"map/scene.bin", &parent_path, record)
+        .map_err(|error| error.to_string())?;
+    Ok(sms_scene::PlacementAddress {
+        raw_resource_path: b"map/scene.bin".to_vec(),
+        record_path,
+    })
+}
+
+fn authored_runtime_readiness_error(document: &StageDocument) -> Option<String> {
+    let authored_blank = document
+        .stage_archive
+        .as_ref()
+        .is_some_and(|archive| matches!(archive.origin(), sms_scene::StageOrigin::Blank { .. }));
+    if authored_blank
+        && !document.objects.iter().any(|object| {
+            object
+                .factory_name
+                .rsplit("::")
+                .next()
+                .is_some_and(|factory| factory == "Mario")
+        })
+    {
+        return Some(
+            "The authored stage has no Mario placement. Drag the Mario class from the Object Palette into the viewport before building or launching."
+                .to_string(),
+        );
+    }
+    None
+}
+
 impl SmsEditorApp {
     pub(super) fn validate(&mut self) {
         if let Some(document) = &self.document {
@@ -183,6 +275,7 @@ impl SmsEditorApp {
             Some(document) => match document.save_project_folder(PathBuf::from(project_root)) {
                 Ok(outcome) => {
                     self.saved_objects = document.objects.clone();
+                    self.saved_lighting = document.lighting.clone();
                     self.document_dirty = false;
                     self.log.push(format!(
                         "Saved editor project with {} file(s).",
@@ -241,6 +334,14 @@ impl SmsEditorApp {
         }
         if self.document.is_none() {
             self.log.push("No stage open.".to_string());
+            return;
+        }
+        if let Some(error) = self
+            .document
+            .as_ref()
+            .and_then(authored_runtime_readiness_error)
+        {
+            self.log.push(format!("Stage build stopped: {error}"));
             return;
         }
         if self.current_project.is_none() {
@@ -433,6 +534,11 @@ impl SmsEditorApp {
     }
 
     pub(super) fn spawn_object_at(&mut self, factory_name: String, translation: [f32; 3]) {
+        let Some(document) = self.document.as_mut() else {
+            self.log
+                .push("Open a stage before placing an object class.".to_string());
+            return;
+        };
         let id = format!(
             "{}-obj-{:04}",
             sanitize_id(&self.stage_id),
@@ -440,7 +546,48 @@ impl SmsEditorApp {
         );
         self.next_object_serial += 1;
 
-        let mut object = SceneObject::new(id.clone(), factory_name.clone());
+        let template = document
+            .objects
+            .iter()
+            .find(|object| object.factory_name == factory_name && object.placement.is_some())
+            .cloned();
+        let mut object = if factory_name == "Mario" {
+            if document
+                .objects
+                .iter()
+                .any(|object| object.factory_name == "Mario")
+            {
+                self.log.push(
+                    "This stage already has a Mario player placement; move the existing Mario instead."
+                        .to_string(),
+                );
+                return;
+            }
+            let address = match ensure_authored_mario_placement(document, translation) {
+                Ok(address) => address,
+                Err(error) => {
+                    self.log
+                        .push(format!("Could not place the Mario class: {error}"));
+                    return;
+                }
+            };
+            let mut object = SceneObject::new(id.clone(), factory_name.clone());
+            object.placement = Some(sms_scene::PlacementBinding::Existing(address));
+            object
+        } else if let Some(mut template) = template {
+            template.id = id.clone();
+            template.source = None;
+            template.placement = template
+                .placement
+                .as_ref()
+                .map(|binding| sms_scene::PlacementBinding::CloneOf(binding.address().clone()));
+            template
+        } else {
+            self.log.push(format!(
+                "Could not place class '{factory_name}': this stage has no typed instance to clone and the decomp-derived schema does not expose a constructor for it."
+            ));
+            return;
+        };
         object.transform.translation = translation;
         if let Some(schema) = self
             .registry
@@ -468,6 +615,41 @@ impl SmsEditorApp {
         );
         self.selected_object_id = Some(id);
         self.rebuild_model_preview_from_document();
+    }
+
+    pub(super) fn can_spawn_factory(&self, factory_name: &str) -> bool {
+        let Some(document) = self.document.as_ref() else {
+            return false;
+        };
+        if factory_name == "Mario" {
+            let authored_blank = document.stage_archive.as_ref().is_some_and(|archive| {
+                matches!(archive.origin(), sms_scene::StageOrigin::Blank { .. })
+            });
+            return authored_blank
+                && !document
+                    .objects
+                    .iter()
+                    .any(|object| object.factory_name == "Mario");
+        }
+        document
+            .objects
+            .iter()
+            .any(|object| object.factory_name == factory_name && object.placement.is_some())
+    }
+
+    pub(super) fn update_stage_lighting(&mut self, lighting: sms_scene::StageLighting) {
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        if document.lighting == lighting {
+            return;
+        }
+        document.lighting = lighting;
+        self.document_dirty =
+            stage_document_differs_from_saved(document, &self.saved_objects, &self.saved_lighting);
+        self.flush_document_change();
+        self.rebuild_gpu_viewport_scene();
+        self.clear_viewport_preview_cache();
     }
 
     pub(super) fn duplicate_selected(&mut self) {
@@ -605,9 +787,13 @@ impl SmsEditorApp {
         self.document_dirty = if in_transaction {
             true
         } else {
-            self.document
-                .as_ref()
-                .is_some_and(|document| document.objects != self.saved_objects)
+            self.document.as_ref().is_some_and(|document| {
+                stage_document_differs_from_saved(
+                    document,
+                    &self.saved_objects,
+                    &self.saved_lighting,
+                )
+            })
         };
         if !in_transaction {
             self.flush_document_change();
@@ -627,7 +813,7 @@ impl SmsEditorApp {
         self.document_dirty = if in_transaction {
             true
         } else {
-            document.objects != self.saved_objects
+            stage_document_differs_from_saved(document, &self.saved_objects, &self.saved_lighting)
         };
         if !in_transaction {
             self.push_undo_record(record);
@@ -695,10 +881,9 @@ impl SmsEditorApp {
                 }
             }
         });
-        self.document_dirty = self
-            .document
-            .as_ref()
-            .is_some_and(|document| document.objects != self.saved_objects);
+        self.document_dirty = self.document.as_ref().is_some_and(|document| {
+            stage_document_differs_from_saved(document, &self.saved_objects, &self.saved_lighting)
+        });
         let Some(record) = record.filter(|record| !record.deltas.is_empty()) else {
             return;
         };
@@ -738,7 +923,11 @@ impl SmsEditorApp {
         };
         if let Some(document) = &mut self.document {
             record.apply_reverse(&mut document.objects);
-            self.document_dirty = document.objects != self.saved_objects;
+            self.document_dirty = stage_document_differs_from_saved(
+                document,
+                &self.saved_objects,
+                &self.saved_lighting,
+            );
         }
         self.redo_stack.push_back(record);
         self.flush_document_change();
@@ -767,7 +956,11 @@ impl SmsEditorApp {
         };
         if let Some(document) = &mut self.document {
             record.apply_forward(&mut document.objects);
-            self.document_dirty = document.objects != self.saved_objects;
+            self.document_dirty = stage_document_differs_from_saved(
+                document,
+                &self.saved_objects,
+                &self.saved_lighting,
+            );
         }
         self.undo_stack.push_back(record);
         self.flush_document_change();
@@ -1036,6 +1229,9 @@ impl SmsEditorApp {
     }
 
     pub(super) fn frame_selected(&mut self) {
+        if self.frame_selected_model_instance() {
+            return;
+        }
         self.stop_camera_fly();
         if let Some(object) = self.selected_object() {
             self.renderer.camera_mut().focus = object.transform.translation;
@@ -1146,4 +1342,84 @@ fn preview_triangle_ranges_for_model_index(
         ranges.push(start..preview.triangles.len());
     }
     ranges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sms_formats::{
+        JDramaDocument, JDramaField, JDramaFieldValue, JDramaRecord, JDramaRecordPayload,
+    };
+
+    #[test]
+    fn authored_mario_placement_uses_typed_player_group_and_constructor() {
+        let player_group = JDramaRecord::new(
+            "IdxGroup",
+            "player group",
+            JDramaRecordPayload::Group {
+                fields: vec![JDramaField {
+                    name: "group_index".to_string(),
+                    value: JDramaFieldValue::U32(6),
+                }],
+                children: Vec::new(),
+            },
+        )
+        .unwrap();
+        let root = JDramaRecord::new(
+            "GroupObj",
+            "scene",
+            JDramaRecordPayload::Group {
+                fields: Vec::new(),
+                children: vec![player_group],
+            },
+        )
+        .unwrap();
+        let mut archive = sms_scene::SourceFreeStageArchive::new().unwrap();
+        archive
+            .insert_resource(
+                b"map/scene.bin".to_vec(),
+                StageResourceDocument::Placement(JDramaDocument { root }),
+            )
+            .unwrap();
+        archive.set_origin(sms_scene::StageOrigin::Blank {
+            target_slot: "custom0".to_string(),
+            preset_version: sms_scene::BLANK_STAGE_PRESET_VERSION,
+        });
+        let mut document = StageDocument {
+            stage_id: "custom0".to_string(),
+            base_root: PathBuf::from("."),
+            assets: Vec::new(),
+            objects: Vec::new(),
+            changed_files: BTreeMap::new(),
+            stage_archive: Some(archive),
+            stage_archive_source_path: Some(PathBuf::from("custom0.szs")),
+            archive_edits: sms_scene::StageArchiveEdits::default(),
+            registry: None,
+            load_issues: Vec::new(),
+            lighting: sms_scene::StageLighting::default(),
+            actor_previews: BTreeMap::new(),
+            loaded_project: None,
+        };
+
+        let address = ensure_authored_mario_placement(&mut document, [10.0, 20.0, 30.0]).unwrap();
+        assert_eq!(address.raw_resource_path, b"map/scene.bin");
+        let placements = document.stage_archive.as_ref().unwrap().object_placements();
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].type_name, "Mario");
+        assert_eq!(placements[0].record_path, address.record_path);
+        assert_eq!(placements[0].transform.translation, [10.0, 20.0, 30.0]);
+        assert_eq!(placements[0].transform.scale, [1.0; 3]);
+        assert!(authored_runtime_readiness_error(&document).is_some());
+        document.objects.push(SceneObject {
+            id: "mario".to_string(),
+            source: None,
+            placement: Some(sms_scene::PlacementBinding::Existing(address)),
+            factory_name: "Mario".to_string(),
+            class_name: None,
+            transform: Transform::default(),
+            raw_params: BTreeMap::new(),
+            asset_hints: Vec::new(),
+        });
+        assert_eq!(authored_runtime_readiness_error(&document), None);
+    }
 }

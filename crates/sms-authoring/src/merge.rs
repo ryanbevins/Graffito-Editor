@@ -20,6 +20,12 @@ pub enum ModelInstanceExportMode {
     SeparateRuntimeObject,
     StockMapObjBase,
     MapTerrain,
+    /// Rebuilds the stage-global `map/map/sky.bmd` consumed by `TSky`.
+    ///
+    /// This remains an explicit scene role instead of a filename convention:
+    /// the editor also authors the matching typed `Sky` placement when the
+    /// open stage does not already contain one.
+    Skybox,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

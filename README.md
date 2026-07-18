@@ -79,6 +79,8 @@ may be missing or visually incorrect.
   gizmos, with snapping support
 - Import rigid `.gltf` and `.glb` models into native project-owned model assets,
   edit their GX materials and collision settings, and place typed instances
+- Create a source-free stage under a new project-owned runtime mapping, then
+  author its terrain, Mario placement, skybox, and lighting in the scene
 - Use undo and redo for the currently supported object operations
 - Inspect raw and decoded object parameters
 - Run basic document validation and review load or validation issues in the UI
@@ -111,11 +113,12 @@ The `sms-cli` package currently provides commands to:
 Run `cargo run -p sms-cli -- --help` to see the current command list and
 arguments.
 
-`create-blank-stage` generates small source-free proxy BMDs for the required
-coin, bottle, NormalBlock, and JuiceBlock manager closure unless an explicit
-`--proxy-asset` is supplied. It rejects a Yaz0/RARC payload above the editor's
-12 MiB blank-stage safety budget before writing output, leaving headroom in
-Sunshine's 24 MiB MEM1.
+`create-blank-stage` creates an empty external archive for a new stage ID, with
+the built-in source-free bootstrap resources and internal placeholder terrain
+needed by the runtime. It does not add a `stageArc.bin` mapping; managed release
+authoring supplies that mapping. The command rejects a Yaz0/RARC payload above
+the editor's 12 MiB blank-stage safety budget before writing output, leaving
+headroom in Sunshine's 24 MiB MEM1.
 
 ## Projects, Model Export, and Managed Builds
 
@@ -139,10 +142,58 @@ See [the project format specification](docs/project-format.md) for the version 1
 schema and path-resolution rules.
 
 This output records the editor's current object representation and typed archive
-edits. The stage's semantic archive is freshly imported from the configured base
-root when the stage opens; it is not cached in the project. Saving a project does
-**not** rewrite retail `scene.bin`, patch a game image, or produce files that
-Dolphin can run as a mod. Building is a separate, explicit action.
+edits. For a retail-backed stage, its semantic archive is freshly imported from
+the configured base root when the stage opens; it is not cached in the project.
+The source-free authored-stage baseline is the explicit exception described
+below. Saving a project does **not** rewrite retail `scene.bin`, patch a game
+image, or produce files that Dolphin can run as a mod. Building is a separate,
+explicit action.
+
+### Create New Stage
+
+The experimental **Create New Stage** workflow is available after opening a
+`.sms` project through **File > New Stage...** or **+ New Stage** in the Stages
+content browser. Creation asks for a unique stage ID. It creates a minimal,
+source-free scene with an internal runtime placeholder terrain; it does not ask
+for a world model, place Mario, select a skybox, or clone lighting from a retail
+stage.
+
+The project derives its own `files/data/stageArc.bin` from the configured game
+release and adds the stage ID to an unused scenario in the editor's reserved,
+runtime-supported areas. Existing retail area, scenario, and archive mappings are
+left intact. An ID conflict or exhausted reserved scenario range is rejected
+rather than replacing a retail mapping or guessing another slot.
+
+Terrain and actors are authored after the empty stage opens. Drag a
+collision-bearing project model into the world; the first such model in a new
+blank stage defaults to **Bake as map terrain**, replacing only the internal
+placeholder terrain when the stage is built. Drag the `Mario` class from the
+object palette into the viewport and position it with the normal scene tools.
+A managed build or Dolphin launch is blocked until the authored stage has this
+typed Mario placement. A placed model can be assigned as the **Stage Skybox**,
+and the stage's ambient and light settings are edited in-scene. These choices
+are stage data, so skybox and lighting can be changed later without recreating
+the stage.
+
+The authored semantic baseline is stored at
+`<project-data-root>/files/editor/stages/<stage-id>.stage.json`, beside the normal
+`<stage-id>.scene.json` editor overlay. The baseline contains typed semantic data
+and deterministic reconstruction metadata, not cached source-archive or
+container bytes. It is restored before the editor overlay when the project is
+reopened.
+The project-owned `files/data/stageArc.bin` records the new runtime mapping; the
+configured retail table remains a read-only source.
+
+**Build Game** rebuilds the baseline as
+`run-root/files/data/scene/<stage-id>.szs` and overlays the project-owned
+`stageArc.bin` into the managed release. **Launch in Dolphin** performs the same
+managed build, resolves the new archive through that staged table, and
+direct-boots its allocated area and scenario. Neither action writes to the
+extracted base game or replaces its stage assets or mappings.
+
+This workflow remains experimental. Successful compilation, semantic round trips,
+and managed-build checks are not visual or in-game runtime validation; generated
+stages still require manual verification in Dolphin.
 
 ### Placed-model export modes
 
@@ -182,7 +233,9 @@ leave those dependencies unsatisfied.
 **Build Game** saves the project, rebuilds the stage from semantic documents,
 and prepares `<managed-build-root>/run-root/` as a complete runnable extracted
 game directory. Every base file is copied independently, then the rebuilt stage
-is atomically installed at its exact game-relative path.
+and project-owned game-file overlays are atomically installed at their exact
+game-relative paths. For an authored stage, those overlays include the
+project-owned `files/data/stageArc.bin` containing its new runtime mapping.
 The managed build root defaults to a `.smsbuild` sibling of the `.sms`
 descriptor and is protected by a project-identity marker.
 
@@ -216,14 +269,15 @@ only after a byte-identical second rebuild. It refuses output inside the
 extracted base tree and rejects unsupported resource kinds instead of copying
 payloads through.
 
-Managed builds use the semantic archive imported when the stage was opened.
-Typed transform, deletion, duplicate, resource, model, collision, and complete
-JDrama insertion edits are applied before every resource and container layer is
-rebuilt. Source-less palette objects and unmodeled parameter changes are
-rejected instead of producing incomplete placement streams. Model geometry is
-canonically relaid out when compiled. Version 3 editor projects persist typed
-edits, while the semantic baseline is freshly imported when the stage opens;
-the build uses that in-memory import and never rereads the retail archive path.
+For a retail-backed stage, managed builds use the semantic archive imported when
+the stage was opened. For a stage made with **Create New Stage**, they use the
+managed source-free semantic baseline described above. Typed transform,
+deletion, duplicate, resource, model, collision, and complete JDrama insertion
+edits are applied before every resource and container layer is rebuilt.
+Source-less palette objects and unmodeled parameter changes are rejected instead
+of producing incomplete placement streams. Model geometry is canonically relaid
+out when compiled. Version 3 editor projects persist typed edits; builds never
+reread a retail stage archive after the applicable semantic baseline is loaded.
 
 For a detached workflow, `import-stage-document` first proves an exact rebuild
 and then creates a standalone typed JSON document whose RARC payload slots are

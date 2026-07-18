@@ -246,6 +246,13 @@ impl SmsEditorApp {
         rect: egui::Rect,
         response: &egui::Response,
     ) {
+        if let Some(payload) = response.dnd_release_payload::<ObjectPaletteDragPayload>() {
+            if let Some(pointer) = ui.input(|input| input.pointer.latest_pos()) {
+                let world = self.screen_to_world_floor(rect, pointer);
+                self.spawn_object_at(payload.factory_name.clone(), world);
+            }
+            return;
+        }
         if let Some(payload) = response.dnd_release_payload::<ModelAssetDragPayload>() {
             if let Some(pointer) = ui.input(|input| input.pointer.latest_pos()) {
                 let world = self.screen_to_world_floor(rect, pointer);
@@ -2094,8 +2101,19 @@ impl SmsEditorApp {
             egui::Stroke::new(2.0, egui::Color32::from_rgb(93, 158, 236)),
         );
 
-        if self.palette_factory.is_some() && self.tool == EditorTool::Place {
-            let text = self.palette_factory.as_deref().unwrap_or_default();
+        if (self.palette_factory.is_some() || self.placing_model_asset.is_some())
+            && self.tool == EditorTool::Place
+        {
+            let text = self.palette_factory.clone().unwrap_or_else(|| {
+                self.placing_model_asset
+                    .and_then(|id| {
+                        self.model_catalog_entries
+                            .iter()
+                            .find(|entry| entry.id == id)
+                            .map(|entry| entry.name.clone())
+                    })
+                    .unwrap_or_else(|| "model asset".to_string())
+            });
             let rect = egui::Rect::from_min_size(
                 rect.left_bottom() + egui::vec2(16.0, -48.0),
                 egui::vec2(260.0, 34.0),
@@ -2108,7 +2126,7 @@ impl SmsEditorApp {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                format!("Placing {text}"),
+                format!("Placing {text} — click to confirm"),
                 egui::FontId::proportional(13.0),
                 egui::Color32::from_rgb(215, 238, 231),
             );

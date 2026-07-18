@@ -9,9 +9,10 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sms_formats::{
-    mount_scene_archive, parse_jdrama_object_records, read_stage_asset_bytes, scan_stage_assets,
-    JDramaAmbient, JDramaDocument, JDramaField, JDramaFieldValue, JDramaLight, JDramaObjectRecord,
-    JDramaRecord, JDramaRecordPayload, PrmFile, SourceLocation, StageAsset, StageAssetKind,
+    mount_scene_archive, parse_jdrama_object_records, read_stage_asset_bytes,
+    scan_common_stage_assets, scan_stage_assets, JDramaAmbient, JDramaDocument, JDramaField,
+    JDramaFieldValue, JDramaLight, JDramaObjectRecord, JDramaRecord, JDramaRecordPayload, PrmFile,
+    SourceLocation, StageAsset, StageAssetKind,
 };
 use sms_schema::{
     EnemyActorDefinition, EnemyManagerDefinition, EnemyModelDefinition, ObjectRegistry,
@@ -25,10 +26,11 @@ mod stage_export;
 mod validation;
 
 pub use blank_stage::{
-    BlankStageBootstrapKind, BlankStageBootstrapManifest, BlankStageBootstrapRequirement,
-    BlankStageBootstrapResource, BlankStagePreset, BlankStageTargetMetadata,
-    BLANK_STAGE_BOOTSTRAP_REQUIREMENTS, BLANK_STAGE_PRESET_VERSION,
-    DEFAULT_BLANK_STAGE_TARGET_SLOT,
+    blank_stage_mario_record, blank_stage_sky_record, BlankStageBootstrapKind,
+    BlankStageBootstrapManifest, BlankStageBootstrapRequirement, BlankStageBootstrapResource,
+    BlankStageLightingPreset, BlankStagePreset, BlankStageSkyboxPreset, BlankStageTargetMetadata,
+    BLANK_STAGE_BOOTSTRAP_REQUIREMENTS, BLANK_STAGE_CAMERA_DIRECTORY_MARKER_PATH,
+    BLANK_STAGE_COIN_PARTICLE_PATH, BLANK_STAGE_PRESET_VERSION, DEFAULT_BLANK_STAGE_TARGET_SLOT,
 };
 pub use stage_archive::{
     SourceFreeStageArchive, StageCompression, StageObjectPlacement, StageOrigin, StageResource,
@@ -309,6 +311,132 @@ impl StageDocument {
         })
     }
 
+    /// Creates a document for a genuinely new authored stage id.
+    ///
+    /// No retail stage archive is opened or required. The semantic archive is
+    /// mounted at the virtual runtime identity
+    /// `<base>/files/data/scene/<stage_id>.szs`, which is also the path a
+    /// managed release build will author later.
+    pub fn from_authored_archive(
+        base_root: impl AsRef<Path>,
+        stage_id: impl Into<String>,
+        mut archive: SourceFreeStageArchive,
+    ) -> Result<Self> {
+        let base_root = base_root.as_ref().to_path_buf();
+        if !base_root.exists() {
+            return Err(SceneError::MissingBaseRoot(base_root));
+        }
+        let stage_id = stage_id.into();
+        validate_stage_id(&stage_id)?;
+        validate_authored_archive_target(&archive, &stage_id)?;
+        blank_stage::ensure_blank_stage_runtime_resources(&mut archive)?;
+        let source_path = authored_stage_virtual_source_path(&base_root, &stage_id)?;
+        let assets = authored_stage_assets(&base_root, &source_path, &archive)?;
+        let (objects, load_issues, lighting) =
+            load_scene_objects_from_assets_with_reader(&assets, |path| {
+                read_semantic_stage_asset_bytes(&archive, &source_path, path)
+            });
+        let semantic_json = archive.to_semantic_json()?;
+        let archive = SourceFreeStageArchive::from_semantic_json(&semantic_json)?;
+        Ok(Self {
+            stage_id,
+            base_root,
+            assets,
+            objects,
+            changed_files: BTreeMap::new(),
+            stage_archive: Some(archive),
+            stage_archive_source_path: Some(source_path),
+            archive_edits: StageArchiveEdits::default(),
+            registry: None,
+            load_issues,
+            lighting,
+            actor_previews: BTreeMap::new(),
+            loaded_project: None,
+        })
+    }
+
+    /// Reopens an authored stage directly from a managed project baseline.
+    /// This is the safe restart path for stage ids that do not exist in the
+    /// extracted retail game.
+    pub fn open_authored_project_stage(
+        base_root: impl AsRef<Path>,
+        stage_id: impl Into<String>,
+        project_root: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let base_root = base_root.as_ref();
+        let stage_id = stage_id.into();
+        let archive = project_store::load_authored_stage_baseline(
+            base_root,
+            &stage_id,
+            project_root.as_ref(),
+        )?
+        .ok_or_else(|| {
+            SceneError::StageExport(format!(
+                "project has no authored stage baseline for '{stage_id}'"
+            ))
+        })?;
+        let mut document = Self::from_authored_archive(base_root, stage_id, archive)?;
+        document.load_project_folder(project_root)?;
+        Ok(document)
+    }
+
+    /// Replaces the current stage baseline with a source-free authored archive
+    /// targeting this document's existing retail slot. Project identity and
+    /// already loaded project state are preserved; scene-derived state is
+    /// regenerated entirely from the authored semantic resources.
+    pub fn replace_with_authored_archive(
+        &mut self,
+        mut archive: SourceFreeStageArchive,
+    ) -> Result<()> {
+        validate_authored_archive_target(&archive, &self.stage_id)?;
+        blank_stage::ensure_blank_stage_runtime_resources(&mut archive)?;
+
+        // Normalize through the public detached document format. Besides
+        // proving a stable semantic rebuild, this prevents a caller-owned
+        // archive instance from carrying unvalidated container state into the
+        // editor document.
+        let semantic_json = archive.to_semantic_json()?;
+        let archive = SourceFreeStageArchive::from_semantic_json(&semantic_json)?;
+        let source_path = match &self.stage_archive_source_path {
+            Some(source_path) => source_path.clone(),
+            None => authored_stage_virtual_source_path(&self.base_root, &self.stage_id)?,
+        };
+        let assets = authored_stage_assets(&self.base_root, &source_path, &archive)?;
+        let (objects, load_issues, lighting) =
+            load_scene_objects_from_assets_with_reader(&assets, |path| {
+                read_semantic_stage_asset_bytes(&archive, &source_path, path)
+            });
+
+        let registry = self.registry.take();
+        self.assets = assets;
+        self.objects = objects;
+        self.stage_archive = Some(archive);
+        self.stage_archive_source_path = Some(source_path);
+        self.archive_edits = StageArchiveEdits::default();
+        self.load_issues = load_issues;
+        self.lighting = lighting;
+        self.actor_previews.clear();
+        if let Some(registry) = registry {
+            self.set_registry(registry);
+        }
+        Ok(())
+    }
+
+    /// Reads a stage asset from the document's detached semantic archive when
+    /// the path addresses its mounted stage source. Common files and other
+    /// external assets retain the normal filesystem/archive reader behavior.
+    pub fn read_asset_bytes(&self, path: impl AsRef<Path>) -> Result<Vec<u8>> {
+        let path = path.as_ref();
+        if let (Some(archive), Some(source_path)) =
+            (&self.stage_archive, &self.stage_archive_source_path)
+        {
+            if let Some(bytes) = read_matching_semantic_stage_asset(archive, source_path, path)? {
+                return Ok(bytes);
+            }
+        }
+        Ok(read_stage_asset_bytes(path)?)
+    }
+
     pub fn with_registry(mut self, registry: ObjectRegistry) -> Self {
         self.set_registry(registry);
         self
@@ -316,7 +444,10 @@ impl StageDocument {
 
     pub fn set_registry(&mut self, registry: ObjectRegistry) {
         let (actor_previews, preview_issues) =
-            build_actor_preview_catalog(&self.base_root, &self.assets, &registry);
+            build_actor_preview_catalog(&self.base_root, &self.assets, &registry, |path| {
+                self.read_asset_bytes(path)
+                    .map_err(|error| error.to_string())
+            });
         let object_preview_issues =
             apply_registry_preview_hints(&mut self.objects, &self.assets, &registry);
         self.actor_previews = actor_previews;
@@ -402,10 +533,31 @@ impl StageDocument {
             stage_id: self.stage_id.clone(),
             objects: self.objects.clone(),
             archive_edits: self.archive_edits.clone(),
+            lighting: Some(self.lighting.clone()),
         };
         let bytes = serde_json::to_vec_pretty(&overlay)?;
         self.mark_changed_file(path, bytes)?;
         Ok(())
+    }
+
+    pub fn authored_stage_baseline_path(&self) -> Result<PathBuf> {
+        validate_stage_id(&self.stage_id)?;
+        Ok(PathBuf::from("editor")
+            .join("stages")
+            .join(format!("{}.stage.json", self.stage_id)))
+    }
+
+    fn queue_authored_stage_baseline_change(&mut self) -> Result<()> {
+        let Some(archive) = self.stage_archive.as_ref() else {
+            return Ok(());
+        };
+        if !matches!(archive.origin(), StageOrigin::Blank { .. }) {
+            return Ok(());
+        }
+        validate_authored_archive_target(archive, &self.stage_id)?;
+        let path = self.authored_stage_baseline_path()?;
+        let bytes = archive.to_semantic_json()?;
+        self.mark_changed_file(path, bytes)
     }
 
     pub fn editor_overlay_path(&self) -> Result<PathBuf> {
@@ -420,6 +572,7 @@ impl StageDocument {
         project_root: impl AsRef<Path>,
     ) -> Result<ProjectSaveOutcome> {
         self.queue_editor_overlay_change()?;
+        self.queue_authored_stage_baseline_change()?;
         let project_root = project_root.as_ref();
         let loaded_root = if project_root.is_absolute() {
             project_root.to_path_buf()
@@ -470,6 +623,12 @@ pub struct EditorSceneOverlay {
     pub objects: Vec<SceneObject>,
     #[serde(default)]
     pub archive_edits: StageArchiveEdits,
+    /// Ordered typed `AmbAry`/`LightAry` state authored in the scene.
+    ///
+    /// `None` preserves compatibility with older overlays, whose lighting is
+    /// inherited from the semantic stage baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lighting: Option<StageLighting>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -804,8 +963,153 @@ fn is_portable_project_component(component: &OsStr) -> bool {
         .is_some_and(|suffix| matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
 }
 
+fn validate_authored_archive_target(
+    archive: &SourceFreeStageArchive,
+    stage_id: &str,
+) -> Result<()> {
+    match archive.origin() {
+        StageOrigin::Blank { target_slot, .. } if target_slot.eq_ignore_ascii_case(stage_id) => {
+            Ok(())
+        }
+        StageOrigin::Blank { target_slot, .. } => Err(SceneError::StageExport(format!(
+            "authored stage target '{target_slot}' does not match document stage '{stage_id}'"
+        ))),
+        StageOrigin::ImportedArchive => Err(SceneError::StageExport(format!(
+            "stage '{stage_id}' requires a blank authored archive origin"
+        ))),
+    }
+}
+
+/// Returns the virtual game-relative archive identity for an authored stage.
+/// The path is not created and may intentionally not exist in the extracted
+/// retail base.
+pub fn authored_stage_virtual_source_path(base_root: &Path, stage_id: &str) -> Result<PathBuf> {
+    validate_stage_id(stage_id)?;
+    Ok(base_root
+        .join("files")
+        .join("data")
+        .join("scene")
+        .join(format!("{stage_id}.szs")))
+}
+
+/// Lists validated authored stage ids persisted in a managed project.
+/// Retail stages without a semantic authored baseline are not returned.
+pub fn discover_authored_project_stage_ids(project_root: impl AsRef<Path>) -> Result<Vec<String>> {
+    project_store::discover_authored_stage_ids(project_root.as_ref())
+}
+
+fn authored_stage_assets(
+    base_root: &Path,
+    source_path: &Path,
+    archive: &SourceFreeStageArchive,
+) -> Result<Vec<StageAsset>> {
+    let mut assets = scan_common_stage_assets(base_root)?;
+    assets.extend(archive.resources().iter().map(|resource| StageAsset {
+        path: PathBuf::from(format!(
+            "{}!/{}",
+            source_path.display(),
+            String::from_utf8_lossy(&resource.raw_path)
+        )),
+        kind: semantic_stage_asset_kind(&resource.raw_path),
+    }));
+    assets.sort_by(|left, right| left.path.cmp(&right.path));
+    assets.dedup_by(|left, right| left.path == right.path);
+    Ok(assets)
+}
+
+fn semantic_stage_asset_kind(raw_path: &[u8]) -> StageAssetKind {
+    let path = String::from_utf8_lossy(raw_path);
+    match Path::new(path.as_ref())
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "arc" | "szs" => StageAssetKind::Archive,
+        "bmd" | "bdl" => StageAssetKind::Model,
+        "bmt" => StageAssetKind::MaterialTable,
+        "bti" | "bmp" => StageAssetKind::Texture,
+        "col" => StageAssetKind::Collision,
+        "bmg" => StageAssetKind::Message,
+        "jpa" | "jpc" => StageAssetKind::Particle,
+        "bck" | "btp" | "btk" | "brk" | "bas" => StageAssetKind::Animation,
+        "bin" | "prm" | "map" => StageAssetKind::Placement,
+        _ => StageAssetKind::Other,
+    }
+}
+
+fn read_semantic_stage_asset_bytes(
+    archive: &SourceFreeStageArchive,
+    source_path: &Path,
+    path: &Path,
+) -> Result<Vec<u8>> {
+    if let Some(bytes) = read_matching_semantic_stage_asset(archive, source_path, path)? {
+        Ok(bytes)
+    } else {
+        Ok(read_stage_asset_bytes(path)?)
+    }
+}
+
+fn read_matching_semantic_stage_asset(
+    archive: &SourceFreeStageArchive,
+    source_path: &Path,
+    path: &Path,
+) -> Result<Option<Vec<u8>>> {
+    let Some(raw_resource_path) = semantic_resource_path_for_asset(source_path, path) else {
+        return Ok(None);
+    };
+    archive
+        .resource_bytes(&raw_resource_path)?
+        .map(Some)
+        .ok_or_else(|| {
+            SceneError::StageExport(format!(
+                "semantic stage resource '{}' is not present in the authored archive",
+                String::from_utf8_lossy(&raw_resource_path)
+            ))
+        })
+}
+
+fn semantic_resource_path_for_asset(source_path: &Path, path: &Path) -> Option<Vec<u8>> {
+    let path_text = path.to_string_lossy();
+    let (archive_path, resource_path) = path_text.split_once("!/")?;
+    if !stage_archive_paths_match(Path::new(archive_path), source_path) {
+        return None;
+    }
+    Some(
+        resource_path
+            .replace('\\', "/")
+            .trim_start_matches('/')
+            .as_bytes()
+            .to_vec(),
+    )
+}
+
+fn stage_archive_paths_match(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .eq_ignore_ascii_case(
+                right
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .trim_end_matches('/'),
+            ),
+    }
+}
+
 fn load_scene_objects_from_assets(
     assets: &[StageAsset],
+) -> (Vec<SceneObject>, Vec<ValidationIssue>, StageLighting) {
+    load_scene_objects_from_assets_with_reader(assets, |path| Ok(read_stage_asset_bytes(path)?))
+}
+
+fn load_scene_objects_from_assets_with_reader(
+    assets: &[StageAsset],
+    mut read_asset: impl FnMut(&Path) -> Result<Vec<u8>>,
 ) -> (Vec<SceneObject>, Vec<ValidationIssue>, StageLighting) {
     let mut objects = Vec::new();
     let mut issues = Vec::new();
@@ -847,7 +1151,7 @@ fn load_scene_objects_from_assets(
         let path_text = asset.path.to_string_lossy().replace('\\', "/");
         let asset_identity = stable_path_identity(&path_text);
 
-        let bytes = match read_stage_asset_bytes(&asset.path) {
+        let bytes = match read_asset(&asset.path) {
             Ok(bytes) => bytes,
             Err(err) => {
                 issues.push(ValidationIssue::error(
@@ -1061,13 +1365,22 @@ fn apply_registry_preview_hints(
                 role: AssetRole::InferredPreviewModel,
             });
         }
-        let resource_name = object.raw_param("actor_tail_string");
+        let resource_name = object.raw_param("actor_tail_string").map(str::to_string);
         let object_definition = registry.find_object(&object.factory_name);
+        if let Some(definition) = object_definition {
+            // Class names are schema provenance rather than serialized stage
+            // data. Refresh them alongside the other registry-derived hints
+            // so a newer decomp extractor can repair old "Unknown" labels
+            // without rewriting the placement record.
+            object.class_name = Some(definition.class_name.clone());
+        }
         let is_map_static =
             object_definition.is_some_and(|definition| definition.class_name == "TMapStaticObj");
         let is_map_obj = registry.is_map_obj_factory(&object.factory_name);
         let map_obj_resource = if is_map_obj {
-            resource_name.and_then(|resource_name| registry.find_map_obj_resource(resource_name))
+            resource_name
+                .as_deref()
+                .and_then(|resource_name| registry.find_map_obj_resource(resource_name))
         } else {
             None
         };
@@ -1126,7 +1439,7 @@ fn apply_registry_preview_hints(
         }
 
         let map_static_binding = if is_map_static {
-            resource_name.and_then(|resource_name| {
+            resource_name.as_deref().and_then(|resource_name| {
                 registry
                     .map_static_models
                     .iter()
@@ -1254,6 +1567,7 @@ fn enemy_runtime_uniform_scale(
     actor: &EnemyActorDefinition,
     manager: &EnemyManagerDefinition,
     assets: &[StageAsset],
+    read_asset: &mut impl FnMut(&Path) -> std::result::Result<Vec<u8>, String>,
 ) -> std::result::Result<Option<f32>, String> {
     let Some(definition) = &actor.runtime_uniform_scale else {
         return Ok(None);
@@ -1311,7 +1625,7 @@ fn enemy_runtime_uniform_scale(
             manager.factory_name
         ));
     }
-    let bytes = read_stage_asset_bytes(&asset.path).map_err(|error| {
+    let bytes = read_asset(&asset.path).map_err(|error| {
         format!(
             "Could not read runtime scale parameters {}: {error}",
             asset.path.display()
@@ -1383,6 +1697,7 @@ fn build_actor_preview_catalog(
     base_root: &Path,
     assets: &[StageAsset],
     registry: &ObjectRegistry,
+    mut read_asset: impl FnMut(&Path) -> std::result::Result<Vec<u8>, String>,
 ) -> (BTreeMap<String, ActorPreview>, Vec<ValidationIssue>) {
     let chara_folders = match load_obj_chara_folders(base_root) {
         Ok(folders) => folders,
@@ -1428,7 +1743,7 @@ fn build_actor_preview_catalog(
                 .ends_with("/map/scene.bin")
         })
     {
-        let Ok(bytes) = read_stage_asset_bytes(&asset.path) else {
+        let Ok(bytes) = read_asset(&asset.path) else {
             issues.push(ValidationIssue::warning(
                 "enemy-preview-placement-read-failed",
                 format!(
@@ -1473,7 +1788,12 @@ fn build_actor_preview_catalog(
                 else {
                     continue;
                 };
-                match enemy_runtime_uniform_scale(actor, manager, &parameter_assets) {
+                match enemy_runtime_uniform_scale(
+                    actor,
+                    manager,
+                    &parameter_assets,
+                    &mut read_asset,
+                ) {
                     Ok(scale) => {
                         runtime_uniform_scales.insert(
                             (actor.factory_name.clone(), manager.factory_name.clone()),
@@ -2076,6 +2396,7 @@ mod tests {
         assert_eq!(overlay.stage_id, "dolpic");
         assert!(overlay.objects.is_empty());
         assert_eq!(overlay.archive_edits, StageArchiveEdits::default());
+        assert!(overlay.lighting.is_none());
     }
 
     #[test]
@@ -2238,6 +2559,17 @@ mod tests {
         let root = unique_test_project_root("overlay-round-trip");
         let mut saved = empty_document("dolpic");
         saved.objects = vec![SceneObject::new("edited-object", "Coin")];
+        saved.lighting = StageLighting {
+            lights: vec![JDramaLight {
+                name: Some("authored key".to_string()),
+                position: [10.0, 20.0, 30.0],
+                color: [40, 50, 60, 255],
+            }],
+            ambients: vec![JDramaAmbient {
+                name: Some("authored ambient".to_string()),
+                color: [70, 80, 90, 255],
+            }],
+        };
         saved.archive_edits.replace_collision(
             b"map/map.col".to_vec(),
             sms_formats::ColFile::new(vec![], vec![]),
@@ -2254,9 +2586,183 @@ mod tests {
         assert!(reopened.load_project_folder(&root).unwrap());
         assert_eq!(reopened.objects, saved.objects);
         assert_eq!(reopened.archive_edits, saved.archive_edits);
+        assert_eq!(reopened.lighting, saved.lighting);
         assert!(reopened.loaded_project.is_some());
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn authored_stage_project_round_trip_restores_baseline_before_overlay() {
+        let fixture_root = unique_test_project_root("authored-stage-round-trip");
+        let base_root = fixture_root.join("base");
+        let project_root = fixture_root.join("project");
+        let scene_root = base_root.join("files/data/scene");
+        fs::create_dir_all(&scene_root).unwrap();
+
+        let retail_archive = authored_stage_archive("test11", 1.0, [10, 20, 30, 255], 1);
+        fs::write(
+            scene_root.join("test11.szs"),
+            retail_archive.encode().unwrap(),
+        )
+        .unwrap();
+
+        let authored_archive = authored_stage_archive("test11", 9.0, [90, 80, 70, 255], 9);
+        let mut expected_archive = authored_archive.clone();
+        blank_stage::ensure_blank_stage_runtime_resources(&mut expected_archive).unwrap();
+        let expected_baseline = expected_archive.to_semantic_json().unwrap();
+        let mut saved =
+            StageDocument::from_authored_archive(&base_root, "test11", authored_archive).unwrap();
+
+        assert!(matches!(
+            saved.stage_archive.as_ref().unwrap().origin(),
+            StageOrigin::Blank { target_slot, .. } if target_slot == "test11"
+        ));
+        assert_eq!(saved.objects.len(), 1);
+        assert_eq!(saved.objects[0].factory_name, "Mario");
+        assert_eq!(saved.objects[0].transform.translation[0], 9.0);
+        assert_eq!(
+            saved.lighting.object_lighting().unwrap().color,
+            [90, 80, 70, 255]
+        );
+        assert_authored_parameter_asset(&saved, 9);
+
+        saved.objects[0].transform.translation[0] = 42.0;
+        saved.save_project_folder(&project_root).unwrap();
+        let baseline_path = project_root.join("files/editor/stages/test11.stage.json");
+        assert_eq!(fs::read(&baseline_path).unwrap(), expected_baseline);
+
+        // Repeated saves must not introduce semantic-document drift.
+        saved.save_project_folder(&project_root).unwrap();
+        assert_eq!(fs::read(&baseline_path).unwrap(), expected_baseline);
+
+        let mut reopened = StageDocument::open(&base_root, "test11").unwrap();
+        assert!(matches!(
+            reopened.stage_archive.as_ref().unwrap().origin(),
+            StageOrigin::ImportedArchive
+        ));
+        assert_eq!(reopened.objects[0].transform.translation[0], 1.0);
+        assert!(reopened.load_project_folder(&project_root).unwrap());
+        assert!(matches!(
+            reopened.stage_archive.as_ref().unwrap().origin(),
+            StageOrigin::Blank { target_slot, .. } if target_slot == "test11"
+        ));
+        assert_eq!(reopened.objects.len(), 1);
+        assert_eq!(reopened.objects[0].transform.translation[0], 42.0);
+        assert_eq!(
+            reopened.lighting.object_lighting().unwrap().color,
+            [90, 80, 70, 255]
+        );
+        assert_authored_parameter_asset(&reopened, 9);
+
+        fs::remove_dir_all(fixture_root).unwrap();
+    }
+
+    #[test]
+    fn genuinely_new_authored_stage_reopens_without_a_retail_archive() {
+        let fixture_root = unique_test_project_root("new-authored-stage-round-trip");
+        let base_root = fixture_root.join("base");
+        let project_root = fixture_root.join("project");
+        fs::create_dir_all(&base_root).unwrap();
+
+        let authored_archive = authored_stage_archive("custom_stage0", 9.0, [90, 80, 70, 255], 9);
+        let mut saved =
+            StageDocument::from_authored_archive(&base_root, "custom_stage0", authored_archive)
+                .unwrap();
+        let virtual_source = base_root.join("files/data/scene/custom_stage0.szs");
+        assert_eq!(
+            saved.stage_archive_source_path.as_deref(),
+            Some(virtual_source.as_path())
+        );
+        assert!(!virtual_source.exists());
+        saved.objects[0].transform.translation[0] = 42.0;
+        saved.lighting.lights[5].color = [12, 34, 56, 255];
+        saved.lighting.ambients[2].color = [78, 90, 123, 255];
+        saved.save_project_folder(&project_root).unwrap();
+
+        assert_eq!(
+            discover_authored_project_stage_ids(&project_root).unwrap(),
+            ["custom_stage0"]
+        );
+        let reopened =
+            StageDocument::open_authored_project_stage(&base_root, "custom_stage0", &project_root)
+                .unwrap();
+        assert_eq!(reopened.objects[0].transform.translation[0], 42.0);
+        assert_eq!(reopened.lighting.lights[5].color, [12, 34, 56, 255]);
+        assert_eq!(reopened.lighting.ambients[2].color, [78, 90, 123, 255]);
+        assert_eq!(
+            reopened.stage_archive_source_path.as_deref(),
+            Some(virtual_source.as_path())
+        );
+        assert!(!virtual_source.exists());
+
+        // The normal open-then-load path also recovers the authored baseline
+        // even though semantic retail import reports no archive for this id.
+        let mut open_then_load = StageDocument::open(&base_root, "custom_stage0").unwrap();
+        assert!(open_then_load.stage_archive.is_none());
+        assert!(open_then_load.load_project_folder(&project_root).unwrap());
+        assert_eq!(open_then_load.objects[0].transform.translation[0], 42.0);
+        assert_eq!(
+            open_then_load.stage_archive_source_path.as_deref(),
+            Some(virtual_source.as_path())
+        );
+
+        fs::remove_dir_all(fixture_root).unwrap();
+    }
+
+    #[test]
+    fn authored_stage_id_substring_does_not_import_a_retail_level() {
+        let fixture_root = unique_test_project_root("authored-stage-no-fuzzy-retail");
+        let base_root = fixture_root.join("base");
+        let retail_path = base_root.join("files/data/scene/airport0.szs");
+        fs::create_dir_all(retail_path.parent().unwrap()).unwrap();
+        fs::write(&retail_path, b"must not be opened").unwrap();
+        let authored_archive = authored_stage_archive("airport", 0.0, [1, 2, 3, 255], 1);
+
+        let document =
+            StageDocument::from_authored_archive(&base_root, "airport", authored_archive).unwrap();
+
+        assert!(document
+            .assets
+            .iter()
+            .all(|asset| !asset.path.to_string_lossy().contains("airport0.szs")));
+        fs::remove_dir_all(fixture_root).unwrap();
+    }
+
+    #[test]
+    fn authored_stage_project_rejects_a_baseline_for_another_target_slot() {
+        let fixture_root = unique_test_project_root("authored-stage-target-validation");
+        let base_root = fixture_root.join("base");
+        let project_root = fixture_root.join("project");
+        let scene_root = base_root.join("files/data/scene");
+        fs::create_dir_all(&scene_root).unwrap();
+
+        let retail_archive = authored_stage_archive("test11", 1.0, [10, 20, 30, 255], 1);
+        fs::write(
+            scene_root.join("test11.szs"),
+            retail_archive.encode().unwrap(),
+        )
+        .unwrap();
+
+        let authored_archive = authored_stage_archive("test11", 9.0, [90, 80, 70, 255], 9);
+        let mut saved =
+            StageDocument::from_authored_archive(&base_root, "test11", authored_archive).unwrap();
+        saved.save_project_folder(&project_root).unwrap();
+
+        let wrong_target = authored_stage_archive("bianco0", 7.0, [70, 60, 50, 255], 7);
+        fs::write(
+            project_root.join("files/editor/stages/test11.stage.json"),
+            wrong_target.to_semantic_json().unwrap(),
+        )
+        .unwrap();
+
+        let mut reopened = StageDocument::open(&base_root, "test11").unwrap();
+        let error = reopened.load_project_folder(&project_root).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("authored stage target 'bianco0' does not match document stage 'test11'"));
+
+        fs::remove_dir_all(fixture_root).unwrap();
     }
 
     #[test]
@@ -2714,6 +3220,131 @@ mod tests {
         ))
     }
 
+    fn authored_stage_archive(
+        target_slot: &str,
+        spawn_x: f32,
+        object_light_color: [u8; 4],
+        parameter_value: i32,
+    ) -> SourceFreeStageArchive {
+        let field = |name: &str, value: JDramaFieldValue| JDramaField {
+            name: name.to_string(),
+            value,
+        };
+        let mut children = (0..6)
+            .map(|index| {
+                JDramaRecord::new(
+                    "Light",
+                    format!("light {index}"),
+                    JDramaRecordPayload::Fields {
+                        fields: vec![
+                            field(
+                                "position",
+                                JDramaFieldValue::Vec3F32([index as f32, 2.0, 3.0]),
+                            ),
+                            field(
+                                "color",
+                                JDramaFieldValue::ColorRgba8(if index == 5 {
+                                    object_light_color
+                                } else {
+                                    [index as u8; 4]
+                                }),
+                            ),
+                            field("range", JDramaFieldValue::F32(50.0)),
+                        ],
+                    },
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        children.extend((0..3).map(|index| {
+            JDramaRecord::new(
+                "AmbColor",
+                format!("ambient {index}"),
+                JDramaRecordPayload::Fields {
+                    fields: vec![field(
+                        "color",
+                        JDramaFieldValue::ColorRgba8(if index == 2 {
+                            [40, 50, 60, 255]
+                        } else {
+                            [index as u8; 4]
+                        }),
+                    )],
+                },
+            )
+            .unwrap()
+        }));
+        children.push(
+            JDramaRecord::new(
+                "Mario",
+                "Mario",
+                JDramaRecordPayload::Actor {
+                    transform: sms_formats::JDramaTransform {
+                        translation: [spawn_x, 20.0, 30.0],
+                        rotation: [0.0, 90.0, 0.0],
+                        scale: [1.0; 3],
+                    },
+                    character_name: "Mario Character".to_string(),
+                    light_map: sms_formats::JDramaLightMap::default(),
+                    fields: vec![
+                        field("starting_water", JDramaFieldValue::U32(100)),
+                        field("equipment_flags", JDramaFieldValue::U32(0)),
+                    ],
+                },
+            )
+            .unwrap(),
+        );
+
+        let mut archive = SourceFreeStageArchive::new_for_blank(target_slot, 1).unwrap();
+        archive
+            .insert_resource(
+                b"map/scene.bin".to_vec(),
+                StageResourceDocument::Placement(JDramaDocument {
+                    root: JDramaRecord::new(
+                        "GroupObj",
+                        "root",
+                        JDramaRecordPayload::Group {
+                            fields: Vec::new(),
+                            children,
+                        },
+                    )
+                    .unwrap(),
+                }),
+            )
+            .unwrap();
+        archive
+            .insert_resource(
+                b"map/authored.prm".to_vec(),
+                StageResourceDocument::Parameters(PrmFile {
+                    entries: vec![sms_formats::PrmEntry::new(
+                        "mNum",
+                        sms_formats::PrmValue::I32(parameter_value),
+                    )
+                    .unwrap()],
+                }),
+            )
+            .unwrap();
+        archive
+    }
+
+    fn assert_authored_parameter_asset(document: &StageDocument, expected_value: i32) {
+        let asset = document
+            .assets
+            .iter()
+            .find(|asset| {
+                asset
+                    .path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .ends_with("/map/authored.prm")
+            })
+            .expect("authored parameter asset");
+        let parameters = PrmFile::parse(&document.read_asset_bytes(&asset.path).unwrap()).unwrap();
+        assert_eq!(
+            parameters.value("mNum"),
+            Some(&sms_formats::PrmValue::I32(expected_value))
+        );
+    }
+
     #[test]
     fn resolves_object_models_from_primary_decomp_resource_bindings() {
         let mut registry = ObjectRegistry::default();
@@ -3168,7 +3799,10 @@ mod tests {
                     .map(|asset| asset.path.to_string_lossy().replace('\\', "/"))
                     .filter(|path| path.to_ascii_lowercase().contains("hinokuri2")),
             );
-            let (catalog, issues) = build_actor_preview_catalog(&base_root, &assets, &registry);
+            let (catalog, issues) =
+                build_actor_preview_catalog(&base_root, &assets, &registry, |path| {
+                    read_stage_asset_bytes(path).map_err(|error| error.to_string())
+                });
             assert!(
                 issues.is_empty(),
                 "enemy preview issues in {}: {issues:?}",
@@ -3455,7 +4089,10 @@ mod tests {
         }];
 
         assert_eq!(
-            enemy_runtime_uniform_scale(&actor, &manager, &assets).unwrap(),
+            enemy_runtime_uniform_scale(&actor, &manager, &assets, &mut |path| {
+                read_stage_asset_bytes(path).map_err(|error| error.to_string())
+            })
+            .unwrap(),
             Some(1.0)
         );
         fs::remove_dir_all(root).unwrap();
@@ -3758,6 +4395,26 @@ mod tests {
         assert!(objects[0].asset_hints.is_empty());
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, "object-preview-model-ambiguous");
+    }
+
+    #[test]
+    fn registry_refresh_replaces_stale_unknown_class_metadata() {
+        let mut registry = ObjectRegistry::default();
+        registry.objects.push(sms_schema::ObjectDefinition {
+            factory_name: "Mario".to_string(),
+            class_name: "TMario".to_string(),
+            category: "System".to_string(),
+            source: sms_schema::SchemaSource::MarNameRefGen,
+            display_name: None,
+            preview_model: None,
+            hidden: false,
+            unsafe_to_edit: false,
+        });
+        let mut objects = vec![SceneObject::new("player", "Mario")];
+        objects[0].class_name = Some("Unknown".to_string());
+
+        assert!(apply_registry_preview_hints(&mut objects, &[], &registry).is_empty());
+        assert_eq!(objects[0].class_name.as_deref(), Some("TMario"));
     }
 
     #[test]

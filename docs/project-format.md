@@ -59,6 +59,60 @@ root. The managed data folder retains the transactional `sms-project.toml`
 manifest, `Content/` assets, and `files/` overlay tree, including its base-game
 identity and lossless-save safeguards.
 
+## Source-free authored stages
+
+The experimental **Create New Stage** workflow operates inside an open project
+through **File > New Stage...** or **+ New Stage** in the Stages content browser.
+Creation accepts a unique stage ID and creates a minimal source-free scene with
+an internal runtime placeholder terrain. It does not require a world model,
+insert Mario, select a skybox, or select a retail lighting source.
+
+The editor derives a project-owned `files/data/stageArc.bin` from the configured
+release and adds a new archive mapping in an unused scenario of its reserved,
+runtime-supported areas. Existing retail mappings and assets are never replaced.
+A conflicting stage ID or an exhausted reserved scenario range is an error.
+
+Stage content is authored through the normal scene workflow. The first
+collision-bearing project model dragged into a new blank stage defaults to
+**Bake as map terrain**, replacing only the internal placeholder during build.
+The user drags the typed `Mario` class from the object palette for player
+placement; managed build and launch remain blocked until it exists. The user
+assigns a placed model as the **Stage Skybox** and edits ambient and light
+settings in-scene. These settings remain editable after creation.
+Only project-owned data and managed builds are changed; the extracted base game
+remains read-only.
+
+An authored stage adds these managed files:
+
+```text
+<project-data-root>/
+  files/
+    editor/
+      stages/
+        <stage-id>.stage.json
+        <stage-id>.scene.json
+    data/
+      stageArc.bin
+```
+
+`<stage-id>.stage.json` is the source-free semantic baseline. It contains typed
+stage data and deterministic reconstruction metadata rather than cached source
+archive or container bytes. `<stage-id>.scene.json` is the normal editor overlay.
+When the project is reopened, the baseline is validated and installed before the
+overlay. `files/data/stageArc.bin` is the project-owned runtime table containing
+the new mapping; the configured release's original table is not modified.
+
+**Build Game** rebuilds the authored semantic stage as
+`run-root/files/data/scene/<stage-id>.szs` and atomically overlays the
+project-owned `stageArc.bin` into the managed release. **Launch in Dolphin**
+performs the same build, resolves that archive against the staged project-owned
+table, and patches the managed `sys/main.dol` for direct boot into the allocated
+area and scenario. A missing mapping is rejected rather than guessed.
+
+These persistence and build paths remain experimental. Compilation, semantic
+round trips, and automated build checks do not establish visual or in-game
+runtime correctness; each authored stage still needs manual Dolphin verification.
+
 ## Managed build tree
 
 Saving a project updates only its managed data; it does not create a playable
@@ -77,19 +131,21 @@ The ownership marker binds the build root to the project identity. The editor
 refuses an unowned or mismatched directory instead of taking it over.
 
 **Build Game** reconciles `run-root/` as a complete runnable copy of the
-extracted game, preserving the
-stage archive's exact game-relative path. Every run-root file has independent
-file identity; byte-identical copies are reused on later builds. The rebuilt
-stage is installed atomically. **Launch in Dolphin** performs the same build,
-resolves the open archive through the staged game's own `stageArc.bin`, and
+extracted game, preserving every authored file's exact game-relative path.
+Every run-root file has independent file identity; byte-identical copies are
+reused on later builds. The rebuilt stage and project-owned file overlays,
+including an authored stage's `files/data/stageArc.bin`, are installed
+atomically. **Launch in Dolphin** performs the same build, resolves the open
+archive through the resulting staged `stageArc.bin`, and
 atomically patches the managed `sys/main.dol` copy. Its behavior-based PowerPC
 patch boots the resolved area and scenario directly while preserving the
 executable's regional or modded code. Keeping the launch executable at that
 exact path lets Dolphin mount the surrounding extracted game directory. Dolphin
 uses its normal user profile by default, preserving the user's controller
 configuration. If `launch.dolphin_user_directory` is set, Dolphin uses that
-profile instead. The extracted base is never opened for modification; the next managed build refreshes the copy
-from its configured base executable before preparing another launch.
+profile instead. The extracted base is never opened for modification; the next
+managed build refreshes the copy from its configured base executable before
+preparing another launch.
 
 Managed **Launch in Dolphin** requires `launch.dolphin_executable`. The optional
 `launch.dolphin_user_directory` applies to both managed and legacy launches.

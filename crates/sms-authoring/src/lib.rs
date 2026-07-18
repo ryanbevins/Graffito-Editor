@@ -4,6 +4,7 @@
 //! low-level BMD/MAT3/TEX1 compiler lives at the format boundary, while this
 //! crate owns secure glTF ingestion and semantic Sunshine collision output.
 
+mod bootstrap;
 mod catalog;
 mod collision;
 mod compile;
@@ -14,6 +15,7 @@ mod merge;
 mod model;
 mod native;
 
+pub use bootstrap::built_in_blank_stage_proxy;
 pub use catalog::*;
 pub use collision::{CollisionCleanupReport, CollisionImportResult, CollisionSimplificationReport};
 pub use compile::{
