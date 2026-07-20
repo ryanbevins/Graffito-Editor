@@ -624,6 +624,9 @@ fn konst_color(selector: u32) -> vec3<f32> {
             return vec3<f32>(1.0);
         }
     }
+    // Keep an explicit post-switch return for FXC, which does not always
+    // recognize WGSL switch defaults as exhaustive after HLSL translation.
+    return vec3<f32>(1.0);
 }
 
 fn konst_alpha(selector: u32) -> f32 {
@@ -645,6 +648,7 @@ fn konst_alpha(selector: u32) -> f32 {
             return 1.0;
         }
     }
+    return 1.0;
 }
 
 fn color_arg(
