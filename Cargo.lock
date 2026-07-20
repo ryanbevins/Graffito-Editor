@@ -1452,6 +1452,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "graffito-editor"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "eframe",
+ "egui",
+ "pollster",
+ "sms-formats",
+ "sms-render",
+ "sms-scene",
+ "sms-schema",
+]
+
+[[package]]
 name = "guillotiere"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3038,20 +3052,6 @@ dependencies = [
  "clap",
  "serde_json",
  "sms-formats",
- "sms-scene",
- "sms-schema",
-]
-
-[[package]]
-name = "sms-editor"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "eframe",
- "egui",
- "pollster",
- "sms-formats",
- "sms-render",
  "sms-scene",
  "sms-schema",
 ]

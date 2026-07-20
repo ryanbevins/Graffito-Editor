@@ -160,7 +160,7 @@ impl SmsEditorApp {
     }
 
     pub(super) fn project_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("SMS Level Editor");
+        ui.heading("Graffito-Editor");
         ui.add_space(4.0);
         labeled_text(ui, "Repo Root", &mut self.repo_root);
         labeled_text(ui, "Base Root", &mut self.base_root);

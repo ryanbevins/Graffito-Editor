@@ -43,9 +43,9 @@ pub enum SceneError {
     InvalidProjectRoot(PathBuf),
     #[error("project output folder overlaps the extracted base game directory: {0}")]
     ProjectOverlapsBase(PathBuf),
-    #[error("refusing to replace a directory that is not an owned SMS Editor project: {0}")]
+    #[error("refusing to replace a directory that is not an owned Graffito-Editor project: {0}")]
     UnownedProjectRoot(PathBuf),
-    #[error("unsupported SMS Editor project manifest at {path}: {reason}")]
+    #[error("unsupported Graffito-Editor project manifest at {path}: {reason}")]
     UnsupportedProjectManifest { path: PathBuf, reason: String },
     #[error("project export is blocked by validation errors: {0}")]
     ValidationFailed(String),

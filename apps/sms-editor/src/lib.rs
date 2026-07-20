@@ -37,7 +37,7 @@ const VIEWPORT_NEAR_CLIP: f32 = 8.0;
 pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("SMS Editor")
+            .with_title("Graffito-Editor")
             .with_inner_size([1560.0, 940.0]),
         renderer: eframe::Renderer::Wgpu,
         depth_buffer: 24,
@@ -45,7 +45,7 @@ pub fn run() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "SMS Editor",
+        "Graffito-Editor",
         options,
         Box::new(|cc| {
             install_style(&cc.egui_ctx);
