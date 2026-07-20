@@ -496,8 +496,12 @@ fn reattach_overlay_source_records(
             continue;
         };
         base_records.insert(source_record_key(source)?, object);
-        if let Some(placement) = object.placement.as_ref() {
-            let key = (placement.address().clone(), source_record_path_key(source)?);
+        if let Some(address) = object
+            .placement
+            .as_ref()
+            .and_then(super::PlacementBinding::source_address)
+        {
+            let key = (address.clone(), source_record_path_key(source)?);
             match base_placements.entry(key) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(Some(object));
@@ -517,10 +521,13 @@ fn reattach_overlay_source_records(
         };
         let key = source_record_key(source)?;
         let base_object = base_records.get(&key).copied().or_else(|| {
-            let placement = object.placement.as_ref()?;
+            let address = object
+                .placement
+                .as_ref()
+                .and_then(super::PlacementBinding::source_address)?;
             let path = source_record_path_key(source).ok()?;
             base_placements
-                .get(&(placement.address().clone(), path))
+                .get(&(address.clone(), path))
                 .copied()
                 .flatten()
         });
@@ -534,9 +541,13 @@ fn reattach_overlay_source_records(
         let Some(base_source) = base_object.source.as_ref() else {
             unreachable!("base source records are indexed only when they have a source");
         };
-        if let Some(base_placement) = base_object.placement.as_ref() {
+        if let Some(base_address) = base_object
+            .placement
+            .as_ref()
+            .and_then(super::PlacementBinding::source_address)
+        {
             match object.placement.as_ref() {
-                Some(placement) if placement.address() != base_placement.address() => {
+                Some(placement) if placement.source_address() != Some(base_address) => {
                     return Err(SceneError::ProjectOverlaySourceMismatch {
                         object_id: object.id.clone(),
                         source_path: source.path.clone(),
@@ -545,16 +556,13 @@ fn reattach_overlay_source_records(
                 }
                 Some(_) => {}
                 None if object.id == base_object.id => {
-                    object.placement = Some(super::PlacementBinding::Existing(
-                        base_placement.address().clone(),
-                    ));
+                    object.placement =
+                        Some(super::PlacementBinding::Existing(base_address.clone()));
                 }
                 None => {
                     // Version 1/2 projects represented duplicates by retaining
                     // the source record location on an object with a new id.
-                    object.placement = Some(super::PlacementBinding::CloneOf(
-                        base_placement.address().clone(),
-                    ));
+                    object.placement = Some(super::PlacementBinding::CloneOf(base_address.clone()));
                 }
             }
         } else if object.placement.is_some() {

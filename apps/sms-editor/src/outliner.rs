@@ -125,6 +125,7 @@ impl<'a> OutlinerBuilder<'a> {
                         .or_default()
                         .push(index);
                 }
+                PlacementBinding::Authored(_) => {}
             }
         }
 
@@ -280,7 +281,7 @@ impl<'a> OutlinerBuilder<'a> {
             }
             let key = match object.placement.as_ref() {
                 Some(placement) => (
-                    normalized_raw_path(&placement.address().raw_resource_path),
+                    normalized_raw_path(placement.raw_resource_path()),
                     OutlinerNodeKind::Resource,
                 ),
                 None => ("Editor Objects".to_string(), OutlinerNodeKind::Editor),
@@ -611,5 +612,38 @@ mod tests {
         assert_eq!(tree.visible_objects, 1);
         assert!(find_object(&tree.roots, "shine").is_some());
         assert!(find_object(&tree.roots, "coin").is_none());
+    }
+
+    #[test]
+    fn authored_placement_is_grouped_under_its_raw_resource() {
+        let mut authored = SceneObject::new("authored", "FixtureActor");
+        authored.placement = Some(PlacementBinding::Authored(sms_scene::AuthoredPlacement {
+            raw_resource_path: b"map/scene.bin".to_vec(),
+            target_group_index: 4,
+            prototype: JDramaRecord {
+                type_name: "FixtureActor".to_string(),
+                name: "fixture actor".to_string(),
+                payload: JDramaRecordPayload::Actor {
+                    transform: JDramaTransform {
+                        translation: [0.0; 3],
+                        rotation: [0.0; 3],
+                        scale: [1.0; 3],
+                    },
+                    character_name: String::new(),
+                    light_map: JDramaLightMap::default(),
+                    fields: Vec::new(),
+                },
+            },
+            dependencies: Vec::new(),
+        }));
+        let tree = build_outliner_tree(&document(vec![authored]), "");
+        let stage = &tree.roots[0];
+        let resource = stage
+            .children
+            .iter()
+            .find(|node| node.detail == "map/scene.bin")
+            .expect("authored placement resource group");
+        assert_eq!(resource.kind, OutlinerNodeKind::Resource);
+        assert!(find_object(&resource.children, "authored").is_some());
     }
 }

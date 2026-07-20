@@ -20,6 +20,8 @@ use sms_schema::{
 use thiserror::Error;
 
 mod blank_stage;
+mod object_authoring;
+mod object_parameters;
 mod project_store;
 mod stage_archive;
 mod stage_export;
@@ -32,6 +34,17 @@ pub use blank_stage::{
     BlankStageSkyboxPreset, BlankStageTargetMetadata, BLANK_STAGE_BOOTSTRAP_REQUIREMENTS,
     BLANK_STAGE_CAMERA_DIRECTORY_MARKER_PATH, BLANK_STAGE_COIN_PARTICLE_PATH,
     BLANK_STAGE_PRESET_VERSION, DEFAULT_BLANK_STAGE_TARGET_SLOT,
+};
+pub use object_authoring::{
+    ObjectAuthoringCatalog, ObjectAuthoringCatalogBuild, ObjectAuthoringCatalogWarning,
+    ObjectAuthoringDependency, ObjectAuthoringResource, ObjectAuthoringTemplate,
+};
+pub(crate) use object_parameters::validate_object_parameter_links;
+pub use object_parameters::{
+    apply_all_object_parameters, apply_dirty_object_parameter_edits, apply_object_parameter_edits,
+    editable_object_parameters, editable_parameters_for_object, seed_scene_object_parameters,
+    sync_scene_object_parameter_aliases, EditableSceneParameter, ObjectParameterKind,
+    ParameterApplyMode, OBJECT_PARAMETER_CHARACTER_NAME, OBJECT_PARAMETER_NAME,
 };
 pub use stage_archive::{
     SourceFreeStageArchive, StageCompression, StageObjectPlacement, StageOrigin, StageResource,
@@ -456,18 +469,282 @@ impl StageDocument {
         Ok(read_stage_asset_bytes(path)?)
     }
 
+    /// Clones the semantic resource after applying the current authored
+    /// overlay in export order. This lets transactional editors merge into a
+    /// detached resource without consulting or mutating the imported source.
+    pub fn effective_resource_clone(
+        &self,
+        raw_resource_path: &[u8],
+    ) -> Result<Option<StageResourceDocument>> {
+        let mut current = if self
+            .archive_edits
+            .resource_removals
+            .iter()
+            .any(|removed| removed == raw_resource_path)
+        {
+            None
+        } else {
+            self.stage_archive
+                .as_ref()
+                .and_then(|archive| archive.resource(raw_resource_path))
+                .cloned()
+        };
+        if let Some(edit) = self
+            .archive_edits
+            .resources
+            .iter()
+            .find(|edit| edit.raw_resource_path == raw_resource_path)
+        {
+            if edit.mode == StageResourceEditMode::Insert && current.is_some() {
+                return Err(SceneError::StageExport(format!(
+                    "resource {} is already present but has an insert-only authored edit",
+                    String::from_utf8_lossy(raw_resource_path)
+                )));
+            }
+            current = Some(edit.document.clone());
+        }
+        for edit in self
+            .archive_edits
+            .models
+            .iter()
+            .filter(|edit| edit.raw_resource_path == raw_resource_path)
+        {
+            match (&current, edit.mode) {
+                (Some(StageResourceDocument::Model(_)), _) | (None, StageModelEditMode::Upsert) => {
+                    current = Some(StageResourceDocument::Model(edit.document.clone()));
+                }
+                (Some(_), _) => {
+                    return Err(SceneError::StageExport(format!(
+                        "resource {} has a model edit but is not a model",
+                        String::from_utf8_lossy(raw_resource_path)
+                    )));
+                }
+                (None, StageModelEditMode::Replace) => {
+                    return Err(SceneError::StageExport(format!(
+                        "model resource {} was not found",
+                        String::from_utf8_lossy(raw_resource_path)
+                    )));
+                }
+            }
+        }
+        for edit in self
+            .archive_edits
+            .collisions
+            .iter()
+            .filter(|edit| edit.raw_resource_path == raw_resource_path)
+        {
+            let replacement = match (&current, edit.mode) {
+                (
+                    Some(StageResourceDocument::Collision(existing)),
+                    StageCollisionEditMode::Append,
+                ) => stage_export::append_collision_document(
+                    existing,
+                    &edit.document,
+                    raw_resource_path,
+                )?,
+                (Some(StageResourceDocument::Collision(_)), _)
+                | (None, StageCollisionEditMode::Upsert) => edit.document.clone(),
+                (Some(_), _) => {
+                    return Err(SceneError::StageExport(format!(
+                        "resource {} has a collision edit but is not collision data",
+                        String::from_utf8_lossy(raw_resource_path)
+                    )));
+                }
+                (None, _) => {
+                    return Err(SceneError::StageExport(format!(
+                        "collision resource {} was not found",
+                        String::from_utf8_lossy(raw_resource_path)
+                    )));
+                }
+            };
+            current = Some(StageResourceDocument::Collision(replacement));
+        }
+        Ok(current)
+    }
+
+    /// Adds a detached semantic resource to the authored archive overlay and
+    /// immediately exposes it through the document asset catalog.
+    pub fn insert_authored_resource(
+        &mut self,
+        raw_resource_path: impl Into<Vec<u8>>,
+        document: StageResourceDocument,
+    ) {
+        self.archive_edits
+            .insert_resource(raw_resource_path.into(), document);
+        self.sync_archive_edit_assets();
+    }
+
+    /// Inserts or replaces a detached semantic resource in the authored
+    /// archive overlay and immediately exposes it through the asset catalog.
+    pub fn upsert_authored_resource(
+        &mut self,
+        raw_resource_path: impl Into<Vec<u8>>,
+        document: StageResourceDocument,
+    ) {
+        self.archive_edits
+            .upsert_resource(raw_resource_path.into(), document);
+        self.sync_archive_edit_assets();
+    }
+
+    /// Restores the exact generic resource-overlay state for one archive path.
+    ///
+    /// Object authoring uses this narrow operation for undo/redo so importing
+    /// a catalog resource does not require snapshotting the complete archive
+    /// edit bundle. The edit and removal positions are intentionally independent:
+    /// malformed or forward-compatible project state can therefore be restored
+    /// byte-for-byte instead of being silently normalized by undo.
+    pub fn set_authored_resource_overlay_state(
+        &mut self,
+        raw_resource_path: impl Into<Vec<u8>>,
+        edit: Option<StageResourceEdit>,
+        edit_index: Option<usize>,
+        removal_index: Option<usize>,
+    ) {
+        self.set_authored_resource_overlay_states(std::iter::once((
+            raw_resource_path.into(),
+            edit,
+            edit_index,
+            removal_index,
+        )));
+    }
+
+    /// Restores several generic resource-overlay paths and refreshes the
+    /// virtual asset catalog once after the complete transaction.
+    pub fn set_authored_resource_overlay_states(
+        &mut self,
+        states: impl IntoIterator<
+            Item = (
+                Vec<u8>,
+                Option<StageResourceEdit>,
+                Option<usize>,
+                Option<usize>,
+            ),
+        >,
+    ) {
+        let states = states.into_iter().collect::<Vec<_>>();
+        for (raw_resource_path, _, _, _) in &states {
+            self.archive_edits
+                .resources
+                .retain(|candidate| candidate.raw_resource_path != *raw_resource_path);
+            self.archive_edits
+                .resource_removals
+                .retain(|candidate| candidate != raw_resource_path);
+        }
+
+        let mut resource_edits = states
+            .iter()
+            .filter_map(|(raw_resource_path, edit, edit_index, _)| {
+                edit.clone().map(|mut edit| {
+                    edit.raw_resource_path = raw_resource_path.clone();
+                    (edit_index.unwrap_or(usize::MAX), edit)
+                })
+            })
+            .collect::<Vec<_>>();
+        resource_edits.sort_by_key(|(index, _)| *index);
+        for (index, edit) in resource_edits {
+            self.archive_edits
+                .resources
+                .insert(index.min(self.archive_edits.resources.len()), edit);
+        }
+
+        let mut removals = states
+            .into_iter()
+            .filter_map(|(raw_resource_path, _, _, removal_index)| {
+                removal_index.map(|index| (index, raw_resource_path))
+            })
+            .collect::<Vec<_>>();
+        removals.sort_by_key(|(index, _)| *index);
+        for (index, raw_resource_path) in removals {
+            self.archive_edits.resource_removals.insert(
+                index.min(self.archive_edits.resource_removals.len()),
+                raw_resource_path,
+            );
+        }
+        self.sync_archive_edit_assets();
+    }
+
+    /// Returns whether a resource will exist after baseline removals and typed
+    /// resource, model, or collision edits are applied.
+    pub fn has_effective_resource(&self, raw_resource_path: &[u8]) -> bool {
+        let edited = self
+            .archive_edits
+            .resources
+            .iter()
+            .any(|edit| edit.raw_resource_path == raw_resource_path)
+            || self
+                .archive_edits
+                .models
+                .iter()
+                .any(|edit| edit.raw_resource_path == raw_resource_path)
+            || self
+                .archive_edits
+                .collisions
+                .iter()
+                .any(|edit| edit.raw_resource_path == raw_resource_path);
+        if edited {
+            return true;
+        }
+        if self
+            .archive_edits
+            .resource_removals
+            .iter()
+            .any(|removed| removed == raw_resource_path)
+        {
+            return false;
+        }
+        self.stage_archive
+            .as_ref()
+            .is_some_and(|archive| archive.resource(raw_resource_path).is_some())
+    }
+
     fn sync_archive_edit_assets(&mut self) {
         let Some(source_path) = self.stage_archive_source_path.as_ref() else {
             return;
         };
+
+        let normalized_path = |raw_path: &[u8]| {
+            raw_path
+                .iter()
+                .map(|byte| match byte {
+                    b'\\' => b'/',
+                    byte => byte.to_ascii_lowercase(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let removed_paths = self
+            .archive_edits
+            .resource_removals
+            .iter()
+            .map(|path| normalized_path(path))
+            .collect::<BTreeSet<_>>();
+        let mut effective_paths = self
+            .stage_archive
+            .iter()
+            .flat_map(|archive| archive.resources())
+            .map(|resource| normalized_path(&resource.raw_path))
+            .filter(|path| !removed_paths.contains(path))
+            .collect::<BTreeSet<_>>();
+        effective_paths.extend(
+            self.archive_edits
+                .resources
+                .iter()
+                .map(|edit| normalized_path(&edit.raw_resource_path)),
+        );
+        effective_paths.extend(
+            self.archive_edits
+                .models
+                .iter()
+                .map(|edit| normalized_path(&edit.raw_resource_path)),
+        );
+        effective_paths.extend(
+            self.archive_edits
+                .collisions
+                .iter()
+                .map(|edit| normalized_path(&edit.raw_resource_path)),
+        );
         self.assets.retain(|asset| {
-            semantic_resource_path_for_asset(source_path, &asset.path).is_none_or(|raw_path| {
-                !self
-                    .archive_edits
-                    .resource_removals
-                    .iter()
-                    .any(|removed| removed.eq_ignore_ascii_case(&raw_path))
-            })
+            semantic_resource_path_for_asset(source_path, &asset.path)
+                .is_none_or(|raw_path| effective_paths.contains(&normalized_path(&raw_path)))
         });
 
         let mut edited_paths = self
@@ -520,6 +797,7 @@ impl StageDocument {
             });
         let object_preview_issues =
             apply_registry_preview_hints(&mut self.objects, &self.assets, &registry);
+        refresh_object_manager_capacity_dependencies(&mut self.objects, &registry);
         self.actor_previews = actor_previews;
         self.load_issues.retain(|issue| {
             !issue.code.starts_with("enemy-preview-") && !issue.code.starts_with("object-preview-")
@@ -539,6 +817,7 @@ impl StageDocument {
         registry: &ObjectRegistry,
     ) {
         let _ = apply_registry_preview_hints(objects, &self.assets, registry);
+        refresh_object_manager_capacity_dependencies(objects, registry);
     }
 
     pub fn actor_preview(&self, object: &SceneObject) -> Option<&ActorPreview> {
@@ -709,7 +988,8 @@ pub struct SceneObject {
     ///
     /// Existing records are edited in place. `CloneOf` retains only the typed
     /// template address so export can clone the semantic record rather than
-    /// copying its original bytes.
+    /// copying its original bytes. Authored placements own a fully typed prototype and
+    /// the support records needed to insert it without a retail source record.
     #[serde(default)]
     pub placement: Option<PlacementBinding>,
     pub factory_name: String,
@@ -717,6 +997,13 @@ pub struct SceneObject {
     pub transform: Transform,
     pub raw_params: BTreeMap<String, SceneParameter>,
     pub asset_hints: Vec<AssetRef>,
+    /// Exact managers selected through structural fields that do not carry a
+    /// direct `manager_name` reference (for example, a map-object resource).
+    ///
+    /// This decomp-derived closure is persisted so headless project export can
+    /// retain clone capacity requirements without regenerating the registry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manager_capacity_dependencies: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -725,17 +1012,61 @@ pub struct PlacementAddress {
     pub record_path: Vec<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AuthoredPlacementDependencyTarget {
+    IndexedGroup { group_index: u32 },
+    NamedGroup { type_name: String, name: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthoredPlacementDependency {
+    /// Exact semantic parent container selected from the retail source.
+    ///
+    /// Older project overlays only persisted `target_group_index`; a missing
+    /// target therefore retains the original IdxGroup behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<AuthoredPlacementDependencyTarget>,
+    pub target_group_index: u32,
+    pub record: JDramaRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthoredPlacement {
+    pub raw_resource_path: Vec<u8>,
+    pub target_group_index: u32,
+    pub prototype: JDramaRecord,
+    #[serde(default)]
+    pub dependencies: Vec<AuthoredPlacementDependency>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "address", rename_all = "snake_case")]
 pub enum PlacementBinding {
     Existing(PlacementAddress),
     CloneOf(PlacementAddress),
+    Authored(AuthoredPlacement),
 }
 
 impl PlacementBinding {
-    pub fn address(&self) -> &PlacementAddress {
+    pub fn source_address(&self) -> Option<&PlacementAddress> {
         match self {
-            Self::Existing(address) | Self::CloneOf(address) => address,
+            Self::Existing(address) | Self::CloneOf(address) => Some(address),
+            Self::Authored(_) => None,
+        }
+    }
+
+    pub fn raw_resource_path(&self) -> &[u8] {
+        match self {
+            Self::Existing(address) | Self::CloneOf(address) => &address.raw_resource_path,
+            Self::Authored(authored) => &authored.raw_resource_path,
+        }
+    }
+
+    pub fn duplicate_for_new_object(&self) -> Self {
+        match self {
+            Self::Existing(address) | Self::CloneOf(address) => Self::CloneOf(address.clone()),
+            Self::Authored(authored) => Self::Authored(authored.clone()),
         }
     }
 }
@@ -751,6 +1082,7 @@ impl SceneObject {
             transform: Transform::default(),
             raw_params: BTreeMap::new(),
             asset_hints: Vec::new(),
+            manager_capacity_dependencies: Vec::new(),
         }
     }
 
@@ -783,6 +1115,64 @@ impl SceneObject {
     pub fn raw_param(&self, key: &str) -> Option<&str> {
         self.raw_params.get(key).map(SceneParameter::raw)
     }
+
+    /// Refreshes the source-derived manager closure persisted for headless
+    /// export. Structural selector parameters are read-only, so duplicating
+    /// this object can safely retain the refreshed exact names.
+    pub fn refresh_manager_capacity_dependencies(&mut self, registry: &ObjectRegistry) {
+        self.manager_capacity_dependencies =
+            derived_object_manager_capacity_dependencies(self, registry)
+                .into_iter()
+                .collect();
+    }
+}
+
+fn derived_object_manager_capacity_dependencies(
+    object: &SceneObject,
+    registry: &ObjectRegistry,
+) -> BTreeSet<String> {
+    let mut manager_names = object
+        .raw_param("launched_enemy_name")
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if let Some(manager_name) = object
+        .raw_param("resource_name")
+        .and_then(|resource_name| registry.find_map_obj_resource(resource_name))
+        .map(|resource| resource.required_manager_name.as_str())
+        .filter(|name| !name.is_empty())
+    {
+        manager_names.insert(manager_name.to_string());
+    }
+    manager_names
+}
+
+fn refresh_object_manager_capacity_dependencies(
+    objects: &mut [SceneObject],
+    registry: &ObjectRegistry,
+) {
+    for object in objects {
+        object.refresh_manager_capacity_dependencies(registry);
+    }
+}
+
+pub(crate) fn resolved_object_manager_capacity_dependencies(
+    object: &SceneObject,
+    registry: Option<&ObjectRegistry>,
+) -> BTreeSet<String> {
+    let mut manager_names = object
+        .manager_capacity_dependencies
+        .iter()
+        .filter(|name| !name.is_empty())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if let Some(registry) = registry {
+        manager_names.extend(derived_object_manager_capacity_dependencies(
+            object, registry,
+        ));
+    }
+    manager_names
 }
 
 #[derive(Debug, Clone)]
@@ -2329,6 +2719,76 @@ mod tests {
     }
 
     #[test]
+    fn restoring_resource_overlay_drops_stale_virtual_assets_and_keeps_baseline_assets() {
+        let parameter_document = || {
+            StageResourceDocument::Parameters(PrmFile {
+                entries: Vec::new(),
+            })
+        };
+        let source_path = PathBuf::from("virtual/custom0.szs");
+        let baseline_path = PathBuf::from("virtual/custom0.szs!/map/base.prm");
+        let extra_path = PathBuf::from("virtual/custom0.szs!/map/catalog.prm");
+        let mut archive = SourceFreeStageArchive::new().unwrap();
+        archive
+            .insert_resource(b"map/base.prm".to_vec(), parameter_document())
+            .unwrap();
+        let mut document = StageDocument {
+            stage_id: "custom0".to_string(),
+            base_root: PathBuf::from("."),
+            assets: vec![StageAsset {
+                path: baseline_path.clone(),
+                kind: StageAssetKind::Placement,
+            }],
+            objects: Vec::new(),
+            changed_files: BTreeMap::new(),
+            stage_archive: Some(archive),
+            stage_archive_source_path: Some(source_path),
+            archive_edits: StageArchiveEdits::default(),
+            registry: None,
+            load_issues: Vec::new(),
+            lighting: StageLighting::default(),
+            actor_previews: BTreeMap::new(),
+            loaded_project: None,
+        };
+
+        document.set_authored_resource_overlay_state(
+            b"map/catalog.prm".to_vec(),
+            Some(StageResourceEdit {
+                raw_resource_path: b"map/catalog.prm".to_vec(),
+                document: parameter_document(),
+                mode: StageResourceEditMode::Insert,
+            }),
+            None,
+            None,
+        );
+        document.set_authored_resource_overlay_state(
+            b"map/base.prm".to_vec(),
+            Some(StageResourceEdit {
+                raw_resource_path: b"map/base.prm".to_vec(),
+                document: parameter_document(),
+                mode: StageResourceEditMode::Upsert,
+            }),
+            None,
+            None,
+        );
+        assert!(document.assets.iter().any(|asset| asset.path == extra_path));
+        assert!(document
+            .assets
+            .iter()
+            .any(|asset| asset.path == baseline_path));
+
+        document.set_authored_resource_overlay_state(b"map/catalog.prm".to_vec(), None, None, None);
+        document.set_authored_resource_overlay_state(b"map/base.prm".to_vec(), None, None, None);
+
+        assert!(!document.assets.iter().any(|asset| asset.path == extra_path));
+        assert!(document
+            .assets
+            .iter()
+            .any(|asset| asset.path == baseline_path));
+        assert!(document.archive_edits.resources.is_empty());
+    }
+
+    #[test]
     fn selects_primary_object_light_and_ambient_by_runtime_names() {
         let lighting = StageLighting {
             lights: vec![JDramaLight {
@@ -3513,6 +3973,9 @@ mod tests {
                 has_move_dependency: false,
                 uses_resource_name_model_fallback: false,
                 primary_model: Some("kibako.bmd".to_string()),
+                animation_resources: Vec::new(),
+                hold_model_path: None,
+                move_bck_path: None,
                 load_flags: 0x1022_0000,
                 collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
@@ -3567,6 +4030,9 @@ mod tests {
                 has_move_dependency: false,
                 uses_resource_name_model_fallback: false,
                 primary_model: Some("efDokanGate.bmd".to_string()),
+                animation_resources: Vec::new(),
+                hold_model_path: None,
+                move_bck_path: None,
                 load_flags: 0x1122_0000,
                 collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
@@ -3608,6 +4074,9 @@ mod tests {
                 has_move_dependency: false,
                 uses_resource_name_model_fallback: false,
                 primary_model: None,
+                animation_resources: Vec::new(),
+                hold_model_path: None,
+                move_bck_path: None,
                 load_flags: 0x1022_0000,
                 collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
@@ -3642,6 +4111,9 @@ mod tests {
                 has_move_dependency: false,
                 uses_resource_name_model_fallback: false,
                 primary_model: None,
+                animation_resources: Vec::new(),
+                hold_model_path: None,
+                move_bck_path: None,
                 load_flags: 0x1022_0000,
                 collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
@@ -3734,6 +4206,9 @@ mod tests {
                 has_move_dependency: false,
                 uses_resource_name_model_fallback: false,
                 primary_model: Some("kibako.bmd".to_string()),
+                animation_resources: Vec::new(),
+                hold_model_path: None,
+                move_bck_path: None,
                 load_flags: 0x1022_0000,
                 collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
@@ -3774,6 +4249,9 @@ mod tests {
                 has_move_dependency: false,
                 uses_resource_name_model_fallback: false,
                 primary_model: Some("wrong_map_obj_model.bmd".to_string()),
+                animation_resources: Vec::new(),
+                hold_model_path: None,
+                move_bck_path: None,
                 load_flags: 0x1022_0000,
                 collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
@@ -3846,6 +4324,9 @@ mod tests {
                 has_move_dependency: false,
                 uses_resource_name_model_fallback: false,
                 primary_model: Some("kibako.bmd".to_string()),
+                animation_resources: Vec::new(),
+                hold_model_path: None,
+                move_bck_path: None,
                 load_flags: 0x1022_0000,
                 collision_resources: Vec::new(),
                 source_file: "src/MoveBG/MapObjInit.cpp".to_string(),

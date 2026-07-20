@@ -25,8 +25,9 @@ use sms_render::{
     gx_blend_compatibility, GxBlendCompatibility, RenderScene, RendererConfig, ViewportRenderer,
 };
 use sms_scene::{
-    AssetRef, AssetRole, SceneError, SceneObject, StageDocument, StageLighting,
-    StageResourceDocument, Transform, ValidationIssue, ValidationSeverity,
+    AssetRef, AssetRole, ObjectAuthoringCatalog, ObjectAuthoringCatalogWarning, SceneError,
+    SceneObject, StageArchiveEdits, StageDocument, StageLighting, StageResourceDocument,
+    StageResourceEdit, Transform, ValidationIssue, ValidationSeverity,
 };
 use sms_schema::{ObjectDefinition, ObjectRegistry, ParticleBindingTarget, SchemaGenerator};
 
@@ -183,6 +184,9 @@ struct LoadedStage {
     archives: Vec<SceneArchiveInfo>,
     registry: Option<ObjectRegistry>,
     schema_warning: Option<String>,
+    object_authoring_catalog_key: Option<ObjectAuthoringCatalogCacheKey>,
+    object_authoring_catalog: Arc<ObjectAuthoringCatalog>,
+    object_authoring_catalog_warnings: Arc<Vec<ObjectAuthoringCatalogWarning>>,
     project_warning: Option<String>,
     document: StageDocument,
     scene: RenderScene,
@@ -191,6 +195,25 @@ struct LoadedStage {
     scene_label_warning: Option<String>,
     retail_skyboxes: Vec<RetailSkyboxEntry>,
     skybox_warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObjectAuthoringCatalogCacheKey {
+    base_root: String,
+    registry_fingerprint: u64,
+    retail_archive_fingerprint: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectAuthoringCatalogCache {
+    key: ObjectAuthoringCatalogCacheKey,
+    catalog: Arc<ObjectAuthoringCatalog>,
+    warnings: Arc<Vec<ObjectAuthoringCatalogWarning>>,
+}
+
+struct LoadedSchema {
+    registry: ObjectRegistry,
+    object_authoring_catalog_cache: Option<ObjectAuthoringCatalogCache>,
 }
 
 struct ProjectLoadSelection {
@@ -206,8 +229,148 @@ struct SceneScanResult {
     skybox_warnings: Vec<String>,
 }
 
+fn build_object_authoring_catalog(
+    base_root: &Path,
+    archives: &[SceneArchiveInfo],
+    registry: &ObjectRegistry,
+) -> ObjectAuthoringCatalogCache {
+    let retail_archives: Vec<_> = archives
+        .iter()
+        .filter(|archive| archive.size_bytes > 0)
+        .cloned()
+        .collect();
+    let build = ObjectAuthoringCatalog::build_with_base_root(&retail_archives, registry, base_root);
+    ObjectAuthoringCatalogCache {
+        key: object_authoring_catalog_cache_key(base_root, archives, registry),
+        catalog: Arc::new(build.catalog),
+        warnings: Arc::new(build.warnings),
+    }
+}
+
+fn object_authoring_catalog_cache_key(
+    base_root: &Path,
+    archives: &[SceneArchiveInfo],
+    registry: &ObjectRegistry,
+) -> ObjectAuthoringCatalogCacheKey {
+    ObjectAuthoringCatalogCacheKey {
+        base_root: normalized_base_root_identity(base_root),
+        registry_fingerprint: object_registry_fingerprint(registry),
+        retail_archive_fingerprint: retail_archive_fingerprint(archives),
+    }
+}
+
+fn object_registry_fingerprint(registry: &ObjectRegistry) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+    let registry_bytes = serde_json::to_vec(registry)
+        .expect("ObjectRegistry serialization cannot fail for its data-only schema");
+    fnv1a_bytes(FNV_OFFSET, &registry_bytes)
+}
+
+fn retail_archive_fingerprint(archives: &[SceneArchiveInfo]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+    let mut retail_archives: Vec<_> = archives
+        .iter()
+        .filter(|archive| archive.size_bytes > 0)
+        .collect();
+    retail_archives.sort_by(|left, right| {
+        left.stage_id
+            .cmp(&right.stage_id)
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    retail_archives
+        .into_iter()
+        .fold(FNV_OFFSET, |hash, archive| {
+            let relative_path = archive
+                .relative_path
+                .to_string_lossy()
+                .replace('/', "\\")
+                .to_ascii_lowercase();
+            let hash = fnv1a_bytes(hash, archive.stage_id.as_bytes());
+            let hash = fnv1a_bytes(hash, &[0]);
+            let hash = fnv1a_bytes(hash, relative_path.as_bytes());
+            let hash = fnv1a_bytes(hash, &archive.size_bytes.to_le_bytes());
+            match std::fs::metadata(&archive.path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            {
+                Some(modified) => {
+                    let hash = fnv1a_bytes(hash, &modified.as_secs().to_le_bytes());
+                    fnv1a_bytes(hash, &modified.subsec_nanos().to_le_bytes())
+                }
+                None => fnv1a_bytes(hash, &[0xff]),
+            }
+        })
+}
+
+fn fnv1a_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    for byte in bytes {
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn normalized_base_root_identity(base_root: &Path) -> String {
+    let absolute = std::fs::canonicalize(base_root).unwrap_or_else(|_| {
+        if base_root.is_absolute() {
+            base_root.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_default().join(base_root)
+        }
+    });
+    let normalized = absolute
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_string();
+    if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
+fn resolve_object_authoring_catalog(
+    base_root: &Path,
+    archives: &[SceneArchiveInfo],
+    registry: Option<&ObjectRegistry>,
+    cached: Option<ObjectAuthoringCatalogCache>,
+) -> Option<ObjectAuthoringCatalogCache> {
+    let registry = registry?;
+    let key = object_authoring_catalog_cache_key(base_root, archives, registry);
+    if let Some(cached) = cached.filter(|cached| cached.key == key) {
+        return Some(cached);
+    }
+    Some(build_object_authoring_catalog(
+        base_root, archives, registry,
+    ))
+}
+
+fn split_object_authoring_catalog_cache(
+    cache: Option<ObjectAuthoringCatalogCache>,
+) -> (
+    Option<ObjectAuthoringCatalogCacheKey>,
+    Arc<ObjectAuthoringCatalog>,
+    Arc<Vec<ObjectAuthoringCatalogWarning>>,
+) {
+    cache.map_or_else(
+        || {
+            (
+                None,
+                Arc::new(ObjectAuthoringCatalog::default()),
+                Arc::new(Vec::new()),
+            )
+        },
+        |cache| (Some(cache.key), cache.catalog, cache.warnings),
+    )
+}
+
 enum BackgroundResult {
-    Schema(Box<Result<ObjectRegistry, String>>),
+    Schema(Box<Result<LoadedSchema, String>>),
     Scan {
         base_root: String,
         result: Result<SceneScanResult, String>,
@@ -226,8 +389,11 @@ fn stage_document_differs_from_saved(
     document: &StageDocument,
     saved_objects: &[SceneObject],
     saved_lighting: &StageLighting,
+    saved_archive_edits: &StageArchiveEdits,
 ) -> bool {
-    document.objects != saved_objects || document.lighting != *saved_lighting
+    document.objects != saved_objects
+        || document.lighting != *saved_lighting
+        || document.archive_edits != *saved_archive_edits
 }
 
 fn validation_issues_for_preview(
@@ -489,14 +655,36 @@ enum ObjectDelta {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+struct ResourceEditState {
+    edit: Option<StageResourceEdit>,
+    edit_index: Option<usize>,
+    removal_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ResourceEditDelta {
+    raw_resource_path: Vec<u8>,
+    before: ResourceEditState,
+    after: ResourceEditState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct ObjectUndoRecord {
     deltas: Vec<ObjectDelta>,
+    resource_deltas: Vec<ResourceEditDelta>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectUndoTransactionKind {
+    Transform,
+    Parameter,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct ObjectUndoTransaction {
     index: usize,
     before: SceneObject,
+    kind: ObjectUndoTransactionKind,
 }
 
 struct SmsEditorApp {
@@ -515,6 +703,9 @@ struct SmsEditorApp {
     game_path: String,
     dolphin_user_dir: String,
     registry: Option<ObjectRegistry>,
+    object_authoring_catalog_cache_key: Option<ObjectAuthoringCatalogCacheKey>,
+    object_authoring_catalog: Arc<ObjectAuthoringCatalog>,
+    object_authoring_catalog_warnings: Arc<Vec<ObjectAuthoringCatalogWarning>>,
     document: Option<StageDocument>,
     render_scene: Option<RenderScene>,
     scene_archives: Vec<SceneArchiveInfo>,
@@ -601,6 +792,7 @@ struct SmsEditorApp {
     next_object_serial: u32,
     saved_objects: Vec<SceneObject>,
     saved_lighting: StageLighting,
+    saved_archive_edits: StageArchiveEdits,
     document_dirty: bool,
     undo_stack: VecDeque<ObjectUndoRecord>,
     redo_stack: VecDeque<ObjectUndoRecord>,
@@ -703,6 +895,9 @@ impl Default for SmsEditorApp {
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             registry: None,
+            object_authoring_catalog_cache_key: None,
+            object_authoring_catalog: Arc::new(ObjectAuthoringCatalog::default()),
+            object_authoring_catalog_warnings: Arc::new(Vec::new()),
             document: None,
             render_scene: None,
             scene_archives: Vec::new(),
@@ -789,6 +984,7 @@ impl Default for SmsEditorApp {
             next_object_serial: 1,
             saved_objects: Vec::new(),
             saved_lighting: StageLighting::default(),
+            saved_archive_edits: StageArchiveEdits::default(),
             document_dirty: false,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
@@ -901,9 +1097,8 @@ impl eframe::App for SmsEditorApp {
             ui.separator();
             self.viewport(ui);
         });
-        if self.undo_transaction.is_some() && !root_ui.input(|input| input.pointer.primary_down()) {
-            self.commit_undo_transaction("Updated transform");
-        }
+        let primary_pointer_down = root_ui.input(|input| input.pointer.primary_down());
+        self.finish_pointer_undo_transaction_if_released(primary_pointer_down);
         self.project_settings_window(root_ui.ctx());
         self.new_stage_dialog(root_ui.ctx());
         self.issues_window(root_ui.ctx());
@@ -930,6 +1125,42 @@ impl SmsEditorApp {
         }
     }
 
+    fn reusable_object_authoring_catalog_cache(
+        &self,
+        base_root: &Path,
+        registry: Option<&ObjectRegistry>,
+    ) -> Option<ObjectAuthoringCatalogCache> {
+        let registry = registry?;
+        let key = self.object_authoring_catalog_cache_key.as_ref()?;
+        (key.base_root == normalized_base_root_identity(base_root)
+            && key.registry_fingerprint == object_registry_fingerprint(registry))
+        .then(|| ObjectAuthoringCatalogCache {
+            key: key.clone(),
+            catalog: Arc::clone(&self.object_authoring_catalog),
+            warnings: Arc::clone(&self.object_authoring_catalog_warnings),
+        })
+    }
+
+    fn install_object_authoring_catalog_cache(
+        &mut self,
+        cache: Option<ObjectAuthoringCatalogCache>,
+    ) {
+        let (key, catalog, warnings) = split_object_authoring_catalog_cache(cache);
+        self.object_authoring_catalog_cache_key = key;
+        self.object_authoring_catalog = catalog;
+        self.object_authoring_catalog_warnings = warnings;
+    }
+
+    fn invalidate_object_authoring_catalog_for_changed_base_root(&mut self) {
+        let Some(key) = self.object_authoring_catalog_cache_key.as_ref() else {
+            return;
+        };
+        let selected_base_root = normalized_base_root_identity(Path::new(self.base_root.trim()));
+        if key.base_root != selected_base_root {
+            self.install_object_authoring_catalog_cache(None);
+        }
+    }
+
     fn generate_schema(&mut self) {
         if self.background_receiver.is_some() {
             self.log
@@ -937,10 +1168,30 @@ impl SmsEditorApp {
             return;
         }
         let repo_root = self.repo_root.clone();
+        let base_root = self.base_root.trim().to_string();
+        let archives = if !base_root.is_empty()
+            && normalized_base_root_identity(Path::new(self.last_scanned_base_root.trim()))
+                == normalized_base_root_identity(Path::new(&base_root))
+        {
+            self.scene_archives.clone()
+        } else {
+            Vec::new()
+        };
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let result = SchemaGenerator::new(repo_root)
                 .generate()
+                .map(|registry| {
+                    let object_authoring_catalog_cache = (!base_root.is_empty()
+                        && archives.iter().any(|archive| archive.size_bytes > 0))
+                    .then(|| {
+                        build_object_authoring_catalog(Path::new(&base_root), &archives, &registry)
+                    });
+                    LoadedSchema {
+                        registry,
+                        object_authoring_catalog_cache,
+                    }
+                })
                 .map_err(|err| err.to_string());
             let _ = sender.send(BackgroundResult::Schema(Box::new(result)));
         });
@@ -950,6 +1201,7 @@ impl SmsEditorApp {
     }
 
     fn refresh_scene_browser_if_needed(&mut self) {
+        self.invalidate_object_authoring_catalog_for_changed_base_root();
         let base_root = self.base_root.trim().to_string();
         if base_root.is_empty() {
             self.pending_auto_refresh_root = None;
@@ -1079,6 +1331,8 @@ impl SmsEditorApp {
         }
 
         let visibility = self.preview_visibility();
+        let existing_object_authoring_catalog_cache = self
+            .reusable_object_authoring_catalog_cache(Path::new(&base_root), self.registry.as_ref());
         let existing_registry = self.registry.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -1142,6 +1396,17 @@ impl SmsEditorApp {
                 if let Some(registry) = registry.clone() {
                     document = document.with_registry(registry);
                 }
+                let object_authoring_catalog_cache = resolve_object_authoring_catalog(
+                    Path::new(&base_root),
+                    &archives,
+                    registry.as_ref(),
+                    existing_object_authoring_catalog_cache,
+                );
+                let (
+                    object_authoring_catalog_key,
+                    object_authoring_catalog,
+                    object_authoring_catalog_warnings,
+                ) = split_object_authoring_catalog_cache(object_authoring_catalog_cache);
                 let (retail_skyboxes, skybox_warnings) = index_retail_skyboxes(&archives);
                 let scene = RenderScene::from_document(&document);
                 let preview = SmsEditorApp::build_model_preview(&document, visibility);
@@ -1152,6 +1417,9 @@ impl SmsEditorApp {
                     archives,
                     registry,
                     schema_warning,
+                    object_authoring_catalog_key,
+                    object_authoring_catalog,
+                    object_authoring_catalog_warnings,
                     project_warning: project_selection.warning,
                     document,
                     scene,
@@ -1179,7 +1447,11 @@ impl SmsEditorApp {
                 self.active_build_cancel = None;
                 match result {
                     BackgroundResult::Schema(result) => match *result {
-                        Ok(registry) => {
+                        Ok(loaded_schema) => {
+                            let LoadedSchema {
+                                registry,
+                                object_authoring_catalog_cache,
+                            } = loaded_schema;
                             self.log.push(format!(
                                 "Generated {} object entries.",
                                 registry.objects.len()
@@ -1194,10 +1466,22 @@ impl SmsEditorApp {
                                     document,
                                     &self.saved_objects,
                                     &self.saved_lighting,
+                                    &self.saved_archive_edits,
                                 );
                                 self.issues = document.validate();
                             }
+                            self.install_object_authoring_catalog_cache(None);
                             self.registry = Some(registry);
+                            let expected_cache_key = self.registry.as_ref().map(|registry| {
+                                object_authoring_catalog_cache_key(
+                                    Path::new(self.base_root.trim()),
+                                    &self.scene_archives,
+                                    registry,
+                                )
+                            });
+                            let refreshed_cache = object_authoring_catalog_cache
+                                .filter(|cache| expected_cache_key.as_ref() == Some(&cache.key));
+                            self.install_object_authoring_catalog_cache(refreshed_cache);
                             self.rebuild_model_preview_cache();
                             if self.document.is_some() {
                                 self.rebuild_model_preview_from_document();
@@ -1380,6 +1664,9 @@ impl SmsEditorApp {
             archives,
             registry,
             schema_warning,
+            object_authoring_catalog_key,
+            object_authoring_catalog,
+            object_authoring_catalog_warnings,
             project_warning,
             document,
             scene,
@@ -1424,12 +1711,42 @@ impl SmsEditorApp {
         self.project_root = project_root;
         self.adopt_resolved_project_data_root();
         self.registry = registry;
+        if self.registry.is_some() {
+            self.log.push(format!(
+                "Object authoring catalog indexed {} typed class(es); content-browser placement can add them with automatic manager and resource dependencies.",
+                object_authoring_catalog.len()
+            ));
+        } else {
+            self.log.push(
+                "Object authoring catalog is unavailable until object schema generation succeeds."
+                    .to_string(),
+            );
+        }
+        for warning in object_authoring_catalog_warnings.iter().take(12) {
+            self.log.push(format!(
+                "Object authoring catalog warning [{}]: {}",
+                warning.source_stage, warning.message
+            ));
+        }
+        if object_authoring_catalog_warnings.len() > 12 {
+            self.log.push(format!(
+                "Object authoring catalog omitted {} additional warning(s).",
+                object_authoring_catalog_warnings.len() - 12
+            ));
+        }
+        let object_authoring_catalog_cache =
+            object_authoring_catalog_key.map(|key| ObjectAuthoringCatalogCache {
+                key,
+                catalog: object_authoring_catalog,
+                warnings: object_authoring_catalog_warnings,
+            });
+        self.install_object_authoring_catalog_cache(object_authoring_catalog_cache);
         self.scene_archives = archives;
         self.scene_labels = scene_labels;
         self.retail_skyboxes = retail_skyboxes;
         self.last_scanned_base_root = self.base_root.trim().to_string();
         self.log.push(format!(
-            "Opened stage '{}' with {} asset(s), {} model(s), {} collision file(s).",
+            "Opened stage '{}' with {} asset(s), {} model(s), {} collision file(s). You can add typed object classes with automatic dependencies from the content browser.",
             document.stage_id,
             document.assets.len(),
             scene.model_paths.len(),
@@ -1479,12 +1796,14 @@ impl SmsEditorApp {
         }
         self.saved_objects = document.objects.clone();
         self.saved_lighting = document.lighting.clone();
+        self.saved_archive_edits = document.archive_edits.clone();
         self.document_dirty = false;
         self.stage_id = document.stage_id.clone();
         self.document = Some(document);
         self.render_scene = Some(scene);
         self.reset_authored_model_preview_base();
         self.model_preview = preview;
+        self.reconcile_loaded_authored_catalog_resources();
         self.animation_started_at = Instant::now();
         self.last_skeletal_animation_tick = u64::MAX;
         self.level_transform_progress = 0.0;

@@ -1987,6 +1987,9 @@ fn reset_fruit_registry() -> ObjectRegistry {
                     has_move_dependency: false,
                     uses_resource_name_model_fallback: true,
                     primary_model: Some(format!("{resource_name}.bmd")),
+                    animation_resources: Vec::new(),
+                    hold_model_path: None,
+                    move_bck_path: None,
                     load_flags: 0x1022_0000,
                     collision_resources: Vec::new(),
                     source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
@@ -3134,6 +3137,9 @@ fn completed_stage_load_is_discarded_when_the_project_path_changed() {
         archives: Vec::new(),
         registry: None,
         schema_warning: None,
+        object_authoring_catalog_key: None,
+        object_authoring_catalog: Default::default(),
+        object_authoring_catalog_warnings: Default::default(),
         project_warning: None,
         document,
         scene,
@@ -3170,6 +3176,9 @@ fn completed_stage_load_adopts_the_resolved_project_folder() {
         archives: Vec::new(),
         registry: None,
         schema_warning: None,
+        object_authoring_catalog_key: None,
+        object_authoring_catalog: Default::default(),
+        object_authoring_catalog_warnings: Default::default(),
         project_warning: Some("Project Folder automatically switched.".to_string()),
         document,
         scene,
@@ -3206,6 +3215,9 @@ fn completed_stage_load_is_discarded_when_the_selected_stage_changed() {
         archives: Vec::new(),
         registry: None,
         schema_warning: None,
+        object_authoring_catalog_key: None,
+        object_authoring_catalog: Default::default(),
+        object_authoring_catalog_warnings: Default::default(),
         project_warning: None,
         document,
         scene,
@@ -3223,6 +3235,84 @@ fn completed_stage_load_is_discarded_when_the_selected_stage_changed() {
         .log
         .iter()
         .any(|message| message.contains("superseded stage")));
+}
+
+#[test]
+fn object_authoring_catalog_cache_identity_tracks_retail_inventory_and_registry() {
+    let root = tempfile::tempdir().unwrap();
+    let archive_path = root.path().join("files/data/scene/dolpic0.szs");
+    std::fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
+    std::fs::write(&archive_path, [0_u8]).unwrap();
+    let retail_archive = SceneArchiveInfo {
+        stage_id: "dolpic0".to_string(),
+        group: "dolpic".to_string(),
+        path: archive_path,
+        relative_path: PathBuf::from("files/data/scene/dolpic0.szs"),
+        size_bytes: 1,
+    };
+    let registry = ObjectRegistry::default();
+    let original_key = object_authoring_catalog_cache_key(
+        root.path(),
+        std::slice::from_ref(&retail_archive),
+        &registry,
+    );
+
+    let authored_archive = SceneArchiveInfo {
+        stage_id: "custom0".to_string(),
+        group: "custom".to_string(),
+        path: root.path().join("files/data/scene/custom0.szs"),
+        relative_path: PathBuf::from("files/data/scene/custom0.szs"),
+        size_bytes: 0,
+    };
+    let with_authored_key = object_authoring_catalog_cache_key(
+        root.path(),
+        &[retail_archive.clone(), authored_archive],
+        &registry,
+    );
+    assert_eq!(original_key, with_authored_key);
+
+    let mut changed_archive = retail_archive.clone();
+    changed_archive.size_bytes = 2;
+    let changed_archive_key =
+        object_authoring_catalog_cache_key(root.path(), &[changed_archive], &registry);
+    assert_ne!(original_key, changed_archive_key);
+
+    let changed_registry = ObjectRegistry {
+        moving_collision_vertex_limit: Some(1),
+        ..ObjectRegistry::default()
+    };
+    let changed_registry_key =
+        object_authoring_catalog_cache_key(root.path(), &[retail_archive], &changed_registry);
+    assert_ne!(original_key, changed_registry_key);
+}
+
+#[test]
+fn object_authoring_catalog_cache_reuses_the_immutable_payload() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = ObjectRegistry::default();
+    let key = object_authoring_catalog_cache_key(root.path(), &[], &registry);
+    let catalog = Arc::new(ObjectAuthoringCatalog::default());
+    let warnings = Arc::new(Vec::new());
+    let app = SmsEditorApp {
+        object_authoring_catalog_cache_key: Some(key),
+        object_authoring_catalog: Arc::clone(&catalog),
+        object_authoring_catalog_warnings: Arc::clone(&warnings),
+        ..SmsEditorApp::default()
+    };
+
+    let reused = app
+        .reusable_object_authoring_catalog_cache(root.path(), Some(&registry))
+        .unwrap();
+    assert!(Arc::ptr_eq(&catalog, &reused.catalog));
+    assert!(Arc::ptr_eq(&warnings, &reused.warnings));
+
+    let changed_registry = ObjectRegistry {
+        moving_collision_vertex_limit: Some(1),
+        ..ObjectRegistry::default()
+    };
+    assert!(app
+        .reusable_object_authoring_catalog_cache(root.path(), Some(&changed_registry))
+        .is_none());
 }
 
 #[test]
@@ -3252,7 +3342,10 @@ fn schema_refresh_updates_derived_preview_metadata_without_marking_the_document_
     };
     let (sender, receiver) = std::sync::mpsc::channel();
     sender
-        .send(BackgroundResult::Schema(Box::new(Ok(registry))))
+        .send(BackgroundResult::Schema(Box::new(Ok(LoadedSchema {
+            registry,
+            object_authoring_catalog_cache: None,
+        }))))
         .unwrap();
     app.background_receiver = Some(receiver);
 

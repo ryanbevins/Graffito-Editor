@@ -73,23 +73,37 @@ may be missing or visually incorrect.
 
 - Create and reopen named `.sms` projects from a launch hub with a persistent
   recent-project list and native file/folder choosers
-- Browse and select placement objects through an outliner
-- Place schema-discovered objects and duplicate or delete existing objects
+- Browse placement classes in the **Objects** content-browser tab and select
+  placed instances through the outliner
+- Place any cataloged actor, enemy, NPC, map object, or other world-placement
+  class from a deterministic retail-backed typed template, then duplicate or
+  delete existing objects
 - Edit translation, rotation, and scale through the inspector and viewport
   gizmos, with snapping support
+- Edit canonical object parameters through typed integer, float, vector, color,
+  and string controls; validated ordinary fields are persisted and applied
+  during build
 - Import rigid `.gltf` and `.glb` models into native project-owned model assets,
   edit their GX materials and collision settings, and place typed instances
 - Create a source-free stage under a new project-owned runtime mapping, then
-  author its terrain, Mario placement, skybox, and lighting in the scene
+  author its terrain, actors, Mario placement, skybox, and lighting in the scene
 - Use undo and redo for the currently supported object operations
-- Inspect raw and decoded object parameters
+- Inspect raw, decoded, and derived object diagnostics
 - Run basic document validation and review load or validation issues in the UI
 
-General parameter editing is not implemented yet; the inspector currently
-displays most decoded parameters rather than writing them back. Imported rigid
-model authoring is available, but general editing of retail terrain topology,
-textures, materials, animation, and other retail asset content remains
-incomplete.
+Object templates and their defaults are derived from typed placements in the
+configured retail stages rather than synthesized from class-name tables. When a
+class requires them, placement also carries its manager and character records,
+stage resources, and named rail graphs into the managed stage. Service-only
+manager or director classes that do not have a safe world-placement template
+remain unavailable in the Objects tab; required services are installed as
+dependencies instead. Imported rigid model authoring is available, but general
+editing of retail terrain topology, textures, materials, animation, and other
+retail asset content remains incomplete.
+
+Runtime-linked names, resource/character/rail selectors, and serialized layout
+counts remain visible but read-only until the editor can rebuild and relink
+their complete dependency structures safely.
 
 ### Development and diagnostic tooling
 
@@ -167,13 +181,26 @@ rather than replacing a retail mapping or guessing another slot.
 Terrain and actors are authored after the empty stage opens. Drag a
 collision-bearing project model into the world; the first such model in a new
 blank stage defaults to **Bake as map terrain**, replacing only the internal
-placeholder terrain when the stage is built. Drag the `Mario` class from the
-object palette into the viewport and position it with the normal scene tools.
-A managed build or Dolphin launch is blocked until the authored stage has this
-typed Mario placement. A placed model can be assigned as the **Stage Skybox**,
-and the stage's ambient and light settings are edited in-scene. These choices
-are stage data, so skybox and lighting can be changed later without recreating
-the stage.
+placeholder terrain when the stage is built. The **Objects** content-browser
+tab exposes each safe, cataloged world-placement class found in the configured
+retail stages. Drag `Mario` and any desired actors, enemies, NPCs, or map objects
+into the viewport and position them with the normal scene tools. Each new object
+starts from a deterministic typed retail template for its class, including that
+class's normal default parameters. The inspector exposes ordinary canonical
+parameters through validated typed controls so they can be customized after
+placement; dependency-driving selectors and stream-layout counts are shown as
+read-only with a reason.
+
+Placement automatically installs the typed manager and character records needed
+by the class and imports its parameter files, models, animations, collision, and
+other discovered resources. Actors that name a rail receive that named graph,
+merged into the stage rail document without replacing unrelated graphs.
+Dependencies already present are reused. Service-only classes without a safe
+placement template are not shown as placeable objects. A managed build or
+Dolphin launch remains blocked until the authored stage has a typed Mario
+placement. A placed model can be assigned as the **Stage Skybox**, and the
+stage's ambient and light settings are edited in-scene. These choices are stage
+data, so skybox and lighting can be changed later without recreating the stage.
 
 The authored semantic baseline is stored at
 `<project-data-root>/files/editor/stages/<stage-id>.stage.json`, beside the normal
@@ -274,10 +301,13 @@ the stage was opened. For a stage made with **Create New Stage**, they use the
 managed source-free semantic baseline described above. Typed transform,
 deletion, duplicate, resource, model, collision, and complete JDrama insertion
 edits are applied before every resource and container layer is rebuilt.
-Source-less palette objects and unmodeled parameter changes are rejected instead
-of producing incomplete placement streams. Model geometry is canonically relaid
-out when compiled. Version 3 editor projects persist typed edits; builds never
-reread a retail stage archive after the applicable semantic baseline is loaded.
+Authored catalog objects retain their typed retail prototype, dependency
+records, resource closure, and canonical parameter edits in the managed project,
+so they remain buildable after the source archive has been discarded. Unknown,
+ambiguous, or noncanonical parameter edits are still rejected instead of
+producing incomplete placement streams. Model geometry is canonically relaid out
+when compiled. Version 3 editor projects persist typed edits; builds never reread
+a retail stage archive after the applicable semantic baseline is loaded.
 
 For a detached workflow, `import-stage-document` first proves an exact rebuild
 and then creates a standalone typed JSON document whose RARC payload slots are

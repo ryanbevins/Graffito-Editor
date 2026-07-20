@@ -110,6 +110,12 @@ impl StageResourceDocument {
     pub fn to_bytes(&self) -> sms_formats::Result<Vec<u8>> {
         encode_resource(self)
     }
+
+    /// Parses one archive child according to its raw resource path into the
+    /// same strict semantic representation used by stage archive import.
+    pub fn parse_for_path(raw_path: &[u8], payload: &[u8]) -> sms_formats::Result<Self> {
+        parse_resource(raw_path, payload)
+    }
 }
 
 impl SourceFreeStageArchive {

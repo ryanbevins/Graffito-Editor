@@ -36,6 +36,7 @@ const STANDALONE_ACTOR_TEX1_SAFETY_BUDGET: u64 = 8 * 1024 * 1024;
 pub(super) enum ContentBrowserKind {
     #[default]
     Stages,
+    Objects,
     Models,
     GameSkyboxes,
 }
@@ -5781,6 +5782,9 @@ mod tests {
                 has_move_dependency: false,
                 uses_resource_name_model_fallback: true,
                 primary_model: Some("/scene/mapObj/VerifiedBlock.bmd".to_string()),
+                animation_resources: Vec::new(),
+                hold_model_path: None,
+                move_bck_path: None,
                 load_flags: 0x1022_0000,
                 collision_resources: vec![sms_schema::MapObjCollisionResourceDefinition {
                     resource_name: "/scene/mapObj/VerifiedBlockCollision.col".to_string(),

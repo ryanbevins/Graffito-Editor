@@ -24,6 +24,8 @@ pub struct JDramaObjectRecord {
     #[serde(default)]
     pub obj_chara_folder: Option<String>,
     #[serde(default)]
+    pub smpl_chara_archive_path: Option<String>,
+    #[serde(default)]
     pub obj_manager_chara: Option<String>,
     #[serde(default)]
     pub live_actor_manager: Option<String>,
@@ -2457,6 +2459,7 @@ fn parse_record_at(
         })
         .unwrap_or_default();
     let obj_chara_folder = read_obj_chara_folder(bytes, after_name, end, &type_name);
+    let smpl_chara_archive_path = read_smpl_chara_archive_path(bytes, after_name, end, &type_name);
     let obj_manager_chara = read_obj_manager_chara(bytes, after_name, end, &type_name);
     let actor_tail_string = actor_layout
         .as_ref()
@@ -2503,6 +2506,7 @@ fn parse_record_at(
         transform,
         stream_strings,
         obj_chara_folder,
+        smpl_chara_archive_path,
         obj_manager_chara,
         live_actor_manager,
         actor_tail_string,
@@ -2609,6 +2613,21 @@ fn read_obj_chara_folder(
     type_name: &str,
 ) -> Option<String> {
     (semantic_type_name(type_name) == "ObjChara")
+        .then(|| {
+            read_len_string(bytes, start, end)
+                .ok()
+                .map(|(value, _)| value)
+        })
+        .flatten()
+}
+
+fn read_smpl_chara_archive_path(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    type_name: &str,
+) -> Option<String> {
+    (semantic_type_name(type_name) == "SmplChara")
         .then(|| {
             read_len_string(bytes, start, end)
                 .ok()
@@ -3595,7 +3614,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_obj_chara_folder_and_manager_reference_from_their_load_streams() {
+    fn reads_character_resources_and_manager_reference_from_their_load_streams() {
         let mut chara_bytes = Vec::new();
         put_len_string(&mut chara_bytes, b"/scene/hamukuri");
         assert_eq!(
@@ -3606,6 +3625,26 @@ mod tests {
             read_obj_chara_folder(&chara_bytes, 0, chara_bytes.len(), "HamuKuriManager").is_none()
         );
         assert!(read_obj_chara_folder(&chara_bytes, 0, chara_bytes.len(), "objChara").is_none());
+
+        let mut simple_chara_bytes = Vec::new();
+        put_len_string(&mut simple_chara_bytes, b"/scene/map/map.arc");
+        assert_eq!(
+            read_smpl_chara_archive_path(
+                &simple_chara_bytes,
+                0,
+                simple_chara_bytes.len(),
+                "JDrama::SmplChara",
+            )
+            .as_deref(),
+            Some("/scene/map/map.arc")
+        );
+        assert!(read_smpl_chara_archive_path(
+            &simple_chara_bytes,
+            0,
+            simple_chara_bytes.len(),
+            "ObjChara"
+        )
+        .is_none());
 
         let mut manager_bytes = Vec::new();
         put_len_string(&mut manager_bytes, b"HamuKuriChara");

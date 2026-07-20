@@ -44,6 +44,13 @@ pub struct RalGraph {
     pub nodes: Vec<RalNode>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RalGraphMerge {
+    pub source_name: String,
+    pub target_name: String,
+    pub inserted: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RalDocument {
     pub graphs: Vec<RalGraph>,
@@ -133,6 +140,159 @@ impl RalDocument {
             file_size: usize_u32(bytes.len(), "RAL file size")?,
             padding: coverage.classify(bytes)?,
         })
+    }
+
+    /// Creates an empty source-free RAL document ready for graph insertion.
+    pub fn empty_canonical() -> Self {
+        Self {
+            graphs: Vec::new(),
+            file_size: 12,
+            padding: Vec::new(),
+        }
+    }
+
+    /// Rebuilds graph descriptors, Shift-JIS names, node arrays, and padding
+    /// into one deterministic source-free layout.
+    pub fn canonicalize_layout(&mut self) -> Result<()> {
+        const DESC_SIZE: usize = 12;
+        const NODE_SIZE: usize = 0x44;
+        let mut canonical = self.clone();
+        let descriptor_end = canonical
+            .graphs
+            .len()
+            .checked_add(1)
+            .and_then(|count| count.checked_mul(DESC_SIZE))
+            .ok_or_else(|| {
+                resource("RAL descriptors", canonical.graphs.len(), u32::MAX as usize)
+            })?;
+        let mut cursor = descriptor_end;
+        for graph in &mut canonical.graphs {
+            if graph.name.contains('\0') {
+                return Err(unsupported("RAL graph name contains a null byte"));
+            }
+            let (encoded, _, had_errors) = SHIFT_JIS.encode(&graph.name);
+            if had_errors {
+                return Err(unsupported(format!(
+                    "RAL graph name {:?} cannot be encoded as Shift-JIS",
+                    graph.name
+                )));
+            }
+            graph.name_offset = usize_u32(cursor, "RAL graph name offset")?;
+            cursor = cursor
+                .checked_add(encoded.len() + 1)
+                .ok_or_else(|| resource("RAL bytes", usize::MAX, u32::MAX as usize))?;
+        }
+        let names_end = cursor;
+        cursor = align_stage_misc(cursor, 4)?;
+        let mut padding = Vec::new();
+        if cursor > names_end {
+            padding.push(StageMiscPaddingRegion {
+                offset: usize_u32(names_end, "RAL padding offset")?,
+                length: usize_u32(cursor - names_end, "RAL padding length")?,
+                style: StageMiscPaddingStyle::Zero,
+            });
+        }
+        for graph in &mut canonical.graphs {
+            graph.nodes_offset = usize_u32(cursor, "RAL graph nodes offset")?;
+            cursor =
+                cursor
+                    .checked_add(graph.nodes.len().checked_mul(NODE_SIZE).ok_or_else(|| {
+                        resource("RAL nodes", graph.nodes.len(), u32::MAX as usize)
+                    })?)
+                    .ok_or_else(|| resource("RAL bytes", usize::MAX, u32::MAX as usize))?;
+        }
+        canonical.file_size = usize_u32(cursor, "RAL file size")?;
+        canonical.padding = padding;
+        // Prove that all graph/node invariants and the derived allocations are
+        // encodable before committing the transactional update.
+        let bytes = canonical.encode()?;
+        let reparsed = Self::parse(&bytes)?;
+        if reparsed.encode()? != bytes {
+            return Err(unsupported("canonical RAL layout is not byte-stable"));
+        }
+        *self = canonical;
+        Ok(())
+    }
+
+    /// Merges exact named source graphs. Equal target graphs are reused;
+    /// conflicting names receive a deterministic Shift-JIS-safe authored name
+    /// which callers must write back to the actor's typed `graph_name` field.
+    pub fn merge_named_graphs(
+        &mut self,
+        source: &Self,
+        names: &[String],
+    ) -> Result<Vec<RalGraphMerge>> {
+        let mut merged = self.clone();
+        let mut used_names = merged
+            .graphs
+            .iter()
+            .chain(source.graphs.iter())
+            .map(|graph| graph.name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut outcomes = Vec::new();
+        for name in names.iter().collect::<std::collections::BTreeSet<_>>() {
+            let mut source_matches = source.graphs.iter().filter(|graph| graph.name == *name);
+            let source_graph = source_matches.next().ok_or_else(|| {
+                unsupported(format!(
+                    "required RAL graph {name:?} was not found in the source"
+                ))
+            })?;
+            if source_matches.any(|graph| graph.nodes != source_graph.nodes) {
+                return Err(unsupported(format!(
+                    "source RAL graph {name:?} has conflicting duplicate definitions"
+                )));
+            }
+            let target_matches = merged
+                .graphs
+                .iter()
+                .filter(|graph| graph.name == *name)
+                .collect::<Vec<_>>();
+            let authored_prefix = format!("{name}_authored");
+            let reusable_authored = merged
+                .graphs
+                .iter()
+                .filter(|graph| {
+                    graph.nodes == source_graph.nodes
+                        && (graph.name == authored_prefix
+                            || graph
+                                .name
+                                .strip_prefix(&format!("{authored_prefix}_"))
+                                .is_some_and(|suffix| suffix.parse::<u16>().is_ok()))
+                })
+                .min_by(|a, b| a.name.cmp(&b.name));
+            let (target_name, inserted) = if !target_matches.is_empty()
+                && target_matches
+                    .iter()
+                    .all(|graph| graph.nodes == source_graph.nodes)
+            {
+                ((*name).clone(), false)
+            } else if let Some(existing) = reusable_authored {
+                (existing.name.clone(), false)
+            } else {
+                let target_name = if target_matches.is_empty() {
+                    (*name).clone()
+                } else {
+                    unique_authored_graph_name(name, &used_names)?
+                };
+                let mut graph = source_graph.clone();
+                graph.name = target_name.clone();
+                graph.name_offset = 0;
+                graph.nodes_offset = 0;
+                used_names.insert(target_name.clone());
+                merged.graphs.push(graph);
+                (target_name, true)
+            };
+            outcomes.push(RalGraphMerge {
+                source_name: (*name).clone(),
+                target_name,
+                inserted,
+            });
+        }
+        if outcomes.iter().any(|outcome| outcome.inserted) {
+            merged.canonicalize_layout()?;
+            *self = merged;
+        }
+        Ok(outcomes)
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -1058,6 +1218,38 @@ fn push_hashed_sized_string(bytes: &mut Vec<u8>, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn align_stage_misc(value: usize, alignment: usize) -> Result<usize> {
+    debug_assert!(alignment.is_power_of_two());
+    value
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
+        .ok_or_else(|| resource("aligned stage misc bytes", usize::MAX, u32::MAX as usize))
+}
+
+fn unique_authored_graph_name(
+    base: &str,
+    used_names: &std::collections::BTreeSet<String>,
+) -> Result<String> {
+    for ordinal in 1..=u16::MAX {
+        let suffix = if ordinal == 1 {
+            "_authored".to_string()
+        } else {
+            format!("_authored_{ordinal}")
+        };
+        let candidate = format!("{base}{suffix}");
+        if used_names.contains(&candidate) {
+            continue;
+        }
+        let (_, _, had_errors) = SHIFT_JIS.encode(&candidate);
+        if !had_errors && !candidate.contains('\0') {
+            return Ok(candidate);
+        }
+    }
+    Err(unsupported(format!(
+        "could not allocate a unique authored name for RAL graph {base:?}"
+    )))
+}
+
 fn read_string(bytes: &[u8], coverage: &mut Coverage, offset: usize) -> Result<String> {
     if offset >= bytes.len() {
         return Err(invalid(offset, bytes.len()));
@@ -1182,7 +1374,102 @@ fn unsupported(message: impl Into<String>) -> FormatError {
 
 #[cfg(test)]
 mod tests {
-    use super::{MeDocument, RalDocument, ReplayLinkDocument, SpcDocument, YmpDocument};
+    use super::{
+        MeDocument, RalDocument, RalGraph, RalNode, ReplayLinkDocument, SpcDocument, YmpDocument,
+    };
+
+    fn ral_node(x: i16) -> RalNode {
+        RalNode {
+            position: [x, 2, 3],
+            connection_count: 0,
+            flags: 0,
+            pitch: 0,
+            yaw: 0,
+            roll: 0,
+            speed: 0,
+            connections: [0; 8],
+            periods: [0.0; 8],
+        }
+    }
+
+    fn ral_graph(name: &str, x: i16) -> RalGraph {
+        RalGraph {
+            name_offset: 0,
+            nodes_offset: 0,
+            name: name.to_string(),
+            nodes: vec![ral_node(x)],
+        }
+    }
+
+    #[test]
+    fn canonical_ral_layout_uses_exact_eof_after_contiguous_nodes() {
+        let mut document = RalDocument {
+            graphs: vec![ral_graph("route_a", 1), ral_graph("route_b", 2)],
+            file_size: 0,
+            padding: Vec::new(),
+        };
+        document.canonicalize_layout().unwrap();
+        // Three 12-byte descriptors, two 8-byte NUL-terminated names, then
+        // two contiguous 0x44-byte nodes with no invented EOF alignment.
+        assert_eq!(document.graphs[0].name_offset, 36);
+        assert_eq!(document.graphs[1].name_offset, 44);
+        assert_eq!(document.graphs[0].nodes_offset, 52);
+        assert_eq!(document.graphs[1].nodes_offset, 120);
+        assert_eq!(document.file_size, 188);
+        assert!(document.padding.is_empty());
+        let bytes = document.encode().unwrap();
+        assert_eq!(bytes.len(), 188);
+        assert_eq!(RalDocument::parse(&bytes).unwrap().encode().unwrap(), bytes);
+    }
+
+    #[test]
+    fn named_ral_merge_reuses_equal_graphs_and_renames_conflicts() {
+        let mut source = RalDocument {
+            graphs: vec![ral_graph("route_a", 10), ral_graph("route_b", 20)],
+            file_size: 0,
+            padding: Vec::new(),
+        };
+        source.canonicalize_layout().unwrap();
+        let mut target = RalDocument {
+            graphs: vec![ral_graph("route_a", 99)],
+            file_size: 0,
+            padding: Vec::new(),
+        };
+        target.canonicalize_layout().unwrap();
+
+        let outcomes = target
+            .merge_named_graphs(&source, &["route_a".to_string(), "route_b".to_string()])
+            .unwrap();
+        assert_eq!(outcomes[0].source_name, "route_a");
+        assert_eq!(outcomes[0].target_name, "route_a_authored");
+        assert!(outcomes[0].inserted);
+        assert_eq!(outcomes[1].target_name, "route_b");
+        assert!(
+            target
+                .graphs
+                .iter()
+                .any(|graph| graph.name == "route_a_authored"
+                    && graph.nodes == source.graphs[0].nodes)
+        );
+        assert!(target.graphs.iter().any(|graph| graph.name == "route_b"));
+
+        let bytes = target.encode().unwrap();
+        let repeated = target
+            .merge_named_graphs(&source, &["route_a".to_string()])
+            .unwrap();
+        assert_eq!(repeated[0].target_name, "route_a_authored");
+        assert!(!repeated[0].inserted);
+        assert_eq!(target.encode().unwrap(), bytes);
+        assert_eq!(RalDocument::parse(&bytes).unwrap().encode().unwrap(), bytes);
+
+        let mut identical = source.clone();
+        let identical_bytes = identical.encode().unwrap();
+        let outcomes = identical
+            .merge_named_graphs(&source, &["route_a".to_string()])
+            .unwrap();
+        assert!(!outcomes[0].inserted);
+        assert_eq!(identical.encode().unwrap(), identical_bytes);
+    }
 
     #[test]
     #[ignore = "requires SMS_BASE_ROOT with extracted retail stage archives"]

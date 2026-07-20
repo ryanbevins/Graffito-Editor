@@ -2,7 +2,12 @@ use super::*;
 
 impl ObjectUndoRecord {
     #[cfg(test)]
-    fn between(before: &[SceneObject], after: &[SceneObject]) -> Self {
+    fn between(
+        before: &[SceneObject],
+        after: &[SceneObject],
+        before_archive_edits: &StageArchiveEdits,
+        after_archive_edits: &StageArchiveEdits,
+    ) -> Self {
         let before_by_id = before
             .iter()
             .enumerate()
@@ -35,10 +40,18 @@ impl ObjectUndoRecord {
                 });
             }
         }
-        Self { deltas }
+        Self {
+            deltas,
+            resource_deltas: resource_edit_deltas_between(
+                before_archive_edits,
+                after_archive_edits,
+            ),
+        }
     }
 
-    fn apply_forward(&self, objects: &mut Vec<SceneObject>) {
+    fn apply_forward(&self, document: &mut StageDocument) {
+        self.apply_resource_edits(document, false);
+        let objects = &mut document.objects;
         let mut removals = self
             .deltas
             .iter()
@@ -70,7 +83,8 @@ impl ObjectUndoRecord {
         }
     }
 
-    fn apply_reverse(&self, objects: &mut Vec<SceneObject>) {
+    fn apply_reverse(&self, document: &mut StageDocument) {
+        let objects = &mut document.objects;
         let mut inserted = self
             .deltas
             .iter()
@@ -100,7 +114,77 @@ impl ObjectUndoRecord {
         for (index, object) in removed {
             objects.insert(index.min(objects.len()), object.clone());
         }
+        self.apply_resource_edits(document, true);
     }
+
+    fn apply_resource_edits(&self, document: &mut StageDocument, reverse: bool) {
+        if self.resource_deltas.is_empty() {
+            return;
+        }
+        document.set_authored_resource_overlay_states(self.resource_deltas.iter().map(|delta| {
+            let state = if reverse { &delta.before } else { &delta.after };
+            (
+                delta.raw_resource_path.clone(),
+                state.edit.clone(),
+                state.edit_index,
+                state.removal_index,
+            )
+        }));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.deltas.is_empty() && self.resource_deltas.is_empty()
+    }
+}
+
+fn resource_edit_state(edits: &StageArchiveEdits, raw_resource_path: &[u8]) -> ResourceEditState {
+    ResourceEditState {
+        edit_index: edits
+            .resources
+            .iter()
+            .position(|edit| edit.raw_resource_path == raw_resource_path),
+        edit: edits
+            .resources
+            .iter()
+            .find(|edit| edit.raw_resource_path == raw_resource_path)
+            .cloned(),
+        removal_index: edits
+            .resource_removals
+            .iter()
+            .position(|removed| removed == raw_resource_path),
+    }
+}
+
+#[cfg(test)]
+fn resource_edit_deltas_between(
+    before: &StageArchiveEdits,
+    after: &StageArchiveEdits,
+) -> Vec<ResourceEditDelta> {
+    let paths = before
+        .resources
+        .iter()
+        .map(|edit| edit.raw_resource_path.clone())
+        .chain(before.resource_removals.iter().cloned())
+        .chain(
+            after
+                .resources
+                .iter()
+                .map(|edit| edit.raw_resource_path.clone()),
+        )
+        .chain(after.resource_removals.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    paths
+        .into_iter()
+        .filter_map(|raw_resource_path| {
+            let before = resource_edit_state(before, &raw_resource_path);
+            let after = resource_edit_state(after, &raw_resource_path);
+            (before != after).then_some(ResourceEditDelta {
+                raw_resource_path,
+                before,
+                after,
+            })
+        })
+        .collect()
 }
 
 fn remove_object_delta(objects: &mut Vec<SceneObject>, expected_index: usize, id: &str) {
@@ -131,7 +215,7 @@ fn ensure_authored_mario_placement(
             object
                 .placement
                 .as_ref()
-                .map(|binding| binding.address().clone())
+                .and_then(|binding| binding.source_address().cloned())
         })
         .collect::<BTreeSet<_>>();
     let archive = document
@@ -201,7 +285,7 @@ pub(super) fn ensure_sky_placement(
             object
                 .placement
                 .as_ref()
-                .map(|binding| binding.address().clone())
+                .and_then(|binding| binding.source_address().cloned())
         })
         .collect::<BTreeSet<_>>();
     let archive = document
@@ -303,6 +387,553 @@ fn authored_runtime_readiness_error(
     None
 }
 
+const CATALOG_TABLES_PATH: &[u8] = b"map/tables.bin";
+const CATALOG_RAL_PATH: &[u8] = b"map/scene.ral";
+
+struct CatalogResourceWrite {
+    raw_resource_path: Vec<u8>,
+    document: StageResourceDocument,
+    upsert: bool,
+}
+
+#[derive(Default)]
+struct CatalogResourcePreflight {
+    writes: Vec<CatalogResourceWrite>,
+    graph_name_rewrites: BTreeMap<String, String>,
+    reused_existing_resources: usize,
+}
+
+fn catalog_resource_edit_deltas(
+    document: &StageDocument,
+    writes: Vec<CatalogResourceWrite>,
+) -> Vec<ResourceEditDelta> {
+    let mut deltas = BTreeMap::<Vec<u8>, ResourceEditDelta>::new();
+    let mut next_new_index = document.archive_edits.resources.len();
+    for write in writes {
+        let raw_resource_path = write.raw_resource_path;
+        let delta = deltas.entry(raw_resource_path.clone()).or_insert_with(|| {
+            let before = resource_edit_state(&document.archive_edits, &raw_resource_path);
+            ResourceEditDelta {
+                raw_resource_path: raw_resource_path.clone(),
+                before: before.clone(),
+                after: before,
+            }
+        });
+        delta.after = ResourceEditState {
+            edit: Some(StageResourceEdit {
+                raw_resource_path,
+                document: write.document,
+                mode: if write.upsert {
+                    sms_scene::StageResourceEditMode::Upsert
+                } else {
+                    sms_scene::StageResourceEditMode::Insert
+                },
+            }),
+            edit_index: delta.after.edit_index.or_else(|| {
+                let index = next_new_index;
+                next_new_index += 1;
+                Some(index)
+            }),
+            removal_index: None,
+        };
+    }
+    deltas
+        .into_values()
+        .filter(|delta| delta.before != delta.after)
+        .collect()
+}
+
+#[derive(Default)]
+struct CatalogResourceRepair {
+    resource_writes: usize,
+    repaired_factories: Vec<String>,
+    errors: Vec<String>,
+}
+
+fn repair_authored_catalog_resources(
+    document: &mut StageDocument,
+    templates: &[sms_scene::ObjectAuthoringTemplate],
+) -> CatalogResourceRepair {
+    let mut repair = CatalogResourceRepair::default();
+    for template in templates {
+        let preflight = match preflight_catalog_resources(document, template) {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                repair
+                    .errors
+                    .push(format!("{}: {error}", template.factory_name));
+                continue;
+            }
+        };
+        let resource_deltas = catalog_resource_edit_deltas(document, preflight.writes);
+        if resource_deltas.is_empty() {
+            continue;
+        }
+        repair.resource_writes += resource_deltas.len();
+        repair
+            .repaired_factories
+            .push(template.factory_name.clone());
+        ObjectUndoRecord {
+            deltas: Vec::new(),
+            resource_deltas,
+        }
+        .apply_forward(document);
+    }
+    repair
+}
+
+fn preflight_catalog_resources(
+    document: &StageDocument,
+    template: &sms_scene::ObjectAuthoringTemplate,
+) -> Result<CatalogResourcePreflight, String> {
+    let mut preflight = CatalogResourcePreflight::default();
+    let mut seen = BTreeSet::new();
+    for resource in &template.resources {
+        let normalized = String::from_utf8_lossy(&resource.raw_resource_path)
+            .replace('\\', "/")
+            .trim_matches('/')
+            .to_ascii_lowercase();
+        if normalized == "map/scene.ral" {
+            continue;
+        }
+        if !seen.insert(resource.raw_resource_path.clone()) {
+            continue;
+        }
+        match document
+            .effective_resource_clone(&resource.raw_resource_path)
+            .map_err(|error| {
+                format!(
+                    "could not inspect effective resource {}: {error}",
+                    String::from_utf8_lossy(&resource.raw_resource_path)
+                )
+            })? {
+            None => {
+                let source = parse_catalog_resource(resource)?;
+                let restores_removed_baseline = document
+                    .archive_edits
+                    .resource_removals
+                    .iter()
+                    .any(|removed| removed == &resource.raw_resource_path)
+                    && document.stage_archive.as_ref().is_some_and(|archive| {
+                        archive.resource(&resource.raw_resource_path).is_some()
+                    });
+                preflight.writes.push(CatalogResourceWrite {
+                    raw_resource_path: resource.raw_resource_path.clone(),
+                    document: source,
+                    upsert: restores_removed_baseline,
+                });
+            }
+            Some(_) => {
+                // Catalog entries express runtime path dependencies. An exact
+                // target path is already satisfied and remains authoritative;
+                // never replace stage-local or user-authored data just because
+                // another retail stage carries byte-different contents there.
+                preflight.reused_existing_resources += 1;
+            }
+        }
+    }
+
+    if !template.character_records.is_empty() {
+        let current = document
+            .effective_resource_clone(CATALOG_TABLES_PATH)
+            .map_err(|error| format!("could not inspect effective map/tables.bin: {error}"))?;
+        let (tables, changed) = merge_character_table(current, &template.character_records)?;
+        if changed {
+            preflight.writes.push(CatalogResourceWrite {
+                raw_resource_path: CATALOG_TABLES_PATH.to_vec(),
+                document: StageResourceDocument::Placement(tables),
+                upsert: true,
+            });
+        }
+    }
+
+    if !template.required_graph_names.is_empty() {
+        let source_resource = template
+            .resources
+            .iter()
+            .find(|resource| {
+                String::from_utf8_lossy(&resource.raw_resource_path)
+                    .replace('\\', "/")
+                    .trim_matches('/')
+                    .eq_ignore_ascii_case("map/scene.ral")
+            })
+            .ok_or_else(|| {
+                format!(
+                    "source stage {} has no map/scene.ral for required graph(s) {}",
+                    template.source_stage,
+                    template.required_graph_names.join(", ")
+                )
+            })?;
+        let StageResourceDocument::Rail(source_rail) = parse_catalog_resource(source_resource)?
+        else {
+            return Err("catalog map/scene.ral did not parse as rail data".to_string());
+        };
+        let (mut target_rail, target_existed) = match document
+            .effective_resource_clone(CATALOG_RAL_PATH)
+            .map_err(|error| format!("could not inspect effective map/scene.ral: {error}"))?
+        {
+            Some(StageResourceDocument::Rail(rail)) => (rail, true),
+            Some(_) => {
+                return Err("effective map/scene.ral is not typed rail data".to_string());
+            }
+            None => (sms_formats::RalDocument::empty_canonical(), false),
+        };
+        let outcomes = target_rail
+            .merge_named_graphs(&source_rail, &template.required_graph_names)
+            .map_err(|error| format!("could not merge required rail graph: {error}"))?;
+        for outcome in &outcomes {
+            if outcome.source_name != outcome.target_name {
+                preflight
+                    .graph_name_rewrites
+                    .insert(outcome.source_name.clone(), outcome.target_name.clone());
+            }
+        }
+        if !target_existed || outcomes.iter().any(|outcome| outcome.inserted) {
+            preflight.writes.push(CatalogResourceWrite {
+                raw_resource_path: CATALOG_RAL_PATH.to_vec(),
+                document: StageResourceDocument::Rail(target_rail),
+                upsert: true,
+            });
+        }
+    }
+    Ok(preflight)
+}
+
+fn parse_catalog_resource(
+    resource: &sms_scene::ObjectAuthoringResource,
+) -> Result<StageResourceDocument, String> {
+    let bytes =
+        sms_formats::read_stage_asset_bytes(&resource.source_asset_path).map_err(|error| {
+            format!(
+                "could not read required retail resource {} from {}: {error}",
+                String::from_utf8_lossy(&resource.raw_resource_path),
+                resource.source_asset_path.display()
+            )
+        })?;
+    StageResourceDocument::parse_for_path(&resource.raw_resource_path, &bytes).map_err(|error| {
+        format!(
+            "could not parse required retail resource {} from {}: {error}",
+            String::from_utf8_lossy(&resource.raw_resource_path),
+            resource.source_asset_path.display()
+        )
+    })
+}
+
+fn semantic_record_type(type_name: &str) -> &str {
+    type_name.rsplit("::").next().unwrap_or(type_name)
+}
+
+fn character_record_equal(
+    left: &sms_formats::JDramaRecord,
+    right: &sms_formats::JDramaRecord,
+) -> bool {
+    semantic_record_type(&left.type_name) == semantic_record_type(&right.type_name)
+        && left.name == right.name
+        && left.payload == right.payload
+}
+
+fn name_ref_group_paths(document: &sms_formats::JDramaDocument) -> Vec<Vec<usize>> {
+    fn visit(record: &sms_formats::JDramaRecord, path: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+        if semantic_record_type(&record.type_name) == "NameRefGrp" {
+            out.push(path.clone());
+        }
+        if let sms_formats::JDramaRecordPayload::Group { children, .. } = &record.payload {
+            for (index, child) in children.iter().enumerate() {
+                path.push(index);
+                visit(child, path, out);
+                path.pop();
+            }
+        }
+    }
+    let mut out = Vec::new();
+    visit(&document.root, &mut Vec::new(), &mut out);
+    out
+}
+
+fn jdrama_record_mut<'a>(
+    root: &'a mut sms_formats::JDramaRecord,
+    path: &[usize],
+) -> Option<&'a mut sms_formats::JDramaRecord> {
+    let mut record = root;
+    for index in path {
+        let sms_formats::JDramaRecordPayload::Group { children, .. } = &mut record.payload else {
+            return None;
+        };
+        record = children.get_mut(*index)?;
+    }
+    Some(record)
+}
+
+fn merge_character_table(
+    current: Option<StageResourceDocument>,
+    registrations: &[sms_formats::JDramaRecord],
+) -> Result<(sms_formats::JDramaDocument, bool), String> {
+    let (mut document, mut changed) = match current {
+        Some(StageResourceDocument::Placement(document)) => (document, false),
+        Some(_) => return Err("effective map/tables.bin is not placement data".to_string()),
+        None => (
+            sms_formats::JDramaDocument {
+                root: sms_formats::JDramaRecord {
+                    type_name: "NameRefGrp".to_string(),
+                    name: "SMS authored character registrations".to_string(),
+                    payload: sms_formats::JDramaRecordPayload::Group {
+                        fields: Vec::new(),
+                        children: Vec::new(),
+                    },
+                },
+            },
+            true,
+        ),
+    };
+    let mut paths = name_ref_group_paths(&document);
+    if paths.is_empty() {
+        let sms_formats::JDramaRecordPayload::Group { children, .. } = &mut document.root.payload
+        else {
+            return Err("map/tables.bin has no NameRefGrp and its root is not a group".to_string());
+        };
+        children.push(sms_formats::JDramaRecord {
+            type_name: "NameRefGrp".to_string(),
+            name: "SMS authored character registrations".to_string(),
+            payload: sms_formats::JDramaRecordPayload::Group {
+                fields: Vec::new(),
+                children: Vec::new(),
+            },
+        });
+        paths = name_ref_group_paths(&document);
+        changed = true;
+    }
+    if paths.len() != 1 {
+        return Err(format!(
+            "map/tables.bin has {} NameRefGrp records; character insertion is ambiguous",
+            paths.len()
+        ));
+    }
+    let target = jdrama_record_mut(&mut document.root, &paths[0])
+        .ok_or_else(|| "map/tables.bin NameRefGrp path became invalid".to_string())?;
+    let sms_formats::JDramaRecordPayload::Group { children, .. } = &mut target.payload else {
+        return Err("map/tables.bin NameRefGrp is not a typed group".to_string());
+    };
+    let mut registrations = registrations.to_vec();
+    registrations.sort_by(|a, b| {
+        a.name.cmp(&b.name).then_with(|| {
+            semantic_record_type(&a.type_name).cmp(semantic_record_type(&b.type_name))
+        })
+    });
+    for registration in registrations {
+        let matches = children
+            .iter()
+            .filter(|existing| existing.name == registration.name)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => {
+                children.push(registration);
+                changed = true;
+            }
+            [existing] if character_record_equal(existing, &registration) => {}
+            [_] => {
+                return Err(format!(
+                    "character registration {:?} conflicts with an existing map/tables.bin record",
+                    registration.name
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "character registration {:?} is ambiguous because map/tables.bin already contains {} exact-name records",
+                    registration.name,
+                    matches.len()
+                ));
+            }
+        }
+    }
+    Ok((document, changed))
+}
+
+fn set_typed_vec3_field(
+    fields: &mut [sms_formats::JDramaField],
+    name: &str,
+    value: [f32; 3],
+) -> Result<(), String> {
+    let field = fields
+        .iter_mut()
+        .find(|field| field.name == name)
+        .ok_or_else(|| format!("typed transform field '{name}' is missing"))?;
+    let sms_formats::JDramaFieldValue::Vec3F32(current) = &mut field.value else {
+        return Err(format!("typed transform field '{name}' is not a vec3"));
+    };
+    *current = value;
+    Ok(())
+}
+
+fn reset_catalog_prototype_transform(
+    record: &mut sms_formats::JDramaRecord,
+    translation: [f32; 3],
+) -> Result<(), String> {
+    match &mut record.payload {
+        sms_formats::JDramaRecordPayload::Actor { transform, .. } => {
+            *transform = sms_formats::JDramaTransform {
+                translation,
+                rotation: [0.0; 3],
+                scale: [1.0; 3],
+            };
+            Ok(())
+        }
+        sms_formats::JDramaRecordPayload::Fields { fields } => {
+            let (translation_name, rotation_name, scale_name) = match record
+                .type_name
+                .rsplit("::")
+                .next()
+                .unwrap_or(&record.type_name)
+            {
+                "AreaCylinder" => ("center", "authoring_vector", "cylinder_parameters"),
+                "Generator" => ("position", "rotation", "authoring_vector"),
+                type_name => {
+                    return Err(format!(
+                        "catalog prototype '{type_name}' has no editable typed transform"
+                    ))
+                }
+            };
+            set_typed_vec3_field(fields, translation_name, translation)?;
+            set_typed_vec3_field(fields, rotation_name, [0.0; 3])?;
+            set_typed_vec3_field(fields, scale_name, [1.0; 3])
+        }
+        _ => Err(format!(
+            "catalog prototype '{}' is not transform-editable",
+            record.type_name
+        )),
+    }
+}
+
+fn rewrite_catalog_graph_names_in_record(
+    record: &mut sms_formats::JDramaRecord,
+    rewrites: &BTreeMap<String, String>,
+    applied: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    let fields = match &mut record.payload {
+        sms_formats::JDramaRecordPayload::Actor { fields, .. }
+        | sms_formats::JDramaRecordPayload::Fields { fields }
+        | sms_formats::JDramaRecordPayload::Group { fields, .. } => fields,
+        sms_formats::JDramaRecordPayload::Empty => return Ok(()),
+    };
+    for field in fields.iter_mut().filter(|field| field.name == "graph_name") {
+        let sms_formats::JDramaFieldValue::String(current) = &mut field.value else {
+            return Err(format!(
+                "typed graph_name field on '{}' is not a string",
+                record.type_name
+            ));
+        };
+        if let Some(rewritten) = rewrites.get(current) {
+            applied.insert(current.clone());
+            *current = rewritten.clone();
+        }
+    }
+    if let sms_formats::JDramaRecordPayload::Group { children, .. } = &mut record.payload {
+        for child in children {
+            rewrite_catalog_graph_names_in_record(child, rewrites, applied)?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_catalog_graph_names(
+    prototype: &mut sms_formats::JDramaRecord,
+    dependencies: &mut [sms_scene::AuthoredPlacementDependency],
+    rewrites: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    if rewrites.is_empty() {
+        return Ok(());
+    }
+    let mut applied = BTreeSet::new();
+    rewrite_catalog_graph_names_in_record(prototype, rewrites, &mut applied)?;
+    for dependency in dependencies {
+        rewrite_catalog_graph_names_in_record(&mut dependency.record, rewrites, &mut applied)?;
+    }
+    if let Some(missing) = rewrites.keys().find(|name| !applied.contains(*name)) {
+        return Err(format!(
+            "catalog actor/dependency closure has no typed graph_name value {missing:?} to rewrite"
+        ));
+    }
+    Ok(())
+}
+
+fn object_from_catalog_template(
+    id: String,
+    factory_name: String,
+    translation: [f32; 3],
+    template: &sms_scene::ObjectAuthoringTemplate,
+    graph_name_rewrites: &BTreeMap<String, String>,
+) -> Result<SceneObject, String> {
+    let mut prototype = template.record.clone();
+    let mut dependencies = template
+        .dependencies
+        .iter()
+        .map(|dependency| sms_scene::AuthoredPlacementDependency {
+            target: Some(dependency.target.clone()),
+            target_group_index: dependency.group_index,
+            record: dependency.record.clone(),
+        })
+        .collect::<Vec<_>>();
+    rewrite_catalog_graph_names(&mut prototype, &mut dependencies, graph_name_rewrites)?;
+    reset_catalog_prototype_transform(&mut prototype, translation)?;
+    let mut object = SceneObject::new(id, factory_name);
+    object.transform = Transform {
+        translation,
+        ..Transform::default()
+    };
+    sms_scene::seed_scene_object_parameters(&mut object, &prototype)
+        .map_err(|error| error.to_string())?;
+    object.placement = Some(sms_scene::PlacementBinding::Authored(
+        sms_scene::AuthoredPlacement {
+            raw_resource_path: b"map/scene.bin".to_vec(),
+            target_group_index: template.group_index,
+            prototype,
+            dependencies,
+        },
+    ));
+    Ok(object)
+}
+
+fn duplicate_object_for_spawn(
+    mut source: SceneObject,
+    id: String,
+    translation: [f32; 3],
+    registry: Option<&ObjectRegistry>,
+) -> SceneObject {
+    if let Some(registry) = registry {
+        source.refresh_manager_capacity_dependencies(registry);
+    }
+    source.id = id;
+    source.source = None;
+    source.placement = source
+        .placement
+        .as_ref()
+        .map(sms_scene::PlacementBinding::duplicate_for_new_object);
+    source.transform.translation = translation;
+    source
+}
+
+fn add_catalog_preview_hint(
+    object: &mut SceneObject,
+    document: &StageDocument,
+    template: &sms_scene::ObjectAuthoringTemplate,
+) {
+    let (Some(source_path), Some(raw_path)) = (
+        document.stage_archive_source_path.as_ref(),
+        template.preview_resource_path.as_ref(),
+    ) else {
+        return;
+    };
+    object
+        .asset_hints
+        .retain(|hint| hint.role != AssetRole::PreviewModel);
+    object.asset_hints.push(AssetRef {
+        path: format!(
+            "{}!/{}",
+            source_path.display(),
+            String::from_utf8_lossy(raw_path).replace('\\', "/")
+        ),
+        role: AssetRole::PreviewModel,
+    });
+}
 impl SmsEditorApp {
     pub(super) fn validate(&mut self) {
         if let Some(document) = &self.document {
@@ -367,6 +998,7 @@ impl SmsEditorApp {
                 Ok(outcome) => {
                     self.saved_objects = document.objects.clone();
                     self.saved_lighting = document.lighting.clone();
+                    self.saved_archive_edits = document.archive_edits.clone();
                     self.document_dirty = false;
                     self.log.push(format!(
                         "Saved editor project with {} file(s).",
@@ -626,24 +1258,110 @@ impl SmsEditorApp {
         Some(path)
     }
 
+    fn next_available_object_id(&self) -> Option<(String, u32)> {
+        let document = self.document.as_ref()?;
+        let stage_id = sanitize_id(&self.stage_id);
+        let mut serial = self.next_object_serial.max(1);
+        loop {
+            let id = format!("{stage_id}-obj-{serial:04}");
+            if !document.objects.iter().any(|object| object.id == id) {
+                return Some((id, serial.saturating_add(1)));
+            }
+            serial = serial.checked_add(1)?;
+        }
+    }
+
+    pub(super) fn reconcile_loaded_authored_catalog_resources(&mut self) {
+        let authored_factories = self
+            .document
+            .as_ref()
+            .map(|document| {
+                document
+                    .objects
+                    .iter()
+                    .filter(|object| {
+                        matches!(
+                            object.placement,
+                            Some(sms_scene::PlacementBinding::Authored(_))
+                        )
+                    })
+                    .map(|object| object.factory_name.clone())
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let templates = authored_factories
+            .iter()
+            .filter_map(|factory_name| self.object_authoring_catalog.find(factory_name).cloned())
+            .collect::<Vec<_>>();
+        let repair = self
+            .document
+            .as_mut()
+            .map(|document| repair_authored_catalog_resources(document, &templates))
+            .unwrap_or_default();
+
+        for error in repair.errors {
+            self.log.push(format!(
+                "Could not repair authored object runtime resources: {error}"
+            ));
+        }
+        if repair.resource_writes == 0 {
+            return;
+        }
+        if let (Some(document), Some(registry)) = (&mut self.document, self.registry.clone()) {
+            document.set_registry(registry);
+        }
+        self.document_dirty = self.document.as_ref().is_some_and(|document| {
+            stage_document_differs_from_saved(
+                document,
+                &self.saved_objects,
+                &self.saved_lighting,
+                &self.saved_archive_edits,
+            )
+        });
+        self.flush_document_change();
+        self.rebuild_model_preview_from_document();
+        self.log.push(format!(
+            "Repaired {} missing runtime resource(s) for existing authored class(es): {}. Save the project before launching.",
+            repair.resource_writes,
+            repair.repaired_factories.join(", ")
+        ));
+    }
+
     pub(super) fn spawn_object_at(&mut self, factory_name: String, translation: [f32; 3]) {
-        let Some(document) = self.document.as_mut() else {
+        if self
+            .registry
+            .as_ref()
+            .and_then(|registry| registry.find_object(&factory_name))
+            .is_some_and(|definition| definition.unsafe_to_edit)
+        {
+            self.log.push(format!(
+                "Could not place class '{factory_name}': the schema marks it unsafe to edit."
+            ));
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
             self.log
                 .push("Open a stage before placing an object class.".to_string());
             return;
         };
-        let id = format!(
-            "{}-obj-{:04}",
-            sanitize_id(&self.stage_id),
-            self.next_object_serial
-        );
-        self.next_object_serial += 1;
-
-        let template = document
+        let Some((id, next_object_serial)) = self.next_available_object_id() else {
+            self.log.push(format!(
+                "Could not place class '{factory_name}': no unique editor object id is available."
+            ));
+            return;
+        };
+        let same_stage_template = document
             .objects
             .iter()
             .find(|object| object.factory_name == factory_name && object.placement.is_some())
             .cloned();
+        let catalog_template = same_stage_template
+            .is_none()
+            .then(|| self.object_authoring_catalog.find(&factory_name).cloned())
+            .flatten();
+        let mut catalog_log = None;
+        let mut catalog_resource_deltas = Vec::new();
+
         let mut object = if factory_name == "Mario" {
             if document
                 .objects
@@ -656,7 +1374,10 @@ impl SmsEditorApp {
                 );
                 return;
             }
-            let address = match ensure_authored_mario_placement(document, translation) {
+            let address = match ensure_authored_mario_placement(
+                self.document.as_mut().expect("document was checked above"),
+                translation,
+            ) {
                 Ok(address) => address,
                 Err(error) => {
                     self.log
@@ -679,7 +1400,10 @@ impl SmsEditorApp {
                 );
                 return;
             }
-            let address = match ensure_sky_placement(document, translation) {
+            let address = match ensure_sky_placement(
+                self.document.as_mut().expect("document was checked above"),
+                translation,
+            ) {
                 Ok(address) => address,
                 Err(error) => {
                     self.log
@@ -690,20 +1414,65 @@ impl SmsEditorApp {
             let mut object = SceneObject::new(id.clone(), factory_name.clone());
             object.placement = Some(sms_scene::PlacementBinding::Existing(address));
             object
-        } else if let Some(mut template) = template {
-            template.id = id.clone();
-            template.source = None;
-            template.placement = template
-                .placement
-                .as_ref()
-                .map(|binding| sms_scene::PlacementBinding::CloneOf(binding.address().clone()));
-            template
+        } else if let Some(template) = same_stage_template {
+            duplicate_object_for_spawn(template, id.clone(), translation, self.registry.as_ref())
+        } else if let Some(template) = catalog_template {
+            let preflight = match preflight_catalog_resources(
+                self.document.as_ref().expect("document was checked above"),
+                &template,
+            ) {
+                Ok(preflight) => preflight,
+                Err(error) => {
+                    self.log.push(format!(
+                        "Could not place class '{factory_name}' from the retail catalog: {error}"
+                    ));
+                    return;
+                }
+            };
+            let mut object = match object_from_catalog_template(
+                id.clone(),
+                factory_name.clone(),
+                translation,
+                &template,
+                &preflight.graph_name_rewrites,
+            ) {
+                Ok(object) => object,
+                Err(error) => {
+                    self.log.push(format!(
+                        "Could not place class '{factory_name}' from the retail catalog: {error}"
+                    ));
+                    return;
+                }
+            };
+            add_catalog_preview_hint(
+                &mut object,
+                self.document.as_ref().expect("document was checked above"),
+                &template,
+            );
+            let authored_resource_count = preflight.writes.len();
+            let reused_resource_count = preflight.reused_existing_resources;
+            catalog_resource_deltas = catalog_resource_edit_deltas(
+                self.document.as_ref().expect("document was checked above"),
+                preflight.writes,
+            );
+            catalog_log = Some(format!(
+                "Placed '{factory_name}' from retail stage '{}': {} manager/support dependency record(s), {} stage-local character registration(s), {} required graph(s), {} catalog resource(s), {} existing target resource(s) reused, {} resource write(s).",
+                template.source_stage,
+                template.dependencies.len(),
+                template.character_records.len(),
+                template.required_graph_names.len(),
+                template.resources.len(),
+                reused_resource_count,
+                authored_resource_count
+            ));
+            object
         } else {
             self.log.push(format!(
-                "Could not place class '{factory_name}': this stage has no typed instance to clone and the decomp-derived schema does not expose a constructor for it."
+                "Could not place class '{factory_name}': this stage has no typed instance to duplicate and the retail authoring catalog has no template."
             ));
             return;
         };
+
         object.transform.translation = translation;
         if let Some(schema) = self
             .registry
@@ -711,14 +1480,21 @@ impl SmsEditorApp {
             .and_then(|registry| registry.find_object(&factory_name))
         {
             object.class_name = Some(schema.class_name.clone());
-            if let Some(model) = &schema.preview_model {
-                object.asset_hints.push(AssetRef {
-                    path: model.clone(),
-                    role: AssetRole::PreviewModel,
-                });
+            if !object
+                .asset_hints
+                .iter()
+                .any(|hint| hint.role == AssetRole::PreviewModel)
+            {
+                if let Some(model) = &schema.preview_model {
+                    object.asset_hints.push(AssetRef {
+                        path: model.clone(),
+                        role: AssetRole::PreviewModel,
+                    });
+                }
             }
         }
 
+        self.next_object_serial = next_object_serial;
         let index = self
             .document
             .as_ref()
@@ -727,9 +1503,13 @@ impl SmsEditorApp {
             "Added object",
             ObjectUndoRecord {
                 deltas: vec![ObjectDelta::Insert { index, object }],
+                resource_deltas: catalog_resource_deltas,
             },
         );
         self.selected_object_id = Some(id);
+        if let Some(message) = catalog_log {
+            self.log.push(message);
+        }
         self.rebuild_model_preview_from_document();
     }
 
@@ -737,6 +1517,14 @@ impl SmsEditorApp {
         let Some(document) = self.document.as_ref() else {
             return false;
         };
+        if self
+            .registry
+            .as_ref()
+            .and_then(|registry| registry.find_object(factory_name))
+            .is_some_and(|definition| definition.unsafe_to_edit)
+        {
+            return false;
+        }
         if factory_name == "Mario" {
             let authored_blank = document.stage_archive.as_ref().is_some_and(|archive| {
                 matches!(archive.origin(), sms_scene::StageOrigin::Blank { .. })
@@ -758,6 +1546,7 @@ impl SmsEditorApp {
             .objects
             .iter()
             .any(|object| object.factory_name == factory_name && object.placement.is_some())
+            || self.object_authoring_catalog.find(factory_name).is_some()
     }
 
     pub(super) fn update_stage_lighting(&mut self, lighting: sms_scene::StageLighting) {
@@ -768,8 +1557,12 @@ impl SmsEditorApp {
             return;
         }
         document.lighting = lighting;
-        self.document_dirty =
-            stage_document_differs_from_saved(document, &self.saved_objects, &self.saved_lighting);
+        self.document_dirty = stage_document_differs_from_saved(
+            document,
+            &self.saved_objects,
+            &self.saved_lighting,
+            &self.saved_archive_edits,
+        );
         self.flush_document_change();
         self.rebuild_gpu_viewport_scene();
         self.clear_viewport_preview_cache();
@@ -779,21 +1572,19 @@ impl SmsEditorApp {
         let Some(source) = self.selected_object().cloned() else {
             return;
         };
-        let id = format!(
-            "{}-obj-{:04}",
-            sanitize_id(&self.stage_id),
-            self.next_object_serial
-        );
-        self.next_object_serial += 1;
+        let Some((id, next_object_serial)) = self.next_available_object_id() else {
+            self.log.push(
+                "Could not duplicate object: no unique editor object id is available.".to_string(),
+            );
+            return;
+        };
 
-        let mut clone = source;
-        clone.id = id.clone();
-        clone.placement = clone
-            .placement
-            .as_ref()
-            .map(|binding| sms_scene::PlacementBinding::CloneOf(binding.address().clone()));
-        clone.transform.translation[0] += self.snap_translation.max(25.0);
-        clone.transform.translation[2] += self.snap_translation.max(25.0);
+        let mut translation = source.transform.translation;
+        translation[0] += self.snap_translation.max(25.0);
+        translation[2] += self.snap_translation.max(25.0);
+        let clone =
+            duplicate_object_for_spawn(source, id.clone(), translation, self.registry.as_ref());
+        self.next_object_serial = next_object_serial;
         let index = self
             .document
             .as_ref()
@@ -805,6 +1596,7 @@ impl SmsEditorApp {
                     index,
                     object: clone,
                 }],
+                resource_deltas: Vec::new(),
             },
         );
         self.selected_object_id = Some(id);
@@ -832,6 +1624,7 @@ impl SmsEditorApp {
             "Deleted object",
             ObjectUndoRecord {
                 deltas: vec![ObjectDelta::Remove { index, object }],
+                resource_deltas: Vec::new(),
             },
         );
         self.selected_object_id = None;
@@ -860,6 +1653,7 @@ impl SmsEditorApp {
                     before: Box::new(before),
                     after: Box::new(after),
                 }],
+                resource_deltas: Vec::new(),
             },
         );
         let has_rendered_model = self
@@ -883,6 +1677,97 @@ impl SmsEditorApp {
         }
     }
 
+    pub(super) fn update_selected_parameter(
+        &mut self,
+        key: impl Into<String>,
+        raw: impl Into<String>,
+    ) {
+        let key = key.into();
+        let raw = raw.into();
+        let Some(before) = self.selected_object().cloned() else {
+            return;
+        };
+        let descriptors = match self
+            .document
+            .as_ref()
+            .expect("a selected object belongs to an open document")
+            .editable_parameters_for_object(&before)
+        {
+            Ok(descriptors) => descriptors,
+            Err(error) => {
+                self.log.push(format!(
+                    "Could not edit parameter '{key}' on '{}': {error}",
+                    object_display_name(&before)
+                ));
+                return;
+            }
+        };
+        let Some(descriptor) = descriptors.iter().find(|descriptor| descriptor.key == key) else {
+            self.log.push(format!(
+                "Could not edit parameter '{key}' on '{}': it is not a canonical typed field.",
+                object_display_name(&before)
+            ));
+            return;
+        };
+        if let Some(reason) = descriptor.read_only_reason.as_deref() {
+            self.log.push(format!(
+                "Could not edit parameter '{key}' on '{}': {reason}",
+                object_display_name(&before)
+            ));
+            return;
+        }
+        if descriptor.raw_value == raw {
+            return;
+        }
+
+        let old_manager_name = (key == "manager_name")
+            .then(|| before.raw_param("manager_name").map(str::to_owned))
+            .flatten();
+        let mut after = before.clone();
+        after.set_raw_param(key.clone(), raw.clone());
+        sms_scene::sync_scene_object_parameter_aliases(&mut after);
+
+        if let Some(sms_scene::PlacementBinding::Authored(authored)) = after.placement.as_ref() {
+            let mut validation_record = authored.prototype.clone();
+            if let Err(error) =
+                sms_scene::apply_dirty_object_parameter_edits(&mut validation_record, &after)
+            {
+                self.log.push(format!(
+                    "Could not edit parameter '{key}' on '{}': {error}",
+                    object_display_name(&before)
+                ));
+                return;
+            }
+        }
+
+        if let (Some(old_manager_name), Some(sms_scene::PlacementBinding::Authored(authored))) =
+            (old_manager_name, after.placement.as_mut())
+        {
+            let mut renamed = 0;
+            for dependency in &mut authored.dependencies {
+                if dependency.record.name == old_manager_name {
+                    dependency.record.name = raw.clone();
+                    renamed += 1;
+                }
+            }
+            if renamed == 0 {
+                self.log.push(format!(
+                    "Parameter update warning for '{}': no authored dependency matched manager name {:?}.",
+                    object_display_name(&before), old_manager_name
+                ));
+            }
+        }
+        self.apply_object_edit(
+            "Updated object parameter",
+            ObjectUndoRecord {
+                deltas: vec![ObjectDelta::Update {
+                    before: Box::new(before),
+                    after: Box::new(after),
+                }],
+                resource_deltas: Vec::new(),
+            },
+        );
+    }
     #[cfg(test)]
     pub(super) fn mutate_document(&mut self, label: &str, mutate: impl FnOnce(&mut StageDocument)) {
         let in_transaction = self.undo_transaction.is_some();
@@ -891,7 +1776,7 @@ impl SmsEditorApp {
         } else {
             self.document
                 .as_ref()
-                .map(|document| document.objects.clone())
+                .map(|document| (document.objects.clone(), document.archive_edits.clone()))
         };
         if let Some(document) = &mut self.document {
             mutate(document);
@@ -899,10 +1784,16 @@ impl SmsEditorApp {
         let undo_record = if in_transaction {
             None
         } else {
-            before
-                .as_ref()
-                .zip(self.document.as_ref())
-                .map(|(before, document)| ObjectUndoRecord::between(before, &document.objects))
+            before.as_ref().zip(self.document.as_ref()).map(
+                |((before_objects, before_archive_edits), document)| {
+                    ObjectUndoRecord::between(
+                        before_objects,
+                        &document.objects,
+                        before_archive_edits,
+                        &document.archive_edits,
+                    )
+                },
+            )
         };
         if let Some(record) = undo_record {
             self.push_undo_record(record);
@@ -915,6 +1806,7 @@ impl SmsEditorApp {
                     document,
                     &self.saved_objects,
                     &self.saved_lighting,
+                    &self.saved_archive_edits,
                 )
             })
         };
@@ -925,18 +1817,29 @@ impl SmsEditorApp {
     }
 
     fn apply_object_edit(&mut self, label: &str, record: ObjectUndoRecord) {
-        if record.deltas.is_empty() {
+        if record.is_empty() {
             return;
         }
         let in_transaction = self.undo_transaction.is_some();
+        let registry = (!record.resource_deltas.is_empty())
+            .then(|| self.registry.clone())
+            .flatten();
         let Some(document) = &mut self.document else {
             return;
         };
-        record.apply_forward(&mut document.objects);
+        record.apply_forward(document);
+        if let Some(registry) = registry {
+            document.set_registry(registry);
+        }
         self.document_dirty = if in_transaction {
             true
         } else {
-            stage_document_differs_from_saved(document, &self.saved_objects, &self.saved_lighting)
+            stage_document_differs_from_saved(
+                document,
+                &self.saved_objects,
+                &self.saved_lighting,
+                &self.saved_archive_edits,
+            )
         };
         if !in_transaction {
             self.push_undo_record(record);
@@ -956,6 +1859,14 @@ impl SmsEditorApp {
     }
 
     pub(super) fn begin_undo_transaction(&mut self) {
+        self.begin_object_undo_transaction(ObjectUndoTransactionKind::Transform);
+    }
+
+    pub(super) fn begin_parameter_undo_transaction(&mut self) {
+        self.begin_object_undo_transaction(ObjectUndoTransactionKind::Parameter);
+    }
+
+    fn begin_object_undo_transaction(&mut self, kind: ObjectUndoTransactionKind) {
         if self.undo_transaction.is_none() {
             self.undo_transaction = self.selected_object_id.as_ref().and_then(|selected_id| {
                 self.document.as_ref().and_then(|document| {
@@ -967,9 +1878,20 @@ impl SmsEditorApp {
                         .map(|(index, object)| ObjectUndoTransaction {
                             index,
                             before: object.clone(),
+                            kind,
                         })
                 })
             });
+        }
+    }
+
+    pub(super) fn finish_pointer_undo_transaction_if_released(&mut self, primary_down: bool) {
+        let is_transform_transaction = self
+            .undo_transaction
+            .as_ref()
+            .is_some_and(|transaction| transaction.kind == ObjectUndoTransactionKind::Transform);
+        if is_transform_transaction && !primary_down {
+            self.commit_undo_transaction("Updated transform");
         }
     }
 
@@ -994,6 +1916,7 @@ impl SmsEditorApp {
                         })
                         .into_iter()
                         .collect(),
+                    resource_deltas: Vec::new(),
                 }
             } else {
                 ObjectUndoRecord {
@@ -1001,13 +1924,19 @@ impl SmsEditorApp {
                         index: transaction.index,
                         object: transaction.before.clone(),
                     }],
+                    resource_deltas: Vec::new(),
                 }
             }
         });
         self.document_dirty = self.document.as_ref().is_some_and(|document| {
-            stage_document_differs_from_saved(document, &self.saved_objects, &self.saved_lighting)
+            stage_document_differs_from_saved(
+                document,
+                &self.saved_objects,
+                &self.saved_lighting,
+                &self.saved_archive_edits,
+            )
         });
-        let Some(record) = record.filter(|record| !record.deltas.is_empty()) else {
+        let Some(record) = record.filter(|record| !record.is_empty()) else {
             return;
         };
         self.push_undo_record(record);
@@ -1016,7 +1945,7 @@ impl SmsEditorApp {
     }
 
     fn push_undo_record(&mut self, record: ObjectUndoRecord) {
-        if record.deltas.is_empty() {
+        if record.is_empty() {
             return;
         }
         self.undo_stack.push_back(record);
@@ -1044,12 +1973,19 @@ impl SmsEditorApp {
         let Some(record) = self.undo_stack.pop_back() else {
             return;
         };
+        let registry = (!record.resource_deltas.is_empty())
+            .then(|| self.registry.clone())
+            .flatten();
         if let Some(document) = &mut self.document {
-            record.apply_reverse(&mut document.objects);
+            record.apply_reverse(document);
+            if let Some(registry) = registry {
+                document.set_registry(registry);
+            }
             self.document_dirty = stage_document_differs_from_saved(
                 document,
                 &self.saved_objects,
                 &self.saved_lighting,
+                &self.saved_archive_edits,
             );
         }
         self.redo_stack.push_back(record);
@@ -1077,12 +2013,19 @@ impl SmsEditorApp {
         let Some(record) = self.redo_stack.pop_back() else {
             return;
         };
+        let registry = (!record.resource_deltas.is_empty())
+            .then(|| self.registry.clone())
+            .flatten();
         if let Some(document) = &mut self.document {
-            record.apply_forward(&mut document.objects);
+            record.apply_forward(document);
+            if let Some(registry) = registry {
+                document.set_registry(registry);
+            }
             self.document_dirty = stage_document_differs_from_saved(
                 document,
                 &self.saved_objects,
                 &self.saved_lighting,
+                &self.saved_archive_edits,
             );
         }
         self.undo_stack.push_back(record);
@@ -1471,8 +2414,105 @@ fn preview_triangle_ranges_for_model_index(
 mod tests {
     use super::*;
     use sms_formats::{
-        JDramaDocument, JDramaField, JDramaFieldValue, JDramaRecord, JDramaRecordPayload,
+        JDramaDocument, JDramaField, JDramaFieldValue, JDramaRecord, JDramaRecordPayload, PrmFile,
     };
+
+    fn command_test_document(objects: Vec<SceneObject>) -> StageDocument {
+        StageDocument {
+            stage_id: "fixture0".to_string(),
+            base_root: PathBuf::from("."),
+            assets: Vec::new(),
+            objects,
+            changed_files: BTreeMap::new(),
+            stage_archive: None,
+            stage_archive_source_path: Some(PathBuf::from("virtual/fixture0.szs")),
+            archive_edits: StageArchiveEdits::default(),
+            registry: None,
+            load_issues: Vec::new(),
+            lighting: StageLighting::default(),
+            actor_previews: BTreeMap::new(),
+            loaded_project: None,
+        }
+    }
+
+    fn empty_parameter_document() -> StageResourceDocument {
+        StageResourceDocument::Parameters(PrmFile {
+            entries: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn spawn_skips_loaded_object_id_collision() {
+        let mut template = SceneObject::new("fixture0-obj-0001", "FixtureEnemy");
+        template.placement = Some(sms_scene::PlacementBinding::Existing(
+            sms_scene::PlacementAddress {
+                raw_resource_path: b"map/scene.bin".to_vec(),
+                record_path: vec![4, 0],
+            },
+        ));
+        let mut app = SmsEditorApp {
+            stage_id: "fixture0".to_string(),
+            document: Some(command_test_document(vec![template])),
+            ..SmsEditorApp::default()
+        };
+
+        app.spawn_object_at("FixtureEnemy".to_string(), [10.0, 20.0, 30.0]);
+
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.objects.len(), 2);
+        assert_eq!(document.objects[1].id, "fixture0-obj-0002");
+        assert_eq!(
+            document.objects[1].transform.translation,
+            [10.0, 20.0, 30.0]
+        );
+        assert_eq!(app.selected_object_id.as_deref(), Some("fixture0-obj-0002"));
+        assert_eq!(app.selected_object().unwrap().factory_name, "FixtureEnemy");
+        assert_eq!(app.next_object_serial, 3);
+        assert_eq!(
+            document
+                .objects
+                .iter()
+                .map(|object| object.id.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            document.objects.len()
+        );
+    }
+
+    #[test]
+    fn duplicate_skips_loaded_object_id_collisions() {
+        let source = SceneObject::new("source-object", "FixtureEnemy");
+        let occupied_one = SceneObject::new("fixture0-obj-0001", "OtherFixture");
+        let occupied_two = SceneObject::new("fixture0-obj-0002", "OtherFixture");
+        let mut app = SmsEditorApp {
+            stage_id: "fixture0".to_string(),
+            selected_object_id: Some(source.id.clone()),
+            document: Some(command_test_document(vec![
+                source,
+                occupied_one,
+                occupied_two,
+            ])),
+            ..SmsEditorApp::default()
+        };
+
+        app.duplicate_selected();
+
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.objects.len(), 4);
+        assert_eq!(document.objects[3].id, "fixture0-obj-0003");
+        assert_eq!(app.selected_object_id.as_deref(), Some("fixture0-obj-0003"));
+        assert_eq!(app.selected_object().unwrap().id, "fixture0-obj-0003");
+        assert_eq!(app.next_object_serial, 4);
+        assert_eq!(
+            document
+                .objects
+                .iter()
+                .map(|object| object.id.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            document.objects.len()
+        );
+    }
 
     #[test]
     fn authored_mario_placement_uses_typed_player_group_and_constructor() {
@@ -1542,6 +2582,7 @@ mod tests {
             transform: Transform::default(),
             raw_params: BTreeMap::new(),
             asset_hints: Vec::new(),
+            manager_capacity_dependencies: Vec::new(),
         });
         assert_eq!(authored_runtime_readiness_error(&document, false), None);
     }
@@ -1612,5 +2653,748 @@ mod tests {
             .expect("a Sky actor without sky.bmd is not runnable");
         assert!(error.contains("no skybox model"), "{error}");
         assert_eq!(authored_runtime_readiness_error(&document, true), None);
+    }
+
+    #[test]
+    fn catalog_template_seeds_defaults_and_owns_dependencies() {
+        let prototype = JDramaRecord {
+            type_name: "FixtureEnemy".to_string(),
+            name: "retail fixture".to_string(),
+            payload: JDramaRecordPayload::Actor {
+                transform: sms_formats::JDramaTransform {
+                    translation: [90.0, 80.0, 70.0],
+                    rotation: [4.0, 5.0, 6.0],
+                    scale: [2.0; 3],
+                },
+                character_name: "FixtureChara".to_string(),
+                light_map: sms_formats::JDramaLightMap::default(),
+                fields: vec![
+                    JDramaField {
+                        name: "manager_name".to_string(),
+                        value: JDramaFieldValue::String("fixture manager".to_string()),
+                    },
+                    JDramaField {
+                        name: "behavior".to_string(),
+                        value: JDramaFieldValue::U32(17),
+                    },
+                ],
+            },
+        };
+        let dependency_record = JDramaRecord {
+            type_name: "FixtureManager".to_string(),
+            name: "fixture manager".to_string(),
+            payload: JDramaRecordPayload::Fields { fields: Vec::new() },
+        };
+        let template = sms_scene::ObjectAuthoringTemplate {
+            factory_name: "FixtureEnemy".to_string(),
+            group_index: 4,
+            record: prototype,
+            dependencies: vec![sms_scene::ObjectAuthoringDependency {
+                group_index: 2,
+                target: sms_scene::AuthoredPlacementDependencyTarget::IndexedGroup {
+                    group_index: 2,
+                },
+                record: dependency_record,
+            }],
+            character_records: Vec::new(),
+            required_graph_names: Vec::new(),
+            resources: Vec::new(),
+            preview_resource_path: None,
+            source_stage: "fixture0".to_string(),
+        };
+
+        let object = object_from_catalog_template(
+            "fixture-object".to_string(),
+            "FixtureEnemy".to_string(),
+            [1.0, 2.0, 3.0],
+            &template,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(object.raw_param("name"), Some("retail fixture"));
+        assert_eq!(object.raw_param("manager_name"), Some("fixture manager"));
+        assert_eq!(object.raw_param("behavior"), Some("17"));
+        let Some(sms_scene::PlacementBinding::Authored(authored)) = object.placement.as_ref()
+        else {
+            panic!("catalog object must own an authored placement");
+        };
+        assert_eq!(authored.raw_resource_path, b"map/scene.bin");
+        assert_eq!(authored.target_group_index, 4);
+        assert_eq!(authored.dependencies.len(), 1);
+        assert_eq!(authored.dependencies[0].target_group_index, 2);
+        let JDramaRecordPayload::Actor { transform, .. } = &authored.prototype.payload else {
+            panic!("expected actor prototype");
+        };
+        assert_eq!(transform.translation, [1.0, 2.0, 3.0]);
+        assert_eq!(transform.rotation, [0.0; 3]);
+        assert_eq!(transform.scale, [1.0; 3]);
+
+        let duplicate =
+            duplicate_object_for_spawn(object, "fixture-copy".to_string(), [4.0, 5.0, 6.0], None);
+        assert_eq!(duplicate.id, "fixture-copy");
+        assert!(matches!(
+            duplicate.placement,
+            Some(sms_scene::PlacementBinding::Authored(_))
+        ));
+        assert_eq!(duplicate.transform.translation, [4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn shared_spawn_and_duplicate_path_refreshes_manager_capacity_closure() {
+        let mut source = SceneObject::new("launcher", "CommonLauncher");
+        source.insert_source_raw_param("launched_enemy_name", "fixture manager");
+        source.manager_capacity_dependencies = vec!["stale manager".to_string()];
+        source.placement = Some(sms_scene::PlacementBinding::Existing(
+            sms_scene::PlacementAddress {
+                raw_resource_path: b"map/scene.bin".to_vec(),
+                record_path: vec![1, 0],
+            },
+        ));
+        let registry = ObjectRegistry::default();
+
+        let duplicate = duplicate_object_for_spawn(
+            source,
+            "launcher-copy".to_string(),
+            [4.0, 5.0, 6.0],
+            Some(&registry),
+        );
+
+        assert_eq!(duplicate.manager_capacity_dependencies, ["fixture manager"]);
+        assert!(matches!(
+            duplicate.placement,
+            Some(sms_scene::PlacementBinding::CloneOf(_))
+        ));
+    }
+
+    #[test]
+    fn character_table_merge_is_idempotent_and_rejects_ambiguous_names() {
+        let registration = JDramaRecord {
+            type_name: "ObjChara".to_string(),
+            name: "FixtureChara".to_string(),
+            payload: JDramaRecordPayload::Fields {
+                fields: vec![JDramaField {
+                    name: "resource_folder".to_string(),
+                    value: JDramaFieldValue::String("/scene/fixture".to_string()),
+                }],
+            },
+        };
+        let (document, changed) =
+            merge_character_table(None, std::slice::from_ref(&registration)).unwrap();
+        assert!(changed);
+        let paths = name_ref_group_paths(&document);
+        assert_eq!(paths.len(), 1);
+
+        let (same, changed) = merge_character_table(
+            Some(StageResourceDocument::Placement(document.clone())),
+            std::slice::from_ref(&registration),
+        )
+        .unwrap();
+        assert!(!changed);
+        assert_eq!(same, document);
+
+        let mut duplicate = document.clone();
+        let target = jdrama_record_mut(&mut duplicate.root, &paths[0]).unwrap();
+        let JDramaRecordPayload::Group { children, .. } = &mut target.payload else {
+            unreachable!()
+        };
+        children.push(registration.clone());
+        let error = merge_character_table(
+            Some(StageResourceDocument::Placement(duplicate)),
+            std::slice::from_ref(&registration),
+        )
+        .unwrap_err();
+        assert!(error.contains("ambiguous"), "{error}");
+
+        let mut conflicting = registration.clone();
+        let JDramaRecordPayload::Fields { fields } = &mut conflicting.payload else {
+            unreachable!()
+        };
+        fields[0].value = JDramaFieldValue::String("/scene/different".to_string());
+        let error = merge_character_table(
+            Some(StageResourceDocument::Placement(document)),
+            &[conflicting],
+        )
+        .unwrap_err();
+        assert!(error.contains("conflicts"), "{error}");
+    }
+
+    #[test]
+    fn graph_conflict_rewrite_survives_canonical_parameter_export() {
+        let prototype = JDramaRecord {
+            type_name: "FixtureEnemy".to_string(),
+            name: "retail fixture".to_string(),
+            payload: JDramaRecordPayload::Actor {
+                transform: sms_formats::JDramaTransform {
+                    translation: [10.0, 20.0, 30.0],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: String::new(),
+                light_map: sms_formats::JDramaLightMap::default(),
+                fields: vec![JDramaField {
+                    name: "graph_name".to_string(),
+                    value: JDramaFieldValue::String("route_a".to_string()),
+                }],
+            },
+        };
+        let template = sms_scene::ObjectAuthoringTemplate {
+            factory_name: "FixtureEnemy".to_string(),
+            group_index: 4,
+            record: prototype,
+            dependencies: Vec::new(),
+            character_records: Vec::new(),
+            required_graph_names: vec!["route_a".to_string()],
+            resources: Vec::new(),
+            preview_resource_path: None,
+            source_stage: "fixture0".to_string(),
+        };
+        let rewrites = BTreeMap::from([("route_a".to_string(), "route_a_authored".to_string())]);
+        let object = object_from_catalog_template(
+            "fixture-object".to_string(),
+            "FixtureEnemy".to_string(),
+            [1.0, 2.0, 3.0],
+            &template,
+            &rewrites,
+        )
+        .unwrap();
+        assert_eq!(object.raw_param("graph_name"), Some("route_a_authored"));
+        assert!(!object.raw_params["graph_name"].is_dirty());
+        let Some(sms_scene::PlacementBinding::Authored(authored)) = &object.placement else {
+            unreachable!()
+        };
+        let graph_name = |record: &JDramaRecord| {
+            let JDramaRecordPayload::Actor { fields, .. } = &record.payload else {
+                return None;
+            };
+            fields.iter().find_map(|field| match &field.value {
+                JDramaFieldValue::String(value) if field.name == "graph_name" => {
+                    Some(value.clone())
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(
+            graph_name(&authored.prototype),
+            Some("route_a_authored".to_string())
+        );
+
+        let mut exported = authored.prototype.clone();
+        sms_scene::apply_all_object_parameters(&mut exported, &object).unwrap();
+        assert_eq!(graph_name(&exported), Some("route_a_authored".to_string()));
+    }
+
+    #[test]
+    fn existing_authored_objects_repair_new_catalog_runtime_resources_idempotently() {
+        let catalog_resource = empty_parameter_document();
+        let temp = tempfile::tempdir().unwrap();
+        let source_asset_path = temp.path().join("runtime.prm");
+        std::fs::write(&source_asset_path, catalog_resource.to_bytes().unwrap()).unwrap();
+
+        let prototype = JDramaRecord {
+            type_name: "FixtureEnemy".to_string(),
+            name: "fixture".to_string(),
+            payload: JDramaRecordPayload::Actor {
+                transform: sms_formats::JDramaTransform {
+                    translation: [0.0; 3],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: String::new(),
+                light_map: sms_formats::JDramaLightMap::default(),
+                fields: Vec::new(),
+            },
+        };
+        let mut object = SceneObject::new("fixture-object", "FixtureEnemy");
+        object.placement = Some(sms_scene::PlacementBinding::Authored(
+            sms_scene::AuthoredPlacement {
+                raw_resource_path: b"map/scene.bin".to_vec(),
+                target_group_index: 4,
+                prototype: prototype.clone(),
+                dependencies: Vec::new(),
+            },
+        ));
+        let template = sms_scene::ObjectAuthoringTemplate {
+            factory_name: "FixtureEnemy".to_string(),
+            group_index: 4,
+            record: prototype,
+            dependencies: Vec::new(),
+            character_records: Vec::new(),
+            required_graph_names: Vec::new(),
+            resources: vec![sms_scene::ObjectAuthoringResource {
+                raw_resource_path: b"fixtureanm/runtime.prm".to_vec(),
+                source_asset_path,
+            }],
+            preview_resource_path: None,
+            source_stage: "fixture0".to_string(),
+        };
+        let mut document = command_test_document(vec![object]);
+
+        let repair =
+            repair_authored_catalog_resources(&mut document, std::slice::from_ref(&template));
+        assert_eq!(repair.resource_writes, 1);
+        assert_eq!(repair.repaired_factories, ["FixtureEnemy"]);
+        assert!(
+            document.has_effective_resource(b"fixtureanm/runtime.prm"),
+            "repair should add the newly discovered runtime resource"
+        );
+
+        let second =
+            repair_authored_catalog_resources(&mut document, std::slice::from_ref(&template));
+        assert_eq!(second.resource_writes, 0);
+        assert!(second.repaired_factories.is_empty());
+        assert_eq!(document.archive_edits.resources.len(), 1);
+    }
+
+    #[test]
+    fn catalog_preflight_reuses_existing_runtime_path_without_overwrite() {
+        let raw_resource_path = b"mapobj/shared.prm".to_vec();
+        let catalog_resource = empty_parameter_document();
+        let temp = tempfile::tempdir().unwrap();
+        let source_asset_path = temp.path().join("shared.prm");
+        std::fs::write(&source_asset_path, catalog_resource.to_bytes().unwrap()).unwrap();
+        let existing_resource = StageResourceDocument::Parameters(PrmFile {
+            entries: vec![
+                sms_formats::PrmEntry::new("mNum", sms_formats::PrmValue::I32(7)).unwrap(),
+            ],
+        });
+        let mut document = command_test_document(Vec::new());
+        document.insert_authored_resource(raw_resource_path.clone(), existing_resource.clone());
+        let template = sms_scene::ObjectAuthoringTemplate {
+            factory_name: "FixtureMapObj".to_string(),
+            group_index: 4,
+            record: JDramaRecord::new("FixtureMapObj", "fixture", JDramaRecordPayload::Empty)
+                .unwrap(),
+            dependencies: Vec::new(),
+            character_records: Vec::new(),
+            required_graph_names: Vec::new(),
+            resources: vec![sms_scene::ObjectAuthoringResource {
+                raw_resource_path: raw_resource_path.clone(),
+                source_asset_path,
+            }],
+            preview_resource_path: None,
+            source_stage: "retail-source".to_string(),
+        };
+
+        let preflight = preflight_catalog_resources(&document, &template).unwrap();
+
+        assert!(preflight.writes.is_empty());
+        assert_eq!(preflight.reused_existing_resources, 1);
+        assert_eq!(
+            document
+                .effective_resource_clone(&raw_resource_path)
+                .unwrap(),
+            Some(existing_resource)
+        );
+    }
+    #[test]
+    fn catalog_resource_import_is_atomic_with_object_undo_and_redo() {
+        let mut app = SmsEditorApp {
+            document: Some(command_test_document(Vec::new())),
+            ..SmsEditorApp::default()
+        };
+        let raw_resource_path = b"map/catalog.prm".to_vec();
+        let resource_deltas = catalog_resource_edit_deltas(
+            app.document.as_ref().unwrap(),
+            vec![CatalogResourceWrite {
+                raw_resource_path: raw_resource_path.clone(),
+                document: empty_parameter_document(),
+                upsert: false,
+            }],
+        );
+        let object = SceneObject::new("catalog-object", "FixtureEnemy");
+        app.apply_object_edit(
+            "Added catalog object",
+            ObjectUndoRecord {
+                deltas: vec![ObjectDelta::Insert { index: 0, object }],
+                resource_deltas,
+            },
+        );
+
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.objects.len(), 1);
+        assert!(document.has_effective_resource(&raw_resource_path));
+        assert_eq!(document.archive_edits.resources.len(), 1);
+        assert!(app.document_dirty);
+
+        app.undo();
+        let document = app.document.as_ref().unwrap();
+        assert!(document.objects.is_empty());
+        assert!(!document.has_effective_resource(&raw_resource_path));
+        assert!(document.archive_edits.resources.is_empty());
+        assert!(!document.assets.iter().any(|asset| {
+            asset
+                .path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .ends_with("!/map/catalog.prm")
+        }));
+        assert!(!app.document_dirty);
+
+        app.redo();
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.objects.len(), 1);
+        assert!(document.has_effective_resource(&raw_resource_path));
+        assert_eq!(document.archive_edits.resources.len(), 1);
+        assert!(app.document_dirty);
+    }
+
+    #[test]
+    fn catalog_preflight_restores_removed_baseline_resource_with_upsert_and_exact_undo() {
+        let raw_resource_path = b"map/catalog.prm".to_vec();
+        let catalog_resource = empty_parameter_document();
+        let temp = tempfile::tempdir().unwrap();
+        let source_asset_path = temp.path().join("catalog.prm");
+        std::fs::write(&source_asset_path, catalog_resource.to_bytes().unwrap()).unwrap();
+
+        let mut archive = sms_scene::SourceFreeStageArchive::new().unwrap();
+        archive
+            .insert_resource(raw_resource_path.clone(), catalog_resource.clone())
+            .unwrap();
+        let mut document = command_test_document(Vec::new());
+        document.stage_archive = Some(archive);
+        document
+            .archive_edits
+            .remove_resource(raw_resource_path.clone());
+        let removed_overlay = document.archive_edits.clone();
+        assert!(!document.has_effective_resource(&raw_resource_path));
+
+        let template = sms_scene::ObjectAuthoringTemplate {
+            factory_name: "FixtureEnemy".to_string(),
+            group_index: 7,
+            record: JDramaRecord::new("FixtureEnemy", "fixture enemy", JDramaRecordPayload::Empty)
+                .unwrap(),
+            dependencies: Vec::new(),
+            character_records: Vec::new(),
+            required_graph_names: Vec::new(),
+            resources: vec![sms_scene::ObjectAuthoringResource {
+                raw_resource_path: raw_resource_path.clone(),
+                source_asset_path,
+            }],
+            preview_resource_path: None,
+            source_stage: "fixture0".to_string(),
+        };
+        let preflight = preflight_catalog_resources(&document, &template).unwrap();
+        assert_eq!(preflight.writes.len(), 1);
+        assert!(preflight.writes[0].upsert);
+        let resource_deltas = catalog_resource_edit_deltas(&document, preflight.writes);
+
+        let mut app = SmsEditorApp {
+            saved_archive_edits: removed_overlay.clone(),
+            document: Some(document),
+            ..SmsEditorApp::default()
+        };
+        app.apply_object_edit(
+            "Restored catalog resource",
+            ObjectUndoRecord {
+                deltas: Vec::new(),
+                resource_deltas,
+            },
+        );
+
+        let document = app.document.as_ref().unwrap();
+        assert!(document.archive_edits.resource_removals.is_empty());
+        assert_eq!(document.archive_edits.resources.len(), 1);
+        assert_eq!(
+            document.archive_edits.resources[0].mode,
+            sms_scene::StageResourceEditMode::Upsert
+        );
+        let rebuilt = document.build_stage_archive().unwrap();
+        let reopened = sms_scene::SourceFreeStageArchive::parse(&rebuilt).unwrap();
+        assert_eq!(
+            reopened.resource(&raw_resource_path),
+            Some(&catalog_resource)
+        );
+
+        app.undo();
+
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.archive_edits, removed_overlay);
+        assert!(!document.has_effective_resource(&raw_resource_path));
+        let rebuilt = document.build_stage_archive().unwrap();
+        let reopened = sms_scene::SourceFreeStageArchive::parse(&rebuilt).unwrap();
+        assert!(reopened.resource(&raw_resource_path).is_none());
+        assert!(!app.document_dirty);
+    }
+
+    #[test]
+    fn undo_restores_saved_resource_edit_order_exactly() {
+        let mut document = command_test_document(Vec::new());
+        document.insert_authored_resource(b"map/z_saved.prm".to_vec(), empty_parameter_document());
+        document.insert_authored_resource(b"map/a_saved.prm".to_vec(), empty_parameter_document());
+        let saved_archive_edits = document.archive_edits.clone();
+        let mut app = SmsEditorApp {
+            saved_archive_edits: saved_archive_edits.clone(),
+            document: Some(document),
+            ..SmsEditorApp::default()
+        };
+        let resource_deltas = catalog_resource_edit_deltas(
+            app.document.as_ref().unwrap(),
+            vec![CatalogResourceWrite {
+                raw_resource_path: b"map/z_saved.prm".to_vec(),
+                document: empty_parameter_document(),
+                upsert: true,
+            }],
+        );
+        app.apply_object_edit(
+            "Updated saved catalog resource",
+            ObjectUndoRecord {
+                deltas: Vec::new(),
+                resource_deltas,
+            },
+        );
+        assert!(app.document_dirty);
+
+        app.undo();
+
+        assert_eq!(
+            app.document.as_ref().unwrap().archive_edits,
+            saved_archive_edits
+        );
+        assert!(!app.document_dirty);
+        assert_eq!(
+            app.document.as_ref().unwrap().archive_edits.resources[0].raw_resource_path,
+            b"map/z_saved.prm"
+        );
+    }
+
+    #[test]
+    fn archive_edit_saved_baseline_participates_in_dirty_equality() {
+        let mut document = command_test_document(Vec::new());
+        document.upsert_authored_resource(b"map/saved.prm".to_vec(), empty_parameter_document());
+        let saved_archive_edits = document.archive_edits.clone();
+        assert!(!stage_document_differs_from_saved(
+            &document,
+            &document.objects,
+            &document.lighting,
+            &saved_archive_edits,
+        ));
+
+        document.archive_edits.resources[0].mode = sms_scene::StageResourceEditMode::Insert;
+        assert!(stage_document_differs_from_saved(
+            &document,
+            &document.objects,
+            &document.lighting,
+            &saved_archive_edits,
+        ));
+    }
+
+    #[test]
+    fn update_parameter_rejects_linked_read_only_fields() {
+        let prototype = JDramaRecord {
+            type_name: "FixtureEnemy".to_string(),
+            name: "fixture".to_string(),
+            payload: JDramaRecordPayload::Actor {
+                transform: sms_formats::JDramaTransform {
+                    translation: [0.0; 3],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: String::new(),
+                light_map: sms_formats::JDramaLightMap::default(),
+                fields: vec![JDramaField {
+                    name: "graph_name".to_string(),
+                    value: JDramaFieldValue::String("route_a".to_string()),
+                }],
+            },
+        };
+        let mut object = SceneObject::new("fixture-object", "FixtureEnemy");
+        sms_scene::seed_scene_object_parameters(&mut object, &prototype).unwrap();
+        object.placement = Some(sms_scene::PlacementBinding::Authored(
+            sms_scene::AuthoredPlacement {
+                raw_resource_path: b"map/scene.bin".to_vec(),
+                target_group_index: 4,
+                prototype,
+                dependencies: Vec::new(),
+            },
+        ));
+        let mut app = SmsEditorApp {
+            selected_object_id: Some(object.id.clone()),
+            document: Some(command_test_document(vec![object])),
+            ..SmsEditorApp::default()
+        };
+
+        app.update_selected_parameter("graph_name", "route_b");
+
+        let object = &app.document.as_ref().unwrap().objects[0];
+        assert_eq!(object.raw_param("graph_name"), Some("route_a"));
+        assert!(app.undo_stack.is_empty());
+        assert!(app.log.iter().any(|message| {
+            message.contains("Could not edit parameter 'graph_name'") && message.contains("respawn")
+        }));
+    }
+
+    #[test]
+    fn parameter_keyboard_transaction_survives_pointer_up_and_commits_once() {
+        let prototype = JDramaRecord {
+            type_name: "FixtureEnemy".to_string(),
+            name: "fixture".to_string(),
+            payload: JDramaRecordPayload::Actor {
+                transform: sms_formats::JDramaTransform {
+                    translation: [0.0; 3],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: String::new(),
+                light_map: sms_formats::JDramaLightMap::default(),
+                fields: vec![JDramaField {
+                    name: "ordinary".to_string(),
+                    value: JDramaFieldValue::U32(7),
+                }],
+            },
+        };
+        let mut object = SceneObject::new("fixture-object", "FixtureEnemy");
+        sms_scene::seed_scene_object_parameters(&mut object, &prototype).unwrap();
+        object.placement = Some(sms_scene::PlacementBinding::Authored(
+            sms_scene::AuthoredPlacement {
+                raw_resource_path: b"map/scene.bin".to_vec(),
+                target_group_index: 4,
+                prototype,
+                dependencies: Vec::new(),
+            },
+        ));
+        let mut app = SmsEditorApp {
+            selected_object_id: Some(object.id.clone()),
+            saved_objects: vec![object.clone()],
+            document: Some(command_test_document(vec![object])),
+            ..SmsEditorApp::default()
+        };
+
+        app.begin_parameter_undo_transaction();
+        app.update_selected_parameter("ordinary", "8");
+        app.finish_pointer_undo_transaction_if_released(false);
+        assert!(
+            app.undo_transaction.is_some(),
+            "pointer-up fallback must not split a focused keyboard edit"
+        );
+        assert!(app.undo_stack.is_empty());
+
+        app.update_selected_parameter("ordinary", "9");
+        app.commit_undo_transaction("Updated object parameter");
+
+        assert_eq!(app.undo_stack.len(), 1);
+        assert_eq!(
+            app.selected_object().unwrap().raw_param("ordinary"),
+            Some("9")
+        );
+        app.undo();
+        assert_eq!(
+            app.selected_object().unwrap().raw_param("ordinary"),
+            Some("7")
+        );
+    }
+
+    #[test]
+    fn unsafe_registry_classes_cannot_spawn_from_existing_templates() {
+        let prototype = JDramaRecord {
+            type_name: "UnsafeFixture".to_string(),
+            name: "unsafe fixture".to_string(),
+            payload: JDramaRecordPayload::Actor {
+                transform: sms_formats::JDramaTransform {
+                    translation: [0.0; 3],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: String::new(),
+                light_map: sms_formats::JDramaLightMap::default(),
+                fields: Vec::new(),
+            },
+        };
+        let mut object = SceneObject::new("unsafe-object", "UnsafeFixture");
+        object.placement = Some(sms_scene::PlacementBinding::Authored(
+            sms_scene::AuthoredPlacement {
+                raw_resource_path: b"map/scene.bin".to_vec(),
+                target_group_index: 4,
+                prototype,
+                dependencies: Vec::new(),
+            },
+        ));
+        let registry = ObjectRegistry {
+            objects: vec![sms_schema::ObjectDefinition {
+                factory_name: "UnsafeFixture".to_string(),
+                class_name: "TUnsafeFixture".to_string(),
+                category: "Fixture".to_string(),
+                source: sms_schema::SchemaSource::MarNameRefGen,
+                display_name: None,
+                preview_model: None,
+                hidden: false,
+                unsafe_to_edit: true,
+            }],
+            ..ObjectRegistry::default()
+        };
+        let mut document = command_test_document(vec![object]);
+        document.registry = Some(registry.clone());
+        let app = SmsEditorApp {
+            registry: Some(registry),
+            document: Some(document),
+            ..SmsEditorApp::default()
+        };
+        assert!(!app.can_spawn_factory("UnsafeFixture"));
+    }
+
+    #[test]
+    fn graph_rewrites_cover_dependency_records() {
+        let prototype = JDramaRecord {
+            type_name: "FixtureEnemy".to_string(),
+            name: "fixture".to_string(),
+            payload: JDramaRecordPayload::Actor {
+                transform: sms_formats::JDramaTransform {
+                    translation: [0.0; 3],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: String::new(),
+                light_map: sms_formats::JDramaLightMap::default(),
+                fields: Vec::new(),
+            },
+        };
+        let dependency = JDramaRecord {
+            type_name: "FixtureManager".to_string(),
+            name: "fixture manager".to_string(),
+            payload: JDramaRecordPayload::Fields {
+                fields: vec![JDramaField {
+                    name: "graph_name".to_string(),
+                    value: JDramaFieldValue::String("manager_route".to_string()),
+                }],
+            },
+        };
+        let template = sms_scene::ObjectAuthoringTemplate {
+            factory_name: "FixtureEnemy".to_string(),
+            group_index: 4,
+            record: prototype,
+            dependencies: vec![sms_scene::ObjectAuthoringDependency {
+                group_index: 2,
+                target: sms_scene::AuthoredPlacementDependencyTarget::IndexedGroup {
+                    group_index: 2,
+                },
+                record: dependency,
+            }],
+            character_records: Vec::new(),
+            required_graph_names: vec!["manager_route".to_string()],
+            resources: Vec::new(),
+            preview_resource_path: None,
+            source_stage: "fixture0".to_string(),
+        };
+        let object = object_from_catalog_template(
+            "fixture-object".to_string(),
+            "FixtureEnemy".to_string(),
+            [1.0, 2.0, 3.0],
+            &template,
+            &BTreeMap::from([(
+                "manager_route".to_string(),
+                "manager_route_authored".to_string(),
+            )]),
+        )
+        .unwrap();
+        let Some(sms_scene::PlacementBinding::Authored(authored)) = object.placement else {
+            unreachable!()
+        };
+        let JDramaRecordPayload::Fields { fields } = &authored.dependencies[0].record.payload
+        else {
+            unreachable!()
+        };
+        assert!(fields.iter().any(|field| {
+            field.name == "graph_name"
+                && field.value == JDramaFieldValue::String("manager_route_authored".to_string())
+        }));
     }
 }

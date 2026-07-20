@@ -1,3 +1,5 @@
+use sms_scene::{EditableSceneParameter, ObjectParameterKind};
+
 use super::*;
 
 impl SmsEditorApp {
@@ -590,6 +592,11 @@ impl SmsEditorApp {
             );
             ui.selectable_value(
                 &mut self.content_browser_kind,
+                ContentBrowserKind::Objects,
+                "Objects",
+            );
+            ui.selectable_value(
+                &mut self.content_browser_kind,
                 ContentBrowserKind::Models,
                 "Model Assets",
             );
@@ -602,6 +609,7 @@ impl SmsEditorApp {
         ui.separator();
         match self.content_browser_kind {
             ContentBrowserKind::Stages => self.stage_content_browser_panel(ui),
+            ContentBrowserKind::Objects => self.palette_panel(ui),
             ContentBrowserKind::Models => self.model_content_browser_panel(ui),
             ContentBrowserKind::GameSkyboxes => self.game_skybox_content_browser_panel(ui),
         }
@@ -814,7 +822,7 @@ impl SmsEditorApp {
         let mut chosen: Option<String> = None;
         let mut spawn_now: Option<String> = None;
         let filter = self.object_filter.to_ascii_lowercase();
-        let entries: Vec<ObjectDefinition> = self
+        let matching_objects: Vec<ObjectDefinition> = self
             .registry
             .as_ref()
             .map(|registry| {
@@ -828,36 +836,87 @@ impl SmsEditorApp {
                             || object.class_name.to_ascii_lowercase().contains(&filter)
                             || object.category.to_ascii_lowercase().contains(&filter)
                     })
-                    .take(160)
                     .cloned()
                     .collect()
             })
             .unwrap_or_default();
+        let entries = matching_objects
+            .into_iter()
+            .map(|object| {
+                let placeable = self.can_spawn_factory(&object.factory_name);
+                (object, placeable)
+            })
+            .collect::<Vec<_>>();
+        let placeable_count = entries.iter().filter(|(_, placeable)| *placeable).count();
+        ui.small(format!(
+            "{placeable_count} placeable / {} matching",
+            entries.len()
+        ));
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for object in entries {
+            for (object, placeable) in entries {
                 ui.horizontal(|ui| {
                     let selected = self.palette_factory.as_deref() == Some(&object.factory_name);
-                    let placeable = self.can_spawn_factory(&object.factory_name);
-                    let placement_help = if placeable && object.factory_name == "Sky" {
-                        format!(
-                            "{} / {}\nDrag into the viewport to create the typed TSky placement. Then drag a .smsmodel into the viewport and set its Stage export role to Stage skybox.",
-                            object.category, object.class_name
-                        )
+                    let current_stage_clone = self.document.as_ref().is_some_and(|document| {
+                        document.objects.iter().any(|candidate| {
+                            candidate.factory_name == object.factory_name
+                                && candidate.placement.is_some()
+                        })
+                    });
+                    let catalog_default =
+                        self.object_authoring_catalog.find(&object.factory_name);
+                    let route_help = if object.factory_name == "Mario" {
+                        if current_stage_clone {
+                            "Special Mario placement: this stage already has its singleton player record; edit or move the existing Mario."
+                        } else if placeable {
+                            "Special Mario placement: creates the blank-stage player record at the drop location."
+                        } else {
+                            "Special Mario placement is available only when an authored blank stage does not already contain Mario."
+                        }
+                    } else if object.factory_name == "Sky" {
+                        if current_stage_clone {
+                            "Special Sky placement: this stage already has its singleton TSky record; edit or move the existing Sky."
+                        } else if placeable {
+                            "Special Sky placement: creates TSky. Then assign a .smsmodel with the Stage skybox export role."
+                        } else {
+                            "Special Sky placement is unavailable because this stage cannot accept another TSky record."
+                        }
+                    } else if current_stage_clone {
+                        "Placement source: current-stage clone of an existing typed record."
+                    } else if catalog_default.is_some() {
+                        "Placement source: retail-backed authored default."
                     } else if placeable {
-                        format!(
-                            "{} / {}\nDrag into the viewport to create a typed placement.",
-                            object.category, object.class_name
-                        )
+                        "Placement source: typed project constructor."
+                    } else if is_palette_service_record(&object) {
+                        "Service record: installed automatically when you place an actor that depends on it; it is not directly placeable in the viewport."
+                    } else if object.unsafe_to_edit {
+                        "Unavailable class: the schema marks this record unsafe to edit, so it cannot be placed directly in the viewport."
                     } else {
-                        format!(
-                            "{} / {}\nThis stage has no typed constructor or existing instance to clone.",
-                            object.category, object.class_name
-                        )
+                        "Unavailable class: no safe retail-backed default or current-stage typed instance is available to clone, so direct placement would be unsafe."
                     };
+                    let mut placement_help =
+                        format!("{} / {}\n{route_help}", object.category, object.class_name);
+                    if let Some(template) = catalog_default {
+                        placement_help.push_str(&format!(
+                            "\nDefault source stage: {}\nAutomatic support: {} dependenc{} and {} required resource{}.",
+                            template.source_stage,
+                            template.dependencies.len(),
+                            if template.dependencies.len() == 1 {
+                                "y"
+                            } else {
+                                "ies"
+                            },
+                            template.resources.len(),
+                            if template.resources.len() == 1 {
+                                ""
+                            } else {
+                                "s"
+                            },
+                        ));
+                    }
                     let response = ui
                         .selectable_label(selected, &object.factory_name)
-                        .on_hover_text(placement_help);
+                        .on_hover_text(placement_help.as_str());
                     if placeable {
                         response.dnd_set_drag_payload(ObjectPaletteDragPayload {
                             factory_name: object.factory_name.clone(),
@@ -868,6 +927,7 @@ impl SmsEditorApp {
                     }
                     if ui
                         .add_enabled(placeable, egui::Button::new("Add"))
+                        .on_hover_text(placement_help.as_str())
                         .clicked()
                     {
                         spawn_now = Some(object.factory_name.clone());
@@ -1086,16 +1146,99 @@ impl SmsEditorApp {
 
             ui.separator();
             ui.heading("Params");
-            if object.raw_params.is_empty() {
-                ui.label("No decoded params yet.");
-            } else {
-                for (key, parameter) in object.raw_params {
-                    if let Some(decoded) = parameter.decoded() {
-                        ui.label(format!("{key}: {parameter} ({decoded:?})"));
-                    } else {
-                        ui.label(format!("{key}: {parameter}"));
-                    }
+            let editable_parameters = self
+                .document
+                .as_ref()
+                .map(|document| document.editable_parameters_for_object(&object));
+            let mut canonical_keys = std::collections::BTreeSet::new();
+            match editable_parameters {
+                Some(Ok(parameters)) => {
+                    egui::Grid::new("typed-object-parameters")
+                        .num_columns(3)
+                        .spacing(egui::vec2(8.0, 5.0))
+                        .show(ui, |ui| {
+                            for parameter in parameters {
+                                canonical_keys.insert(parameter.key.clone());
+                                let editable = parameter.read_only_reason.is_none();
+                                ui.add_enabled(editable, egui::Label::new(parameter.key.as_str()))
+                                    .on_hover_text(format!("{:?}", parameter.kind));
+                                let ObjectParameterControlResponse {
+                                    edit,
+                                    raw_value,
+                                    error,
+                                } = ui
+                                    .add_enabled_ui(editable, |ui| {
+                                        object_parameter_control(ui, &parameter)
+                                    })
+                                    .inner;
+                                if let Some(reason) = parameter.read_only_reason.as_deref() {
+                                    ui.add_enabled(
+                                        false,
+                                        egui::Label::new(format!("Read-only: {reason}")),
+                                    )
+                                    .on_hover_text(reason);
+                                } else if let Some(error) = error {
+                                    ui.colored_label(egui::Color32::from_rgb(255, 116, 104), error);
+                                } else {
+                                    ui.small(format!("{:?}", parameter.kind));
+                                }
+                                ui.end_row();
+
+                                if editable {
+                                    if edit.started {
+                                        self.begin_parameter_undo_transaction();
+                                    }
+                                    if let Some(raw_value) = raw_value {
+                                        self.update_selected_parameter(
+                                            parameter.key.clone(),
+                                            raw_value,
+                                        );
+                                    }
+                                    if edit.stopped {
+                                        self.commit_undo_transaction("Updated object parameter");
+                                        self.rebuild_model_preview_from_document();
+                                    }
+                                }
+                            }
+                        });
                 }
+                Some(Err(error)) => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 116, 104),
+                        format!("Could not resolve typed parameters: {error}"),
+                    );
+                }
+                None => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 116, 104),
+                        "The selected object is not attached to an open stage document.",
+                    );
+                }
+            }
+
+            let diagnostics = object
+                .raw_params
+                .iter()
+                .filter(|(key, _)| !canonical_keys.contains(*key))
+                .collect::<Vec<_>>();
+            if !diagnostics.is_empty() {
+                egui::CollapsingHeader::new("Diagnostics")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.small(
+                            "Derived preview aliases and legacy raw values are read-only. Edit the canonical typed parameter above.",
+                        );
+                        for (key, parameter) in diagnostics {
+                            if let Some(decoded) = parameter.decoded() {
+                                ui.monospace(format!(
+                                    "{key}: {} ({decoded:?})",
+                                    parameter.raw()
+                                ));
+                            } else {
+                                ui.monospace(format!("{key}: {}", parameter.raw()));
+                            }
+                        }
+                    });
             }
         } else {
             ui.heading("Inspector");
@@ -1191,6 +1334,236 @@ impl SmsEditorApp {
     }
 }
 
+struct ObjectParameterControlResponse {
+    edit: VectorDragResponse,
+    raw_value: Option<String>,
+    error: Option<String>,
+}
+
+fn object_parameter_control(
+    ui: &mut egui::Ui,
+    parameter: &EditableSceneParameter,
+) -> ObjectParameterControlResponse {
+    match parameter.kind {
+        ObjectParameterKind::U32 => {
+            let parsed = parameter.raw_value.trim().parse::<u32>();
+            let mut error = parsed
+                .as_ref()
+                .err()
+                .map(|error| format!("Expected u32: {error}"));
+            let mut value = parsed.unwrap_or_default();
+            let response = ui.add(egui::DragValue::new(&mut value).speed(1.0));
+            let edit = object_parameter_widget_response(&response);
+            let raw_value = edit.changed.then(|| value.to_string());
+            if raw_value.is_some() {
+                error = None;
+            }
+            ObjectParameterControlResponse {
+                edit,
+                raw_value,
+                error,
+            }
+        }
+        ObjectParameterKind::I32 => {
+            let parsed = parameter.raw_value.trim().parse::<i32>();
+            let mut error = parsed
+                .as_ref()
+                .err()
+                .map(|error| format!("Expected i32: {error}"));
+            let mut value = parsed.unwrap_or_default();
+            let response = ui.add(egui::DragValue::new(&mut value).speed(1.0));
+            let edit = object_parameter_widget_response(&response);
+            let raw_value = edit.changed.then(|| value.to_string());
+            if raw_value.is_some() {
+                error = None;
+            }
+            ObjectParameterControlResponse {
+                edit,
+                raw_value,
+                error,
+            }
+        }
+        ObjectParameterKind::F32 => {
+            let parsed = parse_finite_parameter_f32(&parameter.raw_value);
+            let mut error = parsed.as_ref().err().cloned();
+            let mut value = parsed.unwrap_or_default();
+            let response = ui.add(egui::DragValue::new(&mut value).speed(0.1));
+            let edit = object_parameter_widget_response(&response);
+            let raw_value = edit.changed.then(|| value.to_string());
+            if raw_value.is_some() {
+                error = None;
+            }
+            ObjectParameterControlResponse {
+                edit,
+                raw_value,
+                error,
+            }
+        }
+        ObjectParameterKind::Vec2F32 => {
+            let parsed = parse_finite_parameter_vector::<2>(&parameter.raw_value);
+            let mut error = parsed.as_ref().err().cloned();
+            let mut values = parsed.unwrap_or([0.0; 2]);
+            let mut edit = VectorDragResponse::default();
+            ui.horizontal(|ui| {
+                for (label, value) in ["X", "Y"].into_iter().zip(values.iter_mut()) {
+                    let response = ui.add(
+                        egui::DragValue::new(value)
+                            .speed(0.1)
+                            .prefix(format!("{label} ")),
+                    );
+                    edit.merge(object_parameter_widget_response(&response));
+                }
+            });
+            let raw_value = edit.changed.then(|| format!("{},{}", values[0], values[1]));
+            if raw_value.is_some() {
+                error = None;
+            }
+            ObjectParameterControlResponse {
+                edit,
+                raw_value,
+                error,
+            }
+        }
+        ObjectParameterKind::Vec3F32 => {
+            let parsed = parse_finite_parameter_vector::<3>(&parameter.raw_value);
+            let mut error = parsed.as_ref().err().cloned();
+            let mut values = parsed.unwrap_or([0.0; 3]);
+            let mut edit = VectorDragResponse::default();
+            ui.horizontal(|ui| {
+                for (label, value) in ["X", "Y", "Z"].into_iter().zip(values.iter_mut()) {
+                    let response = ui.add(
+                        egui::DragValue::new(value)
+                            .speed(0.1)
+                            .prefix(format!("{label} ")),
+                    );
+                    edit.merge(object_parameter_widget_response(&response));
+                }
+            });
+            let raw_value = edit
+                .changed
+                .then(|| format!("{},{},{}", values[0], values[1], values[2]));
+            if raw_value.is_some() {
+                error = None;
+            }
+            ObjectParameterControlResponse {
+                edit,
+                raw_value,
+                error,
+            }
+        }
+        ObjectParameterKind::ColorRgba8 => {
+            let parsed = parse_parameter_rgba8(&parameter.raw_value);
+            let mut error = parsed.as_ref().err().cloned();
+            let mut values = parsed.unwrap_or([0; 4]);
+            let mut edit = VectorDragResponse::default();
+            ui.horizontal(|ui| {
+                for (label, value) in ["R", "G", "B", "A"].into_iter().zip(values.iter_mut()) {
+                    let response = ui.add(
+                        egui::DragValue::new(value)
+                            .range(0..=255)
+                            .speed(1.0)
+                            .prefix(format!("{label} ")),
+                    );
+                    edit.merge(object_parameter_widget_response(&response));
+                }
+            });
+            let raw_value = edit
+                .changed
+                .then(|| format!("{},{},{},{}", values[0], values[1], values[2], values[3]));
+            if raw_value.is_some() {
+                error = None;
+            }
+            ObjectParameterControlResponse {
+                edit,
+                raw_value,
+                error,
+            }
+        }
+        ObjectParameterKind::String => {
+            let mut value = parameter.raw_value.clone();
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut value)
+                    .desired_width(220.0)
+                    .clip_text(false),
+            );
+            let edit = object_parameter_widget_response(&response);
+            let error = sms_formats::jdrama_key_code(&value)
+                .err()
+                .map(|error| format!("Invalid Shift-JIS text: {error}"));
+            let raw_value = (edit.changed && error.is_none()).then_some(value);
+            ObjectParameterControlResponse {
+                edit,
+                raw_value,
+                error,
+            }
+        }
+    }
+}
+
+fn object_parameter_widget_response(response: &egui::Response) -> VectorDragResponse {
+    VectorDragResponse {
+        changed: response.changed(),
+        started: response.gained_focus() || response.drag_started(),
+        stopped: response.lost_focus() || response.drag_stopped(),
+    }
+}
+
+fn parse_finite_parameter_f32(raw: &str) -> Result<f32, String> {
+    let value = raw
+        .trim()
+        .parse::<f32>()
+        .map_err(|error| format!("Expected finite f32: {error}"))?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(format!("Expected finite f32, got '{raw}'"))
+    }
+}
+
+fn parse_finite_parameter_vector<const N: usize>(raw: &str) -> Result<[f32; N], String> {
+    let parts = raw.split(',').collect::<Vec<_>>();
+    if parts.len() != N {
+        return Err(format!(
+            "Expected {N} comma-separated finite f32 components, got {}",
+            parts.len()
+        ));
+    }
+    let mut values = [0.0; N];
+    for (index, part) in parts.into_iter().enumerate() {
+        values[index] = parse_finite_parameter_f32(part)
+            .map_err(|error| format!("Component {}: {error}", index + 1))?;
+    }
+    Ok(values)
+}
+
+fn parse_parameter_rgba8(raw: &str) -> Result<[u8; 4], String> {
+    let parts = raw.split(',').collect::<Vec<_>>();
+    if parts.len() != 4 {
+        return Err(format!(
+            "Expected 4 comma-separated RGBA8 components, got {}",
+            parts.len()
+        ));
+    }
+    let mut values = [0; 4];
+    for (index, part) in parts.into_iter().enumerate() {
+        values[index] = part
+            .trim()
+            .parse::<u8>()
+            .map_err(|error| format!("Channel {}: {error}", index + 1))?;
+    }
+    Ok(values)
+}
+
+fn is_palette_service_record(object: &ObjectDefinition) -> bool {
+    is_palette_service_type(&object.factory_name) || is_palette_service_type(&object.class_name)
+}
+
+fn is_palette_service_type(type_name: &str) -> bool {
+    let leaf = type_name.rsplit("::").next().unwrap_or(type_name).trim();
+    let semantic = leaf.strip_prefix('T').unwrap_or(leaf);
+    semantic.ends_with("Manager") || semantic.ends_with("Director")
+}
+
 fn tool_shortcut(tool: EditorTool) -> &'static str {
     match tool {
         EditorTool::Select => "Q",
@@ -1216,4 +1589,42 @@ fn rgba8_drag(ui: &mut egui::Ui, color: &mut [u8; 4]) -> bool {
         }
     });
     changed
+}
+
+#[cfg(test)]
+mod parameter_control_tests {
+    use super::{
+        is_palette_service_type, parse_finite_parameter_f32, parse_finite_parameter_vector,
+        parse_parameter_rgba8,
+    };
+
+    #[test]
+    fn parameter_number_parsers_accept_canonical_values() {
+        assert_eq!(parse_finite_parameter_f32(" 1.25 "), Ok(1.25));
+        assert_eq!(
+            parse_finite_parameter_vector::<3>("1,-2.5,3"),
+            Ok([1.0, -2.5, 3.0])
+        );
+        assert_eq!(parse_parameter_rgba8("0,128,255,7"), Ok([0, 128, 255, 7]));
+    }
+
+    #[test]
+    fn parameter_number_parsers_reject_non_finite_or_malformed_values() {
+        for raw in ["NaN", "inf", "-inf"] {
+            assert!(parse_finite_parameter_f32(raw).is_err(), "{raw}");
+        }
+        assert!(parse_finite_parameter_vector::<2>("1").is_err());
+        assert!(parse_finite_parameter_vector::<2>("1,NaN").is_err());
+        assert!(parse_parameter_rgba8("0,1,2").is_err());
+        assert!(parse_parameter_rgba8("0,1,2,256").is_err());
+    }
+
+    #[test]
+    fn palette_service_types_cover_managers_and_directors_only() {
+        assert!(is_palette_service_type("TBEelTearsManager"));
+        assert!(is_palette_service_type("JDrama::TMarDirector"));
+        assert!(is_palette_service_type("MapObjManager"));
+        assert!(!is_palette_service_type("TBEelTears"));
+        assert!(!is_palette_service_type("DirectorSwitch"));
+    }
 }

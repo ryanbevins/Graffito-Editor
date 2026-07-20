@@ -156,6 +156,13 @@ pub struct ObjectRegistry {
     pub npc_material_colors: Vec<NpcMaterialColorDefinition>,
     #[serde(default)]
     pub enemy_managers: Vec<EnemyManagerDefinition>,
+    /// Stage-local animation folders opened directly by enemy manager
+    /// createAnmData overrides instead of through registered character data.
+    #[serde(default)]
+    pub enemy_manager_animation_folders: Vec<EnemyManagerAnimationFolderDefinition>,
+    /// Map-object slots instantiated directly by actor and manager runtime methods.
+    #[serde(default)]
+    pub runtime_map_obj_dependencies: Vec<RuntimeMapObjDependencyDefinition>,
     #[serde(default)]
     pub enemy_actors: Vec<EnemyActorDefinition>,
     #[serde(default)]
@@ -421,6 +428,23 @@ pub struct MapObjResourceDefinition {
     pub uses_resource_name_model_fallback: bool,
     /// Primary BMD passed to `TMapObjBase::initMActor`, or `None` when actor count is zero.
     pub primary_model: Option<String>,
+    /// Exact `TMapObjAnimData` entries consumed by this slot, truncated to
+    /// `TMapObjAnimDataInfo::unk0` just as retail does.
+    ///
+    /// This includes model switches, extensionless animation identities, the
+    /// unresolved extra string, and animation-sound BAS paths. An empty list
+    /// means the slot uses the `<resource_name>.bmd` fallback or has no actors.
+    #[serde(default)]
+    pub animation_resources: Vec<MapObjAnimationResourceDefinition>,
+    /// Exact BMD path loaded by `TMapObjBase::initHoldData` from
+    /// `TMapObjHoldData::unk0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_model_path: Option<String>,
+    /// Exact BCK path loaded by `TMapObjBase::initBckMoveData` from
+    /// `TMapObjMoveData::unk0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub move_bck_path: Option<String>,
+
     /// Effective `TMActorKeeper::mModelLoaderFlags` selected from `TMapObjData::unk34`.
     ///
     /// The default preserves registries serialized before this field was exposed.
@@ -430,6 +454,28 @@ pub struct MapObjResourceDefinition {
     #[serde(default)]
     pub collision_resources: Vec<MapObjCollisionResourceDefinition>,
     pub source_file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapObjAnimationResourceDefinition {
+    /// Exact `TMapObjAnimData::unk0` model name passed to `initMActor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    /// Exact `TMapObjAnimData::unk4` identity passed to `MActor::setAnimation`.
+    /// It is an extensionless basename, not specifically a BCK path; consumers
+    /// must match it against the supported animation extensions in the actor's
+    /// resource folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animation_name: Option<String>,
+    /// Exact `TMapObjAnimData::unk8` MActor animation channel.
+    #[serde(default)]
+    pub animation_channel: u8,
+    /// Exact, currently unresolved `TMapObjAnimData::unkC` string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_name: Option<String>,
+    /// Exact `TMapObjAnimData::unk10` BAS path passed to `setAnmSound`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bas_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -603,6 +649,20 @@ pub struct EnemyManagerDefinition {
     #[serde(default)]
     pub parameter_path: Option<String>,
     pub models: Vec<EnemyModelDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnemyManagerAnimationFolderDefinition {
+    pub factory_name: String,
+    pub folder: String,
+    pub source_file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeMapObjDependencyDefinition {
+    pub factory_name: String,
+    pub resource_name: String,
+    pub source_file: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -794,6 +854,8 @@ impl SchemaGenerator {
         let mut part_model_indices = BTreeMap::<String, usize>::new();
         let mut manager_actor_classes = BTreeMap::<String, String>::new();
         let mut manager_parameter_paths = BTreeMap::<String, String>::new();
+        let mut manager_animation_folders = BTreeMap::<String, Vec<(String, String)>>::new();
+        let mut runtime_map_obj_dependencies = BTreeMap::<String, Vec<(String, String)>>::new();
         let mut inheritance = BTreeMap::<String, String>::new();
         let mut tev_color_bindings = Vec::new();
         let mut init_tev_colors = BTreeMap::new();
@@ -861,6 +923,24 @@ impl SchemaGenerator {
                 for (class_name, path) in extract_enemy_manager_parameter_paths(text) {
                     manager_parameter_paths.entry(class_name).or_insert(path);
                 }
+                for (class_name, dependencies) in
+                    extract_runtime_map_obj_dependencies(text, &source_file)
+                {
+                    runtime_map_obj_dependencies
+                        .entry(class_name)
+                        .or_default()
+                        .extend(dependencies);
+                }
+                for (class_name, folders) in
+                    extract_enemy_manager_animation_folders(text, &source_file)
+                {
+                    // Preserve even an empty override: some subclasses call
+                    // TObjManager here specifically to avoid inheriting the
+                    // parent's hardcoded stage-local animation directory.
+                    manager_animation_folders
+                        .entry(class_name)
+                        .or_insert(folders);
+                }
                 tev_color_bindings.extend(extract_enemy_tev_color_bindings(text, &source_file));
                 extract_enemy_init_tev_colors(text, &mut init_tev_colors);
             }
@@ -882,6 +962,24 @@ impl SchemaGenerator {
             for (class_name, parent) in supplemental {
                 inheritance.entry(class_name).or_insert(parent);
             }
+        }
+
+        for object in &registry.objects {
+            registry.runtime_map_obj_dependencies.extend(
+                inherited_actor_models_union(
+                    &object.class_name,
+                    &runtime_map_obj_dependencies,
+                    &inheritance,
+                )
+                .into_iter()
+                .map(|(resource_name, source_file)| {
+                    RuntimeMapObjDependencyDefinition {
+                        factory_name: object.factory_name.clone(),
+                        resource_name,
+                        source_file,
+                    }
+                }),
+            );
         }
 
         for definition in &mut registry.enemy_actors {
@@ -958,8 +1056,15 @@ impl SchemaGenerator {
             registry
                 .enemy_managers
                 .retain(|definition| definition.factory_name != object.factory_name);
+            let animation_folders = inherited_actor_models(
+                &object.class_name,
+                &manager_animation_folders,
+                &inheritance,
+            )
+            .unwrap_or_default();
+            let factory_name = object.factory_name;
             registry.enemy_managers.push(EnemyManagerDefinition {
-                factory_name: object.factory_name,
+                factory_name: factory_name.clone(),
                 spawned_actor_class: inherited_actor_class(
                     &object.class_name,
                     &manager_actor_classes,
@@ -974,6 +1079,15 @@ impl SchemaGenerator {
                 model_index,
                 models,
             });
+            registry
+                .enemy_manager_animation_folders
+                .extend(animation_folders.into_iter().map(|(folder, source_file)| {
+                    EnemyManagerAnimationFolderDefinition {
+                        factory_name: factory_name.clone(),
+                        folder,
+                        source_file,
+                    }
+                }));
         }
         registry
             .enemy_managers
@@ -2051,6 +2165,60 @@ fn extract_enemy_manager_parameter_paths(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+fn extract_runtime_map_obj_dependencies(
+    text: &str,
+    source_file: &str,
+) -> Vec<(String, Vec<(String, String)>)> {
+    let method_re = Regex::new(
+        r"(?m)^[^\r\n{};]*\b([A-Za-z_][A-Za-z0-9_]*)::[A-Za-z_][A-Za-z0-9_]*\s*\([^;{}]*\)\s*(?:const\s*)?\{",
+    )
+    .expect("valid runtime map-object method regex");
+    let dependency_re = Regex::new(r#"(?:newAndRegisterObj)\s*\(\s*"([^"]+)""#)
+        .expect("valid runtime map-object dependency regex");
+    let mut by_class = BTreeMap::<String, BTreeSet<(String, String)>>::new();
+    for method in method_re.captures_iter(text) {
+        let Some(whole) = method.get(0) else {
+            continue;
+        };
+        let Some(body) = braced_body(text, whole.end() - 1) else {
+            continue;
+        };
+        by_class.entry(method[1].to_string()).or_default().extend(
+            dependency_re
+                .captures_iter(body)
+                .map(|dependency| (dependency[1].to_string(), source_file.to_string())),
+        );
+    }
+    by_class
+        .into_iter()
+        .map(|(class_name, dependencies)| (class_name, dependencies.into_iter().collect()))
+        .collect()
+}
+
+fn extract_enemy_manager_animation_folders(
+    text: &str,
+    source_file: &str,
+) -> Vec<(String, Vec<(String, String)>)> {
+    let method_re = Regex::new(r"void\s+([A-Za-z_][A-Za-z0-9_]*)::createAnmData\s*\([^)]*\)\s*\{")
+        .expect("valid enemy manager animation method regex");
+    let folder_re = Regex::new(r#"(?:->|\.)init\s*\(\s*"(/scene/[^"]+)"\s*,\s*nullptr"#)
+        .expect("valid enemy manager animation folder regex");
+    method_re
+        .captures_iter(text)
+        .filter_map(|method| {
+            let whole = method.get(0)?;
+            let body = braced_body(text, whole.end() - 1)?;
+            let folders = folder_re
+                .captures_iter(body)
+                .map(|folder| (folder[1].to_string(), source_file.to_string()))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            Some((method[1].to_string(), folders))
+        })
+        .collect()
+}
+
 fn extract_enemy_runtime_uniform_scales(
     text: &str,
     source_file: &str,
@@ -3058,6 +3226,26 @@ fn inherited_actor_models<T: Clone>(
     None
 }
 
+fn inherited_actor_models_union<T: Clone + Ord>(
+    class_name: &str,
+    actor_models: &BTreeMap<String, Vec<T>>,
+    inheritance: &BTreeMap<String, String>,
+) -> Vec<T> {
+    let mut current = class_name.rsplit("::").next().unwrap_or(class_name);
+    let mut visited = BTreeSet::new();
+    let mut models = BTreeSet::new();
+    while visited.insert(current.to_string()) {
+        if let Some(current_models) = actor_models.get(current) {
+            models.extend(current_models.iter().cloned());
+        }
+        let Some(parent) = inheritance.get(current) else {
+            break;
+        };
+        current = parent.rsplit("::").next().unwrap_or(parent);
+    }
+    models.into_iter().collect()
+}
+
 fn inherited_actor_value<T: Clone>(
     class_name: &str,
     values: &BTreeMap<String, T>,
@@ -3499,6 +3687,26 @@ fn dedup_registry(registry: &mut ObjectRegistry) -> Result<()> {
     });
     registry.npc_material_colors.dedup();
 
+    registry.runtime_map_obj_dependencies.sort_by(|a, b| {
+        a.factory_name
+            .cmp(&b.factory_name)
+            .then_with(|| a.resource_name.cmp(&b.resource_name))
+            .then_with(|| a.source_file.cmp(&b.source_file))
+    });
+    registry
+        .runtime_map_obj_dependencies
+        .dedup_by(|a, b| a.factory_name == b.factory_name && a.resource_name == b.resource_name);
+
+    registry.enemy_manager_animation_folders.sort_by(|a, b| {
+        a.factory_name
+            .cmp(&b.factory_name)
+            .then_with(|| a.folder.cmp(&b.folder))
+            .then_with(|| a.source_file.cmp(&b.source_file))
+    });
+    registry
+        .enemy_manager_animation_folders
+        .dedup_by(|a, b| a.factory_name == b.factory_name && a.folder == b.folder);
+
     registry.enemy_managers.sort_by(|a, b| {
         a.factory_name
             .cmp(&b.factory_name)
@@ -3577,6 +3785,62 @@ fn validate_registry(registry: &ObjectRegistry) -> Result<()> {
         .iter()
         .map(|object| (object.factory_name.as_str(), object))
         .collect::<BTreeMap<_, _>>();
+    let map_obj_resource_names = registry
+        .map_obj_resources
+        .iter()
+        .map(|resource| resource.resource_name.as_str())
+        .collect::<BTreeSet<_>>();
+    for dependency in &registry.runtime_map_obj_dependencies {
+        if dependency.resource_name.is_empty() || dependency.source_file.is_empty() {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "factory {} has a runtime map-object dependency without a name or provenance",
+                    dependency.factory_name
+                ),
+            });
+        }
+        if !objects.contains_key(dependency.factory_name.as_str()) {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "runtime map-object dependency {} has no registered factory {}",
+                    dependency.resource_name, dependency.factory_name
+                ),
+            });
+        }
+        if !map_obj_resource_names.contains(dependency.resource_name.as_str()) {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "factory {} instantiates unknown map-object resource {}",
+                    dependency.factory_name, dependency.resource_name
+                ),
+            });
+        }
+    }
+
+    let enemy_manager_factories = registry
+        .enemy_managers
+        .iter()
+        .map(|manager| manager.factory_name.as_str())
+        .collect::<BTreeSet<_>>();
+    for animation in &registry.enemy_manager_animation_folders {
+        if animation.folder.is_empty() || animation.source_file.is_empty() {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "enemy manager {} has an animation folder without a path or provenance",
+                    animation.factory_name
+                ),
+            });
+        }
+        if !enemy_manager_factories.contains(animation.factory_name.as_str()) {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "animation folder {} has no enemy manager factory {}",
+                    animation.folder, animation.factory_name
+                ),
+            });
+        }
+    }
+
     for resource in &registry.object_resources {
         if !objects.contains_key(resource.factory_name.as_str()) {
             return Err(SchemaError::RegistryInvariant {
@@ -4152,6 +4416,74 @@ mod tests {
         )
         .expect("inherit runtime scale metadata");
         assert_eq!(inherited.source_file, "src/Enemy/fixture.cpp");
+    }
+
+    #[test]
+    fn extracts_runtime_map_object_dependencies_across_class_inheritance() {
+        let text = r#"
+            void TFixtureManager::loadAfter() {
+                TSmallEnemyManager::loadAfter();
+                TMapObjBaseManager::newAndRegisterObj("mushroom1up");
+            }
+
+            void TFixtureVariantManager::loadAfter() {
+                TFixtureManager::loadAfter();
+                gpMapObjManager->newAndRegisterObj("mario_cap");
+            }
+        "#;
+        let extracted = extract_runtime_map_obj_dependencies(text, "src/Enemy/fixture.cpp")
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let inheritance = BTreeMap::from([(
+            "TFixtureVariantManager".to_string(),
+            "TFixtureManager".to_string(),
+        )]);
+        assert_eq!(
+            inherited_actor_models_union("TFixtureVariantManager", &extracted, &inheritance,),
+            [
+                ("mario_cap".to_string(), "src/Enemy/fixture.cpp".to_string()),
+                (
+                    "mushroom1up".to_string(),
+                    "src/Enemy/fixture.cpp".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_direct_manager_animation_folders_and_preserves_empty_overrides() {
+        let text = r#"
+            void TFixtureManager::createAnmData() {
+                MActorAnmData* data = new MActorAnmData;
+                data->init("/scene/fixtureanm", nullptr);
+                unk20 = data;
+            }
+
+            void TFixtureVariantManager::createAnmData() {
+                TObjManager::createAnmData();
+            }
+        "#;
+        let extracted = extract_enemy_manager_animation_folders(text, "src/Enemy/fixture.cpp")
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            extracted["TFixtureManager"],
+            [(
+                "/scene/fixtureanm".to_string(),
+                "src/Enemy/fixture.cpp".to_string()
+            )]
+        );
+        assert!(extracted["TFixtureVariantManager"].is_empty());
+
+        let inheritance = BTreeMap::from([(
+            "TFixtureVariantManager".to_string(),
+            "TFixtureManager".to_string(),
+        )]);
+        assert!(
+            inherited_actor_models("TFixtureVariantManager", &extracted, &inheritance,)
+                .expect("explicit override")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4960,6 +5292,9 @@ mod tests {
             has_move_dependency: false,
             uses_resource_name_model_fallback: true,
             primary_model: Some("kibako.bmd".to_string()),
+            animation_resources: Vec::new(),
+            hold_model_path: None,
+            move_bck_path: None,
             load_flags: 0x1022_0000,
             collision_resources: Vec::new(),
             source_file: "src/MoveBG/MapObjInit.cpp".to_string(),
@@ -5009,6 +5344,9 @@ mod tests {
         assert!(!resource.has_hold_dependency);
         assert!(!resource.has_move_dependency);
         assert!(!resource.uses_resource_name_model_fallback);
+        assert!(resource.animation_resources.is_empty());
+        assert_eq!(resource.hold_model_path, None);
+        assert_eq!(resource.move_bck_path, None);
         assert_eq!(resource.load_flags, 0x1022_0000);
 
         let map_static: MapStaticModelDefinition = toml::from_str(
@@ -5121,11 +5459,46 @@ mod tests {
         assert_eq!(z_turn_disk.primary_model.as_deref(), Some("zTurnDisk.bmd"));
         assert!(!z_turn_disk.has_hold_dependency);
         assert!(z_turn_disk.has_move_dependency);
+        assert!(z_turn_disk.animation_resources.is_empty());
+        assert_eq!(
+            z_turn_disk.move_bck_path.as_deref(),
+            Some("/scene/mapObj/zTurnDisk.bck")
+        );
+
         let wood_barrel = registry
             .find_map_obj_resource("wood_barrel")
             .expect("decomp stock wood_barrel slot");
         assert!(wood_barrel.has_hold_dependency);
         assert!(!wood_barrel.has_move_dependency);
+        assert_eq!(
+            wood_barrel.hold_model_path.as_deref(),
+            Some("/scene/mapObj/barrel_offset.bmd")
+        );
+        assert_eq!(wood_barrel.animation_resources.len(), 7);
+        assert_eq!(
+            wood_barrel.animation_resources[0].model_name.as_deref(),
+            Some("barrel_normal.bmd")
+        );
+        assert_eq!(
+            wood_barrel.animation_resources[2].model_name.as_deref(),
+            Some("barrel_crash.bmd")
+        );
+        assert_eq!(
+            wood_barrel.animation_resources[2].animation_name.as_deref(),
+            Some("barrel_crash")
+        );
+        assert_eq!(
+            wood_barrel.animation_resources[2].bas_path.as_deref(),
+            Some("/scene/mapObj/barrel_crash.bas")
+        );
+        assert_eq!(
+            wood_barrel.animation_resources[5].animation_name.as_deref(),
+            Some("barrel_rot")
+        );
+        assert_eq!(
+            wood_barrel.animation_resources[5].bas_path.as_deref(),
+            Some("/scene/mapObj/barrel_rot.bas")
+        );
         assert_eq!(
             registry
                 .map_obj_resources

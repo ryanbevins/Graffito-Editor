@@ -9,6 +9,130 @@ use crate::{FormatError, Result};
 const FORMAT: &str = "JPA1 rebuild";
 const HEADER_SIZE: usize = 0x20;
 
+#[derive(Debug, Clone, Copy)]
+struct JsonF32(f32);
+
+impl Serialize for JsonF32 {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self.0.is_finite() {
+            self.0.serialize(serializer)
+        } else {
+            #[derive(Serialize)]
+            struct BitPattern {
+                f32_bits: u32,
+            }
+            BitPattern {
+                f32_bits: self.0.to_bits(),
+            }
+            .serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for JsonF32 {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Representation {
+            Number(f32),
+            BitPattern { f32_bits: u32 },
+            LegacyNull(()),
+        }
+        Ok(match Representation::deserialize(deserializer)? {
+            Representation::Number(value) => Self(value),
+            Representation::BitPattern { f32_bits } => Self(f32::from_bits(f32_bits)),
+            // serde_json historically wrote every non-finite f32 as null. The
+            // affected retail JPA corpus uses 0xffffffff as its field sentinel.
+            Representation::LegacyNull(()) => Self(f32::from_bits(u32::MAX)),
+        })
+    }
+}
+
+mod f32_serde {
+    use super::JsonF32;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(value: &f32, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        JsonF32(*value).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<f32, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(JsonF32::deserialize(deserializer)?.0)
+    }
+}
+
+mod f32_array_serde {
+    use super::JsonF32;
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S, const N: usize>(
+        values: &[f32; N],
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        values
+            .iter()
+            .copied()
+            .map(JsonF32)
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D, const N: usize>(
+        deserializer: D,
+    ) -> std::result::Result<[f32; N], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let values = Vec::<JsonF32>::deserialize(deserializer)?;
+        let length = values.len();
+        let values: [JsonF32; N] = values
+            .try_into()
+            .map_err(|_| D::Error::custom(format!("expected {N} f32 values, found {length}")))?;
+        Ok(values.map(|value| value.0))
+    }
+}
+
+mod f32_vec4_serde {
+    use super::JsonF32;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(values: &[[f32; 4]], serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        values
+            .iter()
+            .map(|value| value.map(JsonF32))
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<Vec<[f32; 4]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Vec::<[JsonF32; 4]>::deserialize(deserializer)?
+            .into_iter()
+            .map(|value| value.map(|component| component.0))
+            .collect())
+    }
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JpaxDocument {
     pub blocks: Vec<JpaxBlock>,
@@ -40,12 +164,15 @@ pub enum JpaxBlock {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JpaxDynamicsBlock {
+    #[serde(with = "f32_array_serde")]
     pub scale: [f32; 3],
+    #[serde(with = "f32_array_serde")]
     pub translation: [f32; 3],
     pub rotation: [i16; 3],
     pub volume_type: u8,
     pub emit_interval: u8,
     pub volume_subdivision: u16,
+    #[serde(with = "f32_serde")]
     pub spawn_rate: f32,
     pub spawn_rate_random: i16,
     pub max_frame: i16,
@@ -61,7 +188,9 @@ pub struct JpaxDynamicsBlock {
     pub momentum_random: i16,
     pub base_air_resistance: i16,
     pub air_resistance_random: i16,
+    #[serde(with = "f32_array_serde")]
     pub initial_velocity: [f32; 4],
+    #[serde(with = "f32_serde")]
     pub initial_moment: f32,
     pub direction: [i16; 3],
     pub direction_spread: i16,
@@ -82,7 +211,9 @@ pub struct JpaxBaseShapeBlock {
     pub texture_indices_offset: u16,
     pub primary_colors_offset: u16,
     pub environment_colors_offset: u16,
+    #[serde(with = "f32_serde")]
     pub base_size_y: f32,
+    #[serde(with = "f32_serde")]
     pub base_size_x: f32,
     pub loop_offset: i16,
     pub color_animation_flags: u8,
@@ -167,7 +298,9 @@ pub struct JpaxChildShapeBlock {
     pub spawn_count: i16,
     pub spawn_timing: i16,
     pub spawn_step: u8,
+    #[serde(with = "f32_serde")]
     pub position_random: f32,
+    #[serde(with = "f32_serde")]
     pub base_velocity: f32,
     pub inherit_velocity: i16,
     pub velocity_random: i16,
@@ -179,7 +312,9 @@ pub struct JpaxChildShapeBlock {
     pub texture_index: u8,
     pub inherit_scale: i16,
     pub inherit_alpha: i16,
+    #[serde(with = "f32_serde")]
     pub base_size_y: f32,
+    #[serde(with = "f32_serde")]
     pub base_size_x: f32,
     pub rotate_speed: i16,
     pub rotate_enabled: u8,
@@ -196,11 +331,17 @@ pub struct JpaxFieldBlock {
     pub add_type: u8,
     pub cycle: u8,
     pub status: u16,
+    #[serde(with = "f32_serde")]
     pub magnitude: f32,
+    #[serde(with = "f32_serde")]
     pub secondary_magnitude: f32,
+    #[serde(with = "f32_serde")]
     pub max_distance: f32,
+    #[serde(with = "f32_array_serde")]
     pub position: [f32; 3],
+    #[serde(with = "f32_array_serde")]
     pub direction: [f32; 3],
+    #[serde(with = "f32_array_serde")]
     pub parameters: [f32; 3],
     pub fade: [i16; 4],
 }
@@ -212,6 +353,7 @@ pub struct JpaxKeyframeBlock {
     pub interpolation_type: u8,
     pub loop_enabled: u8,
     pub reserved_13: u8,
+    #[serde(with = "f32_vec4_serde")]
     pub keys: Vec<[f32; 4]>,
 }
 
@@ -1645,6 +1787,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn json_preserves_non_finite_float_bits_and_migrates_legacy_nulls() {
+        let mut dynamics = zero_dynamics();
+        dynamics.scale = [1.0, f32::from_bits(0x7fc0_1234), f32::INFINITY];
+        dynamics.spawn_rate = f32::NEG_INFINITY;
+        dynamics.initial_velocity = [0.0, 1.0, f32::from_bits(u32::MAX), 3.0];
+        let field = JpaxFieldBlock {
+            kind: 1,
+            field_flags: u8::MAX,
+            add_type: 1,
+            cycle: u8::MAX,
+            status: 2,
+            magnitude: 1.8,
+            secondary_magnitude: 0.0,
+            max_distance: 0.0,
+            position: [0.0; 3],
+            direction: [0.0, 1.0, 0.0],
+            parameters: [0.25, f32::from_bits(u32::MAX), f32::from_bits(u32::MAX)],
+            fade: [0; 4],
+        };
+        let document = JpaxDocument {
+            blocks: vec![
+                JpaxBlock::Dynamics(dynamics),
+                JpaxBlock::Field(field),
+                JpaxBlock::Keyframes(JpaxKeyframeBlock {
+                    allocation_size: 0x40,
+                    parameter_type: 0,
+                    interpolation_type: 0,
+                    loop_enabled: 0,
+                    reserved_13: 0,
+                    keys: vec![[
+                        1.0,
+                        f32::from_bits(0x7fa0_4567),
+                        f32::INFINITY,
+                        f32::NEG_INFINITY,
+                    ]],
+                }),
+            ],
+            layout: JpaxLayout::Standard,
+            trailing_zero_padding: 0,
+        };
+
+        let json = serde_json::to_string(&document).unwrap();
+
+        assert!(!json.contains(":null"));
+        assert!(json.contains("\"f32_bits\":4294967295"));
+        let restored: JpaxDocument = serde_json::from_str(&json).unwrap();
+        let JpaxBlock::Dynamics(restored_dynamics) = &restored.blocks[0] else {
+            unreachable!()
+        };
+        assert_eq!(restored_dynamics.scale[1].to_bits(), 0x7fc0_1234);
+        assert_eq!(
+            restored_dynamics.scale[2].to_bits(),
+            f32::INFINITY.to_bits()
+        );
+        assert_eq!(
+            restored_dynamics.spawn_rate.to_bits(),
+            f32::NEG_INFINITY.to_bits()
+        );
+        let JpaxBlock::Keyframes(restored_keys) = &restored.blocks[2] else {
+            unreachable!()
+        };
+        assert_eq!(restored_keys.keys[0][1].to_bits(), 0x7fa0_4567);
+        assert_eq!(restored_keys.keys[0][2].to_bits(), f32::INFINITY.to_bits());
+        assert_eq!(
+            restored_keys.keys[0][3].to_bits(),
+            f32::NEG_INFINITY.to_bits()
+        );
+
+        let legacy_json = json.replace("{\"f32_bits\":4294967295}", "null");
+        let migrated: JpaxDocument = serde_json::from_str(&legacy_json).unwrap();
+        let JpaxBlock::Field(migrated_field) = &migrated.blocks[1] else {
+            unreachable!()
+        };
+        assert_eq!(migrated_field.parameters[1].to_bits(), u32::MAX);
+        assert_eq!(migrated_field.parameters[2].to_bits(), u32::MAX);
+        assert!(!serde_json::to_string(&migrated).unwrap().contains(":null"));
+    }
     #[test]
     fn semantic_mutation_changes_rebuilt_jpa_without_source_bytes() {
         let source_document = JpaxDocument {

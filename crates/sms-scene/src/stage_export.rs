@@ -13,8 +13,8 @@ use sms_formats::{
 };
 
 use crate::{
-    PlacementAddress, PlacementBinding, Result, SceneError, SceneObject, SourceFreeStageArchive,
-    StageDocument, StageObjectPlacement, StageResourceDocument,
+    ObjectRegistry, PlacementAddress, PlacementBinding, Result, SceneError, SceneObject,
+    SourceFreeStageArchive, StageDocument, StageObjectPlacement, StageResourceDocument,
 };
 
 const WORLD_COLLISION_PATH: &[u8] = b"map/map.col";
@@ -352,7 +352,12 @@ impl StageDocument {
         apply_resource_edits(&mut archive, edits)?;
         reconcile_scene_lighting(&mut archive, &self.lighting)?;
         let inserted_placement_roots = apply_placement_inserts(&mut archive, edits)?;
-        reconcile_scene_objects(&mut archive, &self.objects, &inserted_placement_roots)?;
+        reconcile_scene_objects(
+            &mut archive,
+            &self.objects,
+            &inserted_placement_roots,
+            self.registry.as_ref(),
+        )?;
         let rebuilt = archive.encode()?;
         let reopened = SourceFreeStageArchive::parse(&rebuilt)?;
         if reopened.encode()? != rebuilt {
@@ -642,7 +647,7 @@ fn apply_resource_edits(
     Ok(())
 }
 
-fn append_collision_document(
+pub(crate) fn append_collision_document(
     existing: &ColFile,
     authored: &ColFile,
     raw_resource_path: &[u8],
@@ -1288,6 +1293,7 @@ fn reconcile_scene_objects(
     archive: &mut SourceFreeStageArchive,
     objects: &[SceneObject],
     inserted_placement_roots: &[PlacementAddress],
+    registry: Option<&ObjectRegistry>,
 ) -> Result<()> {
     let baseline = archive
         .object_placements()
@@ -1309,65 +1315,153 @@ fn reconcile_scene_objects(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    if baseline.is_empty() && !objects.is_empty() {
+    let has_source_bound_object = objects.iter().any(|object| {
+        matches!(
+            object.placement,
+            Some(PlacementBinding::Existing(_) | PlacementBinding::CloneOf(_))
+        )
+    });
+    if baseline.is_empty() && has_source_bound_object {
         return Err(stage_export_error(
             "the archive has no canonical map/scene.bin actor records",
         ));
     }
 
-    let mut existing = BTreeMap::<PlacementAddress, &SceneObject>::new();
+    let mut existing = BTreeMap::<PlacementAddress, (&SceneObject, JDramaRecord)>::new();
     let mut clones = Vec::<(PlacementAddress, &SceneObject, JDramaRecord)>::new();
+    let mut authored = Vec::<(&crate::AuthoredPlacement, &SceneObject, JDramaRecord)>::new();
     for object in objects {
-        let dirty_params = object
-            .raw_params
-            .iter()
-            .filter(|(_, value)| value.is_dirty())
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>();
-        if !dirty_params.is_empty() {
-            return Err(stage_export_error(format!(
-                "object '{}' has unmodeled parameter edit(s): {}",
-                object.id,
-                dirty_params.join(", ")
-            )));
-        }
         let Some(binding) = object.placement.as_ref() else {
             return Err(stage_export_error(format!(
                 "object '{}' has no typed JDrama placement constructor",
                 object.id
             )));
         };
-        let address = binding.address();
-        let Some(placement) = baseline.get(address) else {
-            return Err(stage_export_error(format!(
-                "object '{}' references missing placement {}:{}",
-                object.id,
-                display_raw_path(&address.raw_resource_path),
-                display_record_path(&address.record_path)
-            )));
-        };
-        validate_object_identity(object, placement)?;
         match binding {
-            PlacementBinding::Existing(address) => {
-                if existing.insert(address.clone(), object).is_some() {
+            PlacementBinding::Existing(address) | PlacementBinding::CloneOf(address) => {
+                let Some(placement) = baseline.get(address) else {
                     return Err(stage_export_error(format!(
-                        "multiple existing objects reference {}:{}",
+                        "object '{}' references missing placement {}:{}",
+                        object.id,
                         display_raw_path(&address.raw_resource_path),
                         display_record_path(&address.record_path)
                     )));
+                };
+                validate_object_identity(object, placement)?;
+                let mut record = placement_record(archive, address)?.clone();
+                crate::validate_object_parameter_links(&record, object, binding)?;
+                crate::apply_object_parameter_edits(
+                    &mut record,
+                    object,
+                    crate::ParameterApplyMode::AllCanonical,
+                )?;
+                match binding {
+                    PlacementBinding::Existing(_) => {
+                        if existing.insert(address.clone(), (object, record)).is_some() {
+                            return Err(stage_export_error(format!(
+                                "multiple existing objects reference {}:{}",
+                                display_raw_path(&address.raw_resource_path),
+                                display_record_path(&address.record_path)
+                            )));
+                        }
+                    }
+                    PlacementBinding::CloneOf(_) => {
+                        clones.push((address.clone(), object, record));
+                    }
+                    PlacementBinding::Authored(_) => unreachable!(),
                 }
             }
-            PlacementBinding::CloneOf(address) => {
-                clones.push((
-                    address.clone(),
+            PlacementBinding::Authored(placement) => {
+                validate_authored_object_identity(object, placement)?;
+                let mut record = placement.prototype.clone();
+                crate::validate_object_parameter_links(&record, object, binding)?;
+                crate::apply_object_parameter_edits(
+                    &mut record,
                     object,
-                    placement_record(archive, address)?.clone(),
-                ));
+                    crate::ParameterApplyMode::AllCanonical,
+                )?;
+                authored.push((placement, object, record));
             }
         }
     }
 
-    for (address, object) in &existing {
+    // Runtime managers and other support records must exist before their
+    // actors are appended. Identity is the exact record name plus semantic
+    // (namespace-insensitive) type, matching the runtime lookup contract.
+    for (placement, object, _) in &authored {
+        for dependency in &placement.dependencies {
+            ensure_authored_dependency(
+                archive,
+                &placement.raw_resource_path,
+                dependency,
+                &object.id,
+            )?;
+        }
+    }
+
+    let mut manager_references = BTreeMap::<(Vec<u8>, String), usize>::new();
+    let mut required_manager_references = BTreeSet::<(Vec<u8>, String)>::new();
+    for (address, (object, record)) in &existing {
+        count_manager_reference(
+            &mut manager_references,
+            &mut required_manager_references,
+            &address.raw_resource_path,
+            object,
+            record,
+            registry,
+        )?;
+    }
+    for (address, object, record) in &clones {
+        count_manager_reference(
+            &mut manager_references,
+            &mut required_manager_references,
+            &address.raw_resource_path,
+            object,
+            record,
+            registry,
+        )?;
+    }
+    for (placement, object, record) in &authored {
+        let (mut manager_names, mut required_names) =
+            record_manager_names(record, object, registry)?;
+        for dependency in &placement.dependencies {
+            if dependency_has_typed_capacity(dependency) {
+                manager_names.insert(dependency.record.name.clone());
+                required_names.insert(dependency.record.name.clone());
+            }
+        }
+        required_manager_references.extend(
+            required_names
+                .into_iter()
+                .map(|name| (placement.raw_resource_path.clone(), name)),
+        );
+        for manager_name in manager_names {
+            increment_manager_reference(
+                &mut manager_references,
+                &placement.raw_resource_path,
+                manager_name,
+            )?;
+        }
+    }
+    for ((raw_resource_path, manager_name), count) in manager_references {
+        let required_capacity = u32::try_from(count).map_err(|_| {
+            stage_export_error(format!(
+                "manager {manager_name:?} has too many authored object references"
+            ))
+        })?;
+        let missing_is_error = required_manager_references
+            .contains(&(raw_resource_path.clone(), manager_name.clone()));
+        raise_manager_capacity_floor(
+            archive,
+            &raw_resource_path,
+            &manager_name,
+            required_capacity,
+            missing_is_error,
+        )?;
+    }
+
+    for (address, (object, record)) in &existing {
+        *placement_record_mut(archive, address)? = record.clone();
         archive.set_object_transform(
             &address.raw_resource_path,
             &address.record_path,
@@ -1375,8 +1469,8 @@ fn reconcile_scene_objects(
         )?;
     }
 
-    // Appending clones does not shift any imported child index, so original
-    // addresses remain valid for the deletions that follow.
+    // Appending clones and authored records does not shift imported child
+    // indices, so original addresses remain valid for later deletions.
     for (address, object, record) in clones {
         let (_, parent_path) = address.record_path.split_last().ok_or_else(|| {
             stage_export_error(format!("object '{}' references the root record", object.id))
@@ -1385,6 +1479,21 @@ fn reconcile_scene_objects(
             archive.insert_placement_record(&address.raw_resource_path, parent_path, record)?;
         archive.set_object_transform(
             &address.raw_resource_path,
+            &record_path,
+            to_jdrama_transform(object),
+        )?;
+    }
+    for (placement, object, record) in authored {
+        let parent_path = authored_target_group_path(
+            archive,
+            &placement.raw_resource_path,
+            placement.target_group_index,
+            &object.id,
+        )?;
+        let record_path =
+            archive.insert_placement_record(&placement.raw_resource_path, &parent_path, record)?;
+        archive.set_object_transform(
+            &placement.raw_resource_path,
             &record_path,
             to_jdrama_transform(object),
         )?;
@@ -1416,17 +1525,617 @@ fn validate_object_identity(object: &SceneObject, placement: &StageObjectPlaceme
             object.id, placement.type_name, object.factory_name
         )));
     }
-    if let Some(name) = object.raw_param("name") {
-        if name != placement.name {
+    Ok(())
+}
+
+fn validate_authored_object_identity(
+    object: &SceneObject,
+    placement: &crate::AuthoredPlacement,
+) -> Result<()> {
+    if semantic_record_type_name(&object.factory_name)
+        != semantic_record_type_name(&placement.prototype.type_name)
+    {
+        return Err(stage_export_error(format!(
+            "object '{}' changed authored factory from '{}' to '{}' without a typed field mapping",
+            object.id, placement.prototype.type_name, object.factory_name
+        )));
+    }
+    Ok(())
+}
+
+fn authored_target_group_path(
+    archive: &SourceFreeStageArchive,
+    raw_resource_path: &[u8],
+    target_group_index: u32,
+    object_id: &str,
+) -> Result<Vec<usize>> {
+    if !is_editor_placement_resource(raw_resource_path) {
+        return Err(stage_export_error(format!(
+            "object '{object_id}' targets non-canonical placement resource {}",
+            display_raw_path(raw_resource_path)
+        )));
+    }
+
+    archive
+        .find_group_record_path(raw_resource_path, "IdxGroup", Some(target_group_index))?
+        .ok_or_else(|| {
+            stage_export_error(format!(
+                "object '{object_id}' targets missing IdxGroup {target_group_index} in {}",
+                display_raw_path(raw_resource_path)
+            ))
+        })
+}
+
+fn authored_dependency_target_path(
+    archive: &SourceFreeStageArchive,
+    raw_resource_path: &[u8],
+    dependency: &crate::AuthoredPlacementDependency,
+    object_id: &str,
+) -> Result<Vec<usize>> {
+    match dependency.target.as_ref() {
+        None => authored_target_group_path(
+            archive,
+            raw_resource_path,
+            dependency.target_group_index,
+            object_id,
+        ),
+        Some(crate::AuthoredPlacementDependencyTarget::IndexedGroup { group_index }) => {
+            authored_target_group_path(archive, raw_resource_path, *group_index, object_id)
+        }
+        Some(crate::AuthoredPlacementDependencyTarget::NamedGroup { type_name, name }) => {
+            let matches = named_record_paths(archive, raw_resource_path, type_name, name)?;
+            let [target_path] = matches.as_slice() else {
+                return Err(stage_export_error(if matches.is_empty() {
+                    format!(
+                        "object '{object_id}' targets missing dependency container type '{}' named {:?} in {}",
+                        semantic_record_type_name(type_name),
+                        name,
+                        display_raw_path(raw_resource_path)
+                    )
+                } else {
+                    format!(
+                        "object '{object_id}' targets ambiguous dependency container type '{}' named {:?} in {} ({} matches)",
+                        semantic_record_type_name(type_name),
+                        name,
+                        display_raw_path(raw_resource_path),
+                        matches.len()
+                    )
+                }));
+            };
+            let target = placement_record(
+                archive,
+                &PlacementAddress {
+                    raw_resource_path: raw_resource_path.to_vec(),
+                    record_path: target_path.clone(),
+                },
+            )?;
+            if !matches!(target.payload, JDramaRecordPayload::Group { .. }) {
+                return Err(stage_export_error(format!(
+                    "object '{object_id}' dependency container type '{}' named {:?} is not a group in {}",
+                    semantic_record_type_name(type_name),
+                    name,
+                    display_raw_path(raw_resource_path)
+                )));
+            }
+            Ok(target_path.clone())
+        }
+    }
+}
+
+fn authored_dependency_target_description(
+    dependency: &crate::AuthoredPlacementDependency,
+) -> String {
+    match dependency.target.as_ref() {
+        None => format!("IdxGroup {}", dependency.target_group_index),
+        Some(crate::AuthoredPlacementDependencyTarget::IndexedGroup { group_index }) => {
+            format!("IdxGroup {group_index}")
+        }
+        Some(crate::AuthoredPlacementDependencyTarget::NamedGroup { type_name, name }) => format!(
+            "container type '{}' named {:?}",
+            semantic_record_type_name(type_name),
+            name
+        ),
+    }
+}
+
+fn ensure_authored_dependency(
+    archive: &mut SourceFreeStageArchive,
+    raw_resource_path: &[u8],
+    dependency: &crate::AuthoredPlacementDependency,
+    object_id: &str,
+) -> Result<()> {
+    let target_path =
+        authored_dependency_target_path(archive, raw_resource_path, dependency, object_id)?;
+    let conflicts = conflicting_named_records(
+        archive,
+        raw_resource_path,
+        &dependency.record.type_name,
+        &dependency.record.name,
+    )?;
+    if let Some((_, conflicting_type)) = conflicts.first() {
+        return Err(stage_export_error(format!(
+            "dependency name {:?} for object '{}' is already used by semantic type '{}' in {} ({} conflicting record(s))",
+            dependency.record.name,
+            object_id,
+            semantic_record_type_name(conflicting_type),
+            display_raw_path(raw_resource_path),
+            conflicts.len()
+        )));
+    }
+    let matches = named_record_paths(
+        archive,
+        raw_resource_path,
+        &dependency.record.type_name,
+        &dependency.record.name,
+    )?;
+    match matches.as_slice() {
+        [] => {
+            archive.insert_placement_record(
+                raw_resource_path,
+                &target_path,
+                dependency.record.clone(),
+            )?;
+        }
+        [record_path] => {
+            let (_, parent_path) = record_path.split_last().ok_or_else(|| {
+                stage_export_error(format!(
+                    "dependency type '{}' named {:?} unexpectedly resolves to the placement root",
+                    semantic_record_type_name(&dependency.record.type_name),
+                    dependency.record.name
+                ))
+            })?;
+            if parent_path != target_path {
+                return Err(stage_export_error(format!(
+                    "dependency type '{}' named {:?} for object '{}' exists outside {}",
+                    semantic_record_type_name(&dependency.record.type_name),
+                    dependency.record.name,
+                    object_id,
+                    authored_dependency_target_description(dependency)
+                )));
+            }
+            let address = PlacementAddress {
+                raw_resource_path: raw_resource_path.to_vec(),
+                record_path: record_path.clone(),
+            };
+            let compatibility = {
+                let existing = placement_record(archive, &address)?;
+                dependency_record_compatibility(existing, &dependency.record)
+            };
+            match compatibility {
+                DependencyRecordCompatibility::Exact => {}
+                DependencyRecordCompatibility::Capacity(merged_capacity) => {
+                    let existing = placement_record_mut(archive, &address)?;
+                    let capacity = unique_dependency_capacity_mut(existing).ok_or_else(|| {
+                        stage_export_error(format!(
+                            "dependency type '{}' named {:?} for object '{}' lost its unique typed capacity while merging",
+                            semantic_record_type_name(&dependency.record.type_name),
+                            dependency.record.name,
+                            object_id
+                        ))
+                    })?;
+                    *capacity = merged_capacity;
+                }
+                DependencyRecordCompatibility::Incompatible => {
+                    return Err(stage_export_error(format!(
+                        "dependency type '{}' named {:?} for object '{}' has an incompatible payload in {}",
+                        semantic_record_type_name(&dependency.record.type_name),
+                        dependency.record.name,
+                        object_id,
+                        display_raw_path(raw_resource_path)
+                    )));
+                }
+            }
+        }
+        _ => {
             return Err(stage_export_error(format!(
-                "object '{}' changed its JDrama name without a typed field mapping",
-                object.id
+                "dependency type '{}' named {:?} for object '{}' is ambiguous in {} ({} matches)",
+                semantic_record_type_name(&dependency.record.type_name),
+                dependency.record.name,
+                object_id,
+                display_raw_path(raw_resource_path),
+                matches.len()
             )));
         }
     }
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DependencyRecordCompatibility {
+    Exact,
+    Capacity(u32),
+    Incompatible,
+}
+
+fn dependency_record_compatibility(
+    existing: &JDramaRecord,
+    requested: &JDramaRecord,
+) -> DependencyRecordCompatibility {
+    if existing.payload == requested.payload {
+        return DependencyRecordCompatibility::Exact;
+    }
+
+    let mut normalized_existing = existing.clone();
+    let mut normalized_requested = requested.clone();
+    let Some(existing_capacity) = normalize_unique_dependency_capacity(&mut normalized_existing)
+    else {
+        return DependencyRecordCompatibility::Incompatible;
+    };
+    let Some(requested_capacity) = normalize_unique_dependency_capacity(&mut normalized_requested)
+    else {
+        return DependencyRecordCompatibility::Incompatible;
+    };
+    if normalized_existing.payload != normalized_requested.payload {
+        return DependencyRecordCompatibility::Incompatible;
+    }
+
+    DependencyRecordCompatibility::Capacity(existing_capacity.max(requested_capacity))
+}
+
+fn normalize_unique_dependency_capacity(record: &mut JDramaRecord) -> Option<u32> {
+    let capacity = unique_dependency_capacity_mut(record)?;
+    let value = *capacity;
+    *capacity = 0;
+    Some(value)
+}
+
+fn unique_dependency_capacity_mut(record: &mut JDramaRecord) -> Option<&mut u32> {
+    let fields = jdrama_record_fields_mut(record)?;
+    let capacity_indices = fields
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| (field.name == "capacity").then_some(index))
+        .collect::<Vec<_>>();
+    let [capacity_index] = capacity_indices.as_slice() else {
+        return None;
+    };
+    match &mut fields[*capacity_index].value {
+        JDramaFieldValue::U32(capacity) => Some(capacity),
+        _ => None,
+    }
+}
+
+fn named_record_paths(
+    archive: &SourceFreeStageArchive,
+    raw_resource_path: &[u8],
+    type_name: &str,
+    name: &str,
+) -> Result<Vec<Vec<usize>>> {
+    let Some(StageResourceDocument::Placement(document)) = archive.resource(raw_resource_path)
+    else {
+        return Err(stage_export_error(format!(
+            "placement resource {} was not found",
+            display_raw_path(raw_resource_path)
+        )));
+    };
+    let mut matches = Vec::new();
+    collect_named_record_paths(
+        &document.root,
+        type_name,
+        name,
+        &mut Vec::new(),
+        &mut matches,
+    );
+    Ok(matches)
+}
+
+fn collect_named_record_paths(
+    record: &JDramaRecord,
+    type_name: &str,
+    name: &str,
+    path: &mut Vec<usize>,
+    matches: &mut Vec<Vec<usize>>,
+) {
+    if semantic_record_type_name(&record.type_name) == semantic_record_type_name(type_name)
+        && record.name == name
+    {
+        matches.push(path.clone());
+    }
+    if let JDramaRecordPayload::Group { children, .. } = &record.payload {
+        for (index, child) in children.iter().enumerate() {
+            path.push(index);
+            collect_named_record_paths(child, type_name, name, path, matches);
+            path.pop();
+        }
+    }
+}
+
+fn count_manager_reference(
+    references: &mut BTreeMap<(Vec<u8>, String), usize>,
+    required_references: &mut BTreeSet<(Vec<u8>, String)>,
+    raw_resource_path: &[u8],
+    object: &SceneObject,
+    record: &JDramaRecord,
+    registry: Option<&ObjectRegistry>,
+) -> Result<()> {
+    let (manager_names, required_names) = record_manager_names(record, object, registry)?;
+    required_references.extend(
+        required_names
+            .into_iter()
+            .map(|name| (raw_resource_path.to_vec(), name)),
+    );
+    for manager_name in manager_names {
+        increment_manager_reference(references, raw_resource_path, manager_name)?;
+    }
+    Ok(())
+}
+
+fn conflicting_named_records(
+    archive: &SourceFreeStageArchive,
+    raw_resource_path: &[u8],
+    expected_type_name: &str,
+    name: &str,
+) -> Result<Vec<(Vec<usize>, String)>> {
+    let Some(StageResourceDocument::Placement(document)) = archive.resource(raw_resource_path)
+    else {
+        return Err(stage_export_error(format!(
+            "placement resource {} was not found",
+            display_raw_path(raw_resource_path)
+        )));
+    };
+    let mut conflicts = Vec::new();
+    collect_conflicting_named_records(
+        &document.root,
+        expected_type_name,
+        name,
+        &mut Vec::new(),
+        &mut conflicts,
+    );
+    Ok(conflicts)
+}
+
+fn collect_conflicting_named_records(
+    record: &JDramaRecord,
+    expected_type_name: &str,
+    name: &str,
+    path: &mut Vec<usize>,
+    conflicts: &mut Vec<(Vec<usize>, String)>,
+) {
+    if record.name == name
+        && semantic_record_type_name(&record.type_name)
+            != semantic_record_type_name(expected_type_name)
+    {
+        conflicts.push((path.clone(), record.type_name.clone()));
+    }
+    if let JDramaRecordPayload::Group { children, .. } = &record.payload {
+        for (index, child) in children.iter().enumerate() {
+            path.push(index);
+            collect_conflicting_named_records(child, expected_type_name, name, path, conflicts);
+            path.pop();
+        }
+    }
+}
+
+fn increment_manager_reference(
+    references: &mut BTreeMap<(Vec<u8>, String), usize>,
+    raw_resource_path: &[u8],
+    manager_name: String,
+) -> Result<()> {
+    let count = references
+        .entry((raw_resource_path.to_vec(), manager_name))
+        .or_default();
+    *count = count
+        .checked_add(1)
+        .ok_or_else(|| stage_export_error("manager reference count overflowed usize"))?;
+    Ok(())
+}
+
+fn dependency_has_typed_capacity(dependency: &crate::AuthoredPlacementDependency) -> bool {
+    jdrama_record_fields(&dependency.record).is_some_and(|fields| {
+        let mut capacities = fields.iter().filter(|field| field.name == "capacity");
+        matches!(
+            (capacities.next(), capacities.next()),
+            (
+                Some(JDramaField {
+                    value: JDramaFieldValue::U32(_),
+                    ..
+                }),
+                None
+            )
+        )
+    })
+}
+
+fn record_manager_names(
+    record: &JDramaRecord,
+    object: &SceneObject,
+    registry: Option<&ObjectRegistry>,
+) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    let mut required_names = crate::resolved_object_manager_capacity_dependencies(object, registry);
+    let mut manager_names = required_names.clone();
+    if let Some(manager_name) = record_string_field(record, &object.id, "manager_name")? {
+        manager_names.insert(manager_name);
+    }
+    if let Some(manager_name) = record_string_field(record, &object.id, "launched_enemy_name")? {
+        manager_names.insert(manager_name.clone());
+        required_names.insert(manager_name);
+    }
+
+    // TMapObjData resolves the runtime manager through the exact resource
+    // identity, so use the decomp-derived registry relation instead of a
+    // per-factory exception. This also covers CloneOf records, which do not
+    // own authored dependency records.
+    if let (Some(registry), Some(resource_name)) = (
+        registry,
+        record_string_field(record, &object.id, "resource_name")?,
+    ) {
+        if let Some(manager_name) = registry
+            .find_map_obj_resource(&resource_name)
+            .map(|resource| resource.required_manager_name.as_str())
+            .filter(|name| !name.is_empty())
+        {
+            manager_names.insert(manager_name.to_string());
+            required_names.insert(manager_name.to_string());
+        }
+    }
+
+    Ok((manager_names, required_names))
+}
+
+fn record_string_field(
+    record: &JDramaRecord,
+    object_id: &str,
+    field_name: &str,
+) -> Result<Option<String>> {
+    let Some(fields) = jdrama_record_fields(record) else {
+        return Ok(None);
+    };
+    let matching_fields = fields
+        .iter()
+        .filter(|field| field.name == field_name)
+        .collect::<Vec<_>>();
+    match matching_fields.as_slice() {
+        [] => Ok(None),
+        [field] => match &field.value {
+            JDramaFieldValue::String(value) if value.is_empty() => Ok(None),
+            JDramaFieldValue::String(value) => Ok(Some(value.clone())),
+            _ => Err(stage_export_error(format!(
+                "object '{object_id}' has a {field_name} field that is not a typed string"
+            ))),
+        },
+        _ => Err(stage_export_error(format!(
+            "object '{object_id}' has multiple {field_name} fields"
+        ))),
+    }
+}
+
+fn raise_manager_capacity_floor(
+    archive: &mut SourceFreeStageArchive,
+    raw_resource_path: &[u8],
+    manager_name: &str,
+    required_capacity: u32,
+    missing_is_error: bool,
+) -> Result<()> {
+    let matches = {
+        let Some(StageResourceDocument::Placement(document)) = archive.resource(raw_resource_path)
+        else {
+            return Err(stage_export_error(format!(
+                "placement resource {} was not found",
+                display_raw_path(raw_resource_path)
+            )));
+        };
+        let mut matches = Vec::new();
+        collect_manager_capacity_paths(&document.root, manager_name, &mut Vec::new(), &mut matches);
+        matches
+    };
+    let record_path = match matches.as_slice() {
+        [] if missing_is_error => {
+            return Err(stage_export_error(format!(
+                "manager named {manager_name:?} with exactly one typed capacity field was not found in {}",
+                display_raw_path(raw_resource_path)
+            )));
+        }
+        [] => return Ok(()),
+        [record_path] => record_path.clone(),
+        _ => {
+            return Err(stage_export_error(format!(
+                "manager named {manager_name:?} with a capacity field is ambiguous in {} ({} matches)",
+                display_raw_path(raw_resource_path),
+                matches.len()
+            )));
+        }
+    };
+    let address = PlacementAddress {
+        raw_resource_path: raw_resource_path.to_vec(),
+        record_path,
+    };
+    let record = placement_record_mut(archive, &address)?;
+    let fields = jdrama_record_fields_mut(record).ok_or_else(|| {
+        stage_export_error(format!(
+            "manager named {manager_name:?} has no typed field payload"
+        ))
+    })?;
+    let capacity_fields = fields
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| field.name == "capacity")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let [capacity_index] = capacity_fields.as_slice() else {
+        return Err(stage_export_error(format!(
+            "manager named {manager_name:?} does not have exactly one capacity field"
+        )));
+    };
+    let JDramaFieldValue::U32(capacity) = &mut fields[*capacity_index].value else {
+        return Err(stage_export_error(format!(
+            "manager named {manager_name:?} has a capacity field that is not typed u32"
+        )));
+    };
+    if *capacity < required_capacity {
+        *capacity = required_capacity;
+    }
+    Ok(())
+}
+
+fn collect_manager_capacity_paths(
+    record: &JDramaRecord,
+    manager_name: &str,
+    path: &mut Vec<usize>,
+    matches: &mut Vec<Vec<usize>>,
+) {
+    if record.name == manager_name
+        && jdrama_record_fields(record)
+            .is_some_and(|fields| fields.iter().any(|field| field.name == "capacity"))
+    {
+        matches.push(path.clone());
+    }
+    if let JDramaRecordPayload::Group { children, .. } = &record.payload {
+        for (index, child) in children.iter().enumerate() {
+            path.push(index);
+            collect_manager_capacity_paths(child, manager_name, path, matches);
+            path.pop();
+        }
+    }
+}
+
+fn jdrama_record_fields(record: &JDramaRecord) -> Option<&[JDramaField]> {
+    match &record.payload {
+        JDramaRecordPayload::Fields { fields }
+        | JDramaRecordPayload::Actor { fields, .. }
+        | JDramaRecordPayload::Group { fields, .. } => Some(fields),
+        JDramaRecordPayload::Empty => None,
+    }
+}
+
+fn jdrama_record_fields_mut(record: &mut JDramaRecord) -> Option<&mut Vec<JDramaField>> {
+    match &mut record.payload {
+        JDramaRecordPayload::Fields { fields }
+        | JDramaRecordPayload::Actor { fields, .. }
+        | JDramaRecordPayload::Group { fields, .. } => Some(fields),
+        JDramaRecordPayload::Empty => None,
+    }
+}
+
+fn placement_record_mut<'a>(
+    archive: &'a mut SourceFreeStageArchive,
+    address: &PlacementAddress,
+) -> Result<&'a mut JDramaRecord> {
+    let Some(StageResourceDocument::Placement(document)) =
+        archive.resource_mut(&address.raw_resource_path)
+    else {
+        return Err(stage_export_error(format!(
+            "placement resource {} was not found",
+            display_raw_path(&address.raw_resource_path)
+        )));
+    };
+    let mut record = &mut document.root;
+    for index in &address.record_path {
+        let JDramaRecordPayload::Group { children, .. } = &mut record.payload else {
+            return Err(stage_export_error(format!(
+                "placement path {} crosses a non-group",
+                display_record_path(&address.record_path)
+            )));
+        };
+        record = children.get_mut(*index).ok_or_else(|| {
+            stage_export_error(format!(
+                "placement path {} is outside {}",
+                display_record_path(&address.record_path),
+                display_raw_path(&address.raw_resource_path)
+            ))
+        })?;
+    }
+    Ok(record)
+}
 fn placement_record<'a>(
     archive: &'a SourceFreeStageArchive,
     address: &PlacementAddress,
@@ -1576,7 +2285,10 @@ mod tests {
         RarcEntryRecord, RarcLayout, RarcNodeRecord,
     };
 
-    use crate::{PlacementBinding, Transform};
+    use crate::{
+        AuthoredPlacement, AuthoredPlacementDependency, AuthoredPlacementDependencyTarget,
+        PlacementBinding, Transform,
+    };
 
     #[test]
     fn authored_stage_lighting_rewrites_typed_records_by_stable_order_and_name() {
@@ -1734,6 +2446,489 @@ mod tests {
     }
 
     #[test]
+    fn authored_record_insert_and_transform_survive_reparse() {
+        let mut archive = authoring_strategy_archive(Vec::new());
+        let dependency = fixture_manager_dependency(1);
+        let mut object = authored_test_object(
+            "authored-enemy",
+            live_actor_record("authored enemy", "fixture manager"),
+            7,
+            vec![dependency],
+        );
+        object.transform = Transform {
+            translation: [100.0, 200.0, 300.0],
+            rotation_degrees: [10.0, 20.0, 30.0],
+            scale: [2.0, 3.0, 4.0],
+        };
+
+        reconcile_scene_objects(&mut archive, &[object], &[], None).unwrap();
+        let rebuilt = archive.encode().unwrap();
+        let reopened = SourceFreeStageArchive::parse(&rebuilt).unwrap();
+        assert_eq!(reopened.encode().unwrap(), rebuilt);
+
+        let paths =
+            named_record_paths(&reopened, WORLD_SCENE_PATH, "LiveActor", "authored enemy").unwrap();
+        assert_eq!(paths.len(), 1);
+        let record = placement_record(
+            &reopened,
+            &PlacementAddress {
+                raw_resource_path: WORLD_SCENE_PATH.to_vec(),
+                record_path: paths[0].clone(),
+            },
+        )
+        .unwrap();
+        let JDramaRecordPayload::Actor {
+            transform, fields, ..
+        } = &record.payload
+        else {
+            panic!("authored enemy was not an actor");
+        };
+        assert_eq!(transform.translation, [100.0, 200.0, 300.0]);
+        assert_eq!(transform.rotation, [10.0, 20.0, 30.0]);
+        assert_eq!(transform.scale, [2.0, 3.0, 4.0]);
+        assert_eq!(
+            typed_field_value(fields, "manager_name"),
+            &JDramaFieldValue::String("fixture manager".to_string())
+        );
+    }
+
+    #[test]
+    fn authored_dependency_is_inserted_into_retail_conductor_container() {
+        let mut archive = authoring_conductor_archive(Vec::new(), Vec::new());
+        let mut dependency = fixture_manager_dependency(1);
+        dependency.target = Some(AuthoredPlacementDependencyTarget::NamedGroup {
+            type_name: "GroupObj".to_string(),
+            name: "conductor initialization".to_string(),
+        });
+        let object = authored_test_object(
+            "authored-enemy",
+            live_actor_record("authored enemy", "fixture manager"),
+            7,
+            vec![dependency],
+        );
+
+        reconcile_scene_objects(&mut archive, &[object], &[], None).unwrap();
+
+        let managers = named_record_paths(
+            &archive,
+            WORLD_SCENE_PATH,
+            "FixtureManager",
+            "fixture manager",
+        )
+        .unwrap();
+        assert_eq!(managers, vec![vec![0, 0]]);
+    }
+
+    #[test]
+    fn authored_dependency_rejects_match_outside_retail_conductor_container() {
+        let mut dependency = fixture_manager_dependency(1);
+        let misplaced = dependency.record.clone();
+        dependency.target = Some(AuthoredPlacementDependencyTarget::NamedGroup {
+            type_name: "GroupObj".to_string(),
+            name: "conductor initialization".to_string(),
+        });
+        let mut archive = authoring_conductor_archive(Vec::new(), vec![misplaced]);
+        let object = authored_test_object(
+            "authored-enemy",
+            live_actor_record("authored enemy", "fixture manager"),
+            7,
+            vec![dependency],
+        );
+
+        let error = reconcile_scene_objects(&mut archive, &[object], &[], None).unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "exists outside container type 'GroupObj' named \"conductor initialization\""
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn authored_dependencies_are_deduplicated_across_actors() {
+        let mut archive = authoring_strategy_archive(Vec::new());
+        let dependency = fixture_manager_dependency(1);
+        let first = authored_test_object(
+            "first-enemy",
+            live_actor_record("first enemy", "fixture manager"),
+            7,
+            vec![dependency.clone()],
+        );
+        let second = authored_test_object(
+            "second-enemy",
+            live_actor_record("second enemy", "fixture manager"),
+            7,
+            vec![dependency],
+        );
+
+        reconcile_scene_objects(&mut archive, &[first, second], &[], None).unwrap();
+
+        let managers = named_record_paths(
+            &archive,
+            WORLD_SCENE_PATH,
+            "FixtureManager",
+            "fixture manager",
+        )
+        .unwrap();
+        assert_eq!(managers.len(), 1);
+        let actors = archive
+            .object_placements()
+            .into_iter()
+            .filter(|placement| placement.type_name == "LiveActor")
+            .count();
+        assert_eq!(actors, 2);
+    }
+
+    #[test]
+    fn authored_dependency_rejects_same_type_and_name_with_incompatible_payload() {
+        let mut archive = authoring_strategy_archive(Vec::new());
+        let first_dependency = fixture_manager_dependency(1);
+        let mut incompatible_dependency = fixture_manager_dependency(1);
+        let JDramaRecordPayload::Fields { fields } = &mut incompatible_dependency.record.payload
+        else {
+            unreachable!()
+        };
+        let JDramaFieldValue::U32(load_value) = &mut fields[2].value else {
+            unreachable!()
+        };
+        *load_value = 99;
+        let first = authored_test_object(
+            "first-enemy",
+            live_actor_record("first enemy", "fixture manager"),
+            7,
+            vec![first_dependency],
+        );
+        let second = authored_test_object(
+            "second-enemy",
+            live_actor_record("second enemy", "fixture manager"),
+            7,
+            vec![incompatible_dependency],
+        );
+
+        let error = reconcile_scene_objects(&mut archive, &[first, second], &[], None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("incompatible payload"), "{error}");
+        assert!(error.contains("FixtureManager"), "{error}");
+    }
+
+    #[test]
+    fn authored_dependency_rejects_different_type_conflict_alongside_exact_match() {
+        let mut archive = authoring_strategy_archive(Vec::new());
+        let dependency = fixture_manager_dependency(1);
+        archive
+            .insert_placement_record(WORLD_SCENE_PATH, &[0], dependency.record.clone())
+            .unwrap();
+        archive
+            .insert_placement_record(
+                WORLD_SCENE_PATH,
+                &[0],
+                JDramaRecord::new(
+                    "OtherManager",
+                    "fixture manager",
+                    JDramaRecordPayload::Fields { fields: Vec::new() },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let object = authored_test_object(
+            "authored-enemy",
+            live_actor_record("authored enemy", "fixture manager"),
+            7,
+            vec![dependency],
+        );
+
+        let error = reconcile_scene_objects(&mut archive, &[object], &[], None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("already used by semantic type 'OtherManager'"),
+            "{error}"
+        );
+        assert!(error.contains("1 conflicting record(s)"), "{error}");
+    }
+
+    #[test]
+    fn authored_dependency_capacity_merges_to_max_before_reference_floor() {
+        let mut archive = authoring_strategy_archive(Vec::new());
+        let objects = [
+            ("first-enemy", "first enemy", 3),
+            ("second-enemy", "second enemy", 7),
+            ("third-enemy", "third enemy", 5),
+        ]
+        .into_iter()
+        .map(|(id, name, capacity)| {
+            authored_test_object(
+                id,
+                live_actor_record(name, "fixture manager"),
+                7,
+                vec![fixture_manager_dependency(capacity)],
+            )
+        })
+        .collect::<Vec<_>>();
+
+        reconcile_scene_objects(&mut archive, &objects, &[], None).unwrap();
+
+        let manager_path = named_record_paths(
+            &archive,
+            WORLD_SCENE_PATH,
+            "FixtureManager",
+            "fixture manager",
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let manager = placement_record(
+            &archive,
+            &PlacementAddress {
+                raw_resource_path: WORLD_SCENE_PATH.to_vec(),
+                record_path: manager_path,
+            },
+        )
+        .unwrap();
+        let JDramaRecordPayload::Fields { fields } = &manager.payload else {
+            panic!("fixture manager did not retain typed fields");
+        };
+        assert_eq!(
+            typed_field_value(fields, "capacity"),
+            &JDramaFieldValue::U32(7)
+        );
+    }
+
+    #[test]
+    fn dependency_manager_capacity_is_floored_for_authored_map_objects() {
+        let mut archive = authoring_strategy_archive(Vec::new());
+        let dependency = fixture_manager_dependency(1);
+        let first = authored_test_object(
+            "first-map-object",
+            map_static_record("first map object", "fixture resource"),
+            3,
+            vec![dependency.clone()],
+        );
+        let second = authored_test_object(
+            "second-map-object",
+            map_static_record("second map object", "fixture resource"),
+            3,
+            vec![dependency],
+        );
+
+        reconcile_scene_objects(&mut archive, &[first, second], &[], None).unwrap();
+
+        let manager_path = named_record_paths(
+            &archive,
+            WORLD_SCENE_PATH,
+            "FixtureManager",
+            "fixture manager",
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let manager = placement_record(
+            &archive,
+            &PlacementAddress {
+                raw_resource_path: WORLD_SCENE_PATH.to_vec(),
+                record_path: manager_path,
+            },
+        )
+        .unwrap();
+        let JDramaRecordPayload::Fields { fields } = &manager.payload else {
+            panic!("fixture manager did not retain typed fields");
+        };
+        assert_eq!(
+            typed_field_value(fields, "capacity"),
+            &JDramaFieldValue::U32(2)
+        );
+    }
+
+    #[test]
+    fn cloned_map_object_uses_registry_manager_relation_for_capacity_floor() {
+        let prototype = map_static_record("retail map object", "fixture resource");
+        let mut archive = authoring_strategy_archive(vec![prototype.clone()]);
+        archive
+            .insert_placement_record(WORLD_SCENE_PATH, &[0], fixture_manager_dependency(1).record)
+            .unwrap();
+        let mut objects = existing_and_clone_objects(&prototype);
+        let mut registry = ObjectRegistry::default();
+        registry
+            .map_obj_resources
+            .push(sms_schema::MapObjResourceDefinition {
+                resource_name: "fixture resource".to_string(),
+                actor_type: 0,
+                object_flags: 0,
+                required_manager_name: "fixture manager".to_string(),
+                has_hold_dependency: false,
+                has_move_dependency: false,
+                uses_resource_name_model_fallback: false,
+                primary_model: None,
+                animation_resources: Vec::new(),
+                hold_model_path: None,
+                move_bck_path: None,
+                load_flags: 0x1022_0000,
+                collision_resources: Vec::new(),
+                source_file: "fixture".to_string(),
+            });
+
+        crate::refresh_object_manager_capacity_dependencies(&mut objects, &registry);
+        assert_eq!(
+            objects[0].manager_capacity_dependencies,
+            ["fixture manager"]
+        );
+        let persisted: Vec<SceneObject> =
+            serde_json::from_slice(&serde_json::to_vec(&objects).unwrap()).unwrap();
+
+        reconcile_scene_objects(&mut archive, &persisted, &[], None).unwrap();
+
+        assert_eq!(fixture_manager_capacity(&archive), 2);
+        assert_eq!(
+            named_record_paths(
+                &archive,
+                WORLD_SCENE_PATH,
+                "MapStaticObj",
+                "retail map object",
+            )
+            .unwrap()
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn cloned_launcher_counts_its_implicit_launched_enemy_manager() {
+        let prototype = common_launcher_record("retail launcher", "fixture manager");
+        let mut archive = authoring_strategy_archive(vec![prototype.clone()]);
+        archive
+            .insert_placement_record(WORLD_SCENE_PATH, &[0], fixture_manager_dependency(1).record)
+            .unwrap();
+        let objects = existing_and_clone_objects(&prototype);
+
+        reconcile_scene_objects(&mut archive, &objects, &[], None).unwrap();
+
+        assert_eq!(fixture_manager_capacity(&archive), 2);
+        assert_eq!(
+            named_record_paths(
+                &archive,
+                WORLD_SCENE_PATH,
+                "CommonLauncher",
+                "retail launcher",
+            )
+            .unwrap()
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn persisted_implicit_manager_dependency_rejects_missing_manager() {
+        let prototype = map_static_record("retail map object", "fixture resource");
+        let mut archive = authoring_strategy_archive(vec![prototype.clone()]);
+        let mut objects = existing_and_clone_objects(&prototype);
+        for object in &mut objects {
+            object.manager_capacity_dependencies = vec!["fixture manager".to_string()];
+        }
+
+        let error = reconcile_scene_objects(&mut archive, &objects, &[], None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("manager named \"fixture manager\""),
+            "{error}"
+        );
+        assert!(error.contains("was not found"), "{error}");
+    }
+
+    #[test]
+    fn persisted_implicit_manager_dependency_rejects_ambiguous_manager() {
+        let prototype = map_static_record("retail map object", "fixture resource");
+        let mut archive = authoring_strategy_archive(vec![prototype.clone()]);
+        let manager = fixture_manager_dependency(1).record;
+        archive
+            .insert_placement_record(WORLD_SCENE_PATH, &[0], manager.clone())
+            .unwrap();
+        archive
+            .insert_placement_record(WORLD_SCENE_PATH, &[0], manager)
+            .unwrap();
+        let mut objects = existing_and_clone_objects(&prototype);
+        for object in &mut objects {
+            object.manager_capacity_dependencies = vec!["fixture manager".to_string()];
+        }
+
+        let error = reconcile_scene_objects(&mut archive, &objects, &[], None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("manager named \"fixture manager\""),
+            "{error}"
+        );
+        assert!(error.contains("is ambiguous"), "{error}");
+        assert!(error.contains("2 matches"), "{error}");
+    }
+
+    #[test]
+    fn persisted_existing_and_clone_typed_field_edits_are_exported() {
+        let prototype = map_change_stage_record("base object", "base resource", 1);
+        let mut archive = authoring_strategy_archive(vec![prototype.clone()]);
+        let source_address = PlacementAddress {
+            raw_resource_path: WORLD_SCENE_PATH.to_vec(),
+            record_path: vec![1, 0],
+        };
+
+        let mut existing = SceneObject::new("existing", "MapObjChangeStage");
+        existing.placement = Some(PlacementBinding::Existing(source_address.clone()));
+        existing.transform = Transform::default();
+        crate::seed_scene_object_parameters(&mut existing, &prototype).unwrap();
+        existing.set_raw_param("stage_id", "17");
+
+        let mut clone = existing.clone();
+        clone.id = "clone".to_string();
+        clone.placement = Some(PlacementBinding::CloneOf(source_address));
+        clone.set_raw_param("stage_id", "29");
+
+        let persisted: Vec<SceneObject> =
+            serde_json::from_slice(&serde_json::to_vec(&vec![existing, clone]).unwrap()).unwrap();
+        assert!(!persisted[0].raw_params["stage_id"].is_dirty());
+        assert!(!persisted[1].raw_params["stage_id"].is_dirty());
+
+        reconcile_scene_objects(&mut archive, &persisted, &[], None).unwrap();
+        let rebuilt = archive.encode().unwrap();
+        let reopened = SourceFreeStageArchive::parse(&rebuilt).unwrap();
+
+        let paths = named_record_paths(
+            &reopened,
+            WORLD_SCENE_PATH,
+            "MapObjChangeStage",
+            "base object",
+        )
+        .unwrap();
+        assert_eq!(paths.len(), 2);
+        let mut stage_ids = paths
+            .into_iter()
+            .map(|record_path| {
+                let record = placement_record(
+                    &reopened,
+                    &PlacementAddress {
+                        raw_resource_path: WORLD_SCENE_PATH.to_vec(),
+                        record_path,
+                    },
+                )
+                .unwrap();
+                let JDramaRecordPayload::Actor { fields, .. } = &record.payload else {
+                    panic!("edited map object was not an actor");
+                };
+                let JDramaFieldValue::U32(value) = typed_field_value(fields, "stage_id") else {
+                    panic!("stage_id field was not a u32");
+                };
+                *value
+            })
+            .collect::<Vec<_>>();
+        stage_ids.sort_unstable();
+        assert_eq!(stage_ids, [17, 29]);
+    }
+
+    #[test]
     fn genuinely_missing_placement_address_is_still_rejected() {
         let fixture = StageFixture::new("missing-placement-address");
         let mut document = fixture.document();
@@ -1747,7 +2942,7 @@ mod tests {
     }
 
     #[test]
-    fn source_less_and_dirty_unmodeled_objects_are_rejected() {
+    fn source_less_and_dirty_unknown_objects_are_rejected() {
         let fixture = StageFixture::new("reject-untyped");
         let mut source_less = fixture.document();
         source_less
@@ -1762,7 +2957,10 @@ mod tests {
         let mut dirty = fixture.document();
         dirty.objects[0].set_raw_param("resource_name", "edited");
         let error = dirty.build_stage_archive().unwrap_err().to_string();
-        assert!(error.contains("unmodeled parameter edit"), "{error}");
+        assert!(
+            error.contains("dirty unknown or synthetic parameter"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2981,6 +4179,274 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn authoring_strategy_archive(
+        existing_map_objects: Vec<JDramaRecord>,
+    ) -> SourceFreeStageArchive {
+        let root = JDramaRecord::new(
+            "Strategy",
+            "strategy",
+            JDramaRecordPayload::Group {
+                fields: Vec::new(),
+                children: vec![
+                    indexed_group_record(2, "managers", Vec::new()),
+                    indexed_group_record(3, "objects", existing_map_objects),
+                    indexed_group_record(7, "enemies", Vec::new()),
+                ],
+            },
+        )
+        .unwrap();
+        let mut archive = SourceFreeStageArchive::new().unwrap();
+        archive
+            .insert_resource(
+                WORLD_SCENE_PATH.to_vec(),
+                StageResourceDocument::Placement(JDramaDocument { root }),
+            )
+            .unwrap();
+        archive
+    }
+
+    fn authoring_conductor_archive(
+        conductor_children: Vec<JDramaRecord>,
+        indexed_manager_children: Vec<JDramaRecord>,
+    ) -> SourceFreeStageArchive {
+        let conductor = JDramaRecord::new(
+            "GroupObj",
+            "conductor initialization",
+            JDramaRecordPayload::Group {
+                fields: Vec::new(),
+                children: conductor_children,
+            },
+        )
+        .unwrap();
+        let strategy = JDramaRecord::new(
+            "Strategy",
+            "strategy",
+            JDramaRecordPayload::Group {
+                fields: Vec::new(),
+                children: vec![
+                    indexed_group_record(2, "managers", indexed_manager_children),
+                    indexed_group_record(7, "enemies", Vec::new()),
+                ],
+            },
+        )
+        .unwrap();
+        let root = JDramaRecord::new(
+            "GroupObj",
+            "whole scene",
+            JDramaRecordPayload::Group {
+                fields: Vec::new(),
+                children: vec![conductor, strategy],
+            },
+        )
+        .unwrap();
+        let mut archive = SourceFreeStageArchive::new().unwrap();
+        archive
+            .insert_resource(
+                WORLD_SCENE_PATH.to_vec(),
+                StageResourceDocument::Placement(JDramaDocument { root }),
+            )
+            .unwrap();
+        archive
+    }
+
+    fn indexed_group_record(
+        group_index: u32,
+        name: &str,
+        children: Vec<JDramaRecord>,
+    ) -> JDramaRecord {
+        JDramaRecord::new(
+            "IdxGroup",
+            name,
+            JDramaRecordPayload::Group {
+                fields: vec![JDramaField {
+                    name: "group_index".to_string(),
+                    value: JDramaFieldValue::U32(group_index),
+                }],
+                children,
+            },
+        )
+        .unwrap()
+    }
+
+    fn authored_test_object(
+        id: &str,
+        prototype: JDramaRecord,
+        target_group_index: u32,
+        dependencies: Vec<AuthoredPlacementDependency>,
+    ) -> SceneObject {
+        let mut object = SceneObject::new(id, prototype.type_name.clone());
+        crate::seed_scene_object_parameters(&mut object, &prototype).unwrap();
+        object.placement = Some(PlacementBinding::Authored(AuthoredPlacement {
+            raw_resource_path: WORLD_SCENE_PATH.to_vec(),
+            target_group_index,
+            prototype,
+            dependencies,
+        }));
+        object
+    }
+
+    fn fixture_manager_dependency(capacity: u32) -> AuthoredPlacementDependency {
+        AuthoredPlacementDependency {
+            target: None,
+            target_group_index: 2,
+            record: JDramaRecord::new(
+                "FixtureManager",
+                "fixture manager",
+                JDramaRecordPayload::Fields {
+                    fields: vec![
+                        JDramaField {
+                            name: "character_name".to_string(),
+                            value: JDramaFieldValue::String(
+                                "fixture manager character".to_string(),
+                            ),
+                        },
+                        JDramaField {
+                            name: "capacity".to_string(),
+                            value: JDramaFieldValue::U32(capacity),
+                        },
+                        JDramaField {
+                            name: "manager_load_value".to_string(),
+                            value: JDramaFieldValue::U32(0),
+                        },
+                    ],
+                },
+            )
+            .unwrap(),
+        }
+    }
+
+    fn existing_and_clone_objects(prototype: &JDramaRecord) -> Vec<SceneObject> {
+        let source_address = PlacementAddress {
+            raw_resource_path: WORLD_SCENE_PATH.to_vec(),
+            record_path: vec![1, 0],
+        };
+        let mut existing = SceneObject::new("existing", prototype.type_name.clone());
+        crate::seed_scene_object_parameters(&mut existing, prototype).unwrap();
+        existing.placement = Some(PlacementBinding::Existing(source_address.clone()));
+        let mut clone = existing.clone();
+        clone.id = "clone".to_string();
+        clone.placement = Some(PlacementBinding::CloneOf(source_address));
+        vec![existing, clone]
+    }
+
+    fn fixture_manager_capacity(archive: &SourceFreeStageArchive) -> u32 {
+        let manager_path = named_record_paths(
+            archive,
+            WORLD_SCENE_PATH,
+            "FixtureManager",
+            "fixture manager",
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let record = placement_record(
+            archive,
+            &PlacementAddress {
+                raw_resource_path: WORLD_SCENE_PATH.to_vec(),
+                record_path: manager_path,
+            },
+        )
+        .unwrap();
+        let fields = jdrama_record_fields(record).unwrap();
+        let JDramaFieldValue::U32(capacity) = typed_field_value(fields, "capacity") else {
+            panic!("fixture manager capacity was not a u32");
+        };
+        *capacity
+    }
+
+    fn common_launcher_record(name: &str, launched_enemy_name: &str) -> JDramaRecord {
+        let mut record = map_static_record(name, "launcher resource");
+        record.type_name = "CommonLauncher".to_string();
+        let JDramaRecordPayload::Actor { fields, .. } = &mut record.payload else {
+            unreachable!()
+        };
+        fields.push(JDramaField {
+            name: "launched_enemy_name".to_string(),
+            value: JDramaFieldValue::String(launched_enemy_name.to_string()),
+        });
+        record
+    }
+
+    fn live_actor_record(name: &str, manager_name: &str) -> JDramaRecord {
+        JDramaRecord::new(
+            "LiveActor",
+            name,
+            JDramaRecordPayload::Actor {
+                transform: JDramaTransform {
+                    translation: [0.0; 3],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: format!("{name} character"),
+                light_map: JDramaLightMap::default(),
+                fields: vec![JDramaField {
+                    name: "manager_name".to_string(),
+                    value: JDramaFieldValue::String(manager_name.to_string()),
+                }],
+            },
+        )
+        .unwrap()
+    }
+
+    fn map_static_record(name: &str, resource_name: &str) -> JDramaRecord {
+        JDramaRecord::new(
+            "MapStaticObj",
+            name,
+            JDramaRecordPayload::Actor {
+                transform: JDramaTransform {
+                    translation: [0.0; 3],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: format!("{name} character"),
+                light_map: JDramaLightMap::default(),
+                fields: vec![JDramaField {
+                    name: "resource_name".to_string(),
+                    value: JDramaFieldValue::String(resource_name.to_string()),
+                }],
+            },
+        )
+        .unwrap()
+    }
+
+    fn map_change_stage_record(name: &str, resource_name: &str, stage_id: u32) -> JDramaRecord {
+        JDramaRecord::new(
+            "MapObjChangeStage",
+            name,
+            JDramaRecordPayload::Actor {
+                transform: JDramaTransform {
+                    translation: [0.0; 3],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: format!("{name} character"),
+                light_map: JDramaLightMap::default(),
+                fields: vec![
+                    JDramaField {
+                        name: "resource_name".to_string(),
+                        value: JDramaFieldValue::String(resource_name.to_string()),
+                    },
+                    JDramaField {
+                        name: "stage_id".to_string(),
+                        value: JDramaFieldValue::U32(stage_id),
+                    },
+                ],
+            },
+        )
+        .unwrap()
+    }
+
+    fn typed_field_value<'a>(fields: &'a [JDramaField], name: &str) -> &'a JDramaFieldValue {
+        let matches = fields
+            .iter()
+            .filter(|field| field.name == name)
+            .collect::<Vec<_>>();
+        let [field] = matches.as_slice() else {
+            panic!("expected one typed field named {name:?}");
+        };
+        &field.value
     }
 
     fn unique_root(label: &str) -> PathBuf {

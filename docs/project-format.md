@@ -75,10 +75,26 @@ A conflicting stage ID or an exhausted reserved scenario range is an error.
 Stage content is authored through the normal scene workflow. The first
 collision-bearing project model dragged into a new blank stage defaults to
 **Bake as map terrain**, replacing only the internal placeholder during build.
-The user drags the typed `Mario` class from the object palette for player
-placement; managed build and launch remain blocked until it exists. The user
-assigns a placed model as the **Stage Skybox** and edits ambient and light
-settings in-scene. These settings remain editable after creation.
+The **Objects** content-browser tab exposes safe world-placement classes derived
+from typed records in the configured retail stages. The user drags the typed
+`Mario` class into the viewport for player placement; managed build and launch
+remain blocked until it exists. Actors, enemies, NPCs, map objects, and other
+cataloged placement classes use a deterministic retail-backed template for
+their class, including its normal default parameter values. Canonical parameters
+that do not drive dependency links or serialized stream layout remain editable
+through validated typed inspector controls after placement. Linked names,
+resource/character/rail selectors, and layout counts remain visible and explain
+why they are read-only until their dependent records can be rebuilt safely.
+
+Placing a catalog object carries its typed manager and character dependencies
+into the scene, imports the discovered parameter, model, animation, collision,
+and related resource closure, and merges any required named rail graph without
+replacing unrelated graphs. Existing equivalent dependencies are reused.
+Manager, director, and other service-only classes without a safe typed placement
+template remain unavailable as direct authoring choices; required services are
+installed automatically. The user assigns a placed model as the **Stage Skybox**
+and edits ambient and light settings in-scene. These settings remain editable
+after creation.
 Only project-owned data and managed builds are changed; the extracted base game
 remains read-only.
 
@@ -98,9 +114,14 @@ An authored stage adds these managed files:
 `<stage-id>.stage.json` is the source-free semantic baseline. It contains typed
 stage data and deterministic reconstruction metadata rather than cached source
 archive or container bytes. `<stage-id>.scene.json` is the normal editor overlay.
-When the project is reopened, the baseline is validated and installed before the
-overlay. `files/data/stageArc.bin` is the project-owned runtime table containing
-the new mapping; the configured release's original table is not modified.
+The overlay persists authored object prototypes, dependency records, resource
+references, and canonical parameter edits rather than retaining the retail
+archive as a fallback. When the project is reopened, the baseline is validated
+and installed before the overlay. Managed export reconstructs object records and
+their dependency/resource closure from this typed state. Unknown, ambiguous, or
+noncanonical parameter edits are rejected. `files/data/stageArc.bin` is the
+project-owned runtime table containing the new mapping; the configured release's
+original table is not modified.
 
 **Build Game** rebuilds the authored semantic stage as
 `run-root/files/data/scene/<stage-id>.szs` and atomically overlays the
