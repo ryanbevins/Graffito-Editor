@@ -38,6 +38,7 @@ mod gpu_viewport;
 mod managed_build;
 mod model_assets;
 mod outliner;
+mod play_in_editor;
 mod project;
 mod project_ui;
 mod scene_labels;
@@ -369,6 +370,21 @@ fn split_object_authoring_catalog_cache(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DolphinLaunchMode {
+    Editor,
+    External,
+}
+
+impl DolphinLaunchMode {
+    fn progress_label(self) -> &'static str {
+        match self {
+            Self::Editor => "Launch in Editor",
+            Self::External => "Launch in Dolphin",
+        }
+    }
+}
+
 enum BackgroundResult {
     Schema(Box<Result<LoadedSchema, String>>),
     Scan {
@@ -379,7 +395,10 @@ enum BackgroundResult {
     CreateStage(Result<Box<LoadedStage>, String>),
     RetailSkybox(Result<RetailSkyboxSelection, String>),
     Build(Result<managed_build::ManagedGameBuildOutcome, String>),
-    BuildAndRun(Result<managed_build::ManagedGameLaunchOutcome, String>),
+    BuildAndRun {
+        mode: DolphinLaunchMode,
+        result: Result<managed_build::ManagedGameLaunchOutcome, String>,
+    },
 }
 
 mod preview_types;
@@ -804,6 +823,7 @@ struct SmsEditorApp {
     background_receiver: Option<Receiver<BackgroundResult>>,
     background_label: Option<String>,
     active_build_cancel: Option<Arc<AtomicBool>>,
+    embedded_dolphin: Option<play_in_editor::EmbeddedDolphinSession>,
     animation_started_at: Instant,
     last_skeletal_animation_tick: u64,
     level_transform_progress: f32,
@@ -996,6 +1016,7 @@ impl Default for SmsEditorApp {
             background_receiver: None,
             background_label: None,
             active_build_cancel: None,
+            embedded_dolphin: None,
             animation_started_at: Instant::now(),
             last_skeletal_animation_tick: u64::MAX,
             level_transform_progress: 0.0,
@@ -1020,8 +1041,9 @@ impl SmsEditorApp {
 }
 
 impl eframe::App for SmsEditorApp {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_background_task(ctx);
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.poll_background_task(ctx, Some(frame));
+        self.poll_embedded_dolphin(ctx);
         self.poll_model_import(ctx);
         self.persist_camera_state_if_due();
         self.sync_window_title(ctx);
@@ -1035,6 +1057,10 @@ impl eframe::App for SmsEditorApp {
         }
 
         if self.show_project_hub {
+            return;
+        }
+
+        if self.embedded_dolphin.is_some() {
             return;
         }
 
@@ -1068,7 +1094,7 @@ impl eframe::App for SmsEditorApp {
         }
     }
 
-    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root_ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         if self.show_project_hub {
             egui::CentralPanel::default().show(root_ui, |ui| self.project_hub(ui));
             self.new_project_dialog(root_ui.ctx());
@@ -1095,7 +1121,11 @@ impl eframe::App for SmsEditorApp {
         egui::CentralPanel::default().show(root_ui, |ui| {
             self.viewport_toolbar(ui);
             ui.separator();
-            self.viewport(ui);
+            if self.embedded_dolphin.is_some() {
+                self.embedded_dolphin_viewport(ui, frame);
+            } else {
+                self.viewport(ui);
+            }
         });
         let primary_pointer_down = root_ui.input(|input| input.pointer.primary_down());
         self.finish_pointer_undo_transaction_if_released(primary_pointer_down);
@@ -1103,6 +1133,12 @@ impl eframe::App for SmsEditorApp {
         self.new_stage_dialog(root_ui.ctx());
         self.issues_window(root_ui.ctx());
         self.unsaved_changes_dialog(root_ui.ctx());
+    }
+
+    fn on_exit(&mut self) {
+        if let Some(mut session) = self.embedded_dolphin.take() {
+            session.detach_window();
+        }
     }
 }
 
@@ -1438,7 +1474,7 @@ impl SmsEditorApp {
             .push(format!("Opening stage '{}'...", self.stage_id));
     }
 
-    fn poll_background_task(&mut self, ctx: &egui::Context) {
+    fn poll_background_task(&mut self, ctx: &egui::Context, frame: Option<&eframe::Frame>) {
         let result = self.background_receiver.as_ref().map(Receiver::try_recv);
         match result {
             Some(Ok(result)) => {
@@ -1596,7 +1632,7 @@ impl SmsEditorApp {
                         }
                         Err(err) => self.log.push(format!("Game build failed: {err}")),
                     },
-                    BackgroundResult::BuildAndRun(result) => match result {
+                    BackgroundResult::BuildAndRun { mode, result } => match result {
                         Ok(outcome) => {
                             self.log.push(format!(
                                 "Built runnable {}-byte stage at '{}' ({} independent copies, {} reused).",
@@ -1634,12 +1670,14 @@ impl SmsEditorApp {
                                     outcome.direct_boot.target.scenario_index,
                                 ));
                             }
-                            self.launch_managed_dolphin(&outcome);
+                            self.launch_managed_dolphin(&outcome, mode, frame);
                         }
-                        Err(err) if managed_build::is_cancelled_error(&err) => {
-                            self.log.push(format!("Launch in Dolphin cancelled: {err}"))
-                        }
-                        Err(err) => self.log.push(format!("Launch in Dolphin failed: {err}")),
+                        Err(err) if managed_build::is_cancelled_error(&err) => self
+                            .log
+                            .push(format!("{} cancelled: {err}", mode.progress_label())),
+                        Err(err) => self
+                            .log
+                            .push(format!("{} failed: {err}", mode.progress_label())),
                     },
                 }
             }

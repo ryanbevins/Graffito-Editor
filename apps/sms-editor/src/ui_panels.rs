@@ -68,19 +68,6 @@ impl SmsEditorApp {
                     ui.close();
                     self.build_game();
                 }
-                if ui
-                    .add_enabled(
-                        build_enabled && !self.dolphin_path.trim().is_empty(),
-                        egui::Button::new("Launch in Dolphin"),
-                    )
-                    .on_hover_text(
-                        "Save current changes, update the isolated runnable game mirror, and boot directly into the open scene in Dolphin",
-                    )
-                    .clicked()
-                {
-                    ui.close();
-                    self.build_and_launch();
-                }
                 ui.separator();
                 if ui
                     .button("Launch Configured Game (legacy)")
@@ -234,6 +221,39 @@ impl SmsEditorApp {
                     }
                     self.clear_viewport_preview_cache();
                 }
+            }
+
+            ui.separator();
+            let launch_enabled = self.document.is_some()
+                && self.current_project.is_some()
+                && self.background_receiver.is_none()
+                && self.embedded_dolphin.is_none()
+                && !self.dolphin_path.trim().is_empty();
+            if ui
+                .add_enabled(launch_enabled, egui::Button::new("Launch in Editor"))
+                .on_hover_text(
+                    "Save and build the open scene, start Dolphin, and integrate its game view into this viewport",
+                )
+                .clicked()
+            {
+                self.build_and_launch(DolphinLaunchMode::Editor);
+            }
+            if ui
+                .add_enabled(launch_enabled, egui::Button::new("Launch in Dolphin"))
+                .on_hover_text(
+                    "Save and build the open scene, then start it in a normal external Dolphin window",
+                )
+                .clicked()
+            {
+                self.build_and_launch(DolphinLaunchMode::External);
+            }
+            if self.embedded_dolphin.is_some()
+                && ui
+                    .button("Stop")
+                    .on_hover_text("Stop the current Play in Editor Dolphin session")
+                    .clicked()
+            {
+                self.stop_play_in_editor();
             }
 
             if self
@@ -537,7 +557,7 @@ impl SmsEditorApp {
         let choose_user_dir =
             path_display_row(ui, "User Dir", &self.dolphin_user_dir, "Browse...", true);
         ui.small(
-            "Launch in Dolphin refreshes the managed runnable mirror, skips the Nintendo logo sequence, and boots the open scene directly. Leave User Dir blank to use your normal Dolphin profile and controller configuration.",
+            "Both launch buttons refresh the managed runnable mirror, skip the Nintendo logo sequence, and boot the open scene directly. Launch in Editor embeds Dolphin into the viewport; Launch in Dolphin keeps an external window. Leave User Dir blank to use your normal Dolphin profile and controller configuration.",
         );
         ui.label("Legacy external game launch (optional)");
         let choose_game = path_display_row(ui, "Game", &self.game_path, "Browse...", true);

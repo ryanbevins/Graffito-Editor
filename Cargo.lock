@@ -3161,6 +3161,7 @@ dependencies = [
  "eframe",
  "egui",
  "pollster",
+ "raw-window-handle",
  "rfd",
  "serde",
  "serde_json",
@@ -3172,6 +3173,7 @@ dependencies = [
  "tempfile",
  "toml",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

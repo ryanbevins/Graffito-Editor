@@ -1548,22 +1548,27 @@ impl SmsEditorApp {
     }
 
     pub(super) fn build_game(&mut self) {
-        self.start_managed_stage_build(false);
+        self.start_managed_stage_build(None);
     }
 
-    pub(super) fn build_and_launch(&mut self) {
-        self.start_managed_stage_build(true);
+    pub(super) fn build_and_launch(&mut self, mode: DolphinLaunchMode) {
+        if mode == DolphinLaunchMode::Editor && self.embedded_dolphin.is_some() {
+            self.log
+                .push("A Play in Editor session is already running.".to_string());
+            return;
+        }
+        self.start_managed_stage_build(Some(mode));
     }
 
-    fn start_managed_stage_build(&mut self, launch_after_build: bool) {
+    fn start_managed_stage_build(&mut self, launch_mode: Option<DolphinLaunchMode>) {
         if self.background_receiver.is_some() {
             self.log
                 .push("Another background operation is already running.".to_string());
             return;
         }
-        if launch_after_build && self.dolphin_path.trim().is_empty() {
+        if launch_mode.is_some() && self.dolphin_path.trim().is_empty() {
             self.log
-                .push("Launch in Dolphin requires a Dolphin executable.".to_string());
+                .push("Launching requires a Dolphin executable.".to_string());
             return;
         }
         if self.document.is_none() {
@@ -1649,29 +1654,35 @@ impl SmsEditorApp {
                 managed_build::check_cancelled(&task_cancel)?;
                 managed_build::build_managed_game(&project, &document, &archive_bytes, &task_cancel)
             });
-            if launch_after_build {
+            if let Some(mode) = launch_mode {
                 let result = result.and_then(|build| {
                     managed_build::prepare_managed_game_launch(build, &task_cancel)
                 });
-                let _ = sender.send(BackgroundResult::BuildAndRun(result));
+                let _ = sender.send(BackgroundResult::BuildAndRun { mode, result });
             } else {
                 let _ = sender.send(BackgroundResult::Build(result));
             }
         });
         self.background_receiver = Some(receiver);
         self.active_build_cancel = Some(build_cancel);
-        self.background_label = Some(if launch_after_build {
-            "Preparing and launching current scene".to_string()
-        } else {
-            "Building managed game".to_string()
+        self.background_label = Some(match launch_mode {
+            Some(DolphinLaunchMode::Editor) => "Preparing Play in Editor".to_string(),
+            Some(DolphinLaunchMode::External) => {
+                "Preparing and launching current scene".to_string()
+            }
+            None => "Building managed game".to_string(),
         });
         self.log.push(format!(
             "Building stage from semantic documents and {} placed model instance(s) into the project's managed game directory{}...",
             model_instance_count,
-            if launch_after_build {
-                ", then preparing direct scene boot in Dolphin"
-            } else {
-                ""
+            match launch_mode {
+                Some(DolphinLaunchMode::Editor) => {
+                    ", then preparing direct scene boot for Play in Editor"
+                }
+                Some(DolphinLaunchMode::External) => {
+                    ", then preparing direct scene boot in Dolphin"
+                }
+                None => "",
             }
         ));
     }
@@ -1691,6 +1702,8 @@ impl SmsEditorApp {
     pub(super) fn launch_managed_dolphin(
         &mut self,
         outcome: &managed_build::ManagedGameLaunchOutcome,
+        mode: DolphinLaunchMode,
+        frame: Option<&eframe::Frame>,
     ) {
         if self.dolphin_path.trim().is_empty() {
             self.log.push(
@@ -1711,30 +1724,135 @@ impl SmsEditorApp {
             return;
         }
 
+        let editor_host = if mode == DolphinLaunchMode::Editor {
+            let Some(frame) = frame else {
+                self.log
+                    .push("Play in Editor could not access the native editor window.".to_string());
+                return;
+            };
+            match play_in_editor::EditorHostWindow::from_frame(frame) {
+                Ok(host) => Some(host),
+                Err(error) => {
+                    self.log
+                        .push(format!("Play in Editor is unavailable: {error}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
         let mut command = Command::new(&self.dolphin_path);
         let configured_user_dir =
             Self::configure_dolphin_user_directory(&mut command, &self.dolphin_user_dir);
+        if mode == DolphinLaunchMode::Editor {
+            Self::configure_play_in_editor_input(&mut command);
+        }
         command
             .current_dir(&outcome.run.run_root)
             .arg("-b")
             .arg("-e")
             .arg(&outcome.direct_boot.launch_dol);
 
-        match command.spawn() {
-            Ok(_) => self.log.push(format!(
+        let profile = configured_user_dir
+            .as_ref()
+            .map(|path| format!("configured Dolphin user directory '{}'", path.display()))
+            .unwrap_or_else(|| "Dolphin's normal user profile".to_string());
+        match (mode, command.spawn()) {
+            (DolphinLaunchMode::External, Ok(_)) => self.log.push(format!(
                 "Launched Dolphin directly into '{}' (runtime area {}, scenario {}) with managed game '{}' using {}.",
                 outcome.direct_boot.target.archive_name,
                 outcome.direct_boot.target.area_index,
                 outcome.direct_boot.target.scenario_index,
                 outcome.direct_boot.launch_dol.display(),
-                configured_user_dir
-                    .as_ref()
-                    .map(|path| format!("configured Dolphin user directory '{}'", path.display()))
-                    .unwrap_or_else(|| "Dolphin's normal user profile".to_string())
+                profile,
             )),
-            Err(err) => self
+            (DolphinLaunchMode::Editor, Ok(child)) => {
+                self.embedded_dolphin = Some(play_in_editor::EmbeddedDolphinSession::new(
+                    child,
+                    editor_host.expect("editor host was validated before spawning Dolphin"),
+                ));
+                self.log.push(format!(
+                    "Started Play in Editor for '{}' (runtime area {}, scenario {}) using {}; waiting for Dolphin's render window.",
+                    outcome.direct_boot.target.archive_name,
+                    outcome.direct_boot.target.area_index,
+                    outcome.direct_boot.target.scenario_index,
+                    profile,
+                ));
+            }
+            (_, Err(error)) => self
                 .log
-                .push(format!("Failed to launch managed Dolphin build: {err}")),
+                .push(format!("Failed to launch managed Dolphin build: {error}")),
+        }
+    }
+
+    pub(super) fn poll_embedded_dolphin(&mut self, ctx: &egui::Context) {
+        let event = self
+            .embedded_dolphin
+            .as_mut()
+            .map(play_in_editor::EmbeddedDolphinSession::poll);
+        match event {
+            Some(Ok(Some(play_in_editor::EmbeddedDolphinEvent::Attached))) => {
+                self.log
+                    .push("Dolphin is now running inside the editor viewport.".to_string());
+            }
+            Some(Ok(Some(play_in_editor::EmbeddedDolphinEvent::Exited))) => {
+                self.embedded_dolphin = None;
+                self.log.push("Play in Editor session ended.".to_string());
+            }
+            Some(Err(error)) => {
+                self.embedded_dolphin = None;
+                self.log.push(format!(
+                    "Play in Editor could not embed Dolphin; the managed Dolphin process was stopped: {error}"
+                ));
+            }
+            Some(Ok(None)) => {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+            None => {}
+        }
+    }
+
+    pub(super) fn embedded_dolphin_viewport(&mut self, ui: &mut egui::Ui, _frame: &eframe::Frame) {
+        let available = ui.available_size();
+        let size = egui::vec2(available.x.max(240.0), available.y.max(240.0));
+        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        ui.painter()
+            .rect_filled(rect, 0.0, egui::Color32::from_rgb(8, 10, 12));
+
+        let attached = self
+            .embedded_dolphin
+            .as_ref()
+            .is_some_and(play_in_editor::EmbeddedDolphinSession::is_attached);
+        if !attached {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Starting Dolphin...",
+                egui::FontId::proportional(18.0),
+                egui::Color32::from_gray(190),
+            );
+        }
+
+        let position_result = self
+            .embedded_dolphin
+            .as_mut()
+            .map(|session| session.set_viewport_bounds(rect, ui.ctx().pixels_per_point()));
+        if let Some(Err(error)) = position_result {
+            self.embedded_dolphin = None;
+            self.log.push(format!(
+                "Play in Editor lost the embedded Dolphin window; the managed Dolphin process was stopped: {error}"
+            ));
+        }
+    }
+
+    pub(super) fn stop_play_in_editor(&mut self) {
+        let Some(session) = self.embedded_dolphin.take() else {
+            return;
+        };
+        match session.stop() {
+            Ok(()) => self.log.push("Stopped Play in Editor.".to_string()),
+            Err(error) => self.log.push(error),
         }
     }
 
@@ -1767,6 +1885,14 @@ impl SmsEditorApp {
         let path = PathBuf::from(configured);
         command.arg("-u").arg(&path);
         Some(path)
+    }
+
+    pub(super) fn configure_play_in_editor_input(command: &mut Command) {
+        command
+            .arg("-C")
+            .arg("Dolphin.Interface.PauseOnFocusLost=False")
+            .arg("-C")
+            .arg("Dolphin.Input.BackgroundInput=True");
     }
 
     fn next_available_object_id(&self) -> Option<(String, u32)> {

@@ -125,10 +125,11 @@ original table is not modified.
 
 **Build Game** rebuilds the authored semantic stage as
 `run-root/files/data/scene/<stage-id>.szs` and atomically overlays the
-project-owned `stageArc.bin` into the managed release. **Launch in Dolphin**
-performs the same build, resolves that archive against the staged project-owned
-table, and patches the managed `sys/main.dol` for direct boot into the allocated
-area and scenario. A missing mapping is rejected rather than guessed.
+project-owned `stageArc.bin` into the managed release. **Launch in Editor** and
+**Launch in Dolphin** perform the same build, resolve that archive against the
+staged project-owned table, and patch the managed `sys/main.dol` for direct boot
+into the allocated area and scenario. A missing mapping is rejected rather than
+guessed.
 
 These persistence and build paths remain experimental. Compilation, semantic
 round trips, and automated build checks do not establish visual or in-game
@@ -137,8 +138,8 @@ runtime correctness; each authored stage still needs manual Dolphin verification
 ## Managed build tree
 
 Saving a project updates only its managed data; it does not create a playable
-mod. **Build Game** and **Launch in Dolphin** use the separate project-owned
-managed build root:
+mod. **Build Game**, **Launch in Editor**, and **Launch in Dolphin** use the
+separate project-owned managed build root:
 
 ```text
 Isle Delfino.smsbuild/
@@ -156,9 +157,9 @@ extracted game, preserving every authored file's exact game-relative path.
 Every run-root file has independent file identity; byte-identical copies are
 reused on later builds. The rebuilt stage and project-owned file overlays,
 including an authored stage's `files/data/stageArc.bin`, are installed
-atomically. **Launch in Dolphin** performs the same build, resolves the open
-archive through the resulting staged `stageArc.bin`, and
-atomically patches the managed `sys/main.dol` copy. Its behavior-based PowerPC
+atomically. Both launch buttons perform the same build, resolve the open
+archive through the resulting staged `stageArc.bin`, and atomically patch the
+managed `sys/main.dol` copy. Its behavior-based PowerPC
 patch suppresses the Nintendo-logo director, waits for the normal asynchronous
 startup data load to finish, and then boots the resolved area and scenario
 directly while preserving the executable's regional or modded code. Keeping
@@ -166,11 +167,15 @@ the launch executable at that exact path lets Dolphin mount the surrounding
 extracted game directory. Dolphin uses its normal user profile by default,
 preserving the user's controller configuration. If
 `launch.dolphin_user_directory` is set, Dolphin uses that
-profile instead. The extracted base is never opened for modification; the next
-managed build refreshes the copy from its configured base executable before
-preparing another launch.
+profile instead. **Launch in Editor** reparents Dolphin's Windows render window
+into the editor viewport until the user presses Stop. That mode temporarily
+enables Dolphin background input and disables focus-loss pausing through
+command-line overrides; it does not rewrite the saved Dolphin profile.
+**Launch in Dolphin** leaves it as a normal external window. The extracted base is never
+opened for modification; the next managed build refreshes the copy from its
+configured base executable before preparing another launch.
 
-Managed **Launch in Dolphin** requires `launch.dolphin_executable`. The optional
+Both managed launch actions require `launch.dolphin_executable`. The optional
 `launch.dolphin_user_directory` applies to both managed and legacy launches.
 `launch.game_image` belongs only to the legacy external Dolphin launch action.
 

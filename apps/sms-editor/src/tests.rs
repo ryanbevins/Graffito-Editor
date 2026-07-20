@@ -2954,7 +2954,7 @@ fn completed_stage_build_reports_the_managed_game_relative_output() {
         ..SmsEditorApp::default()
     };
 
-    app.poll_background_task(&egui::Context::default());
+    app.poll_background_task(&egui::Context::default(), None);
 
     assert!(app.background_receiver.is_none());
     assert!(app.background_label.is_none());
@@ -2975,8 +2975,9 @@ fn completed_stage_build_reports_the_managed_game_relative_output() {
 fn completed_managed_launch_reports_the_resolved_direct_boot_target() {
     let (sender, receiver) = std::sync::mpsc::channel();
     sender
-        .send(BackgroundResult::BuildAndRun(Ok(
-            managed_build::ManagedGameLaunchOutcome {
+        .send(BackgroundResult::BuildAndRun {
+            mode: DolphinLaunchMode::External,
+            result: Ok(managed_build::ManagedGameLaunchOutcome {
                 run: managed_build::ManagedRunMirrorOutcome {
                     build_root: PathBuf::from("project.smsbuild"),
                     run_root: PathBuf::from("project.smsbuild/run-root"),
@@ -3006,8 +3007,8 @@ fn completed_managed_launch_reports_the_resolved_direct_boot_target() {
                     movie_hook_address: 0x800F_A000,
                     stub_address: 0x8042_0000,
                 },
-            },
-        )))
+            }),
+        })
         .unwrap();
     let mut app = SmsEditorApp {
         background_receiver: Some(receiver),
@@ -3015,7 +3016,7 @@ fn completed_managed_launch_reports_the_resolved_direct_boot_target() {
         ..SmsEditorApp::default()
     };
 
-    app.poll_background_task(&egui::Context::default());
+    app.poll_background_task(&egui::Context::default(), None);
 
     assert!(app.background_receiver.is_none());
     assert!(app.background_label.is_none());
@@ -3081,6 +3082,23 @@ fn configured_dolphin_user_directory_is_forwarded_to_dolphin() {
 }
 
 #[test]
+fn play_in_editor_keeps_input_active_when_dolphin_loses_top_level_focus() {
+    let mut command = Command::new("Dolphin");
+
+    SmsEditorApp::configure_play_in_editor_input(&mut command);
+
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        [
+            std::ffi::OsStr::new("-C"),
+            std::ffi::OsStr::new("Dolphin.Interface.PauseOnFocusLost=False"),
+            std::ffi::OsStr::new("-C"),
+            std::ffi::OsStr::new("Dolphin.Input.BackgroundInput=True"),
+        ]
+    );
+}
+
+#[test]
 fn managed_build_cancel_state_logs_once_and_clears_with_the_result() {
     let cancel = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -3111,7 +3129,7 @@ fn managed_build_cancel_state_logs_once_and_clears_with_the_result() {
             managed_build::MANAGED_BUILD_CANCELLED
         ))))
         .unwrap();
-    app.poll_background_task(&egui::Context::default());
+    app.poll_background_task(&egui::Context::default(), None);
 
     assert!(app.background_receiver.is_none());
     assert!(app.background_label.is_none());
@@ -3351,7 +3369,7 @@ fn schema_refresh_updates_derived_preview_metadata_without_marking_the_document_
         .unwrap();
     app.background_receiver = Some(receiver);
 
-    app.poll_background_task(&egui::Context::default());
+    app.poll_background_task(&egui::Context::default(), None);
 
     assert!(!app.is_dirty());
     assert_eq!(app.document.as_ref().unwrap().objects, app.saved_objects);

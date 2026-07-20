@@ -213,10 +213,11 @@ configured retail table remains a read-only source.
 
 **Build Game** rebuilds the baseline as
 `run-root/files/data/scene/<stage-id>.szs` and overlays the project-owned
-`stageArc.bin` into the managed release. **Launch in Dolphin** performs the same
-managed build, resolves the new archive through that staged table, and
-direct-boots its allocated area and scenario. Neither action writes to the
-extracted base game or replaces its stage assets or mappings.
+`stageArc.bin` into the managed release. **Launch in Editor** and
+**Launch in Dolphin** perform the same managed build, resolve the new archive
+through that staged table, and direct-boot its allocated area and scenario.
+Neither action writes to the extracted base game or replaces its stage assets
+or mappings.
 
 This workflow remains experimental. Successful compilation, semantic round trips,
 and managed-build checks are not visual or in-game runtime validation; generated
@@ -255,7 +256,7 @@ the open scene, and slots with compiled `mHold` model/joint or `mMove`
 BCK/joint dependencies are excluded because replacing only their BMD/COL would
 leave those dependencies unsatisfied.
 
-### Build Game and Launch in Dolphin
+### Build Game and play controls
 
 **Build Game** saves the project, rebuilds the stage from semantic documents,
 and prepares `<managed-build-root>/run-root/` as a complete runnable extracted
@@ -266,8 +267,9 @@ project-owned `files/data/stageArc.bin` containing its new runtime mapping.
 The managed build root defaults to a `.smsbuild` sibling of the `.sms`
 descriptor and is protected by a project-identity marker.
 
-**Launch in Dolphin** performs that same freshness pass, resolves the open
-archive's runtime area and scenario from the staged game's own
+**Launch in Editor** and **Launch in Dolphin** perform that same freshness
+pass, resolve the open archive's runtime area and scenario from the staged
+game's own
 `files/data/stageArc.bin`, and atomically patches the managed copy at
 `run-root/sys/main.dol`. The patcher recognizes the Nintendo-logo setup and
 post-logo transition by PowerPC behavior instead of a regional address or known
@@ -277,9 +279,14 @@ waits for its required background archive, audio, card, and stage-table setup
 before entering gameplay. Dolphin runs the launch
 DOL with its normal user profile by default, preserving the user's controller
 configuration, or with the project-configured Dolphin user directory when one
-is set. It enters the open scene without the Nintendo logo sequence, file
-select, Delfino Plaza, or scenario selection. An automatic movie is bypassed
-for that initial transition only; later transitions keep normal game behavior.
+is set. **Launch in Editor** integrates the Windows Dolphin render window into
+the editor viewport and provides a Stop control. Its temporary launch overrides
+keep input active and prevent focus-loss pausing without changing the user's
+saved Dolphin profile. **Launch in Dolphin** keeps the normal external Dolphin
+window. Both enter the open scene without the Nintendo
+logo sequence, file select, Delfino Plaza, or scenario selection. An automatic
+movie is bypassed for that initial transition only; later transitions keep
+normal game behavior.
 
 When one archive has several runtime contexts, the first entry in that game's
 `stageArc.bin` is used deterministically and the complete match count is
