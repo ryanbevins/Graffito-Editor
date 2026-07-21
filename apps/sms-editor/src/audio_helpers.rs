@@ -303,6 +303,18 @@ impl SmsEditorApp {
         }
     }
 
+    pub(super) fn clear_audio_helper_selection(&mut self) {
+        if self.selected_audio_helper_id.is_none() {
+            return;
+        }
+        self.finish_audio_cube_edit();
+        self.selected_audio_helper_id = None;
+        // Rail helpers enter Routes mode as part of being selected. Once the
+        // helper is left, that helper-owned mode must not keep masking the
+        // newly selected actor's inspector.
+        self.route_mode = false;
+    }
+
     pub(super) fn selected_audio_helper(&self) -> Option<AudioHelper> {
         let selected = self.selected_audio_helper_id.as_deref()?;
         self.audio_helpers()
@@ -1128,6 +1140,18 @@ mod tests {
         assert!((point[0] - 10.0).abs() < 0.001);
         assert!((point[1] - 120.0).abs() < 0.001);
         assert!((point[2] + 20.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn clearing_audio_helper_selection_also_leaves_helper_owned_route_mode() {
+        let mut app = SmsEditorApp {
+            selected_audio_helper_id: Some("rail:fixture".to_string()),
+            route_mode: true,
+            ..SmsEditorApp::default()
+        };
+        app.clear_audio_helper_selection();
+        assert!(app.selected_audio_helper_id.is_none());
+        assert!(!app.route_mode);
     }
 
     #[test]

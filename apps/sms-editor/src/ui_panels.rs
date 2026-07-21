@@ -1137,9 +1137,8 @@ impl SmsEditorApp {
             if self.asset_dirty && !self.save_selected_model_asset() {
                 return;
             }
-            self.finish_audio_cube_edit();
+            self.clear_audio_helper_selection();
             self.selected_object_id = Some(id);
-            self.selected_audio_helper_id = None;
             self.selected_model_instance_id = None;
             self.selected_model_asset = None;
             self.selected_model_document = None;
@@ -1149,10 +1148,9 @@ impl SmsEditorApp {
             if self.asset_dirty && !self.save_selected_model_asset() {
                 return;
             }
-            self.finish_audio_cube_edit();
+            self.clear_audio_helper_selection();
             self.selected_model_instance_id = Some(id);
             self.selected_object_id = None;
-            self.selected_audio_helper_id = None;
             self.selected_model_asset = None;
             self.selected_model_document = None;
             self.saved_model_document = None;

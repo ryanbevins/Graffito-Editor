@@ -123,6 +123,22 @@ struct AudioAssets {
     waves: Vec<HashMap<u16, WaveRecord>>,
     wave_archives: HashMap<String, Arc<Vec<u8>>>,
     decoded_waves: HashMap<(usize, u16), Arc<DecodedWave>>,
+    fx_lines: [Option<FxLineConfig>; 4],
+    instrument_rng: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FxDestination {
+    buffer_id: u16,
+    volume: f32,
+}
+
+#[derive(Clone, Debug)]
+struct FxLineConfig {
+    enabled: u8,
+    circular_buffer_blocks: usize,
+    destinations: [FxDestination; 2],
+    filter_coefficients: [f32; 8],
 }
 
 #[derive(Debug)]
@@ -153,12 +169,41 @@ impl ReleaseSpec {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
+struct EnvelopeCommand {
+    mode: i16,
+    time: u16,
+    value: i16,
+}
+
+#[derive(Clone, Debug)]
+struct OscillatorSpec {
+    kind: u8,
+    rate: f32,
+    attack: Option<Arc<Vec<EnvelopeCommand>>>,
+    release: Option<Arc<Vec<EnvelopeCommand>>>,
+    width: f32,
+    vertex: f32,
+}
+
+#[derive(Clone)]
 struct InstrumentRegion {
     wave_id: u16,
     volume: f32,
     pitch: f32,
-    release: ReleaseSpec,
+    pan: f32,
+    fxmix: f32,
+    oscillators: Vec<OscillatorSpec>,
+    direct_release: u16,
+}
+
+struct RegionParameters {
+    volume: f32,
+    pitch: f32,
+    pan: f32,
+    fxmix: f32,
+    oscillators: Vec<OscillatorSpec>,
+    direct_release: u16,
 }
 
 impl AudioAssets {
@@ -167,7 +212,7 @@ impl AudioAssets {
         let sequence = fs::read(audio_res.join("Seqs/sequence.arc"))
             .map_err(|error| format!("read sequence.arc: {error}"))?;
         let aaf = load_msound_aaf(base_root, &audio_res)?;
-        let (sequence_header, bank_entries, wave_entries) = parse_aaf_tables(&aaf)?;
+        let (sequence_header, bank_entries, wave_entries, fx_lines) = parse_aaf_tables(&aaf)?;
         let mut banks = HashMap::new();
         for (offset, size, wave_bank) in bank_entries {
             let bytes = checked_slice(&aaf, offset, size, "AAF bank")?.to_vec();
@@ -193,6 +238,8 @@ impl AudioAssets {
             waves,
             wave_archives: HashMap::new(),
             decoded_waves: HashMap::new(),
+            fx_lines,
+            instrument_rng: 0,
         })
     }
 
@@ -219,17 +266,18 @@ impl AudioAssets {
     }
 
     fn instrument_region(
-        &self,
+        &mut self,
         virtual_bank: u8,
         program: u8,
         key: u8,
         velocity: u8,
     ) -> Result<(usize, InstrumentRegion), String> {
-        let bank = self
+        let (bank_bytes, wave_bank) = self
             .banks
             .get(&virtual_bank)
+            .map(|bank| (Arc::clone(&bank.bytes), bank.wave_bank))
             .ok_or_else(|| format!("sequence requested missing virtual bank {virtual_bank}"))?;
-        let bytes = bank.bytes.as_slice();
+        let bytes = bank_bytes.as_slice();
         let region = if program < 0x80 {
             let inst_offset =
                 be_u32(bytes, 0x24 + program as usize * 4, "instrument offset")? as usize;
@@ -249,8 +297,26 @@ impl AudioAssets {
                 velocity,
                 "velocity region",
             )?;
-            let release = instrument_release(bytes, inst_offset)?;
-            parse_vmap(bytes, vmap, inst_volume, inst_pitch, release)?
+            let oscillators = instrument_oscillators(bytes, inst_offset)?;
+            let effects = instrument_effects(
+                bytes,
+                [inst_offset + 0x18, inst_offset + 0x20],
+                key,
+                velocity,
+                &mut self.instrument_rng,
+            )?;
+            parse_vmap(
+                bytes,
+                vmap,
+                RegionParameters {
+                    volume: inst_volume * effects.volume,
+                    pitch: inst_pitch * effects.pitch,
+                    pan: effects.pan.unwrap_or(0.5),
+                    fxmix: effects.fxmix.unwrap_or(0.0),
+                    oscillators,
+                    direct_release: 0,
+                },
+            )?
         } else if (0xe4..=0xef).contains(&program) {
             let perc_offset = be_u32(
                 bytes,
@@ -280,22 +346,45 @@ impl AudioAssets {
                 velocity,
                 "percussion velocity region",
             )?;
-            let release = if be_u32(bytes, perc_offset, "percussion magic")? == 0x5045_5232 {
-                ReleaseSpec::direct(be_u16(
+            let direct_release = if be_u32(bytes, perc_offset, "percussion magic")? == 0x5045_5232 {
+                be_u16(
                     bytes,
                     perc_offset + 0x308 + key as usize * 2,
                     "percussion release",
-                )?)
+                )?
             } else {
                 // TDrumSet::TPerc initializes this to 1000 when the older PERC
                 // bank layout has no per-key release table.
-                ReleaseSpec::direct(1000)
+                1000
             };
-            parse_vmap(bytes, vmap, volume, pitch, release)?
+            let pan = if be_u32(bytes, perc_offset, "percussion magic")? == 0x5045_5232 {
+                bytes[perc_offset + 0x288 + key as usize] as i8 as f32 / 127.0
+            } else {
+                0.5
+            };
+            let effects = instrument_effects(
+                bytes,
+                [pmap + 8, usize::MAX],
+                key,
+                velocity,
+                &mut self.instrument_rng,
+            )?;
+            parse_vmap(
+                bytes,
+                vmap,
+                RegionParameters {
+                    volume: volume * effects.volume,
+                    pitch: pitch * effects.pitch,
+                    pan: effects.pan.unwrap_or(pan),
+                    fxmix: effects.fxmix.unwrap_or(0.0),
+                    oscillators: Vec::new(),
+                    direct_release,
+                },
+            )?
         } else {
             return Err(format!("unsupported bank program 0x{program:02X}"));
         };
-        Ok((bank.wave_bank, region))
+        Ok((wave_bank, region))
     }
 
     fn decoded_wave(&mut self, wave_bank: usize, wave_id: u16) -> Result<Arc<DecodedWave>, String> {
@@ -404,13 +493,19 @@ fn load_msound_aaf(base_root: &Path, audio_res: &Path) -> Result<Vec<u8>, String
 type BankEntry = (usize, usize, usize);
 type WaveEntry = (usize, usize, u32);
 
-type AafTables = (Vec<u8>, Vec<BankEntry>, Vec<WaveEntry>);
+type AafTables = (
+    Vec<u8>,
+    Vec<BankEntry>,
+    Vec<WaveEntry>,
+    [Option<FxLineConfig>; 4],
+);
 
 fn parse_aaf_tables(aaf: &[u8]) -> Result<AafTables, String> {
     let mut cursor = 0usize;
     let mut sequence_header = None;
     let mut banks = Vec::new();
     let mut waves = Vec::new();
+    let mut fx_resource = None;
     for _ in 0..64 {
         let command = be_u32(aaf, cursor, "AAF command")?;
         cursor += 4;
@@ -446,6 +541,8 @@ fn parse_aaf_tables(aaf: &[u8]) -> Result<AafTables, String> {
                 let resource = checked_slice(aaf, offset, size, "AAF resource")?;
                 if command == 4 {
                     sequence_header = Some(resource.to_vec());
+                } else if command == 7 {
+                    fx_resource = Some(resource.to_vec());
                 }
             }
             other => return Err(format!("unsupported msound.aaf command {other}")),
@@ -455,7 +552,64 @@ fn parse_aaf_tables(aaf: &[u8]) -> Result<AafTables, String> {
         sequence_header.ok_or_else(|| "msound.aaf has no sequence archive header".to_string())?,
         banks,
         waves,
+        fx_resource
+            .as_deref()
+            .map(parse_fx_lines)
+            .transpose()?
+            .unwrap_or([None, None, None, None]),
     ))
+}
+
+fn parse_fx_lines(bytes: &[u8]) -> Result<[Option<FxLineConfig>; 4], String> {
+    const SEND_TABLE: [u16; 12] = [
+        0x0d00, 0x0d60, 0x0dc0, 0x0e20, 0x0e80, 0x0ee0, 0x0ca0, 0x0f40, 0x0fa0, 0x0b00, 0x09a0,
+        0x0000,
+    ];
+    let preset_count = be_u32(bytes, 0, "FX preset count")? as usize;
+    if preset_count == 0 {
+        return Ok([None, None, None, None]);
+    }
+    let preset_offset = be_u32(bytes, 20, "FX preset offset")? as usize;
+    let mut lines = [None, None, None, None];
+    for (index, line) in lines.iter_mut().enumerate() {
+        let offset = preset_offset + index * 0x20;
+        checked_slice(bytes, offset, 0x20, "FX line config")?;
+        let destination = |selector: u16, volume: i16| -> Result<FxDestination, String> {
+            let buffer_id = SEND_TABLE
+                .get(selector as usize)
+                .copied()
+                .ok_or_else(|| format!("invalid FX destination selector {selector}"))?;
+            Ok(FxDestination {
+                buffer_id,
+                volume: volume as f32 / 32768.0,
+            })
+        };
+        let mut filter_coefficients = [0.0; 8];
+        for (coefficient, value) in filter_coefficients.iter_mut().enumerate() {
+            *value = be_i16(
+                bytes,
+                offset + 0x10 + coefficient * 2,
+                "FX filter coefficient",
+            )? as f32
+                / 32768.0;
+        }
+        *line = Some(FxLineConfig {
+            enabled: bytes[offset],
+            circular_buffer_blocks: be_u32(bytes, offset + 0x0c, "FX buffer blocks")? as usize,
+            destinations: [
+                destination(
+                    be_u16(bytes, offset + 2, "FX destination 0")?,
+                    be_i16(bytes, offset + 4, "FX volume 0")?,
+                )?,
+                destination(
+                    be_u16(bytes, offset + 6, "FX destination 1")?,
+                    be_i16(bytes, offset + 8, "FX volume 1")?,
+                )?,
+            ],
+            filter_coefficients,
+        });
+    }
+    Ok(lines)
 }
 
 fn parse_wave_system(bytes: &[u8], kind: u32) -> Result<HashMap<u16, WaveRecord>, String> {
@@ -523,22 +677,100 @@ fn choose_offset_region(
     last.ok_or_else(|| format!("empty {label}"))
 }
 
+struct InstrumentEffects {
+    volume: f32,
+    pitch: f32,
+    pan: Option<f32>,
+    fxmix: Option<f32>,
+}
+
+fn instrument_effects(
+    bytes: &[u8],
+    tables: [usize; 2],
+    key: u8,
+    velocity: u8,
+    rng: &mut u32,
+) -> Result<InstrumentEffects, String> {
+    let mut effects = InstrumentEffects {
+        volume: 1.0,
+        pitch: 1.0,
+        pan: None,
+        fxmix: None,
+    };
+    if tables[0] != usize::MAX {
+        for index in 0..2 {
+            let offset = be_u32(bytes, tables[0] + index * 4, "random effect offset")? as usize;
+            if offset == 0 {
+                continue;
+            }
+            checked_slice(bytes, offset, 0x0c, "random instrument effect")?;
+            let random = jaudio_random(rng) * 2.0 - 0.999_999_9;
+            let value = be_f32(bytes, offset + 4, "random effect center")?
+                + random * be_f32(bytes, offset + 8, "random effect width")?;
+            apply_instrument_effect(&mut effects, bytes[offset], value);
+        }
+    }
+    if tables[1] != usize::MAX {
+        for index in 0..2 {
+            let offset = be_u32(bytes, tables[1] + index * 4, "sense effect offset")? as usize;
+            if offset == 0 {
+                continue;
+            }
+            checked_slice(bytes, offset, 0x0c, "sense instrument effect")?;
+            let input = match bytes[offset + 1] {
+                1 => velocity,
+                2 => key,
+                _ => 0,
+            };
+            let pivot = bytes[offset + 2];
+            let low = be_f32(bytes, offset + 4, "sense effect low")?;
+            let high = be_f32(bytes, offset + 8, "sense effect high")?;
+            let value = if pivot == 0 || pivot == 0x7f {
+                low + input as f32 * (high - low) / 127.0
+            } else if input < pivot {
+                low + (1.0 - low) * input as f32 / pivot as f32
+            } else {
+                1.0 + (high - 1.0) * (input - pivot) as f32 / (0x7f - pivot) as f32
+            };
+            apply_instrument_effect(&mut effects, bytes[offset], value);
+        }
+    }
+    Ok(effects)
+}
+
+fn apply_instrument_effect(effects: &mut InstrumentEffects, target: u8, value: f32) {
+    match target {
+        0 => effects.volume *= value,
+        1 => effects.pitch *= value,
+        2 => effects.pan = Some(value),
+        3 => effects.fxmix = Some(value),
+        _ => {}
+    }
+}
+
+fn jaudio_random(state: &mut u32) -> f32 {
+    *state = state.wrapping_mul(0x0019_660d).wrapping_add(0x3c6e_f35f);
+    f32::from_bits((*state >> 9) | 0x3f80_0000) - 1.0
+}
+
 fn parse_vmap(
     bytes: &[u8],
     offset: usize,
-    volume: f32,
-    pitch: f32,
-    release: ReleaseSpec,
+    parameters: RegionParameters,
 ) -> Result<InstrumentRegion, String> {
     Ok(InstrumentRegion {
         wave_id: be_u32(bytes, offset + 4, "wave id")? as u16,
-        volume: volume * be_f32(bytes, offset + 8, "region volume")?,
-        pitch: pitch * be_f32(bytes, offset + 0x0c, "region pitch")?,
-        release,
+        volume: parameters.volume * be_f32(bytes, offset + 8, "region volume")?,
+        pitch: parameters.pitch * be_f32(bytes, offset + 0x0c, "region pitch")?,
+        pan: parameters.pan,
+        fxmix: parameters.fxmix,
+        oscillators: parameters.oscillators,
+        direct_release: parameters.direct_release,
     })
 }
 
-fn instrument_release(bytes: &[u8], inst_offset: usize) -> Result<ReleaseSpec, String> {
+fn instrument_oscillators(bytes: &[u8], inst_offset: usize) -> Result<Vec<OscillatorSpec>, String> {
+    let mut oscillators = Vec::new();
     for index in 0..2 {
         let osc_offset = be_u32(
             bytes,
@@ -549,48 +781,41 @@ fn instrument_release(bytes: &[u8], inst_offset: usize) -> Result<ReleaseSpec, S
             continue;
         }
         checked_slice(bytes, osc_offset, 0x18, "instrument oscillator")?;
-        if bytes[osc_offset] != 0 {
-            continue;
-        }
-        let table_offset = be_u32(bytes, osc_offset + 0x0c, "release table offset")? as usize;
-        if table_offset == 0 {
-            return Ok(ReleaseSpec::direct(0x10));
-        }
-        return parse_release_table(bytes, table_offset);
+        let attack_offset = be_u32(bytes, osc_offset + 8, "attack table offset")? as usize;
+        let release_offset = be_u32(bytes, osc_offset + 0x0c, "release table offset")? as usize;
+        oscillators.push(OscillatorSpec {
+            kind: bytes[osc_offset],
+            rate: be_f32(bytes, osc_offset + 4, "oscillator rate")?.max(f32::EPSILON),
+            attack: (attack_offset != 0)
+                .then(|| parse_envelope_table(bytes, attack_offset))
+                .transpose()?
+                .map(Arc::new),
+            release: (release_offset != 0)
+                .then(|| parse_envelope_table(bytes, release_offset))
+                .transpose()?
+                .map(Arc::new),
+            width: be_f32(bytes, osc_offset + 0x10, "oscillator width")?,
+            vertex: be_f32(bytes, osc_offset + 0x14, "oscillator vertex")?,
+        });
     }
-    Ok(ReleaseSpec::direct(0x10))
+    Ok(oscillators)
 }
 
-fn parse_release_table(bytes: &[u8], mut offset: usize) -> Result<ReleaseSpec, String> {
-    let mut duration_units = 0u32;
-    let mut curve = 0u8;
+fn parse_envelope_table(bytes: &[u8], mut offset: usize) -> Result<Vec<EnvelopeCommand>, String> {
+    let mut commands = Vec::new();
     for _ in 0..256 {
-        let mode = be_i16(bytes, offset, "release envelope mode")?;
-        let time = be_i16(bytes, offset + 2, "release envelope time")?;
-        let _value = be_i16(bytes, offset + 4, "release envelope value")?;
+        let command = EnvelopeCommand {
+            mode: be_i16(bytes, offset, "envelope mode")?,
+            time: be_i16(bytes, offset + 2, "envelope time")?.max(0) as u16,
+            value: be_i16(bytes, offset + 4, "envelope value")?,
+        };
         offset += 6;
-        match mode {
-            0..=3 => {
-                curve = mode as u8;
-                duration_units = duration_units.saturating_add(time.max(0) as u32);
-            }
-            13 => {
-                // Release envelopes should not loop. If malformed data does,
-                // fall back to JAudio's short direct-release behavior.
-                return Ok(ReleaseSpec::direct(0x10));
-            }
-            14 | 15 => break,
-            _ => return Err(format!("unsupported release envelope mode {mode}")),
+        commands.push(command);
+        if command.mode > 10 {
+            return Ok(commands);
         }
     }
-    if duration_units == 0 {
-        Ok(ReleaseSpec::direct(0x10))
-    } else {
-        Ok(ReleaseSpec {
-            duration_units,
-            curve,
-        })
-    }
+    Err("envelope table has no terminator".to_string())
 }
 
 // Fixed AFC predictor table uploaded by Sunshine's JAudio driver to the DSP.
@@ -705,11 +930,19 @@ struct Track {
     volume: f32,
     pitch: f32,
     pan: f32,
+    fxmix: f32,
     tempo: u16,
     timebase: u16,
     call_stack: Vec<usize>,
     loop_stack: Vec<(usize, u16)>,
     slots: [Option<u64>; 8],
+    parent: Option<usize>,
+    children: [Option<usize>; 16],
+    local_tempo: bool,
+    tick_fraction: f64,
+    inherit_parent_mix: bool,
+    self_oscillators: [VoiceOscillator; 2],
+    self_osc_routes: [u8; 2],
 }
 
 impl Track {
@@ -726,12 +959,33 @@ impl Track {
             volume: 1.0,
             pitch: 0.0,
             pan: 0.5,
+            fxmix: 0.0,
             tempo: 120,
             timebase: 48,
             call_stack: Vec::new(),
             loop_stack: Vec::new(),
             slots: [None; 8],
+            parent: None,
+            children: [None; 16],
+            local_tempo: false,
+            tick_fraction: 0.0,
+            inherit_parent_mix: false,
+            self_oscillators: [default_track_envelope(), default_track_vibrato()],
+            // JASTrack::initTrack starts oscillator 1 on the track-local route.
+            self_osc_routes: [0x0f, 0x0e],
         }
+    }
+
+    fn new_child(pc: usize, parent_index: usize, parent: &Track, mode: u8) -> Self {
+        let mut child = Self::new(pc);
+        child.parent = Some(parent_index);
+        child.tempo = parent.tempo;
+        child.timebase = parent.timebase;
+        child.inherit_parent_mix = mode & 1 == 0;
+        if mode & 2 == 0 {
+            child.registers = parent.registers;
+        }
+        child
     }
 
     fn reg(&self, register: u8) -> u16 {
@@ -759,22 +1013,393 @@ impl Track {
         }
         self.registers[3] = value;
     }
+
+    fn set_simple_oscillator(&mut self, kind: u8) {
+        let (index, oscillator) = match kind {
+            0 => (1, default_track_vibrato()),
+            1 => (0, default_track_tremolo()),
+            2 => (1, default_track_tremolo()),
+            _ => return,
+        };
+        self.self_oscillators[index] = oscillator;
+    }
+
+    fn set_oscillator_parameter(&mut self, target: u8, value: f32) {
+        let Some(index) = target.checked_sub(6).map(|value| value as usize / 3) else {
+            return;
+        };
+        let Some(oscillator) = self.self_oscillators.get_mut(index) else {
+            return;
+        };
+        match (target - 6) % 3 {
+            0 => oscillator.spec.width = value,
+            1 => oscillator.spec.rate = value.max(f32::EPSILON),
+            2 => oscillator.spec.vertex = value,
+            _ => unreachable!(),
+        }
+    }
+
+    fn set_oscillator_route(&mut self, encoded: u8) {
+        let index = (encoded >> 4) as usize;
+        let Some(route) = self.self_osc_routes.get_mut(index) else {
+            return;
+        };
+        let new_route = encoded & 0x0f;
+        if new_route == 0x0e && *route != 0x0e {
+            let spec = self.self_oscillators[index].spec.clone();
+            self.self_oscillators[index] = VoiceOscillator::new(spec);
+        }
+        *route = new_route;
+    }
+
+    fn next_self_modulation(&mut self) -> TrackModulation {
+        let mut modulation = TrackModulation::default();
+        for index in 0..2 {
+            if self.self_osc_routes[index] != 0x0e {
+                continue;
+            }
+            let kind = self.self_oscillators[index].spec.kind;
+            let (value, stopped) = self.self_oscillators[index].next_value();
+            if stopped {
+                continue;
+            }
+            match kind {
+                0 => modulation.volume *= value,
+                1 => modulation.pitch *= value,
+                2 => modulation.pan *= value,
+                3 => modulation.fxmix *= value,
+                _ => {}
+            }
+        }
+        modulation
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EnvelopeSegment {
+    start: f32,
+    target: f32,
+    elapsed: usize,
+    frames: usize,
+    curve: u8,
+}
+
+#[derive(Clone)]
+enum OscillatorState {
+    Table {
+        commands: Arc<Vec<EnvelopeCommand>>,
+        index: usize,
+        segment: Option<EnvelopeSegment>,
+    },
+    Sustain,
+    Direct(EnvelopeSegment),
+    Stopped,
+}
+
+#[derive(Clone)]
+struct VoiceOscillator {
+    spec: OscillatorSpec,
+    state: OscillatorState,
+    phase: f32,
+}
+
+impl VoiceOscillator {
+    fn new(spec: OscillatorSpec) -> Self {
+        let state = if let Some(commands) = &spec.attack {
+            OscillatorState::Table {
+                commands: Arc::clone(commands),
+                index: 0,
+                segment: None,
+            }
+        } else {
+            OscillatorState::Sustain
+        };
+        Self {
+            phase: if spec.attack.is_some() { 0.0 } else { 1.0 },
+            spec,
+            state,
+        }
+    }
+
+    fn begin_release(&mut self, direct: Option<u16>) {
+        if matches!(
+            self.state,
+            OscillatorState::Stopped | OscillatorState::Direct(_)
+        ) {
+            return;
+        }
+        if let Some(encoded) = direct.filter(|value| *value != 0) {
+            self.start_direct_release(encoded);
+        } else if let Some(commands) = &self.spec.release {
+            self.state = OscillatorState::Table {
+                commands: Arc::clone(commands),
+                index: 0,
+                segment: None,
+            };
+        } else {
+            self.start_direct_release(0x10);
+        }
+    }
+
+    fn force_stop(&mut self) {
+        self.start_direct_release(15);
+    }
+
+    fn start_direct_release(&mut self, encoded: u16) {
+        let release = ReleaseSpec::direct(encoded);
+        self.state = OscillatorState::Direct(EnvelopeSegment {
+            start: self.phase,
+            target: 0.0,
+            elapsed: 0,
+            frames: release.frames(),
+            curve: release.curve,
+        });
+    }
+
+    fn next_value(&mut self) -> (f32, bool) {
+        loop {
+            match &mut self.state {
+                OscillatorState::Table {
+                    commands,
+                    index,
+                    segment,
+                } => {
+                    if let Some(active) = segment {
+                        self.phase = envelope_segment_value(*active);
+                        active.elapsed += 1;
+                        if active.elapsed >= active.frames {
+                            self.phase = active.target;
+                            *segment = None;
+                        }
+                        return (self.output(), false);
+                    }
+                    let Some(command) = commands.get(*index).copied() else {
+                        self.state = OscillatorState::Stopped;
+                        continue;
+                    };
+                    match command.mode {
+                        0..=3 => {
+                            *index += 1;
+                            let target = command.value as f32 / 32768.0;
+                            if command.time == 0 {
+                                self.phase = target;
+                                continue;
+                            }
+                            let frames = ((command.time as f32 * OUTPUT_RATE as f32)
+                                / (600.0 * self.spec.rate))
+                                .round()
+                                .max(1.0) as usize;
+                            *segment = Some(EnvelopeSegment {
+                                start: self.phase,
+                                target,
+                                elapsed: 0,
+                                frames,
+                                curve: command.mode as u8,
+                            });
+                        }
+                        13 => {
+                            *index = (command.value.max(0) as usize).min(commands.len());
+                        }
+                        14 => {
+                            self.state = OscillatorState::Sustain;
+                        }
+                        15 => {
+                            self.state = OscillatorState::Stopped;
+                        }
+                        mode => {
+                            let _ = mode;
+                            self.state = OscillatorState::Stopped;
+                        }
+                    }
+                }
+                OscillatorState::Sustain => return (self.output(), false),
+                OscillatorState::Direct(segment) => {
+                    self.phase = envelope_segment_value(*segment);
+                    segment.elapsed += 1;
+                    if segment.elapsed >= segment.frames {
+                        self.phase = 0.0;
+                        self.state = OscillatorState::Stopped;
+                    }
+                    return (self.output(), false);
+                }
+                OscillatorState::Stopped => return (0.0, true),
+            }
+        }
+    }
+
+    fn output(&self) -> f32 {
+        self.spec.vertex + self.phase * self.spec.width
+    }
+}
+
+fn default_volume_oscillator() -> VoiceOscillator {
+    VoiceOscillator::new(OscillatorSpec {
+        kind: 0,
+        rate: 1.0,
+        attack: None,
+        release: None,
+        width: 1.0,
+        vertex: 0.0,
+    })
+}
+
+fn default_track_envelope() -> VoiceOscillator {
+    VoiceOscillator::new(OscillatorSpec {
+        kind: 0,
+        rate: 1.0,
+        attack: None,
+        release: Some(Arc::new(vec![
+            EnvelopeCommand {
+                mode: 0,
+                time: 10,
+                value: 0,
+            },
+            EnvelopeCommand {
+                mode: 15,
+                time: 1,
+                value: 0,
+            },
+        ])),
+        width: 1.0,
+        vertex: 0.0,
+    })
+}
+
+fn default_track_vibrato() -> VoiceOscillator {
+    VoiceOscillator::new(OscillatorSpec {
+        kind: 1,
+        rate: 0.5,
+        attack: Some(Arc::new(vec![
+            EnvelopeCommand {
+                mode: 0,
+                time: 0,
+                value: 0,
+            },
+            EnvelopeCommand {
+                mode: 0,
+                time: 12,
+                value: 0x7fff,
+            },
+            EnvelopeCommand {
+                mode: 0,
+                time: 12,
+                value: 0,
+            },
+            EnvelopeCommand {
+                mode: 0,
+                time: 12,
+                value: -0x4000,
+            },
+            EnvelopeCommand {
+                mode: 0,
+                time: 12,
+                value: 0,
+            },
+            EnvelopeCommand {
+                mode: 13,
+                time: 0,
+                value: 1,
+            },
+        ])),
+        release: None,
+        width: 0.0,
+        vertex: 1.0,
+    })
+}
+
+fn default_track_tremolo() -> VoiceOscillator {
+    VoiceOscillator::new(OscillatorSpec {
+        kind: 0,
+        rate: 0.5,
+        attack: Some(Arc::new(vec![
+            EnvelopeCommand {
+                mode: 0,
+                time: 0,
+                value: 0x7fff,
+            },
+            EnvelopeCommand {
+                mode: 0,
+                time: 20,
+                value: 0,
+            },
+            EnvelopeCommand {
+                mode: 0,
+                time: 20,
+                value: i16::MIN + 1,
+            },
+            EnvelopeCommand {
+                mode: 0,
+                time: 20,
+                value: 0,
+            },
+            EnvelopeCommand {
+                mode: 0,
+                time: 20,
+                value: 0x7fff,
+            },
+            EnvelopeCommand {
+                mode: 13,
+                time: 0,
+                value: 1,
+            },
+        ])),
+        release: None,
+        width: 0.0,
+        vertex: 1.0,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct TrackModulation {
+    volume: f32,
+    pitch: f32,
+    pan: f32,
+    fxmix: f32,
+}
+
+impl Default for TrackModulation {
+    fn default() -> Self {
+        Self {
+            volume: 1.0,
+            pitch: 1.0,
+            pan: 1.0,
+            fxmix: 1.0,
+        }
+    }
+}
+
+fn envelope_segment_value(segment: EnvelopeSegment) -> f32 {
+    let progress = segment.elapsed as f32 / segment.frames.max(1) as f32;
+    envelope_curve(segment.curve, segment.start, segment.target, progress)
 }
 
 struct Voice {
     id: u64,
     wave: Arc<DecodedWave>,
     position: f64,
-    step: f64,
-    volume: f32,
-    pan: f32,
-    release: ReleaseSpec,
-    release_samples: usize,
-    release_total_samples: usize,
-    release_start_gain: f32,
+    base_step: f64,
+    base_volume: f32,
+    instrument_pan: f32,
+    instrument_fxmix: f32,
+    oscillators: Vec<VoiceOscillator>,
+    direct_release: u16,
     releasing: bool,
-    age: usize,
     ticks_remaining: Option<u32>,
+    owner_track: usize,
+}
+
+#[derive(Clone, Copy)]
+enum TrackRelation {
+    Child,
+    Sibling,
+}
+
+#[derive(Clone, Copy)]
+struct PendingTrack {
+    offset: usize,
+    slot: u8,
+    mode: u8,
+    relation: TrackRelation,
 }
 
 fn render_bgm_preview(base_root: &Path, bgm_id: u32, seconds: f32) -> Result<Vec<f32>, String> {
@@ -785,22 +1410,28 @@ fn render_bgm_preview(base_root: &Path, bgm_id: u32, seconds: f32) -> Result<Vec
     let mut next_voice_id = 1u64;
     let max_frames = (OUTPUT_RATE as f32 * seconds) as usize;
     let mut output = Vec::with_capacity(max_frames * 2);
+    let mut reverb_send = Vec::with_capacity(max_frames * 2);
     let mut commands = 0usize;
     let mut sequence_frame_clock = 0.0f64;
     let mut mixed_sequence_frames = 0usize;
 
     while output.len() / 2 < max_frames && tracks.iter().any(|track| !track.finished) {
         let mut track_index = 0usize;
+        let mut advanced = Vec::with_capacity(tracks.len());
         while track_index < tracks.len() {
-            if tracks[track_index].finished {
+            advanced.resize(tracks.len(), false);
+            if tracks[track_index].finished || !track_tick_due(&mut tracks, track_index, &advanced)
+            {
                 track_index += 1;
                 continue;
             }
+            advanced[track_index] = true;
             let mut children = Vec::new();
             if sequence_tick_ready(&mut tracks[track_index]) {
                 process_track(
                     &sequence,
                     &mut tracks[track_index],
+                    track_index,
                     &mut assets,
                     &mut voices,
                     &mut children,
@@ -811,13 +1442,31 @@ fn render_bgm_preview(base_root: &Path, bgm_id: u32, seconds: f32) -> Result<Vec
             if commands > MAX_COMMANDS_PER_TICK * (output.len() / 2 + 1) {
                 return Err("sequence exceeded the preview command safety limit".to_string());
             }
-            for offset in children {
+            for pending in children {
                 if tracks.len() >= MAX_TRACKS {
                     return Err("sequence opened too many tracks".to_string());
                 }
+                let parent_index = match pending.relation {
+                    TrackRelation::Child => Some(track_index),
+                    TrackRelation::Sibling => tracks[track_index].parent,
+                };
+                let Some(parent_index) = parent_index else {
+                    continue;
+                };
+                if let Some(previous) = tracks[parent_index].children[pending.slot as usize] {
+                    close_track_tree(&mut tracks, &mut voices, previous);
+                }
                 // JASTrack::mainProc visits a newly opened child later in the
                 // same sequence update, so it must not lose its first tick.
-                tracks.push(Track::new(offset));
+                let child = Track::new_child(
+                    pending.offset,
+                    parent_index,
+                    &tracks[parent_index],
+                    pending.mode,
+                );
+                let child_index = tracks.len();
+                tracks.push(child);
+                tracks[parent_index].children[pending.slot as usize] = Some(child_index);
             }
             track_index += 1;
         }
@@ -827,12 +1476,183 @@ fn render_bgm_preview(base_root: &Path, bgm_id: u32, seconds: f32) -> Result<Vec
         let target_frames = sequence_frame_clock.round().max(1.0) as usize;
         let tick_frames = target_frames.saturating_sub(mixed_sequence_frames);
         mixed_sequence_frames = target_frames;
-        mix_voices(&mut output, &mut voices, tick_frames, max_frames);
+        mix_voices(
+            &mut output,
+            &mut reverb_send,
+            &mut voices,
+            &mut tracks,
+            tick_frames,
+            max_frames,
+        );
     }
     if output.is_empty() {
         return Err("the selected sequence produced no preview audio".to_string());
     }
+    apply_jaudio_reverb(&mut output, &reverb_send, &assets.fx_lines);
+    for sample in &mut output {
+        *sample = sample.clamp(-1.0, 32767.0 / 32768.0);
+    }
     Ok(output)
+}
+
+struct FxLineState {
+    delay: Vec<f32>,
+    block: usize,
+    last_eight: [f32; 8],
+}
+
+fn apply_jaudio_reverb(
+    output: &mut [f32],
+    reverb_send: &[f32],
+    configs: &[Option<FxLineConfig>; 4],
+) {
+    const DSP_FRAME: usize = 0x50;
+    let mut states: [Option<FxLineState>; 4] = std::array::from_fn(|index| {
+        let config = configs[index].as_ref()?;
+        (config.enabled != 0 && config.circular_buffer_blocks != 0).then(|| FxLineState {
+            delay: vec![0.0; config.circular_buffer_blocks * DSP_FRAME],
+            block: 0,
+            last_eight: [0.0; 8],
+        })
+    });
+    if states.iter().all(Option::is_none) {
+        return;
+    }
+
+    let frame_count = output.len() / 2;
+    for frame_start in (0..frame_count).step_by(DSP_FRAME) {
+        let valid_frames = DSP_FRAME.min(frame_count - frame_start);
+        let mut reverb_buffers = [[0.0f32; DSP_FRAME]; 4];
+
+        for line_index in 0..4 {
+            let (Some(config), Some(state)) =
+                (configs[line_index].as_ref(), states[line_index].as_mut())
+            else {
+                continue;
+            };
+            let delay_start = state.block * DSP_FRAME;
+            let mut filtered = [0.0f32; DSP_FRAME + 8];
+            filtered[..8].copy_from_slice(&state.last_eight);
+            filtered[8..].copy_from_slice(&state.delay[delay_start..delay_start + DSP_FRAME]);
+            state
+                .last_eight
+                .copy_from_slice(&filtered[DSP_FRAME..DSP_FRAME + 8]);
+
+            if config.enabled & 1 != 0 {
+                filter_reverb_block(&mut filtered, &config.filter_coefficients);
+            }
+            for destination in config.destinations {
+                route_reverb_block(
+                    output,
+                    frame_start,
+                    valid_frames,
+                    &mut reverb_buffers,
+                    &filtered[..DSP_FRAME],
+                    destination,
+                );
+            }
+            if config.enabled & 1 == 0 && config.enabled & 2 != 0 {
+                filter_reverb_block(&mut filtered, &config.filter_coefficients);
+            }
+            reverb_buffers[line_index].copy_from_slice(&filtered[..DSP_FRAME]);
+        }
+
+        for frame in 0..valid_frames {
+            reverb_buffers[0][frame] += reverb_send[(frame_start + frame) * 2];
+            reverb_buffers[1][frame] += reverb_send[(frame_start + frame) * 2 + 1];
+        }
+
+        for line_index in 0..4 {
+            let (Some(config), Some(state)) =
+                (configs[line_index].as_ref(), states[line_index].as_mut())
+            else {
+                continue;
+            };
+            let delay_start = state.block * DSP_FRAME;
+            state.delay[delay_start..delay_start + DSP_FRAME]
+                .copy_from_slice(&reverb_buffers[line_index]);
+            state.block = (state.block + 1) % config.circular_buffer_blocks;
+        }
+    }
+}
+
+fn filter_reverb_block(samples: &mut [f32; 0x58], coefficients: &[f32; 8]) {
+    for index in 0..0x50 {
+        samples[index] = coefficients
+            .iter()
+            .enumerate()
+            .map(|(tap, coefficient)| samples[index + tap] * coefficient)
+            .sum::<f32>()
+            .clamp(-1.0, 32767.0 / 32768.0);
+    }
+}
+
+fn route_reverb_block(
+    output: &mut [f32],
+    frame_start: usize,
+    valid_frames: usize,
+    reverb_buffers: &mut [[f32; 0x50]; 4],
+    source: &[f32],
+    destination: FxDestination,
+) {
+    let reverb_index = match destination.buffer_id {
+        0x0dc0 => Some(0),
+        0x0e20 => Some(1),
+        0x0e80 => Some(2),
+        0x0ee0 => Some(3),
+        _ => None,
+    };
+    if let Some(index) = reverb_index {
+        for frame in 0..0x50 {
+            reverb_buffers[index][frame] += source[frame] * destination.volume;
+        }
+        return;
+    }
+    let channel = match destination.buffer_id {
+        0x0d00 => Some(0),
+        0x0d60 => Some(1),
+        _ => None,
+    };
+    if let Some(channel) = channel {
+        for frame in 0..valid_frames {
+            output[(frame_start + frame) * 2 + channel] += source[frame] * destination.volume;
+        }
+    }
+}
+
+fn track_tick_due(tracks: &mut [Track], index: usize, advanced: &[bool]) -> bool {
+    let Some(parent) = tracks[index].parent else {
+        return true;
+    };
+    if !advanced.get(parent).copied().unwrap_or(false) {
+        return false;
+    }
+    if !tracks[index].local_tempo {
+        return true;
+    }
+    let parent_tempo = f64::from(tracks[parent].tempo.max(1));
+    let ratio = (f64::from(tracks[index].tempo.max(1)) / parent_tempo).min(1.0);
+    tracks[index].tick_fraction += ratio;
+    if tracks[index].tick_fraction < 1.0 {
+        return false;
+    }
+    tracks[index].tick_fraction -= 1.0;
+    true
+}
+
+fn close_track_tree(tracks: &mut [Track], voices: &mut [Voice], index: usize) {
+    if tracks.get(index).is_none_or(|track| track.finished) {
+        return;
+    }
+    let children = tracks[index].children;
+    tracks[index].finished = true;
+    tracks[index].slots = [None; 8];
+    for voice in voices.iter_mut().filter(|voice| voice.owner_track == index) {
+        begin_release(voice, None);
+    }
+    for child in children.into_iter().flatten() {
+        close_track_tree(tracks, voices, child);
+    }
 }
 
 fn sequence_tick_ready(track: &mut Track) -> bool {
@@ -846,9 +1666,10 @@ fn sequence_tick_ready(track: &mut Track) -> bool {
 fn process_track(
     sequence: &[u8],
     track: &mut Track,
+    track_index: usize,
     assets: &mut AudioAssets,
     voices: &mut Vec<Voice>,
-    children: &mut Vec<usize>,
+    children: &mut Vec<PendingTrack>,
     next_voice_id: &mut u64,
     commands: &mut usize,
 ) -> Result<(), String> {
@@ -895,8 +1716,8 @@ fn process_track(
             if let Ok((wave_bank, region)) = assets.instrument_region(bank, program, note, velocity)
             {
                 if let Ok(wave) = assets.decoded_wave(wave_bank, region.wave_id) {
-                    let semitones = note as f32 - wave.root_key as f32 + track.pitch * 48.0;
-                    let step = wave.sample_rate as f64 / OUTPUT_RATE as f64
+                    let semitones = note as f32 - wave.root_key as f32;
+                    let base_step = wave.sample_rate as f64 / OUTPUT_RATE as f64
                         * 2.0f64.powf(semitones as f64 / 12.0)
                         * region.pitch as f64;
                     let id = *next_voice_id;
@@ -906,20 +1727,27 @@ fn process_track(
                             begin_release(voice, None);
                         }
                     }
+                    let mut oscillators: Vec<_> = region
+                        .oscillators
+                        .into_iter()
+                        .map(VoiceOscillator::new)
+                        .collect();
+                    if oscillators.is_empty() {
+                        oscillators.push(default_volume_oscillator());
+                    }
                     voices.push(Voice {
                         id,
                         wave,
                         position: 0.0,
-                        step,
-                        volume: (velocity as f32 / 127.0).powi(2) * region.volume * track.volume,
-                        pan: track.pan.clamp(0.0, 1.0),
-                        release: region.release,
-                        release_samples: 0,
-                        release_total_samples: 0,
-                        release_start_gain: 1.0,
+                        base_step,
+                        base_volume: (velocity as f32 / 127.0).powi(2) * region.volume,
+                        instrument_pan: region.pan,
+                        instrument_fxmix: region.fxmix,
+                        oscillators,
+                        direct_release: region.direct_release,
                         releasing: false,
-                        age: 0,
                         ticks_remaining: gate_ticks,
+                        owner_track: track_index,
                     });
                     track.slots[slot] = Some(id);
                 }
@@ -980,10 +1808,18 @@ fn process_track(
                     }
                 }
             }
-            if process_command(sequence, track, command, override_types, children, voices)? {
+            if process_command(
+                sequence,
+                track,
+                track_index,
+                command,
+                override_types,
+                children,
+                voices,
+            )? {
                 return Ok(());
             }
-        } else if process_command(sequence, track, flag, 0, children, voices)? {
+        } else if process_command(sequence, track, track_index, flag, 0, children, voices)? {
             return Ok(());
         }
         if track.finished {
@@ -1063,9 +1899,10 @@ const COMMAND_ARGS: [(u16, u16); 64] = [
 fn process_command(
     sequence: &[u8],
     track: &mut Track,
+    track_index: usize,
     command: u8,
     override_types: u16,
-    children: &mut Vec<usize>,
+    children: &mut Vec<PendingTrack>,
     voices: &mut [Voice],
 ) -> Result<bool, String> {
     if command == 0xc4 || command == 0xc8 {
@@ -1104,7 +1941,24 @@ fn process_command(
         types >>= 2;
     }
     match command {
-        0xc1 | 0xc2 => children.push(args[1] as usize),
+        0xc1 | 0xc2 => {
+            let encoded = args[0] as u8;
+            let mode = if encoded & 0x20 != 0 {
+                4
+            } else {
+                (encoded >> 6) & 3
+            };
+            children.push(PendingTrack {
+                offset: args[1] as usize,
+                slot: encoded & 0x0f,
+                mode,
+                relation: if command == 0xc1 {
+                    TrackRelation::Child
+                } else {
+                    TrackRelation::Sibling
+                },
+            });
+        }
         0xc6 if condition_matches(track.reg(3), args[0] as u8) => {
             if let Some(pc) = track.call_stack.pop() {
                 track.pc = pc;
@@ -1129,16 +1983,36 @@ fn process_command(
             track.wait = args[0];
             return Ok(track.wait > 0);
         }
+        0xd6 => track.set_simple_oscillator(args[0] as u8),
         0xd9 => track.transpose = args[0] as u8 as i8 as i16,
         0xe7 => track.set_reg(3, 0),
-        0xe8 | 0xe9 => {
-            for voice in voices {
+        0xe8 => {
+            for voice in voices
+                .iter_mut()
+                .filter(|voice| voice.owner_track == track_index)
+            {
                 begin_release(voice, None);
             }
             track.slots = [None; 8];
         }
+        0xe9 => {
+            for voice in voices
+                .iter_mut()
+                .filter(|voice| voice.owner_track == track_index && voice.releasing)
+            {
+                for oscillator in &mut voice.oscillators {
+                    oscillator.force_stop();
+                }
+            }
+        }
+        0xf0 => track.set_oscillator_route(args[0] as u8),
         0xfb => skip_printf(sequence, track)?,
-        0xfd => track.tempo = args[0].max(1) as u16,
+        0xfd => {
+            track.tempo = args[0].max(1) as u16;
+            if track.parent.is_some() {
+                track.local_tempo = true;
+            }
+        }
         0xfe => track.timebase = args[0].max(1) as u16,
         0xff => track.finished = true,
         _ => {}
@@ -1180,7 +2054,9 @@ fn parse_time_param(sequence: &[u8], track: &mut Track, mode: u8) -> Result<(), 
     match target {
         0 => track.volume = value.max(0.0),
         1 => track.pitch = value,
+        2 => track.fxmix = value.max(0.0),
         3 => track.pan = value,
+        6..=11 => track.set_oscillator_parameter(target, value),
         _ => {}
     }
     Ok(())
@@ -1278,40 +2154,85 @@ fn condition_matches(value: u16, condition: u8) -> bool {
     }
 }
 
-fn mix_voices(output: &mut Vec<f32>, voices: &mut Vec<Voice>, frames: usize, max_frames: usize) {
+fn mix_voices(
+    output: &mut Vec<f32>,
+    reverb_send: &mut Vec<f32>,
+    voices: &mut Vec<Voice>,
+    tracks: &mut [Track],
+    frames: usize,
+    max_frames: usize,
+) {
     let frames = frames.min(max_frames.saturating_sub(output.len() / 2));
+    let mut track_modulations = vec![TrackModulation::default(); tracks.len()];
     for _ in 0..frames {
+        for (modulation, track) in track_modulations.iter_mut().zip(tracks.iter_mut()) {
+            *modulation = track.next_self_modulation();
+        }
         let mut left = 0.0f32;
         let mut right = 0.0f32;
+        let mut reverb_left = 0.0f32;
+        let mut reverb_right = 0.0f32;
         for voice in voices.iter_mut() {
             let index = voice.position as usize;
             if voice.wave.loop_range.is_none() && index >= voice.wave.samples.len() {
-                voice.releasing = true;
-                voice.release_samples = 0;
+                for oscillator in &mut voice.oscillators {
+                    oscillator.state = OscillatorState::Stopped;
+                }
                 continue;
             }
-            let attack = (voice.age as f32 / 240.0).min(1.0);
-            let release = if voice.releasing {
-                voice.release_start_gain
-                    * release_curve(
-                        voice.release.curve,
-                        voice.release_samples as f32 / voice.release_total_samples.max(1) as f32,
-                    )
-            } else {
-                attack
-            };
-            let sample = resample_voice(voice) * voice.volume * release;
-            left += sample * (1.0 - voice.pan).sqrt();
-            right += sample * voice.pan.sqrt();
-            voice.position += voice.step;
-            voice.age += 1;
-            if voice.releasing {
-                voice.release_samples = voice.release_samples.saturating_sub(1);
+            let mut osc_volume = 1.0f32;
+            let mut osc_pitch = 1.0f32;
+            let mut osc_pan = voice.instrument_pan;
+            let mut osc_fxmix = voice.instrument_fxmix;
+            let mut primary_stopped = false;
+            for (index, oscillator) in voice.oscillators.iter_mut().enumerate() {
+                let kind = oscillator.spec.kind;
+                let (value, stopped) = oscillator.next_value();
+                if index == 0 {
+                    primary_stopped = stopped;
+                }
+                match kind {
+                    0 => osc_volume *= value,
+                    1 => osc_pitch *= value,
+                    2 => osc_pan = value,
+                    3 => osc_fxmix = value,
+                    _ => {}
+                }
             }
+            if primary_stopped {
+                continue;
+            }
+            let (track_volume, track_pitch) =
+                effective_track_gain_and_pitch(tracks, &track_modulations, voice.owner_track);
+            let track = &tracks[voice.owner_track];
+            let modulation = track_modulations[voice.owner_track];
+            let pan = (track.pan * modulation.pan + osc_pan - 0.5).clamp(0.0, 1.0);
+            let fxmix = (track.fxmix * modulation.fxmix + osc_fxmix).clamp(0.0, 1.0);
+            let sample =
+                resample_voice(voice) * voice.base_volume * track_volume * osc_volume.max(0.0);
+            let left_gain = ((1.0 - pan) * std::f32::consts::FRAC_PI_2).sin();
+            let right_gain = (pan * std::f32::consts::FRAC_PI_2).sin();
+            left += sample * left_gain;
+            right += sample * right_gain;
+            let send_gain = (fxmix * std::f32::consts::FRAC_PI_2).sin();
+            reverb_left += sample * left_gain * send_gain;
+            reverb_right += sample * right_gain * send_gain;
+            let pitch = track_pitch as f64 * osc_pitch.max(0.0) as f64;
+            voice.position += voice.base_step * pitch;
         }
-        output.push(left.clamp(-1.0, 32767.0 / 32768.0));
-        output.push(right.clamp(-1.0, 32767.0 / 32768.0));
-        voices.retain(|voice| !voice.releasing || voice.release_samples > 0);
+        output.push(left);
+        output.push(right);
+        reverb_send.push(reverb_left);
+        reverb_send.push(reverb_right);
+        voices.retain(|voice| {
+            !matches!(
+                voice
+                    .oscillators
+                    .first()
+                    .map(|oscillator| &oscillator.state),
+                Some(OscillatorState::Stopped)
+            )
+        });
     }
     for voice in voices.iter_mut().filter(|voice| !voice.releasing) {
         if let Some(remaining) = &mut voice.ticks_remaining {
@@ -1327,34 +2248,87 @@ fn begin_release(voice: &mut Voice, direct: Option<u16>) {
     if voice.releasing {
         return;
     }
-    if let Some(direct) = direct {
-        voice.release = ReleaseSpec::direct(direct);
-    }
     voice.releasing = true;
     voice.ticks_remaining = None;
-    voice.release_total_samples = voice.release.frames();
-    voice.release_samples = voice.release_total_samples;
-    voice.release_start_gain = (voice.age as f32 / 240.0).min(1.0);
+    let direct = direct.or((voice.direct_release != 0).then_some(voice.direct_release));
+    for (index, oscillator) in voice.oscillators.iter_mut().enumerate() {
+        oscillator.begin_release(if index == 0 { direct } else { None });
+    }
 }
 
-fn release_curve(curve: u8, remaining: f32) -> f32 {
-    let remaining = remaining.clamp(0.0, 1.0);
-    match curve {
-        1 => remaining.sqrt(),
-        2 => remaining * remaining,
-        3 => {
-            const SAMPLE_CELL: [f32; 17] = [
-                1.0, 0.970489, 0.781274, 0.546281, 0.399792, 0.289315, 0.212104, 0.157476,
-                0.112613, 0.0817896, 0.0579852, 0.0436415, 0.0308237, 0.0237129, 0.0152593,
-                0.00915555, 0.0,
-            ];
-            let position = (1.0 - remaining) * 16.0;
-            let index = (position as usize).min(15);
-            let fraction = position - index as f32;
-            SAMPLE_CELL[index] + fraction * (SAMPLE_CELL[index + 1] - SAMPLE_CELL[index])
+fn effective_track_gain_and_pitch(
+    tracks: &[Track],
+    modulations: &[TrackModulation],
+    mut index: usize,
+) -> (f32, f32) {
+    let mut volume = 1.0f32;
+    let mut pitch = 1.0f32;
+    loop {
+        let track = &tracks[index];
+        let modulation = modulations[index];
+        volume *= track.volume.max(0.0).powi(2) * modulation.volume.max(0.0);
+        pitch *= 2.0f32.powf(track.pitch * 4.0) * modulation.pitch.max(0.0);
+        if !track.inherit_parent_mix {
+            break;
         }
-        _ => remaining,
+        let Some(parent) = track.parent else {
+            break;
+        };
+        index = parent;
     }
+    (volume, pitch)
+}
+
+fn envelope_curve(curve: u8, start: f32, target: f32, progress: f32) -> f32 {
+    const SQUARE: [f32; 17] = [
+        1.0,
+        0.968_246,
+        0.935414,
+        0.901388,
+        0.866025,
+        0.829156,
+        0.790569,
+        0.75,
+        std::f32::consts::FRAC_1_SQRT_2,
+        0.661438,
+        0.612372,
+        0.559017,
+        0.5,
+        0.433013,
+        0.353553,
+        0.25,
+        0.0,
+    ];
+    const SQUARE_ROOT: [f32; 17] = [
+        1.0, 0.878906, 0.765625, 0.660156, 0.5625, 0.472656, 0.390625, 0.316406, 0.25, 0.191406,
+        0.140625, 0.0976562, 0.0625, 0.0351562, 0.015625, 0.00390625, 0.0,
+    ];
+    const SAMPLE_CELL: [f32; 17] = [
+        1.0, 0.970489, 0.781274, 0.546281, 0.399792, 0.289315, 0.212104, 0.157476, 0.112613,
+        0.0817896, 0.0579852, 0.0436415, 0.0308237, 0.0237129, 0.0152593, 0.00915555, 0.0,
+    ];
+    let progress = progress.clamp(0.0, 1.0);
+    if curve == 0 {
+        return start + (target - start) * progress;
+    }
+    let table = match curve {
+        1 => &SQUARE,
+        2 => &SQUARE_ROOT,
+        3 => &SAMPLE_CELL,
+        _ => return start + (target - start) * progress,
+    };
+    if target < start {
+        target + (start - target) * sample_envelope_table(table, progress)
+    } else {
+        start + (target - start) * sample_envelope_table(table, 1.0 - progress)
+    }
+}
+
+fn sample_envelope_table(table: &[f32; 17], progress: f32) -> f32 {
+    let position = progress.clamp(0.0, 1.0) * 16.0;
+    let index = (position as usize).min(15);
+    let fraction = position - index as f32;
+    table[index] + fraction * (table[index + 1] - table[index])
 }
 
 fn resample_voice(voice: &mut Voice) -> f32 {
@@ -1491,21 +2465,70 @@ mod tests {
     }
 
     #[test]
-    fn jas_release_lengths_and_curves_are_preserved() {
+    fn child_local_tempo_uses_jaudio_parent_ratio() {
+        let root = Track::new(0);
+        let mut child = Track::new_child(1, 0, &root, 0);
+        child.tempo = 60;
+        child.local_tempo = true;
+        let mut tracks = vec![root, child];
+        let advanced = [true, false];
+        assert!(!track_tick_due(&mut tracks, 1, &advanced));
+        assert!(track_tick_due(&mut tracks, 1, &advanced));
+    }
+
+    #[test]
+    fn jas_envelope_lengths_rates_and_curves_are_preserved() {
         assert_eq!(ReleaseSpec::direct(0).duration_units, 0x10);
         assert_eq!(ReleaseSpec::direct(1000).frames(), 53_333);
         assert_eq!(ReleaseSpec::direct(0xc258).curve, 3);
 
         let table = [
-            0x00, 0x03, 0x02, 0x58, 0x00, 0x00, // sample-cell fade for 600 units
-            0x00, 0x0f, 0x00, 0x00, 0x00, 0x00, // end
+            0x00, 0x00, 0x02, 0x58, 0x7f, 0xff, // linear rise for 600 units
+            0x00, 0x0e, 0x00, 0x00, 0x00, 0x00, // sustain
         ];
-        let release = parse_release_table(&table, 0).unwrap();
-        assert_eq!(release.duration_units, 600);
-        assert_eq!(release.frames(), OUTPUT_RATE as usize);
-        assert_eq!(release.curve, 3);
-        assert_eq!(release_curve(0, 0.5), 0.5);
-        assert!(release_curve(3, 0.5) < 0.12);
+        let commands = parse_envelope_table(&table, 0).unwrap();
+        let mut oscillator = VoiceOscillator::new(OscillatorSpec {
+            kind: 0,
+            rate: 0.5,
+            attack: Some(Arc::new(commands)),
+            release: None,
+            width: 1.0,
+            vertex: 0.0,
+        });
+        let mut midpoint = 0.0;
+        for _ in 0..=OUTPUT_RATE as usize {
+            midpoint = oscillator.next_value().0;
+        }
+        assert!((midpoint - 0.5).abs() < 0.001);
+        assert_eq!(envelope_curve(0, 1.0, 0.0, 0.5), 0.5);
+        assert!(envelope_curve(3, 1.0, 0.0, 0.5) < 0.12);
+    }
+
+    #[test]
+    fn child_track_gain_matches_jaudio_squared_parent_chain() {
+        let mut root = Track::new(0);
+        root.volume = 0.75;
+        let mut child = Track::new_child(1, 0, &root, 0);
+        child.volume = 0.5;
+        let tracks = vec![root, child];
+        let modulations = vec![TrackModulation::default(); tracks.len()];
+        let (gain, _) = effective_track_gain_and_pitch(&tracks, &modulations, 1);
+        assert!((gain - 0.140625).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn track_vibrato_uses_jaudio_self_oscillator_parameters() {
+        let mut track = Track::new(0);
+        track.set_oscillator_parameter(9, 0.1);
+        let mut minimum = f32::MAX;
+        let mut maximum = f32::MIN;
+        for _ in 0..5_200 {
+            let pitch = track.next_self_modulation().pitch;
+            minimum = minimum.min(pitch);
+            maximum = maximum.max(pitch);
+        }
+        assert!(minimum < 0.951);
+        assert!(maximum > 1.099);
     }
 
     #[test]

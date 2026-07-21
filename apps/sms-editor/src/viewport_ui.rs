@@ -249,6 +249,7 @@ impl SmsEditorApp {
         if let Some(payload) = response.dnd_release_payload::<ObjectPaletteDragPayload>() {
             if let Some(pointer) = ui.input(|input| input.pointer.latest_pos()) {
                 let world = self.screen_to_world_floor(rect, pointer);
+                self.clear_audio_helper_selection();
                 self.spawn_object_at(payload.factory_name.clone(), world);
             }
             return;
@@ -256,6 +257,7 @@ impl SmsEditorApp {
         if let Some(payload) = response.dnd_release_payload::<ModelAssetDragPayload>() {
             if let Some(pointer) = ui.input(|input| input.pointer.latest_pos()) {
                 let world = self.screen_to_world_floor(rect, pointer);
+                self.clear_audio_helper_selection();
                 self.spawn_model_instance_at(payload.asset_id, world);
             }
             return;
@@ -323,37 +325,46 @@ impl SmsEditorApp {
 
         if response.clicked() && self.hovered_gizmo_axis.is_none() && !gizmo_using_pointer {
             if let Some(pos) = response.interact_pointer_pos() {
-                if self.handle_route_viewport_click(rect, response, modifiers) {
+                let model_instance_id = self.model_instance_at_screen_position(rect, pos);
+                let object_id = model_instance_id
+                    .is_none()
+                    .then(|| self.object_at_screen_position(rect, pos))
+                    .flatten();
+                let leaving_helper_for_world_selection = self.selected_audio_helper_id.is_some()
+                    && (model_instance_id.is_some() || object_id.is_some());
+                if !leaving_helper_for_world_selection
+                    && self.handle_route_viewport_click(rect, response, modifiers)
+                {
                     return;
                 }
                 if self.tool == EditorTool::Place {
                     if let Some(asset_id) = self.placing_model_asset {
                         let world = self.screen_to_world_floor(rect, pos);
+                        self.clear_audio_helper_selection();
                         self.spawn_model_instance_at(asset_id, world);
                         return;
                     }
                     if let Some(factory) = self.palette_factory.clone() {
                         let world = self.screen_to_world_floor(rect, pos);
+                        self.clear_audio_helper_selection();
                         self.spawn_object_at(factory, world);
                         return;
                     }
                 }
 
-                if let Some(instance_id) = self.model_instance_at_screen_position(rect, pos) {
-                    if self.asset_dirty && !self.save_selected_model_asset() {
-                        return;
-                    }
+                if self.asset_dirty && !self.save_selected_model_asset() {
+                    return;
+                }
+                self.clear_audio_helper_selection();
+                if let Some(instance_id) = model_instance_id {
                     self.selected_model_instance_id = Some(instance_id);
                     self.selected_object_id = None;
                     self.selected_model_asset = None;
                     self.selected_model_document = None;
                     self.saved_model_document = None;
                 } else {
-                    if self.asset_dirty && !self.save_selected_model_asset() {
-                        return;
-                    }
                     self.selected_model_instance_id = None;
-                    self.selected_object_id = self.object_at_screen_position(rect, pos);
+                    self.selected_object_id = object_id;
                     if self.selected_object_id.is_some() {
                         self.selected_model_asset = None;
                         self.selected_model_document = None;
