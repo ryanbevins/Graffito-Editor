@@ -53,6 +53,7 @@ fn editor_layout_defaults_to_the_unreal_style_workspace() {
     assert!(!app.show_console);
     assert!(!app.show_stats);
     assert!(app.show_effects);
+    assert_eq!(app.level_transform_progress, FULL_DELFINO_PROGRESSION);
 }
 
 #[test]

@@ -506,6 +506,9 @@ impl SmsEditorApp {
         {
             ui.separator();
             ui.label("Level transformation");
+            if self.stage_id.eq_ignore_ascii_case("dolpic0") {
+                ui.small("Loaded state: full Delfino progression");
+            }
             if let Some(duration_frames) = self
                 .model_preview
                 .as_ref()

@@ -60,6 +60,7 @@ use skybox_library::*;
 use stage_creation::{insert_authored_scene_archive, NewStageDraft};
 
 const VIEWPORT_NEAR_CLIP: f32 = 8.0;
+const FULL_DELFINO_PROGRESSION: f32 = 1.0;
 
 pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -1062,7 +1063,7 @@ impl Default for SmsEditorApp {
             embedded_dolphin: None,
             animation_started_at: Instant::now(),
             last_skeletal_animation_tick: u64::MAX,
-            level_transform_progress: 0.0,
+            level_transform_progress: FULL_DELFINO_PROGRESSION,
             level_transform_playing: false,
             level_transform_started_at: Instant::now(),
             level_transform_playback_origin: 0.0,
@@ -1705,6 +1706,10 @@ impl SmsEditorApp {
                                 outcome.direct_boot.movie_hook_address,
                                 outcome.direct_boot.stub_address,
                             ));
+                            self.log.push(
+                                "Direct boot progression: 120 Shines, 240 blue coins, 99 lives, all persistent Delfino story/nozzle flags set."
+                                    .to_string(),
+                            );
                             if outcome.direct_boot.matching_contexts > 1 {
                                 self.log.push(format!(
                                     "The archive has {} runtime contexts in stageArc.bin; direct boot uses the first table entry (area {}, scenario {}).",
@@ -1901,7 +1906,7 @@ impl SmsEditorApp {
         self.reconcile_loaded_authored_catalog_resources();
         self.animation_started_at = Instant::now();
         self.last_skeletal_animation_tick = u64::MAX;
-        self.level_transform_progress = 0.0;
+        self.level_transform_progress = FULL_DELFINO_PROGRESSION;
         self.level_transform_playing = false;
         self.level_transform_playback_origin = 0.0;
         self.last_level_transform_progress_bits = u32::MAX;
@@ -1933,10 +1938,27 @@ impl SmsEditorApp {
             .iter()
             .map(|cube| cube.model_slot)
             .collect::<BTreeSet<_>>();
+        let instanced_model_paths = document
+            .objects
+            .iter()
+            .flat_map(|object| object.asset_hints.iter())
+            .filter(|hint| {
+                matches!(
+                    hint.role,
+                    AssetRole::PreviewModel | AssetRole::InferredPreviewModel
+                )
+            })
+            .map(|hint| normalized_preview_asset_path(&hint.path))
+            .collect::<BTreeSet<_>>();
         let models: Vec<_> = document
             .assets
             .iter()
             .filter(|asset| asset.kind == StageAssetKind::Model)
+            .filter(|asset| {
+                !instanced_model_paths.contains(&normalized_preview_asset_path(
+                    &asset.path.to_string_lossy(),
+                ))
+            })
             .filter(|asset| map_static_model_is_active(document, &asset.path.to_string_lossy()))
             .filter(|asset| {
                 mirror_surface_model_is_active(
@@ -2052,7 +2074,8 @@ impl SmsEditorApp {
             let loader_flags = map_static_model_loader_flags(document, &asset_path)
                 .unwrap_or_else(|| model_loader_flags_for_path(&asset_path));
             let level_targets = level_transform_targets(document, &asset_path, &file);
-            let initial_overrides = level_transform_overrides(&level_targets, 0.0);
+            let initial_overrides =
+                level_transform_overrides(&level_targets, FULL_DELFINO_PROGRESSION);
             let preview_result = if initial_overrides.is_empty() {
                 file.geometry_preview_with_loader_flags(loader_flags)
             } else {
@@ -2063,7 +2086,7 @@ impl SmsEditorApp {
                     apply_level_transform_visibility(
                         &file,
                         &level_targets,
-                        0.0,
+                        FULL_DELFINO_PROGRESSION,
                         &mut preview.triangles,
                     );
                     apply_model_material_table(document, &asset_path, loader_flags, &mut preview);

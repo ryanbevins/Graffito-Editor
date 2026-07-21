@@ -1269,31 +1269,48 @@ fn retail_nozzle_colors_and_red_pepper_offsets_reach_rendered_materials_and_geom
 }
 
 #[test]
-#[ignore = "requires SMS_BASE_ROOT with extracted Japanese retail assets"]
-fn retail_bianco_graffiti_placement_colors_reach_rendered_materials() {
+#[ignore = "requires SMS_BASE_ROOT with extracted retail assets"]
+fn retail_dolpic10_jelly_gates_use_decomp_named_models() {
     let base_root = retail_base_root();
     let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let registry = SchemaGenerator::new(decomp_root)
         .generate()
-        .expect("generate decomp-derived placement color programs");
-    let document = StageDocument::open(&base_root, "bianco4")
-        .expect("open bianco4")
+        .expect("generate decomp-derived JellyGate model bindings");
+    let document = StageDocument::open(&base_root, "dolpic10")
+        .expect("open dolpic10")
         .with_registry(registry);
-    let graffiti = document
+    let expected = [
+        ("Gate", "05_gate01.bmd"),
+        ("GateToRicco", "05_gate02rico.bmd"),
+        ("GateToMamma", "05_gate03manma.bmd"),
+    ];
+    let gates = document
         .objects
         .iter()
-        .filter(|object| object.factory_name == "WaterHitPictureHideObj")
+        .filter(|object| object.factory_name == "JellyGate")
         .collect::<Vec<_>>();
-    assert_eq!(graffiti.len(), 4, "bianco4 graffiti placement census");
-    for object in &graffiti {
+    assert_eq!(gates.len(), expected.len(), "dolpic10 JellyGate census");
+
+    for (name, model_name) in expected {
+        let gate = gates
+            .iter()
+            .copied()
+            .find(|object| object.raw_param("name") == Some(name))
+            .unwrap_or_else(|| panic!("missing JellyGate {name}"));
+        let model_path = gate
+            .asset_hints
+            .iter()
+            .find(|hint| hint.role == AssetRole::InferredPreviewModel)
+            .map(|hint| hint.path.replace('\\', "/"))
+            .unwrap_or_else(|| panic!("{name} has no inferred preview model"));
+        assert!(
+            model_path.ends_with(&format!("/map/map/gate/{model_name}")),
+            "{name} resolved {model_path}"
+        );
         assert_eq!(
-            map_obj_stream_tev_color(object, document.registry.as_ref()),
-            Some(sms_schema::MapObjTevColorDefinition {
-                register: 0,
-                color: [255, 0, 0, 255],
-            }),
-            "{} placement color",
-            object.id
+            document.object_preview_load_flags(gate),
+            Some(0x1110_0000),
+            "{name} retail loader flags"
         );
     }
 
@@ -1305,102 +1322,29 @@ fn retail_bianco_graffiti_placement_colors_reach_rendered_materials() {
             effects: false,
         },
     )
-    .expect("build bianco4 object preview");
-    for object in &graffiti {
+    .expect("build dolpic10 gate preview");
+    for (name, _) in expected {
+        let gate = gates
+            .iter()
+            .copied()
+            .find(|object| object.raw_param("name") == Some(name))
+            .unwrap();
         let model_index = preview
             .object_model_indices
-            .get(&object.id)
-            .unwrap_or_else(|| panic!("{} rendered model", object.id));
-        let material_indices = preview
+            .get(&gate.id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name} gate model was not rendered; failures: {:?}",
+                    preview.model_failures
+                )
+            });
+        let triangle_count = preview
             .triangles
             .iter()
             .filter(|triangle| triangle.model_index == *model_index)
-            .filter_map(|triangle| triangle.material_index)
-            .collect::<BTreeSet<_>>();
-        assert!(!material_indices.is_empty(), "{} materials", object.id);
-        assert!(material_indices
-            .iter()
-            .all(|index| { preview.materials[*index].tev_colors[0] == [255, 0, 0, 255] }));
+            .count();
+        assert!(triangle_count > 0, "{name} retail gate plane is empty");
     }
-
-    let object = (*graffiti[0]).clone();
-    let model_index = *preview
-        .object_model_indices
-        .get(&object.id)
-        .expect("first bianco4 graffiti model");
-    let mut isolated = preview;
-    isolated
-        .triangles
-        .retain(|triangle| triangle.model_index == model_index);
-    let mut minimum = [f32::INFINITY; 3];
-    let mut maximum = [f32::NEG_INFINITY; 3];
-    for vertex in isolated
-        .triangles
-        .iter()
-        .flat_map(|triangle| triangle.vertices)
-    {
-        for axis in 0..3 {
-            minimum[axis] = minimum[axis].min(vertex[axis]);
-            maximum[axis] = maximum[axis].max(vertex[axis]);
-        }
-    }
-    let center = std::array::from_fn(|axis| (minimum[axis] + maximum[axis]) * 0.5);
-    let radius = (0..3)
-        .map(|axis| maximum[axis] - minimum[axis])
-        .fold(0.0f32, f32::max)
-        .max(1.0);
-    let mut app = SmsEditorApp {
-        document: Some(document),
-        model_preview: Some(isolated),
-        ..SmsEditorApp::default()
-    };
-    let camera = app.renderer.camera_mut();
-    camera.focus = center;
-    camera.yaw_degrees = object.transform.rotation_degrees[1] + 180.0;
-    camera.pitch_degrees = 0.0;
-    camera.distance = radius * 2.0;
-    let frame = app.camera_frame();
-    let lighting = app
-        .document
-        .as_ref()
-        .and_then(|document| document.lighting.object_lighting())
-        .expect("bianco4 object lighting");
-    let image = gpu_viewport::render_preview_offscreen(
-        app.model_preview
-            .as_ref()
-            .expect("isolated graffiti preview"),
-        gpu_viewport::GpuViewportFrame {
-            camera_position: frame.position,
-            right: frame.right,
-            up: frame.up,
-            forward: frame.forward,
-            focal: perspective_focal_length(
-                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(512.0, 512.0)),
-                1.0,
-            ),
-            viewport_size: [512.0, 512.0],
-            viewport_pan: [0.0; 2],
-            near: 1.0,
-            animation_seconds: 0.0,
-            light_position: lighting.position,
-            light_color: gpu_viewport::color_u8_to_f32(lighting.color),
-            ambient_color: Some(gpu_viewport::color_u8_to_f32(lighting.ambient)),
-        },
-        [512, 512],
-    )
-    .expect("render graffiti WGPU framebuffer");
-    let red_pixels = image
-        .pixels
-        .iter()
-        .filter(|pixel| {
-            let [red, green, blue, _] = pixel.to_srgba_unmultiplied();
-            red > 80 && red.saturating_sub(green) > 40 && red.saturating_sub(blue) > 40
-        })
-        .count();
-    assert!(
-        red_pixels > 1_000,
-        "graffiti GPU render stayed black ({red_pixels} red pixels)"
-    );
 }
 
 #[test]

@@ -71,6 +71,7 @@ pub enum SchemaExtractor {
     Params,
     AssetHints,
     MapStaticModels,
+    NamedObjectModels,
     MapObjResources,
     MapObjBallTransforms,
     MapObjModelOverrides,
@@ -98,6 +99,7 @@ impl std::fmt::Display for SchemaExtractor {
             Self::Params => "parameter metadata",
             Self::AssetHints => "asset hint",
             Self::MapStaticModels => "map-static model",
+            Self::NamedObjectModels => "name-selected object model",
             Self::MapObjResources => "map-object resource",
             Self::MapObjBallTransforms => "map-object ball transform",
             Self::MapObjModelOverrides => "map-object model override",
@@ -127,6 +129,9 @@ pub struct ObjectRegistry {
     /// Decomp-derived primary model resources for actor factory names.
     #[serde(default)]
     pub object_resources: Vec<ObjectResourceBinding>,
+    /// Runtime models selected by the exact JDrama object name.
+    #[serde(default)]
+    pub named_object_models: Vec<NamedObjectModelDefinition>,
     #[serde(default)]
     pub map_static_models: Vec<MapStaticModelDefinition>,
     /// Models selected by the exact resource identity stored in `TMapObjData::unk0`.
@@ -240,6 +245,16 @@ impl ObjectRegistry {
     pub fn primary_object_resource(&self, factory_name: &str) -> Option<&ObjectResourceBinding> {
         self.object_resources_for(factory_name)
             .find(|definition| definition.role == ObjectResourceRole::Primary)
+    }
+
+    pub fn find_named_object_model(
+        &self,
+        factory_name: &str,
+        object_name: &str,
+    ) -> Option<&NamedObjectModelDefinition> {
+        self.named_object_models.iter().find(|definition| {
+            definition.factory_name == factory_name && definition.object_name == object_name
+        })
     }
 
     /// Looks up a map-object resource using the case-sensitive identity consumed by retail.
@@ -402,6 +417,15 @@ pub struct ObjectResourceBinding {
     pub role: ObjectResourceRole,
     pub model_name: String,
     pub resource_base: Option<String>,
+    pub load_flags: u32,
+    pub source_file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamedObjectModelDefinition {
+    pub factory_name: String,
+    pub object_name: String,
+    pub model_path: String,
     pub load_flags: u32,
     pub source_file: String,
 }
@@ -834,6 +858,7 @@ impl SchemaGenerator {
         let sources = SourceInventory::build(&self.repo_root)?;
         let mut registry = ObjectRegistry::default();
         self.scan_mar_name_ref_gen(&sources, &mut registry)?;
+        self.scan_named_object_models(&sources, &mut registry)?;
         self.scan_enemy_model_data(&sources, &mut registry)?;
         self.scan_map_obj_manager(&sources, &mut registry)?;
         self.scan_map_obj_resources(&sources, &mut registry)?;
@@ -1204,6 +1229,33 @@ impl SchemaGenerator {
             &inheritance,
         );
         Ok(())
+    }
+
+    fn scan_named_object_models(
+        &self,
+        sources: &SourceInventory,
+        registry: &mut ObjectRegistry,
+    ) -> Result<()> {
+        let source_path = "src/MoveBG/ModelGate.cpp";
+        let source = sources.required(source_path)?.text();
+        let factory_name = registry
+            .objects
+            .iter()
+            .find(|object| object.class_name == "TModelGate")
+            .map(|object| object.factory_name.as_str())
+            .ok_or_else(|| SchemaError::ExtractionDrift {
+                extractor: SchemaExtractor::NamedObjectModels,
+                source_path: self.repo_root.join(source_path),
+                expected: "registered TModelGate factory",
+            })?;
+        registry.named_object_models =
+            extract_model_gate_named_models(source, factory_name, source_path);
+        ensure_extracted(
+            SchemaExtractor::NamedObjectModels,
+            self.repo_root.join(source_path),
+            registry.named_object_models.len(),
+            "TModelGate name-to-model bindings",
+        )
     }
 
     fn scan_map_obj_manager(
@@ -3335,6 +3387,44 @@ fn extract_cpp_string_arrays(text: &str) -> BTreeMap<String, Vec<String>> {
     arrays
 }
 
+fn extract_model_gate_named_models(
+    text: &str,
+    factory_name: &str,
+    source_file: &str,
+) -> Vec<NamedObjectModelDefinition> {
+    let arrays = extract_cpp_string_arrays(text);
+    let Some(object_names) = arrays.get("gateNames") else {
+        return Vec::new();
+    };
+    let Some(model_names) = arrays.get("gateMActorNames") else {
+        return Vec::new();
+    };
+    let model_format = Regex::new(r#"snprintf\s*\([^;]*\"([^\"]*%s[^\"]*)\"\s*,"#)
+        .expect("valid TModelGate model format regex")
+        .captures(text)
+        .map(|captures| captures[1].to_string());
+    let load_flags =
+        Regex::new(r"SMS_MakeMActor\s*\([^;]*,\s*0\s*,\s*(0[xX][0-9A-Fa-f]+|[0-9]+)\s*\)")
+            .expect("valid TModelGate loader flags regex")
+            .captures(text)
+            .and_then(|captures| parse_cpp_u32(&captures[1]));
+    let (Some(model_format), Some(load_flags)) = (model_format, load_flags) else {
+        return Vec::new();
+    };
+
+    object_names
+        .iter()
+        .zip(model_names)
+        .map(|(object_name, model_name)| NamedObjectModelDefinition {
+            factory_name: factory_name.to_string(),
+            object_name: object_name.clone(),
+            model_path: model_format.replace("%s", model_name),
+            load_flags,
+            source_file: source_file.to_string(),
+        })
+        .collect()
+}
+
 fn extract_enemy_named_models(
     text: &str,
     source_file: &str,
@@ -3840,6 +3930,24 @@ fn dedup_registry(registry: &mut ObjectRegistry) -> Result<()> {
             && a.resource_base == b.resource_base
             && a.load_flags == b.load_flags
     });
+    registry.named_object_models.sort_by(|a, b| {
+        a.factory_name
+            .cmp(&b.factory_name)
+            .then_with(|| a.object_name.cmp(&b.object_name))
+            .then_with(|| a.model_path.cmp(&b.model_path))
+    });
+    for duplicate in registry.named_object_models.windows(2) {
+        if duplicate[0].factory_name == duplicate[1].factory_name
+            && duplicate[0].object_name == duplicate[1].object_name
+        {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "duplicate name-selected model {} for {}",
+                    duplicate[0].object_name, duplicate[0].factory_name
+                ),
+            });
+        }
+    }
 
     // Keep the order of the retail lookup table while enforcing its exact key space.
     let mut map_obj_resource_names = BTreeSet::new();
@@ -5613,6 +5721,11 @@ mod tests {
         assert_eq!(first.npc_material_colors_for("NPCExampleA").count(), 1);
         assert!(first.is_map_obj_factory("MapObjBase"));
         assert!(!first.is_map_obj_factory("MapObjFlag"));
+        let gate = first
+            .find_named_object_model("JellyGate", "GateToRicco")
+            .expect("decomp-derived name-selected gate model");
+        assert_eq!(gate.model_path, "/scene/map/map/gate/05_gate02rico.bmd");
+        assert_eq!(gate.load_flags, 0x1110_0000);
         assert_eq!(
             first
                 .collision_surfaces
@@ -6195,6 +6308,24 @@ mod tests {
                 if (strcmp(name, "SharedFixture") == 0) return new TMapObjBase;
                 if (strcmp(name, "NozzleBox") == 0) return new TNozzleBox("box");
                 if (strcmp(name, "FixturePaint") == 0) return new TFixturePaint("paint");
+                if (strcmp(name, "JellyGate") == 0) return new TModelGate("gate");
+            "#,
+        );
+        fixture.write(
+            "src/MoveBG/ModelGate.cpp",
+            r#"
+                static const char* gateMActorNames[] = {
+                    "05_gate01", "05_gate02rico", "05_gate03manma",
+                };
+                void TModelGate::loadAfter() {
+                    static const char* gateNames[] = {
+                        "Gate", "GateToRicco", "GateToMamma", nullptr,
+                    };
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "/scene/map/map/gate/%s.bmd",
+                             gateMActorNames[unk71]);
+                    unk78 = SMS_MakeMActor("/scene/map/map/gate", buf, 0, 0x11100000);
+                }
             "#,
         );
         fixture.write(

@@ -197,6 +197,7 @@ impl StageDocument {
                 parameter_read_only_reason(Some(placement), &descriptor.key, &descriptor.raw_value);
         }
         enrich_monte_parameter_info(&mut descriptors, object, self.registry.as_ref());
+        enrich_named_object_model_parameter_info(&mut descriptors, object, self.registry.as_ref());
         Ok(descriptors)
     }
 }
@@ -819,6 +820,76 @@ fn enrich_monte_parameter_info(
     }
 }
 
+fn enrich_named_object_model_parameter_info(
+    parameters: &mut [EditableSceneParameter],
+    object: &SceneObject,
+    registry: Option<&ObjectRegistry>,
+) {
+    let Some(registry) = registry else {
+        return;
+    };
+    let mut variants = registry
+        .named_object_models
+        .iter()
+        .filter(|definition| definition.factory_name == object.factory_name)
+        .collect::<Vec<_>>();
+    if variants.is_empty() {
+        return;
+    }
+    variants.sort_by(|left, right| {
+        left.model_path
+            .cmp(&right.model_path)
+            .then_with(|| left.object_name.cmp(&right.object_name))
+    });
+
+    for parameter in parameters {
+        parameter.info = match parameter.key.as_str() {
+            OBJECT_PARAMETER_NAME => Some(ObjectParameterInfo {
+                display_name: Some("Gate variant".to_string()),
+                bit_flags: Vec::new(),
+                description: "TModelGate::loadAfter compares this exact JDrama name against the decomp gateNames table. The matching table index selects the gate model, BTK/BRK/BPK animation family, warp destination, and persistent visibility flag; an unknown name falls back to the first gate variant.".to_string(),
+                choices: variants
+                    .iter()
+                    .map(|definition| ObjectParameterChoice {
+                        raw_value: definition.object_name.clone(),
+                        label: named_object_variant_label(
+                            &definition.object_name,
+                            &definition.model_path,
+                        ),
+                        description: format!(
+                            "Exact decomp selector {}. Loads {} with model-loader flags 0x{:08X}.",
+                            definition.object_name,
+                            definition.model_path,
+                            definition.load_flags
+                        ),
+                    })
+                    .collect(),
+                indexed_choice: None,
+                integer_range: None,
+            }),
+            OBJECT_PARAMETER_CHARACTER_NAME => Some(ObjectParameterInfo {
+                display_name: Some("Character registration".to_string()),
+                bit_flags: Vec::new(),
+                description: "JDrama::TActor::load resolves this serialized TCharacter registration. TModelGate has no additional placement-stream parameters: its gate variant comes from the exact runtime name above, while interaction radii, blur settings, animation timing, and opening behavior are constants initialized by TModelGate::loadAfter.".to_string(),
+                choices: Vec::new(),
+                indexed_choice: None,
+                integer_range: None,
+            }),
+            _ => parameter.info.take(),
+        };
+    }
+}
+
+fn named_object_variant_label(object_name: &str, model_path: &str) -> String {
+    let model_name = model_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(model_path)
+        .strip_suffix(".bmd")
+        .unwrap_or(model_path);
+    format!("{object_name} ({model_name})")
+}
+
 fn install_npc_palette_choice(info: &mut ObjectParameterInfo, count: usize) {
     let Ok(last_index) = i64::try_from(count.saturating_sub(1)) else {
         return;
@@ -1231,8 +1302,9 @@ fn display_record_path(path: &[usize]) -> String {
 mod editability_tests {
     use super::{
         apply_dirty_object_parameter_edits, editable_object_parameters,
-        enrich_monte_parameter_info, monte_behavior_preset_name, parameter_read_only_reason,
-        seed_scene_object_parameters, validate_object_parameter_links,
+        enrich_monte_parameter_info, enrich_named_object_model_parameter_info,
+        monte_behavior_preset_name, parameter_read_only_reason, seed_scene_object_parameters,
+        validate_object_parameter_links,
     };
     use crate::{
         AuthoredPlacement, AuthoredPlacementDependency, PlacementAddress, PlacementBinding,
@@ -1286,6 +1358,72 @@ mod editability_tests {
                 }],
             },
         }
+    }
+
+    #[test]
+    fn jelly_gate_parameters_follow_the_decomp_name_selected_model_table() {
+        let mut parameters = editable_object_parameters(&JDramaRecord {
+            type_name: "JellyGate".to_string(),
+            name: "GateToRicco".to_string(),
+            payload: JDramaRecordPayload::Actor {
+                transform: sms_formats::JDramaTransform {
+                    translation: [0.0; 3],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: "GateToRicco character".to_string(),
+                light_map: sms_formats::JDramaLightMap::default(),
+                fields: Vec::new(),
+            },
+        })
+        .unwrap();
+        let registry = ObjectRegistry {
+            named_object_models: vec![
+                sms_schema::NamedObjectModelDefinition {
+                    factory_name: "JellyGate".to_string(),
+                    object_name: "GateToRicco".to_string(),
+                    model_path: "/scene/map/map/gate/05_gate02rico.bmd".to_string(),
+                    load_flags: 0x1110_0000,
+                    source_file: "src/MoveBG/ModelGate.cpp".to_string(),
+                },
+                sms_schema::NamedObjectModelDefinition {
+                    factory_name: "JellyGate".to_string(),
+                    object_name: "Gate".to_string(),
+                    model_path: "/scene/map/map/gate/05_gate01.bmd".to_string(),
+                    load_flags: 0x1110_0000,
+                    source_file: "src/MoveBG/ModelGate.cpp".to_string(),
+                },
+            ],
+            ..ObjectRegistry::default()
+        };
+        let object = SceneObject::new("gate", "JellyGate");
+
+        enrich_named_object_model_parameter_info(&mut parameters, &object, Some(&registry));
+
+        assert_eq!(parameters.len(), 2, "TModelGate has no custom stream tail");
+        let name = &parameters[0];
+        assert_eq!(name.key, "name");
+        assert_eq!(
+            name.info.as_ref().unwrap().display_name.as_deref(),
+            Some("Gate variant")
+        );
+        assert_eq!(
+            name.info
+                .as_ref()
+                .unwrap()
+                .choices
+                .iter()
+                .map(|choice| choice.raw_value.as_str())
+                .collect::<Vec<_>>(),
+            ["Gate", "GateToRicco"]
+        );
+        assert!(name.info.as_ref().unwrap().choices[1]
+            .description
+            .contains("05_gate02rico.bmd"));
+        assert_eq!(
+            parameters[1].info.as_ref().unwrap().display_name.as_deref(),
+            Some("Character registration")
+        );
     }
 
     #[test]

@@ -1093,6 +1093,12 @@ impl StageDocument {
     /// `TMapStaticObj`; a model-path heuristic cannot distinguish those cases.
     pub fn object_preview_load_flags(&self, object: &SceneObject) -> Option<u32> {
         let registry = self.registry.as_ref()?;
+        if let Some(named_model) = object
+            .raw_param("name")
+            .and_then(|name| registry.find_named_object_model(&object.factory_name, name))
+        {
+            return Some(named_model.load_flags);
+        }
         let resource_name = object.raw_param("actor_tail_string")?;
         if registry.is_map_obj_factory(&object.factory_name) {
             let resource = registry.find_map_obj_resource(resource_name)?;
@@ -2246,6 +2252,11 @@ fn apply_registry_preview_hints(
             continue;
         }
 
+        let named_object_binding = object.raw_param("name").and_then(|name| {
+            registry
+                .find_named_object_model(&object.factory_name, name)
+                .map(|model| (model.model_path.clone(), model.source_file.clone()))
+        });
         let map_static_binding = if is_map_static {
             resource_name.as_deref().and_then(|resource_name| {
                 registry
@@ -2262,7 +2273,8 @@ fn apply_registry_preview_hints(
         } else {
             None
         };
-        let binding = map_static_binding
+        let binding = named_object_binding
+            .or(map_static_binding)
             .or_else(|| {
                 registry
                     .find_object(&object.factory_name)
@@ -4502,6 +4514,41 @@ mod tests {
         );
         pollution.set_raw_param("actor_tail_string", "mareseapollutions34567");
         assert_eq!(document.object_preview_load_flags(&pollution), None);
+    }
+
+    #[test]
+    fn named_object_models_follow_exact_runtime_name_selection() {
+        let registry = ObjectRegistry {
+            named_object_models: vec![sms_schema::NamedObjectModelDefinition {
+                factory_name: "JellyGate".to_string(),
+                object_name: "GateToRicco".to_string(),
+                model_path: "/scene/map/map/gate/05_gate02rico.bmd".to_string(),
+                load_flags: 0x1110_0000,
+                source_file: "src/MoveBG/ModelGate.cpp".to_string(),
+            }],
+            ..ObjectRegistry::default()
+        };
+        let assets = vec![StageAsset {
+            path: PathBuf::from("dolpic10.szs!/map/map/gate/05_gate02rico.bmd"),
+            kind: StageAssetKind::Model,
+        }];
+        let mut gate = SceneObject::new("gate", "JellyGate");
+        gate.insert_source_raw_param("name", "GateToRicco");
+
+        assert!(
+            apply_registry_preview_hints(std::slice::from_mut(&mut gate), &assets, &registry)
+                .is_empty()
+        );
+        assert_eq!(
+            gate.asset_hints,
+            [AssetRef {
+                path: "dolpic10.szs!/map/map/gate/05_gate02rico.bmd".to_string(),
+                role: AssetRole::InferredPreviewModel,
+            }]
+        );
+        let mut document = empty_document("dolpic10");
+        document.registry = Some(registry);
+        assert_eq!(document.object_preview_load_flags(&gate), Some(0x1110_0000));
     }
 
     #[test]
