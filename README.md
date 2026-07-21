@@ -267,6 +267,14 @@ project-owned `files/data/stageArc.bin` containing its new runtime mapping.
 The managed build root defaults to a `.smsbuild` sibling of the `.sms`
 descriptor and is protected by a project-identity marker.
 
+The inspector's **Stage Music** option is shared by retail and custom stages.
+Its choices and required wave-scene IDs are derived from the neighboring SMS
+decompilation. **Build Game** writes every saved per-stage choice into the
+managed `run-root/sys/main.dol`, keyed by the runtime area/scenario mappings in
+the packaged `stageArc.bin`. Therefore the music works when the runnable folder
+is booted normally in Dolphin; it is not limited to editor direct boot. The
+extracted base executable remains untouched.
+
 **Launch in Editor** and **Launch in Dolphin** perform that same freshness
 pass, resolve the open archive's runtime area and scenario from the staged
 game's own

@@ -239,6 +239,14 @@ impl SmsEditorApp {
                 }
             }
 
+            if ui
+                .selectable_label(self.show_audio_helpers, "Audio Helpers")
+                .on_hover_text("Show data-driven positional sound ranges, rail emitters, and sound cube volumes")
+                .clicked()
+            {
+                self.show_audio_helpers = !self.show_audio_helpers;
+            }
+
             ui.separator();
             let launch_enabled = self.document.is_some()
                 && self.current_project.is_some()
@@ -1050,7 +1058,7 @@ impl SmsEditorApp {
                 .desired_width(f32::INFINITY),
         );
 
-        let selected_id = self.selected_object_id.as_deref();
+        let selected_id = self.selected_object_id.clone();
         let tree = self
             .document
             .as_ref()
@@ -1078,6 +1086,8 @@ impl SmsEditorApp {
             .cloned()
             .collect::<Vec<_>>();
         egui::ScrollArea::vertical().show(ui, |ui| {
+            self.audio_helpers_hierarchy(ui);
+            ui.separator();
             if !model_instances.is_empty() {
                 egui::CollapsingHeader::new("Authored Model Instances")
                     .default_open(true)
@@ -1112,7 +1122,7 @@ impl SmsEditorApp {
             clicked_id = show_outliner_tree(
                 ui,
                 tree,
-                selected_id,
+                selected_id.as_deref(),
                 !self.outliner_filter.trim().is_empty(),
             );
             if tree.visible_objects == 0 {
@@ -1127,7 +1137,9 @@ impl SmsEditorApp {
             if self.asset_dirty && !self.save_selected_model_asset() {
                 return;
             }
+            self.finish_audio_cube_edit();
             self.selected_object_id = Some(id);
+            self.selected_audio_helper_id = None;
             self.selected_model_instance_id = None;
             self.selected_model_asset = None;
             self.selected_model_document = None;
@@ -1137,8 +1149,10 @@ impl SmsEditorApp {
             if self.asset_dirty && !self.save_selected_model_asset() {
                 return;
             }
+            self.finish_audio_cube_edit();
             self.selected_model_instance_id = Some(id);
             self.selected_object_id = None;
+            self.selected_audio_helper_id = None;
             self.selected_model_asset = None;
             self.selected_model_document = None;
             self.saved_model_document = None;
@@ -1146,16 +1160,23 @@ impl SmsEditorApp {
     }
 
     pub(super) fn inspector_panel(&mut self, ui: &mut egui::Ui) {
+        if self.audio_helper_inspector(ui) {
+            self.stage_music_panel(ui);
+            self.stage_lighting_panel(ui);
+            return;
+        }
         if self.route_inspector_panel(ui) {
             return;
         }
         if self.selected_model_instance_id.is_some() {
             self.model_instance_inspector_panel(ui);
+            self.stage_music_panel(ui);
             self.stage_lighting_panel(ui);
             return;
         }
         if self.selected_model_document.is_some() {
             self.model_asset_inspector_panel(ui);
+            self.stage_music_panel(ui);
             self.stage_lighting_panel(ui);
             return;
         }
@@ -1201,6 +1222,8 @@ impl SmsEditorApp {
                     self.delete_selected();
                 }
             });
+
+            self.object_audio_helper_panel(ui, &object.id);
 
             self.graph_reference_control(ui, &object);
             if !object.runtime_references.is_empty() {
@@ -1423,7 +1446,69 @@ impl SmsEditorApp {
                 ui.label("No stage open.");
             }
         }
+        self.stage_music_panel(ui);
         self.stage_lighting_panel(ui);
+    }
+
+    fn stage_music_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let stage_id = document.stage_id.clone();
+        let current = self.current_stage_music();
+        let mut selected = current.map(|music| (music.bgm_id, music.wave_scene_id));
+        let selected_text = current
+            .and_then(|music| {
+                self.retail_music
+                    .iter()
+                    .find(|entry| {
+                        entry.bgm_id == music.bgm_id && entry.wave_scene_id == music.wave_scene_id
+                    })
+                    .map(|entry| entry.label.as_str())
+            })
+            .map(str::to_string)
+            .or_else(|| current.map(|music| format!("BGM 0x{:08X}", music.bgm_id)))
+            .unwrap_or_else(|| "Game default".to_string());
+
+        ui.separator();
+        egui::CollapsingHeader::new("Stage Music")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.small(
+                    "This project-level option works for retail and custom stages. Build Game writes every saved choice into the runnable game's main.dol, so it also applies when that package is booted normally in Dolphin.",
+                );
+                ui.label("Music");
+                egui::ComboBox::from_id_salt(("stage-music", stage_id.as_str()))
+                    .selected_text(selected_text)
+                    .width(ui.available_width().clamp(180.0, 320.0))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut selected, None, "Game default");
+                        for entry in &self.retail_music {
+                            ui.selectable_value(
+                                &mut selected,
+                                Some((entry.bgm_id, entry.wave_scene_id)),
+                                &entry.label,
+                            )
+                            .on_hover_text(format!(
+                                "BGM 0x{:08X}; wave scene 0x{:X}",
+                                entry.bgm_id, entry.wave_scene_id
+                            ));
+                        }
+                    });
+                if self.retail_music.is_empty() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 180, 90),
+                        "No choices are available. Check the configured decomp source root, then reopen the stage.",
+                    );
+                }
+            });
+        let updated = selected.map(|(bgm_id, wave_scene_id)| ProjectStageMusic {
+            bgm_id,
+            wave_scene_id,
+        });
+        if updated != current {
+            self.set_current_stage_music(updated);
+        }
     }
 
     fn stage_lighting_panel(&mut self, ui: &mut egui::Ui) {

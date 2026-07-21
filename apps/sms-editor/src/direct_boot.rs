@@ -17,7 +17,7 @@ const PPC_BLR: u32 = 0x4e80_0020;
 const DIRECT_BOOT_FLAG: u16 = 0x534d;
 const POST_NLOGO_STATE: i16 = 5;
 const FILE_ALIGNMENT: u32 = 0x20;
-const MIN_STACK_GAP: u32 = 0x100;
+const MIN_STAGE_MUSIC_STACK_GAP: u32 = 0x100;
 const THIS_SEARCH_WORDS: usize = 0x100;
 const STATE_COMPARE_SEARCH_WORDS: usize = 0x40;
 const NLOGO_DIRECT_SEARCH_WORDS: usize = 0x40;
@@ -27,25 +27,32 @@ const INIT_REGISTER_SEARCH_WORDS: usize = 0x40;
 const TRANSITION_CAVE_WORDS: usize = 7;
 const MOVIE_PRIMARY_CAVE_WORDS: usize = 7;
 const MOVIE_SECONDARY_CAVE_WORDS: usize = 3;
-const PROGRESSION_HEAD_CAVE_WORDS: usize = 7;
-const PROGRESSION_COUNTS_HEAD_CAVE_WORDS: usize = 6;
-const PROGRESSION_COUNTS_TAIL_CAVE_WORDS: usize = 5;
-const FULL_CARD_BOOL_BYTES: i16 = 119;
-const LIVES_OFFSET: i16 = 124;
-const SHINE_COUNT_OFFSET: i16 = 208;
-const BLUE_COIN_COUNT_OFFSET: i16 = 212;
-const FULL_LIVES: i16 = 99;
-const FULL_SHINE_COUNT: i16 = 120;
-const FULL_BLUE_COIN_COUNT: i16 = 240;
 const TRANSITION_WORD_COUNT: u32 = 8;
 const MOVIE_WRAPPER_WORD_COUNT: u32 = 9;
 const DIRECT_BOOT_MARKER: &[u8] = b"SMS_EDITOR_DIRECT_BOOT_V1\0";
+const STAGE_MUSIC_MARKER: &[u8] = b"SMS_EDITOR_STAGE_MUSIC_V1\0";
+const MAX_STAGE_MUSIC_OVERRIDES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RuntimeStageTarget {
     pub(super) area_index: u8,
     pub(super) scenario_index: u8,
     pub(super) archive_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RuntimeStageMusicOverride {
+    pub(super) area_index: u8,
+    pub(super) scenario_index: u8,
+    pub(super) bgm_id: u32,
+    pub(super) wave_scene_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StageMusicDol {
+    pub(super) bytes: Vec<u8>,
+    pub(super) hook_address: u32,
+    pub(super) stub_address: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,9 +171,139 @@ struct DirectBootCaves {
     transition: CodeCave,
     movie_primary: CodeCave,
     movie_secondary: CodeCave,
-    progression_head: CodeCave,
-    progression_counts_head: CodeCave,
-    progression_counts_tail: CodeCave,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SoundStageHook {
+    dispatch_anchor: WordAnchor,
+    area_register: u8,
+    scenario_register: u8,
+    ms_stg_offset: i16,
+}
+
+pub(super) fn patch_sms_stage_music_dol(
+    source: &[u8],
+    overrides: &[RuntimeStageMusicOverride],
+) -> Result<StageMusicDol, String> {
+    if overrides.is_empty() {
+        return Err("Stage music patch requires at least one override".to_string());
+    }
+    if overrides.len() > MAX_STAGE_MUSIC_OVERRIDES {
+        return Err(format!(
+            "Stage music patch has {} overrides; the safe limit is {MAX_STAGE_MUSIC_OVERRIDES}",
+            overrides.len()
+        ));
+    }
+    if source
+        .windows(STAGE_MUSIC_MARKER.len())
+        .any(|window| window == STAGE_MUSIC_MARKER)
+    {
+        return Err("The executable already contains a stage music patch".to_string());
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    for override_ in overrides {
+        if !unique.insert((override_.area_index, override_.scenario_index)) {
+            return Err(format!(
+                "Stage music has duplicate runtime area {}, scenario {} overrides",
+                override_.area_index, override_.scenario_index
+            ));
+        }
+        if override_.bgm_id & 0xffff_0000 != 0x8001_0000 || override_.wave_scene_id == u32::MAX {
+            return Err(format!(
+                "Stage music area {}, scenario {} has invalid BGM/wave identifiers",
+                override_.area_index, override_.scenario_index
+            ));
+        }
+    }
+
+    let image = parse_dol(source)?;
+    let hook = find_sound_stage_hook(source, &image)?;
+    let text_slot = (0..DOL_TEXT_SECTION_COUNT)
+        .find(|slot| {
+            !image
+                .sections
+                .iter()
+                .any(|section| section.text && section.slot == *slot)
+        })
+        .ok_or_else(|| "The DOL has no unused text section for stage music".to_string())?;
+    let file_offset = align_up_usize(source.len(), FILE_ALIGNMENT as usize)?;
+    let stack_top = find_stack_top(source, &image)?;
+    let word_count = overrides
+        .len()
+        .checked_mul(11)
+        .and_then(|count| count.checked_add(2))
+        .ok_or_else(|| "Stage music dispatcher word count overflows usize".to_string())?;
+    let unaligned_payload_size = word_count
+        .checked_mul(4)
+        .and_then(|size| size.checked_add(STAGE_MUSIC_MARKER.len()))
+        .ok_or_else(|| "Stage music payload size overflows usize".to_string())?;
+    let payload_size = align_up_usize(unaligned_payload_size, 4)?;
+    let loaded_end = image
+        .sections
+        .iter()
+        .map(|section| section.address_end())
+        .chain(image.bss.map(|(_, end)| Ok(end)))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .ok_or_else(|| "The DOL has no loaded sections".to_string())?;
+    // Extending the loaded image keeps the dispatcher outside the arena without changing
+    // Sunshine's linker-defined startup stack or any runtime stack metadata derived from it.
+    let stub_address = align_up_u32(loaded_end, FILE_ALIGNMENT)?;
+    let words = build_stage_music_stub(stub_address, hook, overrides)?;
+    debug_assert_eq!(words.len(), word_count);
+    let stub_end = stub_address
+        .checked_add(u32::try_from(payload_size).map_err(|_| {
+            "Stage music payload size does not fit the DOL address space".to_string()
+        })?)
+        .ok_or_else(|| "Stage music stub range overflows u32".to_string())?;
+    let safe_stub_end = stub_end
+        .checked_add(MIN_STAGE_MUSIC_STACK_GAP)
+        .ok_or_else(|| "Stage music stack guard overflows u32".to_string())?;
+    if safe_stub_end > stack_top {
+        return Err(format!(
+            "Stage music payload 0x{stub_address:08X}..0x{stub_end:08X} leaves less than 0x{MIN_STAGE_MUSIC_STACK_GAP:X} bytes below the original stack top 0x{stack_top:08X}"
+        ));
+    }
+    reject_injected_range_overlap(&image, stub_address, stub_end)?;
+
+    let hook_address = hook.dispatch_anchor.address()?;
+    let mut bytes = source.to_vec();
+    bytes.resize(file_offset, 0);
+    for word in words {
+        bytes.extend_from_slice(&word.to_be_bytes());
+    }
+    bytes.extend_from_slice(STAGE_MUSIC_MARKER);
+    bytes.resize(
+        file_offset
+            .checked_add(payload_size)
+            .ok_or_else(|| "Stage music output size overflows usize".to_string())?,
+        0,
+    );
+    write_be_u32(
+        &mut bytes,
+        DOL_TEXT_FILE_OFFSETS + text_slot * 4,
+        u32::try_from(file_offset)
+            .map_err(|_| "Stage music file offset does not fit u32".to_string())?,
+    )?;
+    write_be_u32(&mut bytes, DOL_TEXT_ADDRESSES + text_slot * 4, stub_address)?;
+    write_be_u32(
+        &mut bytes,
+        DOL_TEXT_SIZES + text_slot * 4,
+        u32::try_from(payload_size)
+            .map_err(|_| "Stage music section size does not fit u32".to_string())?,
+    )?;
+    write_be_u32(
+        &mut bytes,
+        hook.dispatch_anchor.file_offset()?,
+        encode_branch(hook_address, stub_address, false)?,
+    )?;
+    parse_dol(&bytes)?;
+    Ok(StageMusicDol {
+        bytes,
+        hook_address,
+        stub_address,
+    })
 }
 
 pub(super) fn patch_sms_direct_boot_dol(
@@ -183,7 +320,6 @@ pub(super) fn patch_sms_direct_boot_dol(
     let setup_bypass = find_nlogo_setup_bypass(source, &image, hook.this_register)?;
     let setter = find_next_area_setter(source, &image)?;
     let movie = find_movie_hook(source, &image, setter)?;
-    let flag_manager_sda_offset = find_flag_manager_sda_offset(source, &image)?;
     if hook.this_register == hook.next_state_register {
         return Err(
             "Post-NLogo state register aliases the TApplication register; refusing unsafe patch"
@@ -212,15 +348,10 @@ pub(super) fn patch_sms_direct_boot_dol(
     let transition_address = caves.transition.anchor.address()?;
     let movie_primary_address = caves.movie_primary.anchor.address()?;
     let movie_secondary_address = caves.movie_secondary.anchor.address()?;
-    let progression_addresses = [
-        caves.progression_head.anchor.address()?,
-        caves.progression_counts_head.anchor.address()?,
-        caves.progression_counts_tail.anchor.address()?,
-    ];
 
     let transition_words = build_transition_cave(
         transition_address,
-        progression_addresses[0],
+        original_transition_target,
         hook.this_register,
         hook.next_state_register,
         setter.next_area_offset,
@@ -231,11 +362,6 @@ pub(super) fn patch_sms_direct_boot_dol(
         movie_secondary_address,
         movie.original_target,
         setter.next_area_offset,
-    )?;
-    let progression_words = build_full_progression_caves(
-        progression_addresses,
-        original_transition_target,
-        flag_manager_sda_offset,
     )?;
 
     let mut bytes = source.to_vec();
@@ -283,13 +409,6 @@ pub(super) fn patch_sms_direct_boot_dol(
         caves.movie_secondary.anchor,
         &movie_secondary_words,
     )?;
-    for (cave, words) in [
-        (caves.progression_head, &progression_words[0]),
-        (caves.progression_counts_head, &progression_words[1]),
-        (caves.progression_counts_tail, &progression_words[2]),
-    ] {
-        write_words(&mut bytes, cave.anchor, words)?;
-    }
     parse_dol(&bytes)?;
 
     Ok(DirectBootDol {
@@ -299,6 +418,139 @@ pub(super) fn patch_sms_direct_boot_dol(
         movie_hook_address,
         stub_address: transition_address,
     })
+}
+
+fn find_sound_stage_hook(source: &[u8], image: &DolImage) -> Result<SoundStageHook, String> {
+    let mut candidates = Vec::new();
+    for section in image
+        .sections
+        .iter()
+        .copied()
+        .filter(|section| section.text)
+    {
+        let words = section_words(source, section)?;
+        for word_index in 0..words.len().saturating_sub(9) {
+            let sequence = &words[word_index..word_index + 10];
+            let Some(sound_register) = decode_lwz_from_r13(sequence[0]) else {
+                continue;
+            };
+            let Some(ms_stg_register) = decode_lwz_from_r13(sequence[2]) else {
+                continue;
+            };
+            let tail = if is_cmpwi(sequence[3], 4, -1) && is_beq(sequence[4]) {
+                5
+            } else if decode_d_form(sequence[3], 15) == Some((0, 4, 1))
+                && is_cmplwi(sequence[4], 0, u16::MAX)
+                && is_beq(sequence[5])
+            {
+                6
+            } else {
+                continue;
+            };
+            let Some((area_argument, area_register, area_immediate)) =
+                decode_d_form(sequence[tail + 1], 14)
+            else {
+                continue;
+            };
+            let Some((scenario_argument, scenario_register, scenario_immediate)) =
+                decode_d_form(sequence[tail + 2], 14)
+            else {
+                continue;
+            };
+            if sound_register != 3
+                || !is_relative_bl(sequence[1])
+                || ms_stg_register != 4
+                || decode_lwz_from_r13(sequence[tail]) != Some(3)
+                || immediate_i16(sequence[tail]) != immediate_i16(sequence[0])
+                || area_argument != 5
+                || area_immediate != 0
+                || scenario_argument != 6
+                || scenario_immediate != 0
+                || !is_relative_bl(sequence[tail + 3])
+            {
+                continue;
+            }
+            let call_anchor = WordAnchor {
+                section,
+                word_index: word_index + 1,
+            };
+            let original_target = decode_branch_target(sequence[1], call_anchor.address()?)?;
+            if !address_is_in_text(&image.sections, original_target, 4)? {
+                continue;
+            }
+            candidates.push(SoundStageHook {
+                dispatch_anchor: WordAnchor {
+                    section,
+                    word_index: word_index + 2,
+                },
+                area_register,
+                scenario_register,
+                ms_stg_offset: immediate_i16(sequence[2]),
+            });
+        }
+    }
+    require_unique_value(candidates, "MSound stage initialization call")
+}
+
+fn build_stage_music_stub(
+    stub_address: u32,
+    hook: SoundStageHook,
+    overrides: &[RuntimeStageMusicOverride],
+) -> Result<Vec<u32>, String> {
+    const ENTRY_WORDS: usize = 11;
+    let stage_bgm_offset = hook
+        .ms_stg_offset
+        .checked_add(8)
+        .ok_or_else(|| "MSStageInfo::stageBgm SDA offset overflows i16".to_string())?;
+    let tail_word = overrides
+        .len()
+        .checked_mul(ENTRY_WORDS)
+        .ok_or_else(|| "Stage music dispatcher word count overflows usize".to_string())?;
+    let tail_address = stub_address
+        .checked_add(
+            u32::try_from(tail_word)
+                .map_err(|_| "Stage music dispatcher offset does not fit u32".to_string())?
+                .checked_mul(4)
+                .ok_or_else(|| "Stage music dispatcher byte offset overflows u32".to_string())?,
+        )
+        .ok_or_else(|| "Stage music dispatcher tail address overflows u32".to_string())?;
+    let mut words = Vec::with_capacity(tail_word + 2);
+    for (index, override_) in overrides.iter().enumerate() {
+        let entry_address = stub_address
+            .checked_add(
+                u32::try_from(index * ENTRY_WORDS * 4)
+                    .map_err(|_| "Stage music entry address does not fit u32".to_string())?,
+            )
+            .ok_or_else(|| "Stage music entry address overflows u32".to_string())?;
+        let next_address = entry_address
+            .checked_add((ENTRY_WORDS * 4) as u32)
+            .ok_or_else(|| "Stage music next-entry address overflows u32".to_string())?;
+        words.push(encode_cmpwi(
+            hook.area_register,
+            i16::from(override_.area_index),
+        ));
+        words.push(encode_bne(entry_address + 4, next_address)?);
+        words.push(encode_cmpwi(
+            hook.scenario_register,
+            i16::from(override_.scenario_index),
+        ));
+        words.push(encode_bne(entry_address + 12, next_address)?);
+        words.extend(encode_u32(0, override_.bgm_id));
+        words.push(encode_d_form(36, 0, 13, stage_bgm_offset));
+        words.extend(encode_u32(0, override_.wave_scene_id));
+        words.push(encode_d_form(36, 0, 13, hook.ms_stg_offset));
+        words.push(encode_branch(entry_address + 40, tail_address, false)?);
+    }
+    words.push(encode_d_form(32, 4, 13, hook.ms_stg_offset));
+    words.push(encode_branch(
+        tail_address + 4,
+        hook.dispatch_anchor
+            .address()?
+            .checked_add(4)
+            .ok_or_else(|| "Stage music resume address overflows u32".to_string())?,
+        false,
+    )?);
+    Ok(words)
 }
 
 fn parse_dol(source: &[u8]) -> Result<DolImage, String> {
@@ -681,45 +933,6 @@ fn find_game_loop_this_register(words: &[u32], hook_word: usize) -> Result<u8, S
     }
 }
 
-fn find_flag_manager_sda_offset(source: &[u8], image: &DolImage) -> Result<i16, String> {
-    let mut offsets = std::collections::BTreeSet::new();
-    for section in image
-        .sections
-        .iter()
-        .copied()
-        .filter(|section| section.text)
-    {
-        let words = section_words(source, section)?;
-        for sequence in words.windows(4) {
-            let Some((flag_register, zero_register, upper)) = decode_d_form(sequence[0], 15) else {
-                continue;
-            };
-            let Some(instance_register) = decode_lwz_from_r13(sequence[1]) else {
-                continue;
-            };
-            if zero_register != 0
-                || upper != 1
-                || decode_d_form(sequence[2], 14) != Some((flag_register, flag_register, 0x0386))
-                || !is_relative_bl(sequence[3])
-                || instance_register == flag_register
-            {
-                continue;
-            }
-            offsets.insert(immediate_i16(sequence[1]));
-        }
-    }
-    match offsets.into_iter().collect::<Vec<_>>().as_slice() {
-        [offset] => Ok(*offset),
-        [] => Err(
-            "Could not derive TFlagManager::smInstance from the 0x10386 getBool call".to_string(),
-        ),
-        offsets => Err(format!(
-            "Ambiguous TFlagManager::smInstance SDA offset: found {} candidates",
-            offsets.len()
-        )),
-    }
-}
-
 fn find_next_area_setter(source: &[u8], image: &DolImage) -> Result<NextAreaSetter, String> {
     let mut candidates = Vec::new();
     for section in image
@@ -816,8 +1029,7 @@ fn find_movie_hook(
     require_unique_value(candidates, "checkAdditionalMovie call")
 }
 
-#[allow(dead_code)]
-fn derive_stack_top(source: &[u8], image: &DolImage) -> Result<u32, String> {
+fn find_stack_top(source: &[u8], image: &DolImage) -> Result<u32, String> {
     let entry_section = image
         .sections
         .iter()
@@ -895,41 +1107,6 @@ fn derive_stack_top(source: &[u8], image: &DolImage) -> Result<u32, String> {
             candidates.len()
         )),
     }
-}
-
-#[allow(dead_code)]
-fn derive_safe_upper_boundary(
-    source: &[u8],
-    image: &DolImage,
-    stack_top: u32,
-) -> Result<u32, String> {
-    let mut upper_boundary = None;
-    for section in image
-        .sections
-        .iter()
-        .copied()
-        .filter(|section| section.text)
-    {
-        let words = section_words(source, section)?;
-        for pair in words.windows(2) {
-            if let Some(value) = decode_materialized_address(pair[0], pair[1]) {
-                if value > stack_top {
-                    upper_boundary =
-                        Some(upper_boundary.map_or(value, |current: u32| current.min(value)));
-                }
-            }
-        }
-    }
-    let upper_boundary = upper_boundary.ok_or_else(|| {
-        format!("Could not infer a safe address boundary above stack top 0x{stack_top:08X}")
-    })?;
-    let gap = upper_boundary - stack_top;
-    if gap < MIN_STACK_GAP {
-        return Err(format!(
-            "Inferred stack gap is only 0x{gap:X} bytes (0x{stack_top:08X}..0x{upper_boundary:08X}); direct boot requires at least 0x{MIN_STACK_GAP:X}"
-        ));
-    }
-    Ok(upper_boundary)
 }
 
 #[allow(dead_code, clippy::too_many_arguments)]
@@ -1039,7 +1216,7 @@ fn reject_injected_range_overlap(
 
 fn build_transition_cave(
     cave_address: u32,
-    progression_address: u32,
+    original_transition_target: u32,
     this_register: u8,
     next_state_register: u8,
     next_area_offset: i16,
@@ -1063,58 +1240,10 @@ fn build_transition_cave(
         encode_li(0, DIRECT_BOOT_FLAG as i16),
         encode_d_form(44, 0, this_register, next_flag_offset),
         encode_li(next_state_register, POST_NLOGO_STATE),
-        encode_branch(return_address, progression_address, false)?,
+        encode_branch(return_address, original_transition_target, false)?,
     ];
     debug_assert_eq!(words.len(), TRANSITION_CAVE_WORDS);
     Ok(words)
-}
-
-fn build_full_progression_caves(
-    addresses: [u32; 3],
-    original_transition_target: u32,
-    flag_manager_sda_offset: i16,
-) -> Result<[Vec<u32>; 3], String> {
-    let head_tail = addresses[0]
-        .checked_add(24)
-        .ok_or_else(|| "Progression head tail address overflows u32".to_string())?;
-    let card_bool_loop_branch = addresses[1]
-        .checked_add(4)
-        .ok_or_else(|| "Card-bool loop branch address overflows u32".to_string())?;
-    let counts_head_tail = addresses[1]
-        .checked_add(20)
-        .ok_or_else(|| "Progression-count head tail address overflows u32".to_string())?;
-    let counts_tail_return = addresses[2]
-        .checked_add(16)
-        .ok_or_else(|| "Progression-count tail return address overflows u32".to_string())?;
-
-    let head = vec![
-        encode_mfctr(11),
-        encode_d_form(32, 7, 13, flag_manager_sda_offset),
-        encode_li(8, -1),
-        encode_li(9, FULL_CARD_BOOL_BYTES),
-        encode_mtctr(9),
-        encode_d_form(14, 10, 7, -1),
-        encode_branch(head_tail, addresses[1], false)?,
-    ];
-    let counts_head = vec![
-        encode_d_form(39, 8, 10, 1),
-        encode_bdnz(card_bool_loop_branch, addresses[1])?,
-        encode_li(8, FULL_LIVES),
-        encode_d_form(36, 8, 7, LIVES_OFFSET),
-        encode_li(8, FULL_SHINE_COUNT),
-        encode_branch(counts_head_tail, addresses[2], false)?,
-    ];
-    let counts_tail = vec![
-        encode_d_form(36, 8, 7, SHINE_COUNT_OFFSET),
-        encode_li(8, FULL_BLUE_COIN_COUNT),
-        encode_d_form(36, 8, 7, BLUE_COIN_COUNT_OFFSET),
-        encode_mtctr(11),
-        encode_branch(counts_tail_return, original_transition_target, false)?,
-    ];
-    debug_assert_eq!(head.len(), PROGRESSION_HEAD_CAVE_WORDS);
-    debug_assert_eq!(counts_head.len(), PROGRESSION_COUNTS_HEAD_CAVE_WORDS);
-    debug_assert_eq!(counts_tail.len(), PROGRESSION_COUNTS_TAIL_CAVE_WORDS);
-    Ok([head, counts_head, counts_tail])
 }
 
 fn build_movie_caves(
@@ -1238,107 +1367,57 @@ fn choose_direct_boot_caves(
     original_transition_target: u32,
     original_movie_target: u32,
 ) -> Result<DirectBootCaves, String> {
-    const REQUIREMENTS: [usize; 6] = [
-        TRANSITION_CAVE_WORDS,
-        MOVIE_PRIMARY_CAVE_WORDS,
-        MOVIE_SECONDARY_CAVE_WORDS,
-        PROGRESSION_HEAD_CAVE_WORDS,
-        PROGRESSION_COUNTS_HEAD_CAVE_WORDS,
-        PROGRESSION_COUNTS_TAIL_CAVE_WORDS,
-    ];
-    let mut selected = Vec::with_capacity(REQUIREMENTS.len());
-    if let Some(selection) =
-        select_direct_boot_caves(&caves, &REQUIREMENTS, &mut selected, |selection| {
-            direct_boot_cave_branches_are_encodable(
-                selection,
-                hook_address,
-                movie_hook_address,
-                original_transition_target,
-                original_movie_target,
-            )
-        })
-    {
-        return Ok(DirectBootCaves {
-            transition: selection[0],
-            movie_primary: selection[1],
-            movie_secondary: selection[2],
-            progression_head: selection[3],
-            progression_counts_head: selection[4],
-            progression_counts_tail: selection[5],
-        });
-    }
-    Err(format!(
-        "Could not find six safe executable alignment caves for direct boot and full Delfino progression (word requirements: {REQUIREMENTS:?})"
-    ))
-}
-
-fn select_direct_boot_caves<F>(
-    caves: &[CodeCave],
-    requirements: &[usize],
-    selected: &mut Vec<CodeCave>,
-    accept: F,
-) -> Option<Vec<CodeCave>>
-where
-    F: Fn(&[CodeCave]) -> bool + Copy,
-{
-    let Some((&required_words, remaining)) = requirements.split_first() else {
-        return accept(selected).then(|| selected.clone());
-    };
-    for cave in caves
+    for transition in caves
         .iter()
         .copied()
-        .filter(|cave| cave.word_count >= required_words)
+        .filter(|cave| cave.word_count >= TRANSITION_CAVE_WORDS)
     {
-        if selected
-            .iter()
-            .any(|selected_cave| selected_cave.anchor == cave.anchor)
+        let transition_address = transition.anchor.address()?;
+        if encode_branch(hook_address, transition_address, false).is_err()
+            || encode_branch(transition_address + 24, original_transition_target, false).is_err()
         {
             continue;
         }
-        selected.push(cave);
-        if let Some(selection) = select_direct_boot_caves(caves, remaining, selected, accept) {
-            return Some(selection);
+        for movie_primary in caves
+            .iter()
+            .copied()
+            .filter(|cave| cave.word_count >= MOVIE_PRIMARY_CAVE_WORDS)
+        {
+            if movie_primary.anchor == transition.anchor {
+                continue;
+            }
+            let primary_address = movie_primary.anchor.address()?;
+            if encode_branch(movie_hook_address, primary_address, true).is_err() {
+                continue;
+            }
+            for movie_secondary in caves
+                .iter()
+                .copied()
+                .filter(|cave| cave.word_count >= MOVIE_SECONDARY_CAVE_WORDS)
+            {
+                if movie_secondary.anchor == transition.anchor
+                    || movie_secondary.anchor == movie_primary.anchor
+                {
+                    continue;
+                }
+                let secondary_address = movie_secondary.anchor.address()?;
+                let secondary_tail_address = secondary_address + 8;
+                if encode_bne(primary_address + 8, secondary_tail_address).is_ok()
+                    && encode_branch(primary_address + 24, secondary_address, false).is_ok()
+                    && encode_branch(secondary_tail_address, original_movie_target, false).is_ok()
+                {
+                    return Ok(DirectBootCaves {
+                        transition,
+                        movie_primary,
+                        movie_secondary,
+                    });
+                }
+            }
         }
-        selected.pop();
     }
-    None
-}
-
-fn direct_boot_cave_branches_are_encodable(
-    caves: &[CodeCave],
-    hook_address: u32,
-    movie_hook_address: u32,
-    original_transition_target: u32,
-    original_movie_target: u32,
-) -> bool {
-    let addresses = caves
-        .iter()
-        .map(|cave| cave.anchor.address())
-        .collect::<Result<Vec<_>, _>>();
-    let Ok(addresses) = addresses else {
-        return false;
-    };
-    let transition = addresses[0];
-    let movie_primary = addresses[1];
-    let movie_secondary = addresses[2];
-    let progression_head = addresses[3];
-    let progression_counts_head = addresses[4];
-    let progression_counts_tail = addresses[5];
-    let movie_secondary_tail = movie_secondary + 8;
-    encode_branch(hook_address, transition, false).is_ok()
-        && encode_branch(transition + 24, progression_head, false).is_ok()
-        && encode_branch(progression_head + 24, progression_counts_head, false).is_ok()
-        && encode_branch(progression_counts_head + 20, progression_counts_tail, false).is_ok()
-        && encode_branch(
-            progression_counts_tail + 16,
-            original_transition_target,
-            false,
-        )
-        .is_ok()
-        && encode_branch(movie_hook_address, movie_primary, true).is_ok()
-        && encode_bne(movie_primary + 8, movie_secondary_tail).is_ok()
-        && encode_branch(movie_primary + 24, movie_secondary, false).is_ok()
-        && encode_branch(movie_secondary_tail, original_movie_target, false).is_ok()
+    Err(format!(
+        "Could not find three safe executable alignment caves for direct boot (need {TRANSITION_CAVE_WORDS}, {MOVIE_PRIMARY_CAVE_WORDS}, and {MOVIE_SECONDARY_CAVE_WORDS} words)"
+    ))
 }
 
 fn section_word(source: &[u8], anchor: WordAnchor, relative_word: usize) -> Result<u32, String> {
@@ -1593,26 +1672,22 @@ fn encode_bne(from: u32, to: u32) -> Result<u32, String> {
     Ok(0x4082_0000 | ((displacement as i32 as u32) & 0x0000_fffc))
 }
 
-fn encode_bdnz(from: u32, to: u32) -> Result<u32, String> {
-    let displacement = i64::from(to) - i64::from(from);
-    if from & 3 != 0 || to & 3 != 0 || !(-0x8000..=0x7ffc).contains(&displacement) {
-        return Err(format!(
-            "PowerPC count branch 0x{from:08X} -> 0x{to:08X} is out of range or unaligned"
-        ));
-    }
-    Ok(0x4200_0000 | ((displacement as i32 as u32) & 0x0000_fffc))
-}
-
-fn encode_mfctr(register: u8) -> u32 {
-    0x7c09_02a6 | (u32::from(register) << 21)
-}
-
-fn encode_mtctr(register: u8) -> u32 {
-    0x7c08_03a6 | (u32::from(register) << 21)
-}
-
 fn encode_li(register: u8, immediate: i16) -> u32 {
     0x3800_0000 | (u32::from(register) << 21) | u32::from(immediate as u16)
+}
+
+fn encode_cmpwi(register: u8, immediate: i16) -> u32 {
+    0x2c00_0000 | (u32::from(register) << 16) | u32::from(immediate as u16)
+}
+
+fn encode_u32(register: u8, value: u32) -> [u32; 2] {
+    [
+        encode_d_form(15, register, 0, (value >> 16) as u16 as i16),
+        (24_u32 << 26)
+            | (u32::from(register) << 21)
+            | (u32::from(register) << 16)
+            | u32::from(value as u16),
+    ]
 }
 
 fn encode_cmplwi(register: u8, immediate: u16) -> u32 {
@@ -1674,6 +1749,16 @@ fn align_up_usize(value: usize, alignment: usize) -> Result<usize, String> {
         .ok_or_else(|| format!("Aligning 0x{value:X} to 0x{alignment:X} overflows usize"))
 }
 
+fn align_up_u32(value: u32, alignment: u32) -> Result<u32, String> {
+    if !alignment.is_power_of_two() {
+        return Err(format!("Alignment 0x{alignment:X} is not a power of two"));
+    }
+    value
+        .checked_add(alignment - 1)
+        .map(|rounded| rounded & !(alignment - 1))
+        .ok_or_else(|| format!("Aligning 0x{value:X} to 0x{alignment:X} overflows u32"))
+}
+
 fn read_be_u32(source: &[u8], offset: usize) -> Result<u32, String> {
     let end = offset
         .checked_add(4)
@@ -1720,11 +1805,8 @@ mod tests {
         let mut words = vec![PPC_NOP; SYNTHETIC_TEXT_WORDS];
         let address = |word: usize| layout.text_address + u32::try_from(word * 4).unwrap();
 
-        // Six zero-filled linker alignment gaps, each immediately after a
+        // Three zero-filled linker alignment gaps, each immediately after a
         // return and ending on the next 0x20-byte function boundary.
-        install_alignment_cave(&mut words, 0x108, PROGRESSION_HEAD_CAVE_WORDS);
-        install_alignment_cave(&mut words, 0x148, PROGRESSION_COUNTS_HEAD_CAVE_WORDS);
-        install_alignment_cave(&mut words, 0x158, PROGRESSION_COUNTS_TAIL_CAVE_WORDS);
         install_alignment_cave(&mut words, 0x188, TRANSITION_CAVE_WORDS);
         install_alignment_cave(&mut words, 0x198, MOVIE_PRIMARY_CAVE_WORDS);
         install_alignment_cave(&mut words, 0x1a8, MOVIE_SECONDARY_CAVE_WORDS);
@@ -1774,14 +1856,6 @@ mod tests {
         words[director_word + 11] = encode_d_form(32, 0, 13, -0x7000);
         words[director_word + 12] = 0x6000_0001; // ori r0, r0, 1
         words[director_word + 13] = encode_d_form(36, 0, 13, -0x7000);
-
-        // A stable, semantically identifiable TFlagManager::smInstance use:
-        // getBool(0x10386), one of Delfino Plaza's progression gates.
-        let flag_word = 0x1b0;
-        words[flag_word] = encode_d_form(15, 4, 0, 1);
-        words[flag_word + 1] = encode_d_form(32, 3, 13, -0x6800);
-        words[flag_word + 2] = encode_d_form(14, 4, 4, 0x0386);
-        words[flag_word + 3] = encode_branch(address(flag_word + 3), address(0x1c4), true).unwrap();
 
         // Derive the application register from the nearby app-state 2/3
         // comparisons, independent of its absolute address.
@@ -1895,28 +1969,6 @@ mod tests {
         assert_eq!(decode_lwz_from_r13(sequence[11]), Some(0));
         assert!(is_ori(sequence[12], 0, 0, 1));
         assert_eq!(decode_d_form(sequence[13], 36), Some((0, 13, -0x6800)));
-    }
-
-    #[test]
-    fn full_progression_caves_encode_the_declared_delfino_state() {
-        let addresses = [0x8000_1000, 0x8000_1100, 0x8000_1200];
-        let original_target = 0x8000_2000;
-        let words = build_full_progression_caves(addresses, original_target, -0x6800).unwrap();
-
-        assert_eq!(words[0][1], encode_d_form(32, 7, 13, -0x6800));
-        assert_eq!(words[0][2], encode_li(8, -1));
-        assert_eq!(words[0][3], encode_li(9, 119));
-        assert_eq!(words[1][0], encode_d_form(39, 8, 10, 1));
-        assert_eq!(words[1][2], encode_li(8, 99));
-        assert_eq!(words[1][3], encode_d_form(36, 8, 7, 124));
-        assert_eq!(words[1][4], encode_li(8, 120));
-        assert_eq!(words[2][0], encode_d_form(36, 8, 7, 208));
-        assert_eq!(words[2][1], encode_li(8, 240));
-        assert_eq!(words[2][2], encode_d_form(36, 8, 7, 212));
-        assert_eq!(
-            decode_branch_target(words[2][4], addresses[2] + 16).unwrap(),
-            original_target
-        );
     }
 
     #[test]
@@ -2035,29 +2087,14 @@ mod tests {
             read_be_u32(&patched.bytes, payload_offset + 5 * 4).unwrap(),
             encode_li(29, POST_NLOGO_STATE)
         );
-        let progression_address = decode_branch_target(
+        let transition_target = decode_branch_target(
             read_be_u32(&patched.bytes, payload_offset + 6 * 4).unwrap(),
             patched.stub_address + 6 * 4,
         )
         .unwrap();
-        let progression_offset =
-            usize::try_from(cave_section.file_offset + progression_address - cave_section.address)
-                .unwrap();
         assert_eq!(
-            read_be_u32(&patched.bytes, progression_offset).unwrap(),
-            encode_mfctr(11)
-        );
-        assert_eq!(
-            read_be_u32(&patched.bytes, progression_offset + 4).unwrap(),
-            encode_d_form(32, 7, 13, -0x6800)
-        );
-        assert_eq!(
-            read_be_u32(&patched.bytes, progression_offset + 2 * 4).unwrap(),
-            encode_li(8, -1)
-        );
-        assert_eq!(
-            read_be_u32(&patched.bytes, progression_offset + 3 * 4).unwrap(),
-            encode_li(9, FULL_CARD_BOOL_BYTES)
+            transition_target,
+            layout.text_address + u32::try_from((layout.hook_word + 5) * 4).unwrap()
         );
         assert_eq!(patched.bytes.len(), source.len());
     }
@@ -2146,6 +2183,81 @@ mod tests {
             );
             audit_local_binary(&path);
         }
+    }
+
+    #[test]
+    #[ignore = "requires SMS_US_RETAIL_DOL"]
+    fn packaged_music_patch_composes_with_direct_boot_on_retail_dol() {
+        let path = PathBuf::from(std::env::var_os("SMS_US_RETAIL_DOL").expect("SMS_US_RETAIL_DOL"));
+        let source = fs::read(&path).unwrap();
+        let music = patch_sms_stage_music_dol(
+            &source,
+            &[
+                RuntimeStageMusicOverride {
+                    area_index: 1,
+                    scenario_index: 0,
+                    bgm_id: 0x8001_0002,
+                    wave_scene_id: 0x202,
+                },
+                RuntimeStageMusicOverride {
+                    area_index: 17,
+                    scenario_index: 1,
+                    bgm_id: 0x8001_0001,
+                    wave_scene_id: 0x201,
+                },
+            ],
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        assert!(music.bytes.len() > source.len());
+        let source_image = parse_dol(&source).unwrap();
+        let sound_hook = find_sound_stage_hook(&source, &source_image).unwrap();
+        let original_stack_top = find_stack_top(&source, &source_image).unwrap();
+        let music_image = parse_dol(&music.bytes).unwrap();
+        let patched_stack_top = find_stack_top(&music.bytes, &music_image).unwrap();
+        assert!(address_is_in_text(&music_image.sections, music.stub_address, 4).unwrap());
+        let music_section = music_image
+            .sections
+            .iter()
+            .find(|section| section.text && section.address == music.stub_address)
+            .unwrap();
+        assert_eq!(patched_stack_top, original_stack_top);
+        assert_eq!(music.stub_address % FILE_ALIGNMENT, 0);
+        assert!(
+            music.stub_address
+                >= source_image
+                    .sections
+                    .iter()
+                    .map(|section| section.address_end().unwrap())
+                    .max()
+                    .unwrap()
+        );
+        assert!(
+            music_section.address_end().unwrap() + MIN_STAGE_MUSIC_STACK_GAP <= original_stack_top
+        );
+        let original_init_call = WordAnchor {
+            section: sound_hook.dispatch_anchor.section,
+            word_index: sound_hook.dispatch_anchor.word_index - 1,
+        };
+        assert_eq!(
+            section_word(&music.bytes, original_init_call, 0).unwrap(),
+            section_word(&source, original_init_call, 0).unwrap()
+        );
+        assert_eq!(
+            section_word(&music.bytes, sound_hook.dispatch_anchor, 0).unwrap(),
+            encode_branch(music.hook_address, music.stub_address, false).unwrap()
+        );
+
+        let direct = patch_sms_direct_boot_dol(
+            &music.bytes,
+            &RuntimeStageTarget {
+                area_index: 17,
+                scenario_index: 1,
+                archive_name: "custom.arc".to_string(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("composed direct boot: {error}"));
+        parse_dol(&direct.bytes).unwrap();
+        assert!(direct.bytes.len() >= music.bytes.len());
     }
 
     fn audit_local_binary(path: &Path) {

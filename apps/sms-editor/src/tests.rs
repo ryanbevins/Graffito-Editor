@@ -2323,6 +2323,7 @@ fn decomp_owned_map_static_models_require_a_matching_placement() {
                 actor_name: "BiancoRiver".to_string(),
                 model_path: Some("/scene/map/map/BiancoRiver.bmd".to_string()),
                 load_flags: 0x1021_0000,
+                sound_id: None,
                 source_file: "src/Map/MapStaticObject.cpp".to_string(),
                 stage_bootstrap_created: false,
             },
@@ -2330,6 +2331,7 @@ fn decomp_owned_map_static_models_require_a_matching_placement() {
                 actor_name: "BiaWaterPollution".to_string(),
                 model_path: Some("/scene/map/map/BiaWaterPollution.bmd".to_string()),
                 load_flags: 0x1122_0000,
+                sound_id: None,
                 source_file: "src/Map/MapStaticObject.cpp".to_string(),
                 stage_bootstrap_created: false,
             },
@@ -2337,6 +2339,7 @@ fn decomp_owned_map_static_models_require_a_matching_placement() {
                 actor_name: "sea".to_string(),
                 model_path: Some("/scene/map/map/sea.bmd".to_string()),
                 load_flags: 0x1022_0000,
+                sound_id: None,
                 source_file: "src/Map/MapStaticObject.cpp".to_string(),
                 stage_bootstrap_created: true,
             },
@@ -2344,6 +2347,7 @@ fn decomp_owned_map_static_models_require_a_matching_placement() {
                 actor_name: "mareSeaPollutionS34567".to_string(),
                 model_path: None,
                 load_flags: 0x1021_0000,
+                sound_id: None,
                 source_file: "src/Map/MapStaticObject.cpp".to_string(),
                 stage_bootstrap_created: false,
             },
@@ -3212,6 +3216,8 @@ fn completed_stage_load_is_discarded_when_the_project_path_changed() {
         scene_label_warning: None,
         retail_skyboxes: Vec::new(),
         skybox_warnings: Vec::new(),
+        retail_music: Vec::new(),
+        music_warning: None,
     };
 
     app.apply_loaded_stage(loaded);
@@ -3251,6 +3257,8 @@ fn completed_stage_load_adopts_the_resolved_project_folder() {
         scene_label_warning: None,
         retail_skyboxes: Vec::new(),
         skybox_warnings: Vec::new(),
+        retail_music: Vec::new(),
+        music_warning: None,
     };
 
     app.apply_loaded_stage(loaded);
@@ -3290,6 +3298,8 @@ fn completed_stage_load_is_discarded_when_the_selected_stage_changed() {
         scene_label_warning: None,
         retail_skyboxes: Vec::new(),
         skybox_warnings: Vec::new(),
+        retail_music: Vec::new(),
+        music_warning: None,
     };
 
     app.apply_loaded_stage(loaded);

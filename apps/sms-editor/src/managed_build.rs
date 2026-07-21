@@ -11,7 +11,10 @@ use sms_formats::{
 };
 use sms_scene::StageDocument;
 
-use crate::direct_boot::{patch_sms_direct_boot_dol, RuntimeStageTarget};
+use crate::direct_boot::{
+    patch_sms_direct_boot_dol, patch_sms_stage_music_dol, RuntimeStageMusicOverride,
+    RuntimeStageTarget,
+};
 use crate::project::{normalized_absolute_with_missing_tail, path_is_same_or_child, OpenProject};
 
 const MANAGED_BUILD_MARKER_NAME: &str = ".smsbuild-owner.toml";
@@ -185,7 +188,99 @@ pub(super) fn build_managed_game(
         archive_bytes,
         cancelled,
     )?;
+    install_managed_stage_music(project, &run, cancelled)?;
     Ok(ManagedGameBuildOutcome { run })
+}
+
+fn install_managed_stage_music(
+    project: &OpenProject,
+    run: &ManagedRunMirrorOutcome,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    if project.descriptor.stage_music.is_empty() {
+        return Ok(());
+    }
+    check_cancelled(cancelled)?;
+    let stage_table = find_case_insensitive_path(
+        &run.run_root,
+        &["files", "data", "stageArc.bin"],
+        "runtime stage archive table",
+    )?;
+    let entries =
+        parse_jdrama_scenario_archive_entries(&fs::read(&stage_table).map_err(|error| {
+            format!(
+                "Could not read runtime stage archive table '{}': {error}",
+                stage_table.display()
+            )
+        })?)
+        .map_err(|error| {
+            format!(
+                "Could not parse runtime stage archive table '{}': {error}",
+                stage_table.display()
+            )
+        })?;
+    let mut overrides = Vec::new();
+    for (stage_id, music) in &project.descriptor.stage_music {
+        let matching = entries
+            .iter()
+            .filter(|entry| {
+                runtime_archive_stem(&entry.archive_name)
+                    .is_some_and(|stem| stem.eq_ignore_ascii_case(stage_id))
+            })
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            return Err(format!(
+                "Stage music override '{}' is not mapped by the packaged stageArc.bin",
+                stage_id
+            ));
+        }
+        for entry in matching {
+            overrides.push(RuntimeStageMusicOverride {
+                area_index: u8::try_from(entry.area_index).map_err(|_| {
+                    format!(
+                        "Stage music area {} for '{}' does not fit Sunshine's u8 game sequence",
+                        entry.area_index, stage_id
+                    )
+                })?,
+                scenario_index: u8::try_from(entry.scenario_index).map_err(|_| {
+                    format!(
+                        "Stage music scenario {} for '{}' does not fit Sunshine's u8 game sequence",
+                        entry.scenario_index, stage_id
+                    )
+                })?,
+                bgm_id: music.bgm_id,
+                wave_scene_id: music.wave_scene_id,
+            });
+        }
+    }
+    overrides.sort_by_key(|override_| (override_.area_index, override_.scenario_index));
+    check_cancelled(cancelled)?;
+    let source_dol = fs::read(&run.run_main_dol).map_err(|error| {
+        format!(
+            "Could not read managed game executable '{}': {error}",
+            run.run_main_dol.display()
+        )
+    })?;
+    let patched = patch_sms_stage_music_dol(&source_dol, &overrides).map_err(|error| {
+        format!(
+            "Could not install packaged stage music into '{}': {error}",
+            run.run_main_dol.display()
+        )
+    })?;
+    check_cancelled(cancelled)?;
+    atomic_write_if_changed_with_cancel(&run.run_main_dol, &patched.bytes, cancelled).map_err(
+        |error| {
+            if is_cancelled_error(&error.to_string()) {
+                error.to_string()
+            } else {
+                format!(
+                    "Could not install packaged stage music executable '{}': {error}",
+                    run.run_main_dol.display()
+                )
+            }
+        },
+    )?;
+    Ok(())
 }
 
 pub(super) fn prepare_managed_game_launch(
@@ -1714,7 +1809,7 @@ fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project::SmsProjectFile;
+    use crate::project::{ProjectStageMusic, SmsProjectFile};
     use std::hash::{DefaultHasher, Hash, Hasher};
 
     struct Fixture {
@@ -2240,5 +2335,60 @@ mod tests {
             .save(&fixture.project.descriptor_path)
             .unwrap_err();
         assert!(error.contains("unsafe relative managed build path"));
+    }
+
+    #[test]
+    #[ignore = "requires SMS_BASE_ROOT with an extracted retail game"]
+    fn normal_managed_package_installs_music_without_direct_boot() {
+        let base_root = PathBuf::from(std::env::var_os("SMS_BASE_ROOT").expect("SMS_BASE_ROOT"));
+        let source_dol = base_root.join("sys/main.dol");
+        let source_stage_table = base_root.join("files/data/stageArc.bin");
+        let original_dol = fs::read(&source_dol).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let run_root = root.path().join("run-root");
+        let run_dol = run_root.join("sys/main.dol");
+        let run_stage_table = run_root.join("files/data/stageArc.bin");
+        fs::create_dir_all(run_dol.parent().unwrap()).unwrap();
+        fs::create_dir_all(run_stage_table.parent().unwrap()).unwrap();
+        fs::write(&run_dol, &original_dol).unwrap();
+        fs::copy(source_stage_table, &run_stage_table).unwrap();
+        let descriptor_path = root.path().join("project.sms");
+        let mut descriptor = SmsProjectFile::new(
+            "Music test",
+            base_root.clone(),
+            root.path().join("project-data"),
+            None,
+        );
+        descriptor.stage_music.insert(
+            "dolpic0".to_string(),
+            ProjectStageMusic {
+                bgm_id: 0x8001_0002,
+                wave_scene_id: 0x202,
+            },
+        );
+        let project = OpenProject {
+            descriptor_path,
+            descriptor,
+        };
+        let run = ManagedRunMirrorOutcome {
+            build_root: root.path().to_path_buf(),
+            run_root,
+            run_main_dol: run_dol.clone(),
+            source_relative_path: PathBuf::from("files/data/scene/dolpic0.szs"),
+            stage_output_path: root.path().join("dolpic0.szs"),
+            stage_size_bytes: 0,
+            stage_replaced: false,
+            copied_files: 0,
+            reused_files: 0,
+            removed_entries: 0,
+        };
+        install_managed_stage_music(&project, &run, &AtomicBool::new(false)).unwrap();
+        let packaged = fs::read(&run_dol).unwrap();
+        assert!(packaged.len() > original_dol.len());
+        const MUSIC_MARKER: &[u8] = b"SMS_EDITOR_STAGE_MUSIC_V1\0";
+        assert!(packaged
+            .windows(MUSIC_MARKER.len())
+            .any(|window| window == MUSIC_MARKER));
+        assert_eq!(fs::read(source_dol).unwrap(), original_dol);
     }
 }

@@ -760,6 +760,7 @@ impl SmsEditorApp {
         }
         self.paint_model_instances(painter, rect);
         self.paint_routes(painter, rect);
+        self.paint_audio_helpers(painter, rect);
         self.paint_selected_object_outline(painter, rect);
 
         let projection = self.camera_projection(rect);

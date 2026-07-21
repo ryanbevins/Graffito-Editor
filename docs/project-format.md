@@ -22,6 +22,10 @@ managed_build_root = "Isle Delfino.smsbuild"
 schema_source_root = "C:\\src\\sms"
 last_stage = "dolpic0"
 
+[stage_music.dolpic0]
+bgm_id = 0x80010002
+wave_scene_id = 0x202
+
 [launch]
 dolphin_executable = "C:\\Tools\\Dolphin\\Dolphin.exe"
 game_image = "D:\\Games\\Super Mario Sunshine.rvz"
@@ -39,7 +43,9 @@ Required fields are:
 - `project_data_root`: the directory containing editor-owned overlay data.
 
 `managed_build_root`, `schema_source_root`, `last_stage`, and every value under
-`launch` are optional. The editor updates `last_stage` after a stage opens so
+`launch` are optional. `stage_music` is also optional and stores the selected
+decomp-derived BGM and matching wave-scene identifier by stage ID. The same
+entry shape is used for retail and source-free custom stages. The editor updates `last_stage` after a stage opens so
 reopening the project can restore the working context. When
 `managed_build_root` is omitted, it defaults to a `.smsbuild` sibling of the
 descriptor.
@@ -157,7 +163,12 @@ extracted game, preserving every authored file's exact game-relative path.
 Every run-root file has independent file identity; byte-identical copies are
 reused on later builds. The rebuilt stage and project-owned file overlays,
 including an authored stage's `files/data/stageArc.bin`, are installed
-atomically. Both launch buttons perform the same build, resolve the open
+atomically. Saved stage-music choices are resolved through that staged table and
+installed into the managed `sys/main.dol` as a runtime area/scenario dispatcher.
+The dispatcher updates both Sunshine's stage BGM and wave scene before audio
+initialization, so the choices work when `run-root/` is booted normally in
+Dolphin as well as through either editor launch button. Both launch buttons
+perform the same build, resolve the open
 archive through the resulting staged `stageArc.bin`, and atomically patch the
 managed `sys/main.dol` copy. Its behavior-based PowerPC
 patch suppresses the Nintendo-logo director, waits for the normal asynchronous

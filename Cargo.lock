@@ -1510,6 +1510,7 @@ dependencies = [
  "egui",
  "pollster",
  "raw-window-handle",
+ "regex",
  "rfd",
  "serde",
  "serde_json",

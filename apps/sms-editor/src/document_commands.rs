@@ -1,7 +1,7 @@
 use super::*;
 
 impl ObjectUndoRecord {
-    fn between(
+    pub(super) fn between(
         before: &[SceneObject],
         after: &[SceneObject],
         before_archive_edits: &StageArchiveEdits,
@@ -2919,6 +2919,7 @@ impl SmsEditorApp {
     }
 
     pub(super) fn rebuild_model_preview_from_document(&mut self) {
+        self.rebuild_audio_cube_helpers_cache();
         let visibility = self.preview_visibility();
         let (render_scene, model_preview) =
             self.document.as_ref().map_or((None, None), |document| {

@@ -134,6 +134,15 @@ pub struct ObjectRegistry {
     pub named_object_models: Vec<NamedObjectModelDefinition>,
     #[serde(default)]
     pub map_static_models: Vec<MapStaticModelDefinition>,
+    /// Rail names whose runtime sound-group actor creates positional scene sound.
+    #[serde(default)]
+    pub graph_sound_emitters: Vec<GraphSoundEmitterDefinition>,
+    /// Runtime sound-category distance profiles used by positional SE handles.
+    #[serde(default)]
+    pub sound_attenuation: SoundAttenuationDefinition,
+    /// Cube manager/table bindings constructed by the runtime name factory.
+    #[serde(default)]
+    pub cube_managers: Vec<CubeManagerDefinition>,
     /// Models selected by the exact resource identity stored in `TMapObjData::unk0`.
     #[serde(default)]
     pub map_obj_resources: Vec<MapObjResourceDefinition>,
@@ -445,9 +454,55 @@ pub struct MapStaticModelDefinition {
     #[serde(default)]
     pub model_path: Option<String>,
     pub load_flags: u32,
+    /// Positional sound started by `TMapStaticObj::perform`, when present.
+    #[serde(default)]
+    pub sound_id: Option<u32>,
     pub source_file: String,
     #[serde(default)]
     pub stage_bootstrap_created: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphSoundEmitterDefinition {
+    pub graph_name: String,
+    pub sound_id: u32,
+    pub source_file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SoundAttenuationDefinition {
+    /// Distance inside which positional sounds remain at full volume.
+    #[serde(default)]
+    pub full_volume_distance: u32,
+    #[serde(default)]
+    pub categories: Vec<SoundAttenuationCategoryDefinition>,
+    #[serde(default)]
+    pub source_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SoundAttenuationCategoryDefinition {
+    pub category: u8,
+    pub behavior_flags: u32,
+    pub max_distance: u32,
+    pub fixed_curve_range: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CubeManagerKind {
+    SoundChange,
+    SoundEffect,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CubeManagerDefinition {
+    pub factory_name: String,
+    pub runtime_global: String,
+    pub table_name: String,
+    pub kind: CubeManagerKind,
+    pub source_file: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -868,6 +923,7 @@ impl SchemaGenerator {
         self.scan_map_obj_stream_tev_colors(&sources, &mut registry)?;
         self.scan_params_and_assets(&sources, &mut registry)?;
         self.scan_map_static_models(&sources, &mut registry)?;
+        self.scan_audio_metadata(&sources, &mut registry)?;
         self.scan_map_obj_flags(&sources, &mut registry)?;
         self.scan_collision_surfaces(&sources, &mut registry)?;
         self.scan_particle_bindings(&sources, &mut registry)?;
@@ -1604,6 +1660,32 @@ impl SchemaGenerator {
         Ok(())
     }
 
+    fn scan_audio_metadata(
+        &self,
+        sources: &SourceInventory,
+        registry: &mut ObjectRegistry,
+    ) -> Result<()> {
+        let map_static_path = "src/Map/MapStaticObject.cpp";
+        registry.graph_sound_emitters = extract_graph_sound_emitters(
+            sources.required(map_static_path)?.text(),
+            map_static_path,
+        );
+
+        let handle_path = "src/MSound/MSHandle.cpp";
+        let sound_path = "src/MSound/MSound.cpp";
+        if let (Ok(handle), Ok(sound)) =
+            (sources.required(handle_path), sources.required(sound_path))
+        {
+            registry.sound_attenuation =
+                extract_sound_attenuation(handle.text(), sound.text(), handle_path, sound_path);
+        }
+
+        let factory_path = "src/System/MarNameRefGen.cpp";
+        registry.cube_managers =
+            extract_cube_managers(sources.required(factory_path)?.text(), factory_path);
+        Ok(())
+    }
+
     fn scan_map_obj_flags(
         &self,
         sources: &SourceInventory,
@@ -2193,16 +2275,117 @@ fn extract_map_static_models(text: &str, source_file: &str) -> Vec<MapStaticMode
         };
         let model_path =
             parse_cpp_string(fields[8]).map(|model_name| format!("{directory}/{model_name}.bmd"));
+        let sound_id = parse_cpp_u32(fields[12]).filter(|sound_id| *sound_id != u32::MAX);
         models.push(MapStaticModelDefinition {
             actor_name,
             model_path,
             load_flags,
+            sound_id,
             source_file: source_file.to_string(),
             stage_bootstrap_created: false,
         });
     }
 
     models
+}
+
+fn extract_graph_sound_emitters(text: &str, source_file: &str) -> Vec<GraphSoundEmitterDefinition> {
+    let table_re = Regex::new(r"static\s+const\s+SoundInfoEntry\s+sound_info\s*\[\s*\]\s*=\s*\{")
+        .expect("valid graph sound table regex");
+    let Some(table) = table_re.find(text) else {
+        return Vec::new();
+    };
+    let Some(body) = braced_body(text, table.end() - 1) else {
+        return Vec::new();
+    };
+    let entry_re = Regex::new(r#"\{\s*"([^"]+)"\s*,\s*(0x[0-9A-Fa-f]+|\d+)\s*\}"#)
+        .expect("valid graph sound entry regex");
+    entry_re
+        .captures_iter(body)
+        .filter_map(|captures| {
+            Some(GraphSoundEmitterDefinition {
+                graph_name: captures[1].to_string(),
+                sound_id: parse_cpp_u32(&captures[2])?,
+                source_file: source_file.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn parse_cpp_integral_f32(value: &str) -> Option<u32> {
+    let trimmed = value.trim().trim_end_matches(['f', 'F']);
+    let parsed = trimmed.parse::<f32>().ok()?;
+    (parsed.is_finite() && parsed >= 0.0 && parsed.fract().abs() <= f32::EPSILON)
+        .then_some(parsed as u32)
+}
+
+fn extract_sound_attenuation(
+    handle_source: &str,
+    sound_source: &str,
+    handle_file: &str,
+    sound_file: &str,
+) -> SoundAttenuationDefinition {
+    let table_re = Regex::new(r"SeCategory\s+MSHandle::smSeCategory\s*\[\s*\d+\s*\]\s*=\s*\{")
+        .expect("valid sound category table regex");
+    let entry_re =
+        Regex::new(r"\{\s*(0x[0-9A-Fa-f]+|\d+)\s*,\s*([^,]+)\s*,\s*[^,]+\s*,\s*([^}]+)\}")
+            .expect("valid sound category entry regex");
+    let categories = table_re
+        .find(handle_source)
+        .and_then(|table| braced_body(handle_source, table.end() - 1))
+        .into_iter()
+        .flat_map(|body| entry_re.captures_iter(body))
+        .enumerate()
+        .filter_map(|(category, captures)| {
+            Some(SoundAttenuationCategoryDefinition {
+                category: u8::try_from(category).ok()?,
+                behavior_flags: parse_cpp_u32(&captures[1])?,
+                max_distance: parse_cpp_integral_f32(&captures[2])?,
+                fixed_curve_range: parse_cpp_integral_f32(&captures[3])?,
+            })
+        })
+        .collect();
+    let full_volume_re =
+        Regex::new(r"setParamMaxVolumeDistance\s*\(\s*([0-9]+(?:\.[0-9]+)?f?)\s*\)")
+            .expect("valid full-volume distance regex");
+    let full_volume_distance = full_volume_re
+        .captures(sound_source)
+        .and_then(|captures| parse_cpp_integral_f32(&captures[1]))
+        .unwrap_or_default();
+    SoundAttenuationDefinition {
+        full_volume_distance,
+        categories,
+        source_files: vec![handle_file.to_string(), sound_file.to_string()],
+    }
+}
+
+fn extract_cube_managers(text: &str, source_file: &str) -> Vec<CubeManagerDefinition> {
+    let manager_re = Regex::new(
+        r#"(?s)if\s*\(\s*strcmp\(name,\s*"([^"]+)"\)\s*==\s*0\s*\)\s*return\s+([^;]*?)new\s+TCubeManager\w*\s*\(\s*"[^"]*"\s*,\s*"([^"]+)"\s*\)\s*;"#,
+    )
+    .expect("valid cube manager factory regex");
+    let global_re = Regex::new(r"(gpCube[A-Za-z0-9_]+)").expect("valid cube manager global regex");
+    manager_re
+        .captures_iter(text)
+        .map(|captures| {
+            let runtime_global = global_re
+                .captures(&captures[2])
+                .map(|global| global[1].to_string())
+                .unwrap_or_default();
+            let kind = match runtime_global.strip_prefix("gpCube") {
+                Some("SoundChange") => CubeManagerKind::SoundChange,
+                Some("SoundEffect") => CubeManagerKind::SoundEffect,
+                _ => CubeManagerKind::Other,
+            };
+            CubeManagerDefinition {
+                factory_name: captures[1].to_string(),
+                runtime_global,
+                table_name: captures[3].to_string(),
+                kind,
+                source_file: source_file.to_string(),
+            }
+        })
+        .collect()
 }
 
 fn extract_stage_bootstrap_map_static_actors(text: &str) -> Vec<String> {
@@ -4032,6 +4215,23 @@ fn dedup_registry(registry: &mut ObjectRegistry) -> Result<()> {
     });
     registry.map_static_models.dedup();
 
+    registry.graph_sound_emitters.sort_by(|a, b| {
+        a.graph_name
+            .cmp(&b.graph_name)
+            .then_with(|| a.sound_id.cmp(&b.sound_id))
+    });
+    registry.graph_sound_emitters.dedup();
+    registry
+        .sound_attenuation
+        .categories
+        .sort_by_key(|definition| definition.category);
+    registry.cube_managers.sort_by(|a, b| {
+        a.table_name
+            .cmp(&b.table_name)
+            .then_with(|| a.factory_name.cmp(&b.factory_name))
+    });
+    registry.cube_managers.dedup();
+
     registry.map_obj_flags.sort_by(|a, b| {
         a.factory_name
             .cmp(&b.factory_name)
@@ -5487,7 +5687,7 @@ mod tests {
         let text = r#"
             static const TMapStaticObj::ActorDataTableEntry actor_data_table[] = {
                 { "BiancoRiver", 0, 0, 0.0f, 0.0f, 0.0f, 0.0f, nullptr,
-                  "BiancoRiver", 0x10210000, nullptr, 0, 0xFFFFFFFF, 0, 0, 0, 0x40 },
+                  "BiancoRiver", 0x10210000, nullptr, 0, 0x3022, 0, 0, 0, 0x40 },
                 { "CommonThing", 0, 0, 0.0f, 0.0f, 0.0f, 0.0f, nullptr,
                   "SharedModel", 0x11220000, nullptr, 0, 0xFFFFFFFF, 0, 0, 0, 0x2 },
                 { "NoModel", 0, 0, 0.0f, 0.0f, 0.0f, 0.0f, nullptr,
@@ -5504,6 +5704,7 @@ mod tests {
             Some("/scene/map/map/BiancoRiver.bmd")
         );
         assert_eq!(models[0].load_flags, 0x1021_0000);
+        assert_eq!(models[0].sound_id, Some(0x3022));
         assert_eq!(
             models[1].model_path.as_deref(),
             Some("/common/map/SharedModel.bmd")
@@ -5512,6 +5713,47 @@ mod tests {
         assert_eq!(models[2].actor_name, "NoModel");
         assert_eq!(models[2].model_path, None);
         assert_eq!(models[2].load_flags, 0x1021_0000);
+        assert_eq!(models[2].sound_id, None);
+    }
+
+    #[test]
+    fn extracts_data_driven_audio_helpers_from_decomp_sources() {
+        let map_static = r#"
+            static const SoundInfoEntry sound_info[] = {
+                { "ms_sea", 0x5000 },
+                { "ms_harbor", 0x5003 },
+                { nullptr, 0 },
+            };
+        "#;
+        let emitters = extract_graph_sound_emitters(map_static, "MapStaticObject.cpp");
+        assert_eq!(emitters.len(), 2);
+        assert_eq!(emitters[0].graph_name, "ms_sea");
+        assert_eq!(emitters[0].sound_id, 0x5000);
+
+        let handle = r#"
+            SeCategory MSHandle::smSeCategory[2] = {
+                { 0x02000000, 8000.0f, 0.75f, 150.0f },
+                { 0x03000000, 6000.0f, 1.0f, 500.0f },
+            };
+        "#;
+        let sound = "JAIGlobalParameter::setParamMaxVolumeDistance(1200.0);";
+        let attenuation = extract_sound_attenuation(handle, sound, "handle.cpp", "sound.cpp");
+        assert_eq!(attenuation.full_volume_distance, 1200);
+        assert_eq!(attenuation.categories.len(), 2);
+        assert_eq!(attenuation.categories[1].max_distance, 6000);
+
+        let factories = r#"
+            if (strcmp(name, "CubeSoundChange") == 0)
+                return gpCubeSoundChange
+                       = new TCubeManagerBase("?", "sound change table");
+            if (strcmp(name, "CubeCamera") == 0)
+                return gpCubeCamera = new TCubeManagerBase("?", "camera table");
+        "#;
+        let managers = extract_cube_managers(factories, "MarNameRefGen.cpp");
+        assert_eq!(managers.len(), 2);
+        assert_eq!(managers[0].kind, CubeManagerKind::SoundChange);
+        assert_eq!(managers[0].table_name, "sound change table");
+        assert_eq!(managers[1].kind, CubeManagerKind::Other);
     }
 
     #[test]

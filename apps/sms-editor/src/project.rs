@@ -27,6 +27,29 @@ pub(super) struct ProjectLaunchConfiguration {
     pub(super) dolphin_user_directory: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct ProjectStageMusic {
+    pub(super) bgm_id: u32,
+    pub(super) wave_scene_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) secondary_bgm_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProjectSoundAssignmentKind {
+    MapStatic,
+    Graph,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct ProjectSoundAssignment {
+    pub(super) kind: ProjectSoundAssignmentKind,
+    pub(super) source_name: String,
+    pub(super) original_sound_id: u32,
+    pub(super) sound_id: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct ProjectCameraState {
     pub(super) focus: [f32; 3],
@@ -81,6 +104,12 @@ pub(super) struct SmsProjectFile {
     pub(super) last_stage: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(super) stage_cameras: BTreeMap<String, ProjectCameraState>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) stage_music: BTreeMap<String, ProjectStageMusic>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) sound_assignments: BTreeMap<String, ProjectSoundAssignment>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) audio_previews: BTreeMap<String, PathBuf>,
     #[serde(default)]
     pub(super) launch: ProjectLaunchConfiguration,
 }
@@ -104,6 +133,9 @@ impl SmsProjectFile {
             schema_source_root,
             last_stage: None,
             stage_cameras: BTreeMap::new(),
+            stage_music: BTreeMap::new(),
+            sound_assignments: BTreeMap::new(),
+            audio_previews: BTreeMap::new(),
             launch: ProjectLaunchConfiguration::default(),
         }
     }
@@ -251,6 +283,49 @@ impl SmsProjectFile {
         }) {
             return Err(format!(
                 "Project '{}' has an invalid saved stage camera",
+                path.display()
+            ));
+        }
+        if self.stage_music.iter().any(|(stage, music)| {
+            stage.trim().is_empty()
+                || !stage
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "_-".contains(character))
+                || music.bgm_id & 0xffff_0000 != 0x8001_0000
+                || music.wave_scene_id == u32::MAX
+                || music
+                    .secondary_bgm_id
+                    .is_some_and(|bgm_id| bgm_id & 0xffff_0000 != 0x8001_0000)
+        }) {
+            return Err(format!(
+                "Project '{}' has an invalid saved stage music override",
+                path.display()
+            ));
+        }
+        if self.sound_assignments.iter().any(|(key, assignment)| {
+            key.trim().is_empty()
+                || assignment.source_name.trim().is_empty()
+                || assignment.original_sound_id > u16::MAX.into()
+                || assignment.sound_id > u16::MAX.into()
+        }) {
+            return Err(format!(
+                "Project '{}' has an invalid sound helper assignment",
+                path.display()
+            ));
+        }
+        if self.audio_previews.iter().any(|(key, preview)| {
+            key.trim().is_empty()
+                || preview.as_os_str().is_empty()
+                || preview.is_absolute()
+                || preview.components().any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                })
+        }) {
+            return Err(format!(
+                "Project '{}' has an invalid editor audio-preview path",
                 path.display()
             ));
         }
@@ -745,6 +820,13 @@ mod tests {
                 viewport_pan: [12.0, -8.0],
                 viewport_zoom: 1.25,
                 camera_speed: 0.75,
+            },
+        );
+        project.stage_music.insert(
+            "dolpic0".to_string(),
+            ProjectStageMusic {
+                bgm_id: 0x8001_0002,
+                wave_scene_id: 0x202,
             },
         );
 

@@ -32,6 +32,7 @@ use sms_scene::{
 };
 use sms_schema::{ObjectDefinition, ObjectRegistry, ParticleBindingTarget, SchemaGenerator};
 
+mod audio_helpers;
 mod camera;
 mod direct_boot;
 mod document_commands;
@@ -39,6 +40,7 @@ mod game_text;
 mod gpu_viewport;
 mod managed_build;
 mod model_assets;
+mod music_library;
 mod outliner;
 mod play_in_editor;
 mod project;
@@ -50,8 +52,10 @@ mod stage_creation;
 mod ui_panels;
 mod viewport_ui;
 
+use audio_helpers::*;
 use game_text::*;
 use model_assets::*;
+use music_library::*;
 use outliner::*;
 use project::*;
 use project_ui::{path_display_row, NewProjectDraft};
@@ -201,6 +205,9 @@ struct LoadedStage {
     scene_label_warning: Option<String>,
     retail_skyboxes: Vec<RetailSkyboxEntry>,
     skybox_warnings: Vec<String>,
+    retail_music: Vec<RetailMusicEntry>,
+    retail_sounds: Vec<RetailSoundEntry>,
+    music_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +240,9 @@ struct SceneScanResult {
     label_warning: Option<String>,
     retail_skyboxes: Vec<RetailSkyboxEntry>,
     skybox_warnings: Vec<String>,
+    retail_music: Vec<RetailMusicEntry>,
+    retail_sounds: Vec<RetailSoundEntry>,
+    music_warning: Option<String>,
 }
 
 fn build_object_authoring_catalog(
@@ -756,6 +766,8 @@ struct SmsEditorApp {
     scene_archives: Vec<SceneArchiveInfo>,
     scene_labels: BTreeMap<String, SceneArchiveLabel>,
     retail_skyboxes: Vec<RetailSkyboxEntry>,
+    retail_music: Vec<RetailMusicEntry>,
+    retail_sounds: Vec<RetailSoundEntry>,
     model_preview: Option<ModelPreview>,
     gpu_viewport: Option<gpu_viewport::GpuViewportScene>,
     gpu_target_format: Option<eframe::wgpu::TextureFormat>,
@@ -820,6 +832,10 @@ struct SmsEditorApp {
     show_environment_meshes: bool,
     show_goop_meshes: bool,
     show_effects: bool,
+    show_audio_helpers: bool,
+    selected_audio_helper_id: Option<String>,
+    audio_cube_edit_before: Option<StageArchiveEdits>,
+    audio_cube_helpers_cache: Vec<AudioHelper>,
     outliner_filter: String,
     startup_camera_focus: Option<[f32; 3]>,
     route_mode: bool,
@@ -958,6 +974,8 @@ impl Default for SmsEditorApp {
             scene_archives: Vec::new(),
             scene_labels: BTreeMap::new(),
             retail_skyboxes: Vec::new(),
+            retail_music: Vec::new(),
+            retail_sounds: Vec::new(),
             model_preview: None,
             gpu_viewport: None,
             gpu_target_format: None,
@@ -1022,6 +1040,10 @@ impl Default for SmsEditorApp {
             show_environment_meshes: true,
             show_goop_meshes: true,
             show_effects: true,
+            show_audio_helpers: true,
+            selected_audio_helper_id: None,
+            audio_cube_edit_before: None,
+            audio_cube_helpers_cache: Vec::new(),
             outliner_filter: String::new(),
             route_mode: false,
             show_all_routes: true,
@@ -1359,12 +1381,25 @@ impl SmsEditorApp {
                     Err(error) => (BTreeMap::new(), Some(error)),
                 };
                 let (retail_skyboxes, skybox_warnings) = index_retail_skyboxes(&archives);
+                let (retail_music, music_warning) = match index_retail_music(
+                    Path::new(&repo_root),
+                    Path::new(&task_base_root),
+                    &labels,
+                ) {
+                    Ok(entries) => (entries, None),
+                    Err(error) => (Vec::new(), Some(error)),
+                };
+                let retail_sounds = index_retail_sounds(Path::new(&task_base_root))
+                    .unwrap_or_default();
                 Ok(SceneScanResult {
                     archives,
                     labels,
                     label_warning,
                     retail_skyboxes,
                     skybox_warnings,
+                    retail_music,
+                    retail_sounds,
+                    music_warning,
                 })
             })();
             let _ = sender.send(BackgroundResult::Scan {
@@ -1488,6 +1523,16 @@ impl SmsEditorApp {
                     object_authoring_catalog_warnings,
                 ) = split_object_authoring_catalog_cache(object_authoring_catalog_cache);
                 let (retail_skyboxes, skybox_warnings) = index_retail_skyboxes(&archives);
+                let (retail_music, music_warning) = match index_retail_music(
+                    Path::new(&repo_root),
+                    Path::new(&base_root),
+                    &scene_labels,
+                ) {
+                    Ok(entries) => (entries, None),
+                    Err(error) => (Vec::new(), Some(error)),
+                };
+                let retail_sounds =
+                    index_retail_sounds(Path::new(&base_root)).unwrap_or_default();
                 let scene = RenderScene::from_document(&document);
                 let preview = SmsEditorApp::build_model_preview(&document, visibility);
                 Ok(Box::new(LoadedStage {
@@ -1508,6 +1553,9 @@ impl SmsEditorApp {
                     scene_label_warning,
                     retail_skyboxes,
                     skybox_warnings,
+                    retail_music,
+                    retail_sounds,
+                    music_warning,
                 }))
             })();
             let _ = sender.send(BackgroundResult::Open(result));
@@ -1580,9 +1628,13 @@ impl SmsEditorApp {
                             let count = scan.archives.len();
                             let label_count = scan.labels.len();
                             let skybox_count = scan.retail_skyboxes.len();
+                            let music_count = scan.retail_music.len();
+                            let sound_count = scan.retail_sounds.len();
                             self.scene_archives = scan.archives;
                             self.scene_labels = scan.labels;
                             self.retail_skyboxes = scan.retail_skyboxes;
+                            self.retail_music = scan.retail_music;
+                            self.retail_sounds = scan.retail_sounds;
                             self.last_scanned_base_root = base_root;
                             if self.stage_id.trim().is_empty() {
                                 if let Some(first) = self.scene_archives.first() {
@@ -1599,12 +1651,23 @@ impl SmsEditorApp {
                             self.log.push(format!(
                                 "Indexed {skybox_count} complete retail skybox bundle(s)."
                             ));
+                            self.log.push(format!(
+                                "Indexed {music_count} decomp-derived stage music choice(s)."
+                            ));
+                            self.log.push(format!(
+                                "Indexed {sound_count} exact retail sound name(s)."
+                            ));
                             for warning in scan.skybox_warnings {
                                 self.log.push(warning);
                             }
                             if let Some(warning) = scan.label_warning {
                                 self.log.push(format!(
                                     "Scene names are unavailable; archive IDs remain active: {warning}"
+                                ));
+                            }
+                            if let Some(warning) = scan.music_warning {
+                                self.log.push(format!(
+                                    "Stage music choices are unavailable: {warning}"
                                 ));
                             }
                         }
@@ -1645,7 +1708,7 @@ impl SmsEditorApp {
                                 ));
                             }
                             self.log.push(
-                                "Author the scene by dropping terrain and Mario into the viewport, then set the skybox role and Stage Lighting before runtime testing."
+                                "Author the scene by dropping terrain and Mario into the viewport, then set the skybox role, Stage Music, and Stage Lighting before runtime testing."
                                     .to_string(),
                             );
                         }
@@ -1670,6 +1733,16 @@ impl SmsEditorApp {
                                 "Managed game directory: '{}'. The extracted base game was not modified.",
                                 outcome.run.run_root.display(),
                             ));
+                            if let Some(count) = self
+                                .current_project
+                                .as_ref()
+                                .map(|project| project.descriptor.stage_music.len())
+                                .filter(|count| *count > 0)
+                            {
+                                self.log.push(format!(
+                                    "Installed {count} stage music choice(s) into the packaged sys/main.dol for normal Dolphin boot."
+                                ));
+                            }
                         }
                         Err(err) if managed_build::is_cancelled_error(&err) => {
                             self.log.push(format!("Game build cancelled: {err}"))
@@ -1689,6 +1762,16 @@ impl SmsEditorApp {
                                 "Managed game directory: '{}'. The extracted base game was not modified.",
                                 outcome.run.run_root.display(),
                             ));
+                            if let Some(count) = self
+                                .current_project
+                                .as_ref()
+                                .map(|project| project.descriptor.stage_music.len())
+                                .filter(|count| *count > 0)
+                            {
+                                self.log.push(format!(
+                                    "Installed {count} stage music choice(s) into the packaged sys/main.dol for normal Dolphin boot."
+                                ));
+                            }
                             self.log.push(format!(
                                 "Prepared {} {}-byte direct-boot executable '{}' for '{}' at runtime area {}, scenario {} (logo bypass 0x{:08X}, hook 0x{:08X}, movie hook 0x{:08X}, stub 0x{:08X}).",
                                 if outcome.direct_boot.reused {
@@ -1706,10 +1789,6 @@ impl SmsEditorApp {
                                 outcome.direct_boot.movie_hook_address,
                                 outcome.direct_boot.stub_address,
                             ));
-                            self.log.push(
-                                "Direct boot progression: 120 Shines, 240 blue coins, 99 lives, all persistent Delfino story/nozzle flags set."
-                                    .to_string(),
-                            );
                             if outcome.direct_boot.matching_contexts > 1 {
                                 self.log.push(format!(
                                     "The archive has {} runtime contexts in stageArc.bin; direct boot uses the first table entry (area {}, scenario {}).",
@@ -1762,6 +1841,9 @@ impl SmsEditorApp {
             scene_label_warning,
             retail_skyboxes,
             skybox_warnings,
+            retail_music,
+            retail_sounds,
+            music_warning,
         } = loaded;
         if self.base_root.trim() != base_root {
             self.log.push(format!(
@@ -1794,6 +1876,10 @@ impl SmsEditorApp {
             self.log.push(format!(
                 "Scene names are unavailable; archive IDs remain active: {warning}"
             ));
+        }
+        if let Some(warning) = music_warning {
+            self.log
+                .push(format!("Stage music choices are unavailable: {warning}"));
         }
         self.project_root = project_root;
         self.adopt_resolved_project_data_root();
@@ -1831,6 +1917,8 @@ impl SmsEditorApp {
         self.scene_archives = archives;
         self.scene_labels = scene_labels;
         self.retail_skyboxes = retail_skyboxes;
+        self.retail_music = retail_music;
+        self.retail_sounds = retail_sounds;
         self.last_scanned_base_root = self.base_root.trim().to_string();
         self.log.push(format!(
             "Opened stage '{}' with {} asset(s), {} model(s), {} collision file(s). You can add typed object classes with automatic dependencies from the content browser.",
@@ -1900,6 +1988,7 @@ impl SmsEditorApp {
         self.document_dirty = false;
         self.stage_id = document.stage_id.clone();
         self.document = Some(document);
+        self.rebuild_audio_cube_helpers_cache();
         self.render_scene = Some(scene);
         self.reset_authored_model_preview_base();
         self.model_preview = preview;

@@ -93,7 +93,7 @@ impl SmsEditorApp {
 
                 ui.add_space(8.0);
                 ui.small(
-                    "The editor allocates the next safe reserved area/scenario entry in the project's stageArc.bin and creates a minimal runtime shell. After creation, drag in the world model and any cataloged typed object class; required manager and resource dependencies are added automatically. Assign a model as Stage skybox and edit Stage Lighting in the inspector.",
+                    "The editor allocates the next safe reserved area/scenario entry in the project's stageArc.bin and creates a minimal runtime shell. After creation, drag in the world model and any cataloged typed object class; required manager and resource dependencies are added automatically. Assign a model as Stage skybox, then edit Stage Music and Stage Lighting in the inspector.",
                 );
                 ui.small("The extracted game remains read-only. The project mapping is installed only in managed builds and releases.");
 
@@ -153,6 +153,7 @@ impl SmsEditorApp {
         let mut archives = self.scene_archives.clone();
         let scene_labels = self.scene_labels.clone();
         let retail_skyboxes = self.retail_skyboxes.clone();
+        let retail_music = self.retail_music.clone();
         let existing_object_authoring_catalog_cache = self
             .reusable_object_authoring_catalog_cache(Path::new(&base_root), self.registry.as_ref());
         let existing_registry = self.registry.clone();
@@ -263,6 +264,8 @@ impl SmsEditorApp {
                     scene_label_warning: None,
                     retail_skyboxes,
                     skybox_warnings: Vec::new(),
+                    retail_music,
+                    music_warning: None,
                 }))
             })();
             let _ = sender.send(BackgroundResult::CreateStage(result));
