@@ -14,9 +14,14 @@ pub const GOOP_CELL_SIZE: f32 = 40.0;
 /// Inverse of `TPollutionPos::worldToDepth`'s hard-coded `0.025` conversion.
 /// This is independent of a retail layer's horizontal `mVerticalScale`.
 pub const GOOP_DEPTH_WORLD_UNITS_PER_CODE: f32 = 40.0;
+/// Depth zero cannot be modified by Sunshine's texture-stamp pass. The pass
+/// uses strict `depth > lower && upper > depth` TEV comparisons and clamps a
+/// negative lower bound to zero, making a zero-valued YMP cell permanently
+/// fail the first comparison even when the water stamp is at the same height.
+pub const GOOP_MIN_MUTABLE_DEPTH: u8 = 1;
 pub const GOOP_MAX_LAYERS: usize = 20;
 pub const GOOP_MAX_DIMENSION: usize = 1024;
-pub const GOOP_AUTHORING_FORMAT_VERSION: u32 = 5;
+pub const GOOP_AUTHORING_FORMAT_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -505,7 +510,13 @@ pub fn generate_floor_depth_map(
             "the goop region contains no representable floor cells".to_string(),
         ));
     }
-    let vertical_offset = (minimum / GOOP_CELL_SIZE).floor() * GOOP_CELL_SIZE;
+    // Keep one encoded step below the lowest terrain. Depth 0 is visible but
+    // cannot be changed by TPollutionCounterLayer::drawTexStamp because its
+    // strict lower-bound comparison clamps the bound to 0. Reserving this
+    // guard band makes every generated floor cell paintable and cleanable.
+    let vertical_offset = (minimum / GOOP_DEPTH_WORLD_UNITS_PER_CODE).floor()
+        * GOOP_DEPTH_WORLD_UNITS_PER_CODE
+        - f32::from(GOOP_MIN_MUTABLE_DEPTH) * GOOP_DEPTH_WORLD_UNITS_PER_CODE;
     let mut layer = YmpLayer {
         layer_type: 0,
         subtype: 0,
@@ -529,7 +540,7 @@ pub fn generate_floor_depth_map(
                 continue;
             };
             let depth = ((value - vertical_offset) * 0.025).trunc();
-            if !(0.0..=254.0).contains(&depth) {
+            if !(f32::from(GOOP_MIN_MUTABLE_DEPTH)..=254.0).contains(&depth) {
                 return Err(SceneError::StageExport(format!(
                     "terrain height {value} in cell ({x}, {y}) exceeds the YMP 8-bit vertical span from offset {vertical_offset}"
                 )));
@@ -885,9 +896,6 @@ fn redirect_detail_tex_gens(
             material_section.declared_size
         )));
     }
-    if gradients.iter().skip(1).all(Option::is_none) {
-        return Ok(());
-    }
     let (insertion_offset, allocation_growth, layout_growth) = {
         let J3dRebuildSectionData::Materials(materials) = &mut material_section.data else {
             return Err(SceneError::StageExport(
@@ -932,6 +940,46 @@ fn redirect_detail_tex_gens(
                     "goop template material-zero remap {material_zero_init} is out of bounds"
                 ))
             })?;
+        let mask_source_index = record.tex_coord_indices[0];
+        if mask_source_index == u16::MAX {
+            return Err(SceneError::StageExport(
+                "goop template material zero has no mask texcoord generator".to_string(),
+            ));
+        }
+        let mask_source_offset =
+            usize::from(mask_source_index)
+                .checked_mul(4)
+                .ok_or_else(|| {
+                    SceneError::StageExport(
+                        "goop template MAT3 mask texcoord index overflow".to_string(),
+                    )
+                })?;
+        let mask_source: [u8; 4] = allocation
+            .get(mask_source_offset..mask_source_offset + 4)
+            .ok_or_else(|| {
+                SceneError::StageExport(format!(
+                    "goop template MAT3 mask texcoord index {mask_source_index} is out of bounds"
+                ))
+            })?
+            .try_into()
+            .expect("checked four-byte texcoord record");
+        // Generated texture zero is the mutable pollution mask. Its UVs are
+        // already normalized from the layer's world-space X/Z region, so any
+        // retail texture matrix would move the visible mask away from the YMP
+        // cell that Sunshine stamps. Force TEX0 and GX_IDENTITY while leaving
+        // the template's detail channels and visual material state intact.
+        let redirected_mask = [mask_source[0], 4, 60, mask_source[3]];
+        let redirected_mask_index = allocation
+            .chunks_exact(4)
+            .position(|entry| entry == redirected_mask)
+            .unwrap_or_else(|| {
+                let index = allocation.len() / 4;
+                allocation.extend_from_slice(&redirected_mask);
+                index
+            });
+        record.tex_coord_indices[0] = u16::try_from(redirected_mask_index).map_err(|_| {
+            SceneError::StageExport("goop template MAT3 has too many texcoord entries".to_string())
+        })?;
         for (slot, gradient) in gradients.iter().enumerate().skip(1) {
             if gradient.is_none() || record.tex_coord_indices[slot] == u16::MAX {
                 continue;
@@ -1612,6 +1660,26 @@ mod tests {
             .collect()
     }
 
+    fn mask_material() -> GxMaterial {
+        let mut material = GxMaterial {
+            tex_gen_count: 1,
+            tev_stage_count: 1,
+            ..GxMaterial::default()
+        };
+        material.tex_gens[0] = Some(sms_formats::GxTexCoordGen {
+            function: 1,
+            source: 4,
+            matrix: 60,
+        });
+        material.texture_numbers[0] = Some(0);
+        material.tev_orders[0] = Some(sms_formats::GxTevOrder {
+            tex_coord: Some(0),
+            tex_map: Some(0),
+            color_channel: 0xff,
+        });
+        material
+    }
+
     fn floor_runtime(
         region: GoopRegion,
         width_log2: u16,
@@ -1680,7 +1748,7 @@ mod tests {
     }
 
     #[test]
-    fn floor_generator_uses_tiled_depth_and_runtime_scale() {
+    fn floor_generator_uses_tiled_depth_and_reserves_mutable_zero_guard_band() {
         let triangles = flat(400.0, 125.0);
         let region = GoopRegion {
             min_x: 0.0,
@@ -1689,7 +1757,7 @@ mod tests {
             max_z: 160.0,
         };
         let (offset, depth_map) = generate_floor_depth_map(&triangles, region, 3, 2).unwrap();
-        assert_eq!(offset, 120.0);
+        assert_eq!(offset, 80.0);
         let layer = YmpLayer {
             layer_type: 0,
             subtype: 0,
@@ -1707,7 +1775,7 @@ mod tests {
             map_offset: 0,
             depth_map,
         };
-        assert_eq!(layer.depth_at(1, 1).unwrap(), 0);
+        assert_eq!(layer.depth_at(1, 1).unwrap(), GOOP_MIN_MUTABLE_DEPTH);
     }
 
     #[test]
@@ -1741,8 +1809,8 @@ mod tests {
             map_offset: 0,
             depth_map,
         };
-        assert_eq!(offset, 120.0);
-        assert_eq!(layer.depth_at(0, 0).unwrap(), 0);
+        assert_eq!(offset, 80.0);
+        assert_eq!(layer.depth_at(0, 0).unwrap(), GOOP_MIN_MUTABLE_DEPTH);
         assert_eq!(layer.depth_at(1, 0).unwrap(), 0xff);
     }
 
@@ -1774,9 +1842,9 @@ mod tests {
             map_offset: 0,
             depth_map,
         };
-        assert_eq!(offset, 0.0);
-        assert_eq!(layer.depth_at(0, 0).unwrap(), 5);
-        assert_eq!(layer.depth_at(1, 0).unwrap(), 0);
+        assert_eq!(offset, -40.0);
+        assert_eq!(layer.depth_at(0, 0).unwrap(), 6);
+        assert_eq!(layer.depth_at(1, 0).unwrap(), GOOP_MIN_MUTABLE_DEPTH);
     }
 
     #[test]
@@ -1790,7 +1858,7 @@ mod tests {
             max_z: 160.0,
         };
         let (offset, depth_map) = generate_floor_depth_map(&triangles, region, 3, 2).unwrap();
-        assert_eq!(offset, 200.0);
+        assert_eq!(offset, 160.0);
         let mut layer = YmpLayer {
             layer_type: 0,
             subtype: 0,
@@ -1808,7 +1876,7 @@ mod tests {
             map_offset: 0,
             depth_map,
         };
-        assert_eq!(layer.depth_at(1, 1).unwrap(), 0);
+        assert_eq!(layer.depth_at(1, 1).unwrap(), GOOP_MIN_MUTABLE_DEPTH);
         layer.set_depth(1, 1, 12).unwrap();
         assert_eq!(layer.depth_at(1, 1).unwrap(), 12);
     }
@@ -1883,7 +1951,7 @@ mod tests {
                 ],
                 triangles: vec![[0, 1, 2]],
             }],
-            materials: vec![GxMaterial::default()],
+            materials: vec![mask_material()],
             textures: vec![texture],
         })
         .unwrap();
@@ -1947,7 +2015,7 @@ mod tests {
                 ],
                 triangles: vec![[0, 2, 1]],
             }],
-            materials: vec![GxMaterial::default()],
+            materials: vec![mask_material()],
             textures: vec![texture],
         })
         .unwrap();
@@ -2016,7 +2084,12 @@ mod tests {
         material.tex_gens[0] = Some(sms_formats::GxTexCoordGen {
             function: 1,
             source: 4,
-            matrix: 60,
+            matrix: 30,
+        });
+        material.tex_matrices[0] = Some(sms_formats::GxTexMatrix {
+            scale: [2.0, 3.0],
+            translation: [0.25, -0.125],
+            ..sms_formats::GxTexMatrix::default()
         });
         material.tex_gens[1] = Some(sms_formats::GxTexCoordGen {
             function: 1,
@@ -2119,6 +2192,8 @@ mod tests {
             .iter()
             .find(|material| material.material_index == 0)
             .unwrap();
+        assert_eq!(material.tex_gens[0].source, 4);
+        assert_eq!(material.tex_gens[0].matrix, 60);
         assert_eq!(material.texture_indices[1], Some(1));
         assert_eq!(material.texture_indices[2], Some(2));
         assert_eq!(material.tex_gens[1].source, 5);
@@ -2150,6 +2225,15 @@ mod tests {
                     .all(|uv| (-0.001..=1.001).contains(&uv[0]))
             })
         }));
+        for triangle in &preview.triangles {
+            let mask_coords = triangle.tex_coord_sets[0]
+                .expect("generated geometry keeps normalized mask coordinates");
+            for (position, uv) in triangle.vertices.into_iter().zip(mask_coords) {
+                let expected = [position[0] / 320.0, position[2] / 160.0];
+                assert!((uv[0] - expected[0]).abs() < 0.0001);
+                assert!((uv[1] - expected[1]).abs() < 0.0001);
+            }
+        }
     }
 
     #[test]
