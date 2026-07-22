@@ -335,6 +335,67 @@ impl SmsEditorApp {
         }
     }
 
+    pub(super) fn prepare_generated_goop_resources_for_build(&mut self) -> Result<bool, String> {
+        let jobs = self
+            .document
+            .as_ref()
+            .and_then(|document| document.goop_authoring.as_ref())
+            .map(|authoring| {
+                authoring
+                    .layers
+                    .iter()
+                    .filter(|layer| layer.origin == GoopLayerOrigin::Generated)
+                    .map(|layer| {
+                        let source = layer.style_source.clone().ok_or_else(|| {
+                            format!("layer {} has no retail style provenance", layer.id)
+                        })?;
+                        let model = layer.generated_model.as_ref().ok_or_else(|| {
+                            format!("layer {} has no generated pollution model", layer.id)
+                        })?;
+                        Ok((
+                            source,
+                            layer.resource_stem.clone(),
+                            pollution_material_name(model)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        if jobs.is_empty() {
+            return Ok(false);
+        }
+
+        self.ensure_goop_templates_indexed();
+        let templates = jobs
+            .into_iter()
+            .map(|(source, target_stem, material_name)| {
+                let template = self
+                    .retail_goop_templates
+                    .iter()
+                    .find(|template| {
+                        template.stage_id == source.stage_id
+                            && template.layer_index == source.layer_index
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!("retail template {} is unavailable", source.display_name)
+                    })?;
+                Ok((template, target_stem, material_name))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let document = self
+            .document
+            .as_mut()
+            .ok_or_else(|| "no stage is open".to_string())?;
+        let before = document.archive_edits.clone();
+        for (template, target_stem, material_name) in templates {
+            copy_template_resources(document, &template, &target_stem, &material_name)?;
+            sync_runtime_actor_goop_textures(document, &template)?;
+        }
+        Ok(document.archive_edits != before)
+    }
+
     pub(super) fn goop_inspector_panel(&mut self, ui: &mut egui::Ui) {
         self.ensure_goop_templates_indexed();
         let generator_upgrade_available =
@@ -775,7 +836,7 @@ impl SmsEditorApp {
             document
                 .compile_goop_authoring()
                 .map_err(|error| error.to_string())?;
-            copy_template_animations(document, &template, &target_stem, &active_material_name)?;
+            copy_template_resources(document, &template, &target_stem, &active_material_name)?;
             sync_runtime_actor_goop_textures(document, &template)?;
             Ok(())
         })();
@@ -1280,7 +1341,7 @@ impl SmsEditorApp {
             document
                 .compile_goop_authoring()
                 .map_err(|error| error.to_string())?;
-            copy_template_animations(document, &template, &target_stem, &active_material_name)?;
+            copy_template_resources(document, &template, &target_stem, &active_material_name)?;
             sync_runtime_actor_goop_textures(document, &template)?;
             Ok(())
         })();
@@ -2033,7 +2094,7 @@ fn rebuild_goop_document(
         .compile_goop_authoring()
         .map_err(|error| error.to_string())?;
     for (template, target_stem, active_material_name) in animation_jobs {
-        copy_template_animations(document, &template, &target_stem, &active_material_name)?;
+        copy_template_resources(document, &template, &target_stem, &active_material_name)?;
         sync_runtime_actor_goop_textures(document, &template)?;
     }
     Ok(())
@@ -2054,7 +2115,7 @@ fn pollution_material_name(model: &J3dRebuildDocument) -> Result<String, String>
         .ok_or_else(|| "generated goop model has no active material name".to_string())
 }
 
-fn copy_template_animations(
+fn copy_template_resources(
     document: &mut StageDocument,
     template: &RetailGoopTemplate,
     target_stem: &str,
@@ -2079,6 +2140,15 @@ fn copy_template_animations(
             .file_stem()
             .and_then(|value| value.to_str())
             .is_some_and(|value| value.eq_ignore_ascii_case(&template.resource_stem));
+        let is_pollution_particle = path.to_ascii_lowercase().starts_with("map/pollution/")
+            && matches!(resource.document, StageResourceDocument::Particle(_));
+        if is_pollution_particle {
+            // PollutionLayer loads behavior-specific JPAs from the selected
+            // retail style's pollution directory. Treat those files as part
+            // of the style bundle instead of guessing behavior/file pairs.
+            document.upsert_authored_resource(resource.raw_path.clone(), resource.document.clone());
+            continue;
+        }
         if stem_matches && GOOP_TEMPLATE_ANIMATION_EXTENSIONS.contains(&extension.as_str()) {
             let mut animation = resource.document.clone();
             if let StageResourceDocument::Animation(value) = &mut animation {
@@ -2572,6 +2642,62 @@ mod tests {
     }
 
     #[test]
+    fn retail_goop_style_copies_its_pollution_particle_bundle() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive_path = temp.path().join("sirena0.szs");
+        let mut archive = SourceFreeStageArchive::new_for_blank("sirena0", 1).unwrap();
+        archive
+            .insert_resource(
+                b"map/pollution/ms_thunder_s.jpa".to_vec(),
+                StageResourceDocument::Particle(sms_formats::JpaxDocument::authored_noop()),
+            )
+            .unwrap();
+        archive
+            .insert_resource(
+                b"effects/not_goop.jpa".to_vec(),
+                StageResourceDocument::Particle(sms_formats::JpaxDocument::authored_noop()),
+            )
+            .unwrap();
+        fs::write(&archive_path, archive.encode().unwrap()).unwrap();
+        let template = RetailGoopTemplate {
+            archive_path,
+            ..retail_template("sirena0", 0, GoopBehavior::Electric, "Electric")
+        };
+        let mut document = StageDocument {
+            stage_id: "custom0".to_string(),
+            base_root: temp.path().to_path_buf(),
+            assets: Vec::new(),
+            objects: Vec::new(),
+            changed_files: BTreeMap::new(),
+            stage_archive: None,
+            stage_archive_source_path: None,
+            archive_edits: StageArchiveEdits::default(),
+            registry: None,
+            route_authoring: None,
+            goop_authoring: None,
+            load_issues: Vec::new(),
+            lighting: Default::default(),
+            actor_previews: BTreeMap::new(),
+            loaded_project: None,
+        };
+
+        copy_template_resources(&mut document, &template, "pollution00", "unused").unwrap();
+
+        assert!(matches!(
+            document
+                .effective_resource_clone(b"map/pollution/ms_thunder_s.jpa")
+                .unwrap(),
+            Some(StageResourceDocument::Particle(_))
+        ));
+        assert_eq!(
+            document
+                .effective_resource_clone(b"effects/not_goop.jpa")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn normal_goop_type_choices_hide_retail_provenance_and_keep_selected_variant() {
         assert_eq!(
             semantic_goop_type(GoopBehavior::Slippery, Some("TestChoco2")),
@@ -3059,7 +3185,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires SMS_BASE_ROOT and SMS_PROJECT_ROOT with authored goopmap0"]
-    fn authored_project_migrates_case_alias_and_bakes_primary_actor_goop_texture() {
+    fn authored_project_migrates_primary_goop_runtime_resources() {
         let base_root = std::env::var_os("SMS_BASE_ROOT")
             .map(PathBuf::from)
             .expect("set SMS_BASE_ROOT");
@@ -3100,6 +3226,31 @@ mod tests {
 
         sync_runtime_actor_goop_textures_from_source(&mut document, &style, &archive.path)
             .expect("migrate runtime texture aliases");
+        let (target_stem, material_name) = document
+            .goop_authoring
+            .as_ref()
+            .and_then(|goop| {
+                goop.layers.iter().find_map(|layer| {
+                    let model = layer.generated_model.as_ref()?;
+                    Some((
+                        layer.resource_stem.clone(),
+                        pollution_material_name(model).ok()?,
+                    ))
+                })
+            })
+            .expect("generated goop model");
+        let template = RetailGoopTemplate {
+            stage_id: style.stage_id.clone(),
+            archive_path: archive.path.clone(),
+            model_asset_path: PathBuf::new(),
+            resource_stem: source_pollution_stem(style.layer_index, &style.stage_id),
+            layer_index: style.layer_index,
+            behavior: GoopBehavior::from_runtime_code(style.behavior_code),
+            semantic_type: "regression".to_string(),
+            compatible: true,
+        };
+        copy_template_resources(&mut document, &template, &target_stem, &material_name)
+            .expect("migrate pollution runtime resources");
         let aliases = document
             .archive_edits
             .resources
@@ -3140,6 +3291,10 @@ mod tests {
         assert_eq!(baked.width, expected.width);
         assert_eq!(baked.height, expected.height);
         assert_eq!(baked.rgba, expected.rgba);
+        assert!(matches!(
+            rebuilt.resource(b"map/pollution/ms_thunder_s.jpa"),
+            Some(StageResourceDocument::Particle(_))
+        ));
     }
 
     #[test]

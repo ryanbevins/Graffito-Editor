@@ -41,6 +41,7 @@ mod content_browser;
 mod content_thumbnails;
 mod direct_boot;
 mod document_commands;
+mod dolphin_graphics;
 mod game_content_index;
 mod game_text;
 mod goop;

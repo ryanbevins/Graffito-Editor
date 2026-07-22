@@ -1606,6 +1606,18 @@ impl SmsEditorApp {
             self.log.push("No stage open.".to_string());
             return;
         }
+        match self.prepare_generated_goop_resources_for_build() {
+            Ok(true) => self.log.push(
+                "Restored the selected retail goop style's runtime resource bundle before build."
+                    .to_string(),
+            ),
+            Ok(false) => {}
+            Err(error) => {
+                self.log
+                    .push(format!("Stage build stopped while preparing goop: {error}"));
+                return;
+            }
+        }
         let has_authored_skybox_model = self.model_instances.iter().any(|instance| {
             instance.stage_id.eq_ignore_ascii_case(&self.stage_id)
                 && instance.placement.export_mode == sms_authoring::ModelInstanceExportMode::Skybox
@@ -1789,6 +1801,28 @@ impl SmsEditorApp {
         let mut command = Command::new(&self.dolphin_path);
         let configured_user_dir =
             Self::configure_dolphin_user_directory(&mut command, &self.dolphin_user_dir);
+        let native_goop_mod_ready = match dolphin_graphics::prepare_native_resolution_goop_profile(
+            Path::new(&self.dolphin_path),
+            configured_user_dir.as_deref(),
+            &outcome.run.run_root,
+        ) {
+            Ok(profile) => {
+                if profile.changed {
+                    self.log.push(format!(
+                        "Enabled Dolphin's Native Resolution Goop graphics mod in '{}'.",
+                        profile.profile_path.display()
+                    ));
+                }
+                true
+            }
+            Err(error) => {
+                self.log.push(format!(
+                    "Could not enable Dolphin's targeted Sunshine goop fix; falling back to native resolution for every EFB copy: {error}"
+                ));
+                false
+            }
+        };
+        Self::configure_sms_graphics(&mut command, native_goop_mod_ready);
         if mode == DolphinLaunchMode::Editor {
             Self::configure_play_in_editor_input(&mut command);
         }
@@ -1909,6 +1943,7 @@ impl SmsEditorApp {
 
         let mut command = Command::new(&self.dolphin_path);
         Self::configure_dolphin_user_directory(&mut command, &self.dolphin_user_dir);
+        Self::configure_sms_graphics(&mut command, false);
         command.arg("-b").arg("-e").arg(&self.game_path);
 
         match command.spawn() {
@@ -1937,6 +1972,17 @@ impl SmsEditorApp {
             .arg("Dolphin.Interface.PauseOnFocusLost=False")
             .arg("-C")
             .arg("Dolphin.Input.BackgroundInput=True");
+    }
+
+    pub(super) fn configure_sms_graphics(command: &mut Command, native_goop_mod_ready: bool) {
+        // Dolphin's bundled mod keeps only Sunshine's small goop EFB targets at
+        // native resolution. Older builds fall back to disabling scaled EFB
+        // copies globally.
+        if native_goop_mod_ready {
+            command.arg("-C").arg("GFX.Settings.EnableMods=True");
+        } else {
+            command.arg("-C").arg("GFX.Hacks.EFBScaledCopy=False");
+        }
     }
 
     fn next_available_object_id(&self) -> Option<(String, u32)> {

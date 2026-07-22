@@ -648,7 +648,7 @@ impl SmsEditorApp {
         let choose_user_dir =
             path_display_row(ui, "User Dir", &self.dolphin_user_dir, "Browse...", true);
         ui.small(
-            "Both launch buttons refresh the managed runnable mirror, skip the Nintendo logo sequence, and boot the open scene directly. Launch in Editor embeds Dolphin into the viewport; Launch in Dolphin keeps an external window. Leave User Dir blank to use your normal Dolphin profile and controller configuration.",
+            "Both launch buttons refresh the managed runnable mirror, skip the Nintendo logo sequence, and boot the open scene directly. They enable Dolphin's targeted Native Resolution Goop graphics mod. Launch in Editor embeds Dolphin into the viewport; Launch in Dolphin keeps an external window. Leave User Dir blank to use your normal Dolphin profile and controller configuration.",
         );
         ui.label("Legacy external game launch (optional)");
         let choose_game = path_display_row(ui, "Game", &self.game_path, "Browse...", true);

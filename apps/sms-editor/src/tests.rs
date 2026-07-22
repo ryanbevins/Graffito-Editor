@@ -3325,6 +3325,36 @@ fn play_in_editor_keeps_input_active_when_dolphin_loses_top_level_focus() {
 }
 
 #[test]
+fn dolphin_boot_enables_the_targeted_goop_mod() {
+    let mut command = Command::new("Dolphin");
+
+    SmsEditorApp::configure_sms_graphics(&mut command, true);
+
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        [
+            std::ffi::OsStr::new("-C"),
+            std::ffi::OsStr::new("GFX.Settings.EnableMods=True"),
+        ]
+    );
+}
+
+#[test]
+fn dolphin_boot_falls_back_when_the_targeted_goop_mod_is_unavailable() {
+    let mut command = Command::new("Dolphin");
+
+    SmsEditorApp::configure_sms_graphics(&mut command, false);
+
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        [
+            std::ffi::OsStr::new("-C"),
+            std::ffi::OsStr::new("GFX.Hacks.EFBScaledCopy=False"),
+        ]
+    );
+}
+
+#[test]
 fn managed_build_cancel_state_logs_once_and_clears_with_the_result() {
     let cancel = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = std::sync::mpsc::channel();
