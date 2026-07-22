@@ -48,6 +48,7 @@ impl GpuViewportScene {
                 geometry_generation: 0,
                 dirty_vertex_ranges,
                 dirty_materials: BTreeSet::new(),
+                dirty_textures: BTreeSet::new(),
                 target_format,
             })),
         }
@@ -90,6 +91,23 @@ impl GpuViewportScene {
                     .scene
                     .replace_material_from_preview(index, material, preview);
                 shared.dirty_materials.insert(index);
+            }
+        }
+    }
+
+    pub fn update_textures(&self, preview: &ModelPreview, texture_indices: &[usize]) {
+        if let Ok(mut shared) = self.shared.lock() {
+            for preview_index in texture_indices.iter().copied() {
+                let Some(texture) = preview.textures.get(preview_index) else {
+                    continue;
+                };
+                // GpuSceneData reserves texture zero as the white fallback.
+                let scene_index = preview_index + 1;
+                if scene_index >= shared.scene.textures.len() {
+                    continue;
+                }
+                shared.scene.textures[scene_index] = GpuTextureData::from_preview_texture(texture);
+                shared.dirty_textures.insert(scene_index);
             }
         }
     }
@@ -240,6 +258,7 @@ struct GpuViewportShared {
     geometry_generation: u64,
     dirty_vertex_ranges: Vec<Option<std::ops::Range<usize>>>,
     dirty_materials: BTreeSet<usize>,
+    dirty_textures: BTreeSet<usize>,
     target_format: wgpu::TextureFormat,
 }
 
@@ -294,6 +313,9 @@ impl CallbackTrait for GpuViewportCallback {
         let materials_changed =
             resources.write_materials(device, queue, &shared.scene, &shared.dirty_materials);
         shared.dirty_materials.clear();
+        let textures_changed =
+            resources.write_textures(queue, &shared.scene, &shared.dirty_textures);
+        shared.dirty_textures.clear();
         let active_mirror_slot = shared
             .scene
             .active_mirror_slot(shared.frame.camera_position);
@@ -305,6 +327,7 @@ impl CallbackTrait for GpuViewportCallback {
             scene: scene_rebuilt,
             geometry: geometry_changed,
             materials: materials_changed,
+            textures: textures_changed,
             time_animation: !resources.animated_materials.is_empty(),
         };
         if offscreen_render_required(resources.offscreen_frame_state, frame_state, invalidation) {
@@ -2006,6 +2029,7 @@ struct GpuOffscreenInvalidation {
     scene: bool,
     geometry: bool,
     materials: bool,
+    textures: bool,
     time_animation: bool,
 }
 
@@ -2019,6 +2043,7 @@ fn offscreen_render_required(
         || invalidation.scene
         || invalidation.geometry
         || invalidation.materials
+        || invalidation.textures
         || invalidation.time_animation
 }
 
@@ -2427,6 +2452,54 @@ impl GpuViewportResources {
             }
         }
         materials_changed
+    }
+
+    fn write_textures(
+        &mut self,
+        queue: &wgpu::Queue,
+        scene: &GpuSceneData,
+        dirty_textures: &BTreeSet<usize>,
+    ) -> bool {
+        let mut changed = false;
+        for index in dirty_textures.iter().copied() {
+            let (Some(data), Some(resource)) =
+                (scene.textures.get(index), self.textures.get(index))
+            else {
+                continue;
+            };
+            let Some(base_mip) = data.mips.first() else {
+                continue;
+            };
+            if resource.size != base_mip.size
+                || resource.format != data.format
+                || data.mips.len() != resource.mip_count as usize
+            {
+                continue;
+            }
+            for (level, mip) in data.mips.iter().enumerate() {
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &resource.texture,
+                        mip_level: level as u32,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &mip.rgba,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(mip.size[0] * 4),
+                        rows_per_image: Some(mip.size[1]),
+                    },
+                    wgpu::Extent3d {
+                        width: mip.size[0],
+                        height: mip.size[1],
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+            changed = true;
+        }
+        changed
     }
 
     fn rebuild_target_material_bind_groups(&mut self, device: &wgpu::Device, scene: &GpuSceneData) {
@@ -3062,9 +3135,12 @@ impl GpuViewportTarget {
 }
 
 struct GpuTextureResource {
-    _texture: wgpu::Texture,
+    texture: wgpu::Texture,
     view: wgpu::TextureView,
     sampler: wgpu::Sampler,
+    size: [u32; 2],
+    format: wgpu::TextureFormat,
+    mip_count: u32,
 }
 
 impl GpuTextureResource {
@@ -3120,9 +3196,12 @@ impl GpuTextureResource {
             ..Default::default()
         });
         Self {
-            _texture: texture,
+            texture,
             view,
             sampler,
+            size: base_mip.size,
+            format: data.format,
+            mip_count: data.mips.len() as u32,
         }
     }
 }

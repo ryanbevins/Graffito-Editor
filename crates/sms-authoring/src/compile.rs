@@ -7,7 +7,10 @@ use crate::import::{active_node_mask, global_transforms};
 use crate::math::{
     transform_normal, transform_point, transform_reverses_winding, transform_tangent_frame,
 };
-use crate::{AuthoringError, AuthoringResult, ModelAssetDocument, ModelBounds, NodePurpose};
+use crate::{
+    AuthoringError, AuthoringResult, ModelAssetDocument, ModelBounds, NodePurpose,
+    GX_MAX_TEXTURE_DIMENSION,
+};
 
 /// Exact allocation size of one section in a compiled canonical BMD3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +115,18 @@ impl ModelAssetDocument {
             .into_iter()
             .map(|texture_index| {
                 let texture = &self.textures[texture_index];
+                if texture.width > GX_MAX_TEXTURE_DIMENSION
+                    || texture.height > GX_MAX_TEXTURE_DIMENSION
+                {
+                    return Err(AuthoringError::Compile(format!(
+                        "texture {:?} is {}x{}, exceeding GX's {}x{} hardware limit; reload or reimport the asset so it can be downscaled",
+                        texture.name,
+                        texture.width,
+                        texture.height,
+                        GX_MAX_TEXTURE_DIMENSION,
+                        GX_MAX_TEXTURE_DIMENSION,
+                    )));
+                }
                 let width = u16::try_from(texture.width).map_err(|_| {
                     AuthoringError::Compile(format!(
                         "texture {} width {} exceeds GX u16 dimensions",

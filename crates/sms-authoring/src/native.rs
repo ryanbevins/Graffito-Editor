@@ -41,6 +41,8 @@ impl ModelAssetDocument {
             ));
         }
         document.validate()?;
+        document.migrate_oversized_textures_for_gx();
+        document.validate()?;
         document.repair_legacy_conservative_materials();
         if normalize_legacy_render_collision_winding(&mut document)? {
             document.diagnostics.push(Diagnostic::info(

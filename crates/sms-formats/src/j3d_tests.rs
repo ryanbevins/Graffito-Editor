@@ -370,6 +370,22 @@ fn recognizes_texture_konst_modulate_alpha_args() {
 }
 
 #[test]
+fn recognizes_previous_alpha_pass_used_by_floor_pollution_masks() {
+    assert!(tev_alpha_args_pass_previous(TevAlphaArgs {
+        a: GX_CA_ZERO,
+        b: GX_CA_ZERO,
+        c: GX_CA_ZERO,
+        d: GX_CA_APREV,
+    }));
+    assert!(!tev_alpha_args_pass_previous(TevAlphaArgs {
+        a: GX_CA_ZERO,
+        b: GX_CA_TEXA,
+        c: GX_CA_ZERO,
+        d: GX_CA_APREV,
+    }));
+}
+
+#[test]
 fn texture_raster_konst_preview_tint_blends_toward_material() {
     assert_eq!(texture_raster_konst_blend_preview_channel(128, 160), 175);
     assert_eq!(texture_raster_konst_blend_preview_channel(255, 160), 255);

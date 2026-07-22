@@ -544,7 +544,6 @@ pub(crate) fn cleanup_diagnostics(report: CollisionCleanupReport) -> Vec<Diagnos
                 report.welded_vertices
             ),
             None,
-            false,
         ));
     }
     if report.removed_unused_vertices != 0 {
@@ -555,7 +554,6 @@ pub(crate) fn cleanup_diagnostics(report: CollisionCleanupReport) -> Vec<Diagnos
                 report.removed_unused_vertices
             ),
             None,
-            false,
         ));
     }
     if report.removed_degenerate_triangles != 0 {
@@ -566,7 +564,6 @@ pub(crate) fn cleanup_diagnostics(report: CollisionCleanupReport) -> Vec<Diagnos
                 report.removed_degenerate_triangles
             ),
             None,
-            false,
         ));
     }
     if report.removed_duplicate_triangles != 0 {
@@ -577,7 +574,6 @@ pub(crate) fn cleanup_diagnostics(report: CollisionCleanupReport) -> Vec<Diagnos
                 report.removed_duplicate_triangles
             ),
             None,
-            false,
         ));
     }
     diagnostics

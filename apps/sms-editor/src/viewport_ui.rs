@@ -325,6 +325,11 @@ impl SmsEditorApp {
             }
         }
 
+        if self.handle_goop_viewport_input(ui, rect, response) {
+            self.mark_viewport_interaction(ui);
+            return;
+        }
+
         if response.clicked() && self.hovered_gizmo_axis.is_none() && !gizmo_using_pointer {
             self.content_browser.inspector_active = false;
             if let Some(pos) = response.interact_pointer_pos() {
@@ -777,6 +782,7 @@ impl SmsEditorApp {
         self.paint_routes(painter, rect);
         self.paint_audio_helpers(painter, rect);
         self.paint_selected_object_outline(painter, rect);
+        self.paint_goop_overlay(painter, rect);
 
         let projection = self.camera_projection(rect);
         for object in self.viewport_marker_objects() {
@@ -2299,7 +2305,7 @@ pub(super) fn transform_from_gizmo_drag(
             }
             transform.scale[axis] = value.max(0.001);
         }
-        EditorTool::Select | EditorTool::Place => {}
+        EditorTool::Select | EditorTool::Goop | EditorTool::Place => {}
     }
     transform
 }

@@ -19,7 +19,6 @@ pub(super) fn save_project_folder(
     document: &StageDocument,
     project_root: &Path,
 ) -> Result<(ProjectSaveOutcome, u128)> {
-    document.validate_for_export()?;
     if project_root
         .components()
         .any(|component| matches!(component, Component::ParentDir))
@@ -379,7 +378,12 @@ pub(super) fn load_project_overlay(
     document.objects = overlay.objects;
     document.archive_edits = overlay.archive_edits;
     document.route_authoring = overlay.route_authoring;
+    document.goop_authoring = overlay.goop_authoring;
+    if let Some(authoring) = &mut document.goop_authoring {
+        authoring.stale |= authoring.requires_generator_upgrade();
+    }
     document.sync_archive_edit_assets();
+    let mut discard_empty_missing_route_authoring = false;
     if let Some(authoring) = document.route_authoring.as_ref() {
         match (
             authoring.compile(),
@@ -398,6 +402,14 @@ pub(super) fn load_project_overlay(
                 format!("Saved route authoring data could not be compiled: {error}"),
             )),
             (_, Ok(Some(super::StageResourceDocument::Rail(_)))) => {}
+            (Ok(compiled), Ok(None)) if compiled.graphs.is_empty() => {
+                // Merely opening the Routes tool on a stage without scene.ral
+                // used to persist an empty authoring document. Absence and an
+                // empty graph set are semantically equivalent; normalize back
+                // to absence instead of inventing a resource or reporting a
+                // broken overlay on every reopen.
+                discard_empty_missing_route_authoring = true;
+            }
             (_, Ok(Some(_)) | Ok(None)) => {
                 document.load_issues.push(super::ValidationIssue::error(
                     "route-authoring-resource-missing",
@@ -409,6 +421,9 @@ pub(super) fn load_project_overlay(
                 format!("Could not verify saved route authoring data: {error}"),
             )),
         }
+    }
+    if discard_empty_missing_route_authoring {
+        document.route_authoring = None;
     }
     if let Some(lighting) = overlay.lighting {
         document.lighting = lighting;

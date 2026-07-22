@@ -144,7 +144,7 @@ fn material_fixture_maps_safe_fields_and_reports_unmapped_pbr() {
     }));
     assert!(imported.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == DiagnosticCode::UnmappedMetallicRoughness
-            && diagnostic.acknowledgement_required
+            && !diagnostic.acknowledgement_required
     }));
 }
 
@@ -173,25 +173,38 @@ fn native_load_repairs_the_exact_legacy_invisible_material_program() {
 }
 
 #[test]
-fn acknowledgement_required_pbr_diagnostics_persist_in_native_assets() {
+fn informational_pbr_diagnostics_persist_in_native_assets() {
     let model = fixture_root()
         .join("valid")
         .join("pbr-diagnostics")
         .join("model.glb");
-    let mut asset = import_model(model, &ModelImportOptions::default())
+    let asset = import_model(model, &ModelImportOptions::default())
         .unwrap()
         .asset;
-    let codes = asset
-        .unacknowledged_required_diagnostics()
-        .into_iter()
+    let diagnostics = asset
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            matches!(
+                diagnostic.code,
+                DiagnosticCode::UnmappedMetallicRoughness
+                    | DiagnosticCode::UnmappedNormalTexture
+                    | DiagnosticCode::UnmappedOcclusionTexture
+                    | DiagnosticCode::UnmappedEmissive
+            )
+        })
         .map(|diagnostic| diagnostic.code)
         .collect::<std::collections::BTreeSet<_>>();
-    assert!(!codes.is_empty());
-    asset.acknowledged_diagnostics = codes;
+    assert!(!diagnostics.is_empty());
+    assert!(asset
+        .diagnostics
+        .iter()
+        .all(|diagnostic| !diagnostic.acknowledgement_required));
     let reopened =
         sms_authoring::ModelAssetDocument::from_native_bytes(&asset.to_native_bytes().unwrap())
             .unwrap();
-    assert!(reopened.unacknowledged_required_diagnostics().is_empty());
+    assert_eq!(reopened.diagnostics, asset.diagnostics);
+    assert!(reopened.acknowledged_diagnostics.is_empty());
 }
 
 #[test]

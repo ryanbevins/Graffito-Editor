@@ -152,6 +152,14 @@ impl RouteAuthoringDocument {
             return Err(RouteAuthoringError::InvalidTolerance);
         }
         let any_dirty = self.layout_dirty || self.graphs.iter().any(|graph| graph.dirty);
+        // Early source-free stages represented a missing scene.ral as an empty
+        // zero-byte document. That is not a valid on-disc RAL (even an empty
+        // file needs its 12-byte terminating descriptor), but the sentinel can
+        // still be present in saved project overlays. Canonicalize that exact
+        // source-free state while retaining the byte-preserving path for every
+        // document that could have come from an imported resource.
+        let legacy_source_free_empty =
+            self.graphs.is_empty() && self.file_size == 0 && self.padding.is_empty();
         let mut result = RalDocument {
             graphs: self
                 .graphs
@@ -161,7 +169,7 @@ impl RouteAuthoringDocument {
             file_size: self.file_size,
             padding: self.padding.clone(),
         };
-        if any_dirty {
+        if any_dirty || legacy_source_free_empty {
             result
                 .canonicalize_layout()
                 .map_err(|error| RouteAuthoringError::Format(error.to_string()))?;
@@ -1013,6 +1021,22 @@ mod tests {
         assert_eq!(compiled.graphs[0].nodes.len(), 2);
         assert_eq!(compiled.graphs[0].nodes[0].periods[0], 500.0);
         assert_eq!(compiled.graphs[0].nodes[1].periods[0], 500.0);
+    }
+
+    #[test]
+    fn legacy_source_free_empty_document_compiles_to_valid_ral() {
+        let legacy_empty = RalDocument {
+            graphs: Vec::new(),
+            file_size: 0,
+            padding: Vec::new(),
+        };
+        let routes = RouteAuthoringDocument::lift(ROUTE_RESOURCE_PATH, &legacy_empty);
+
+        let compiled = routes.compile().unwrap();
+        assert_eq!(compiled, RalDocument::empty_canonical());
+        let bytes = compiled.encode().unwrap();
+        assert_eq!(bytes, vec![0; 12]);
+        assert_eq!(RalDocument::parse(&bytes).unwrap(), compiled);
     }
 
     #[test]

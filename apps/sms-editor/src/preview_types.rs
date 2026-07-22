@@ -14,6 +14,9 @@ pub(super) struct ModelPreview {
     pub(super) texture_srt_animations: Vec<J3dTextureSrtAnimation>,
     pub(super) texture_pattern_animations: Vec<PreviewTexturePatternAnimation>,
     pub(super) material_animation_bindings: Vec<Vec<PreviewMaterialAnimationBinding>>,
+    /// Preview texture indices for each runtime pollution layer. Retail models
+    /// can repeat texture zero under the same name, so every alias is retained.
+    pub(super) pollution_texture_indices: BTreeMap<usize, Vec<usize>>,
     pub(super) bounds_min: [f32; 3],
     pub(super) bounds_max: [f32; 3],
     pub(super) camera_bounds_min: [f32; 3],

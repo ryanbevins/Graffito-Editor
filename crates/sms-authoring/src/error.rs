@@ -82,6 +82,7 @@ pub enum DiagnosticCode {
     CoordinateSpaceMigrated,
     CollisionWindingNormalized,
     CollisionSimplified,
+    TextureDownscaledForGx,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +93,8 @@ pub struct Diagnostic {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
     #[serde(default)]
+    /// Legacy persistence field. Diagnostics no longer require acknowledgement
+    /// before compilation or export.
     pub acknowledgement_required: bool,
 }
 
@@ -114,14 +117,13 @@ impl Diagnostic {
         code: DiagnosticCode,
         message: impl Into<String>,
         context: Option<String>,
-        acknowledgement_required: bool,
     ) -> Self {
         Self {
             severity: Severity::Warning,
             code,
             message: message.into(),
             context,
-            acknowledgement_required,
+            acknowledgement_required: false,
         }
     }
 }

@@ -374,6 +374,82 @@ pub struct YmpLayer {
     pub depth_map: Vec<u8>,
 }
 
+impl YmpLayer {
+    pub fn dimensions(&self) -> Result<(usize, usize)> {
+        if self.width_log2 > 15 || self.height_log2 > 15 {
+            return Err(unsupported(format!(
+                "YMP dimensions exceed the supported exponent range: 2^{} x 2^{}",
+                self.width_log2, self.height_log2
+            )));
+        }
+        Ok((1usize << self.width_log2, 1usize << self.height_log2))
+    }
+
+    /// Native GX I8 tile address used by `TPollutionPos::index`.
+    pub fn tiled_index(&self, x: usize, y: usize) -> Result<usize> {
+        let (width, height) = self.dimensions()?;
+        if width < 8 || height < 4 {
+            return Err(unsupported(format!(
+                "runtime pollution grids must be at least 8x4, got {width}x{height}"
+            )));
+        }
+        if x >= width || y >= height {
+            return Err(invalid(
+                y.saturating_mul(width).saturating_add(x),
+                width * height,
+            ));
+        }
+        Ok((y & 3) * 8 + ((x >> 3) + ((y >> 2) << (self.width_log2 - 3))) * 0x20 + (x & 7))
+    }
+
+    pub fn depth_at(&self, x: usize, y: usize) -> Result<u8> {
+        let index = self.tiled_index(x, y)?;
+        self.depth_map
+            .get(index)
+            .copied()
+            .ok_or_else(|| invalid(index, self.depth_map.len()))
+    }
+
+    pub fn set_depth(&mut self, x: usize, y: usize, depth: u8) -> Result<()> {
+        let index = self.tiled_index(x, y)?;
+        let len = self.depth_map.len();
+        *self
+            .depth_map
+            .get_mut(index)
+            .ok_or_else(|| invalid(index, len))? = depth;
+        Ok(())
+    }
+
+    pub fn validate_floor_runtime(&self) -> Result<()> {
+        let (width, height) = self.dimensions()?;
+        if self.flags > 1 {
+            return Err(unsupported(format!(
+                "YMP plane type {} is not a floor layer",
+                self.flags
+            )));
+        }
+        if width > 1024 || height > 1024 {
+            return Err(unsupported(format!(
+                "runtime pollution texture {width}x{height} exceeds GX 1024x1024"
+            )));
+        }
+        if !self.vertical_scale.is_finite() || self.vertical_scale <= 0.0 {
+            return Err(unsupported(format!(
+                "floor pollution cell/depth scale must be finite and positive, got {}",
+                self.vertical_scale
+            )));
+        }
+        if self.depth_map.len() != width * height {
+            return Err(unsupported(format!(
+                "YMP depth map has {} bytes, expected {}",
+                self.depth_map.len(),
+                width * height
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct YmpDocument {
     pub header_reserved: u16,
@@ -384,6 +460,86 @@ pub struct YmpDocument {
 }
 
 impl YmpDocument {
+    /// Packs authored layers into a deterministic source-free YMP allocation.
+    /// Layer maps start on 32-byte boundaries because the runtime addresses
+    /// them as GX I8 tiles.
+    pub fn canonical(mut layers: Vec<YmpLayer>) -> Result<Self> {
+        if layers.len() > 20 {
+            return Err(unsupported(format!(
+                "Sunshine supports at most 20 pollution layers, got {}",
+                layers.len()
+            )));
+        }
+        const HEADER_ALLOCATION: usize = 0x20;
+        const LAYER_SIZE: usize = 0x2C;
+        let table_end = HEADER_ALLOCATION
+            .checked_add(layers.len().saturating_mul(LAYER_SIZE))
+            .ok_or_else(|| resource("YMP layer table", usize::MAX, u32::MAX as usize))?;
+        let mut cursor = align_up(table_end, 0x20)?;
+        for layer in &mut layers {
+            let (width, height) = layer.dimensions()?;
+            if layer.depth_map.len() != width * height {
+                return Err(unsupported(format!(
+                    "YMP depth map has {} bytes, expected {}",
+                    layer.depth_map.len(),
+                    width * height
+                )));
+            }
+            layer.map_offset = usize_u32(cursor, "YMP map offset")?;
+            cursor = cursor
+                .checked_add(layer.depth_map.len())
+                .ok_or_else(|| resource("YMP bytes", usize::MAX, u32::MAX as usize))?;
+            cursor = align_up(cursor, 0x20)?;
+        }
+        let mut padding = Vec::new();
+        if HEADER_ALLOCATION > 8 {
+            padding.push(StageMiscPaddingRegion {
+                offset: 8,
+                length: (HEADER_ALLOCATION - 8) as u32,
+                style: StageMiscPaddingStyle::Zero,
+            });
+        }
+        let table_padding_start = HEADER_ALLOCATION + layers.len() * LAYER_SIZE;
+        let first_map = layers
+            .first()
+            .map_or(cursor, |layer| layer.map_offset as usize);
+        if first_map > table_padding_start {
+            padding.push(StageMiscPaddingRegion {
+                offset: table_padding_start as u32,
+                length: (first_map - table_padding_start) as u32,
+                style: StageMiscPaddingStyle::Zero,
+            });
+        }
+        for window in layers.windows(2) {
+            let end = window[0].map_offset as usize + window[0].depth_map.len();
+            let next = window[1].map_offset as usize;
+            if next > end {
+                padding.push(StageMiscPaddingRegion {
+                    offset: end as u32,
+                    length: (next - end) as u32,
+                    style: StageMiscPaddingStyle::Zero,
+                });
+            }
+        }
+        if let Some(last) = layers.last() {
+            let end = last.map_offset as usize + last.depth_map.len();
+            if cursor > end {
+                padding.push(StageMiscPaddingRegion {
+                    offset: end as u32,
+                    length: (cursor - end) as u32,
+                    style: StageMiscPaddingStyle::Zero,
+                });
+            }
+        }
+        Ok(Self {
+            header_reserved: 0,
+            layer_info_offset: HEADER_ALLOCATION as u32,
+            layers,
+            file_size: usize_u32(cursor, "YMP file size")?,
+            padding,
+        })
+    }
+
     pub fn parse(bytes: impl AsRef<[u8]>) -> Result<Self> {
         const HEADER_SIZE: usize = 8;
         const LAYER_SIZE: usize = 0x2C;
@@ -492,6 +648,13 @@ impl YmpDocument {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.encode()
     }
+}
+
+fn align_up(value: usize, alignment: usize) -> Result<usize> {
+    value
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
+        .ok_or_else(|| resource("aligned allocation", usize::MAX, u32::MAX as usize))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1376,7 +1539,60 @@ fn unsupported(message: impl Into<String>) -> FormatError {
 mod tests {
     use super::{
         MeDocument, RalDocument, RalGraph, RalNode, ReplayLinkDocument, SpcDocument, YmpDocument,
+        YmpLayer,
     };
+
+    fn floor_layer(width_log2: u16, height_log2: u16) -> YmpLayer {
+        YmpLayer {
+            layer_type: 0,
+            subtype: 0,
+            flags: 0,
+            reserved: 0,
+            vertical_offset: -40.0,
+            vertical_scale: 40.0,
+            min_x: 0.0,
+            min_z: 0.0,
+            max_x: (1u32 << width_log2) as f32 * 40.0,
+            max_z: (1u32 << height_log2) as f32 * 40.0,
+            width_log2,
+            height_log2,
+            user_value: 0,
+            map_offset: 0,
+            depth_map: vec![0xff; (1usize << width_log2) * (1usize << height_log2)],
+        }
+    }
+
+    #[test]
+    fn ymp_uses_native_gx_i8_tile_addressing() {
+        let layer = floor_layer(4, 3);
+        assert_eq!(layer.tiled_index(0, 0).unwrap(), 0);
+        assert_eq!(layer.tiled_index(7, 3).unwrap(), 31);
+        assert_eq!(layer.tiled_index(8, 0).unwrap(), 32);
+        assert_eq!(layer.tiled_index(0, 4).unwrap(), 64);
+        assert_eq!(layer.tiled_index(15, 7).unwrap(), 127);
+    }
+
+    #[test]
+    fn canonical_ymp_aligns_every_depth_allocation() {
+        let document = YmpDocument::canonical(vec![floor_layer(3, 2), floor_layer(4, 3)]).unwrap();
+        assert_eq!(document.layer_info_offset, 0x20);
+        assert!(document
+            .layers
+            .iter()
+            .all(|layer| layer.map_offset.is_multiple_of(32)));
+        let bytes = document.encode().unwrap();
+        let reparsed = YmpDocument::parse(&bytes).unwrap();
+        assert_eq!(reparsed.encode().unwrap(), bytes);
+    }
+
+    #[test]
+    fn floor_runtime_validation_preserves_retail_cell_scales() {
+        let mut layer = floor_layer(3, 2);
+        layer.vertical_scale = 32.0;
+        layer.validate_floor_runtime().unwrap();
+        layer.vertical_scale = 0.0;
+        assert!(layer.validate_floor_runtime().is_err());
+    }
 
     fn ral_node(x: i16) -> RalNode {
         RalNode {

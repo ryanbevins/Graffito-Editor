@@ -148,6 +148,20 @@ fn bmd_compile_prunes_and_stably_remaps_unreferenced_textures() {
 }
 
 #[test]
+fn bmd_compile_rejects_referenced_texture_above_gx_dimensions() {
+    let mut asset = four_texture_asset();
+    asset.textures[2].width = 2048;
+    asset.textures[2].height = 1;
+    asset.textures[2].rgba8 = [1, 2, 3, 255].repeat(2048);
+
+    let error = asset.compile_bmd_document().unwrap_err().to_string();
+    assert!(
+        error.contains("exceeding GX's 1024x1024 hardware limit"),
+        "{error}"
+    );
+}
+
+#[test]
 fn referenced_textures_keep_original_index_order_not_slot_discovery_order() {
     let mut asset = four_texture_asset();
     asset.materials[0].gx.texture_numbers[0] = Some(3);

@@ -128,6 +128,10 @@ fn offscreen_cache_invalidates_for_scene_resource_and_animation_changes() {
             ..Default::default()
         },
         GpuOffscreenInvalidation {
+            textures: true,
+            ..Default::default()
+        },
+        GpuOffscreenInvalidation {
             time_animation: true,
             ..Default::default()
         },
@@ -160,6 +164,40 @@ fn offscreen_cache_ignores_time_for_static_materials() {
             ..Default::default()
         }
     ));
+}
+
+#[test]
+fn texture_updates_dirty_only_the_selected_gpu_texture() {
+    let mut preview = geometry_update_preview();
+    let image = egui::ColorImage::filled([2, 2], egui::Color32::BLACK);
+    preview.textures.push(PreviewTexture {
+        image: image.clone(),
+        mips: vec![image],
+        format: 1,
+        wrap_s: 1,
+        wrap_t: 1,
+        min_filter: 1,
+        mag_filter: 1,
+        mipmap_enabled: false,
+        do_edge_lod: false,
+        bias_clamp: false,
+        max_anisotropy: 0,
+        min_lod: 0.0,
+        max_lod: 0.0,
+        lod_bias: 0.0,
+        mipmap_count: 1,
+        has_alpha: true,
+        has_translucent_alpha: false,
+    });
+    let scene = GpuViewportScene::from_preview(&preview, GX_COLOR_FORMAT);
+    preview.textures[0].image = egui::ColorImage::filled([2, 2], egui::Color32::WHITE);
+    preview.textures[0].mips = vec![preview.textures[0].image.clone()];
+
+    scene.update_textures(&preview, &[0]);
+
+    let shared = scene.shared.lock().unwrap();
+    assert_eq!(shared.dirty_textures, BTreeSet::from([1]));
+    assert_eq!(shared.scene.textures[1].mips[0].rgba, vec![255; 16]);
 }
 
 #[test]
@@ -760,6 +798,7 @@ fn geometry_update_preview() -> ModelPreview {
         texture_srt_animations: Vec::new(),
         texture_pattern_animations: Vec::new(),
         material_animation_bindings: Vec::new(),
+        pollution_texture_indices: BTreeMap::new(),
         bounds_min: [0.0; 3],
         bounds_max: [11.0, 1.0, 0.0],
         camera_bounds_min: [0.0; 3],

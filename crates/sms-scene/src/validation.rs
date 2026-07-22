@@ -252,6 +252,14 @@ pub(super) fn validate_document(document: &StageDocument) -> Vec<ValidationIssue
     let mut issues = document.load_issues.clone();
     validate_runtime_actor_links(document, &mut issues);
     validate_routes(document, &mut issues);
+    if let Some(goop) = &document.goop_authoring {
+        if let Err(error) = goop.validate() {
+            issues.push(ValidationIssue::error(
+                "invalid-goop-authoring",
+                error.to_string(),
+            ));
+        }
+    }
 
     if !document.base_root.exists() {
         issues.push(ValidationIssue::error(

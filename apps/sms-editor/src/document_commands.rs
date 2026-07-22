@@ -1498,6 +1498,7 @@ impl SmsEditorApp {
 
     pub(super) fn save_project(&mut self) -> bool {
         let had_selected_model_asset = self.selected_model_asset.is_some();
+        let mut validation_error_count = 0usize;
         if let Some(document) = &self.document {
             if !document_uses_selected_base(document, self.base_root.trim()) {
                 self.log.push(format!(
@@ -1510,19 +1511,12 @@ impl SmsEditorApp {
         }
         if let Some(document) = &self.document {
             self.issues = document.validate();
-            if self
+            validation_error_count = self
                 .issues
                 .iter()
-                .any(|issue| issue.severity == ValidationSeverity::Error)
-            {
-                self.log
-                    .push("Project save blocked by validation errors.".to_string());
-                return false;
-            }
+                .filter(|issue| issue.severity == ValidationSeverity::Error)
+                .count();
         }
-        // Validate the stage and base ownership before committing any sibling
-        // model/instance files. This keeps a known-invalid stage from causing a
-        // partial project save that clears unrelated authoring dirty state.
         if !self.save_selected_model_asset() {
             return false;
         }
@@ -1547,6 +1541,11 @@ impl SmsEditorApp {
                         "Saved editor project with {} file(s).",
                         outcome.manifest.changed_files.len()
                     ));
+                    if validation_error_count > 0 {
+                        self.log.push(format!(
+                            "Saved with {validation_error_count} validation error(s); build and launch remain blocked until they are fixed."
+                        ));
+                    }
                     for warning in outcome.warnings {
                         self.log.push(format!(
                             "Project save warning (recovery path {}): {}",
@@ -1678,7 +1677,17 @@ impl SmsEditorApp {
                 })
                 .and_then(|edits| {
                     managed_build::check_cancelled(&task_cancel)?;
-                    document
+                    let mut finalized_document = document.clone();
+                    finalized_document.archive_edits = edits.clone();
+                    finalized_document
+                        .refresh_goop_stale_status()
+                        .map_err(|error| error.to_string())?;
+                    if let Some(goop) = &finalized_document.goop_authoring {
+                        goop.validate().map_err(|error| {
+                            format!("final terrain/goop validation failed: {error}")
+                        })?;
+                    }
+                    finalized_document
                         .build_stage_archive_with_edits(&edits)
                         .map_err(|error| error.to_string())
                 });
@@ -1724,10 +1733,13 @@ impl SmsEditorApp {
             return;
         };
         if !cancel.swap(true, Ordering::AcqRel) {
-            self.log.push(
+            self.log.push(if self.background_label.as_deref() == Some("Rebuilding goopmaps") {
+                "Cancelling goop rebuild; the current layer will stop at its next checked chunk."
+                    .to_string()
+            } else {
                 "Cancelling managed game build; the current file operation will finish or stop at its next checked chunk."
-                    .to_string(),
-            );
+                    .to_string()
+            });
         }
     }
 
@@ -2758,6 +2770,9 @@ impl SmsEditorApp {
     }
 
     pub(super) fn undo(&mut self) {
+        if self.tool == EditorTool::Goop && self.undo_goop() {
+            return;
+        }
         if (self.selected_model_instance_id.is_some()
             || (self.selected_object_id.is_none()
                 && self.selected_model_document.is_none()
@@ -2798,6 +2813,9 @@ impl SmsEditorApp {
     }
 
     pub(super) fn redo(&mut self) {
+        if self.tool == EditorTool::Goop && self.redo_goop() {
+            return;
+        }
         if (self.selected_model_instance_id.is_some()
             || (self.selected_object_id.is_none()
                 && self.selected_model_document.is_none()
@@ -2919,6 +2937,7 @@ impl SmsEditorApp {
     }
 
     pub(super) fn rebuild_model_preview_from_document(&mut self) {
+        self.refresh_goop_stale_from_final_terrain();
         self.rebuild_audio_cube_helpers_cache();
         let visibility = self.preview_visibility();
         let (render_scene, model_preview) =
@@ -3232,6 +3251,7 @@ mod tests {
             archive_edits: StageArchiveEdits::default(),
             registry: None,
             route_authoring: None,
+            goop_authoring: None,
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
             actor_previews: BTreeMap::new(),
@@ -3550,6 +3570,7 @@ mod tests {
             stage_archive_source_path: Some(PathBuf::from("custom0.szs")),
             archive_edits: sms_scene::StageArchiveEdits::default(),
             route_authoring: None,
+            goop_authoring: None,
             registry: None,
             load_issues: Vec::new(),
             lighting: sms_scene::StageLighting::default(),
@@ -3625,6 +3646,7 @@ mod tests {
             stage_archive: Some(archive),
             stage_archive_source_path: Some(PathBuf::from("custom0.szs")),
             route_authoring: None,
+            goop_authoring: None,
             archive_edits: sms_scene::StageArchiveEdits::default(),
             registry: None,
             load_issues: Vec::new(),

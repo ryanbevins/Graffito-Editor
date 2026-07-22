@@ -23,6 +23,9 @@ use sms_scene::{
 };
 use sms_schema::SchemaGenerator;
 
+const RUNTIME_BMD_SAFETY_BUDGET: u64 = 12 * 1024 * 1024;
+const RUNTIME_TEX1_SAFETY_BUDGET: u64 = 8 * 1024 * 1024;
+
 #[derive(Debug, Parser)]
 #[command(name = "sms-cli")]
 #[command(about = "Super Mario Sunshine editor automation CLI")]
@@ -86,9 +89,6 @@ enum Commands {
         collision_prefix: String,
         #[arg(long, default_value_t = 100.0)]
         units_per_meter: f32,
-        /// Confirm intentionally unmapped PBR inputs before compiled output is emitted.
-        #[arg(long, default_value_t = false)]
-        acknowledge_warnings: bool,
     },
     /// Compile a source-free native model asset to standalone BMD3 and optional COL.
     CompileModelAsset {
@@ -103,8 +103,6 @@ enum Commands {
         /// Exact loader flags for `--loader-profile custom` (decimal or 0x-prefixed).
         #[arg(long, value_parser = parse_u32_auto)]
         loader_flags: Option<u32>,
-        #[arg(long, default_value_t = false)]
-        acknowledge_warnings: bool,
     },
     /// Validate and optionally emit files for a decomp-verified stock resource slot.
     ValidateStockReplacement {
@@ -395,7 +393,6 @@ fn main() -> Result<()> {
             collision_file,
             collision_prefix,
             units_per_meter,
-            acknowledge_warnings,
         } => import_model_command(
             input,
             asset_out,
@@ -405,7 +402,6 @@ fn main() -> Result<()> {
             collision_file,
             collision_prefix,
             units_per_meter,
-            acknowledge_warnings,
         ),
         Commands::CompileModelAsset {
             asset,
@@ -413,13 +409,11 @@ fn main() -> Result<()> {
             col_out,
             loader_profile,
             loader_flags,
-            acknowledge_warnings,
         } => compile_model_asset_command(
             asset,
             bmd_out,
             col_out,
             loader_profile.resolve(loader_flags)?,
-            acknowledge_warnings,
         ),
         Commands::ValidateStockReplacement {
             repo_root,
@@ -773,7 +767,6 @@ fn import_model_command(
     collision_file: Option<PathBuf>,
     collision_prefix: String,
     units_per_meter: f32,
-    acknowledge_warnings: bool,
 ) -> Result<()> {
     if !units_per_meter.is_finite() || units_per_meter <= 0.0 {
         bail!("--units-per-meter must be finite and greater than zero");
@@ -810,7 +803,6 @@ fn import_model_command(
 
     let imported = import_model(&input, &options)
         .with_context(|| format!("import project-authored model {}", input.display()))?;
-    require_acknowledged_diagnostics(&imported.asset, acknowledge_warnings)?;
     let bounds = imported.asset.converted_bounds()?;
     let native = imported.asset.to_native_bytes()?;
     let bmd = bmd_out
@@ -861,10 +853,8 @@ fn compile_model_asset_command(
     bmd_out: PathBuf,
     col_out: Option<PathBuf>,
     profile: TargetLoaderProfile,
-    acknowledge_warnings: bool,
 ) -> Result<()> {
     let asset = load_model_asset(&asset_path)?;
-    require_acknowledged_diagnostics(&asset, acknowledge_warnings)?;
     let materials = asset
         .materials
         .iter()
@@ -931,7 +921,6 @@ fn validate_stock_replacement_command(
     })?;
 
     let asset = load_model_asset(&asset_path)?;
-    require_acknowledged_diagnostics(&asset, acknowledge_warnings)?;
     let materials = asset
         .materials
         .iter()
@@ -1139,21 +1128,6 @@ fn load_model_asset(path: &std::path::Path) -> Result<ModelAssetDocument> {
     }
 }
 
-fn require_acknowledged_diagnostics(asset: &ModelAssetDocument, acknowledged: bool) -> Result<()> {
-    let required = asset.unacknowledged_required_diagnostics();
-    if !acknowledged && !required.is_empty() {
-        let codes = required
-            .iter()
-            .map(|diagnostic| format!("{:?}", diagnostic.code))
-            .collect::<Vec<_>>()
-            .join(", ");
-        bail!(
-            "model has acknowledgement-required diagnostics ({codes}); inspect them and rerun with --acknowledge-warnings"
-        );
-    }
-    Ok(())
-}
-
 #[derive(Debug, serde::Deserialize)]
 struct ProjectModelInstanceManifest {
     format_version: u32,
@@ -1222,18 +1196,6 @@ fn project_stage_edits_with_models(
             assets.insert(instance.placement.asset_id, asset.clone());
             asset
         };
-        let unacknowledged = asset.unacknowledged_required_diagnostics();
-        if !unacknowledged.is_empty() {
-            let codes = unacknowledged
-                .iter()
-                .map(|diagnostic| format!("{:?}", diagnostic.code))
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "model instance {} has unacknowledged import diagnostics ({codes})",
-                instance.placement.instance_id
-            );
-        }
         let resolved = ResolvedModelInstance {
             placement: instance.placement,
             asset,
@@ -1276,6 +1238,11 @@ fn project_stage_edits_with_models(
             let model = asset
                 .compile_bmd_document()
                 .with_context(|| format!("compile separate runtime BMD3 for asset {asset_id}"))?;
+            validate_cli_runtime_model_budget(
+                &model,
+                "SmJ3DAct",
+                &format!("model asset {asset_id}"),
+            )?;
             edits.upsert_model(
                 format!("mapobj/{resource_key}/default.bmd").into_bytes(),
                 model,
@@ -1320,7 +1287,13 @@ fn project_stage_edits_with_models(
 
     if !map_terrain.is_empty() {
         let merged = merge_model_instances("AuthoredMapTerrain", &map_terrain)?;
-        edits.replace_model(b"map/map/map.bmd".to_vec(), merged.compile_bmd_document()?);
+        let model = merged.compile_bmd_document()?;
+        validate_cli_runtime_model_budget(
+            &model,
+            "map-terrain",
+            &format!("merged map-terrain model ({} instances)", map_terrain.len()),
+        )?;
+        edits.replace_model(b"map/map/map.bmd".to_vec(), model);
     }
 
     if skybox.len() > 1 {
@@ -1330,10 +1303,13 @@ fn project_stage_edits_with_models(
         );
     }
     if let Some(resolved) = skybox.first() {
-        edits.upsert_model(
-            b"map/map/sky.bmd".to_vec(),
-            resolved.asset.compile_bmd_document()?,
-        );
+        let model = resolved.asset.compile_bmd_document()?;
+        validate_cli_runtime_model_budget(
+            &model,
+            "TSky",
+            &format!("model asset {}", resolved.placement.asset_id),
+        )?;
+        edits.upsert_model(b"map/map/sky.bmd".to_vec(), model);
         let archive = archive.context(
             "skybox export requires the open source-free stage archive so the typed Sky actor can be verified",
         )?;
@@ -1375,6 +1351,32 @@ fn project_stage_edits_with_models(
         }
     }
     Ok((edits, instance_count))
+}
+
+fn validate_cli_runtime_model_budget(
+    model: &sms_formats::J3dRebuildDocument,
+    target: &str,
+    subject: &str,
+) -> Result<()> {
+    let total_size = 0x20u64
+        + model
+            .sections
+            .iter()
+            .map(|section| u64::from(section.declared_size))
+            .sum::<u64>();
+    let tex1_size = model
+        .sections
+        .iter()
+        .find(|section| section.tag() == *b"TEX1")
+        .map_or(0, |section| u64::from(section.declared_size));
+    if total_size > RUNTIME_BMD_SAFETY_BUDGET || tex1_size > RUNTIME_TEX1_SAFETY_BUDGET {
+        bail!(
+            "{subject} compiles to a {total_size}-byte BMD3 with a {tex1_size}-byte TEX1, exceeding the {target} runtime safety budget ({} bytes total / {} bytes TEX1) for Sunshine's 24 MiB MEM1; prune unused textures or downsize them before building the stage",
+            RUNTIME_BMD_SAFETY_BUDGET,
+            RUNTIME_TEX1_SAFETY_BUDGET,
+        );
+    }
+    Ok(())
 }
 
 fn cli_runtime_resource_key(asset_id: sms_authoring::AssetId) -> String {
@@ -2388,7 +2390,6 @@ mod tests {
             None,
             "COL_".to_string(),
             100.0,
-            false,
         )
         .unwrap();
 
@@ -2399,7 +2400,6 @@ mod tests {
             second_bmd.clone(),
             Some(second_col.clone()),
             TargetLoaderProfile::SunshineMap,
-            false,
         )
         .unwrap();
         assert_eq!(

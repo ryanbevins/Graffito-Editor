@@ -34,6 +34,7 @@ fn document_with_archive(archive: SourceFreeStageArchive) -> StageDocument {
         archive_edits: StageArchiveEdits::default(),
         registry: None,
         route_authoring: None,
+        goop_authoring: None,
         load_issues: Vec::new(),
         lighting: StageLighting::default(),
         actor_previews: BTreeMap::new(),

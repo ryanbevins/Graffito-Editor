@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 
 use sms_authoring::{
     import_model, AssetReference, CatalogError, CatalogFilter, CatalogIssueKind, CollisionDocument,
-    CollisionGroup, CollisionSurface, ColorSet, ModelAssetCatalog, ModelAssetDocument,
-    ModelCoordinateSpace, ModelImportOptions, ModelMesh, ModelNode, ModelPrimitive, ModelTexture,
-    NodePurpose, TexCoordSet,
+    CollisionGroup, CollisionSurface, ColorSet, DiagnosticCode, ModelAssetCatalog,
+    ModelAssetDocument, ModelCoordinateSpace, ModelImportOptions, ModelMesh, ModelNode,
+    ModelPrimitive, ModelTexture, NodePurpose, TexCoordSet, GX_MAX_TEXTURE_DIMENSION,
 };
 
 fn test_document(name: &str) -> ModelAssetDocument {
@@ -95,6 +95,32 @@ fn managed_manifest_round_trips_without_inline_geometry_or_textures() {
         .is_file());
     assert!(managed.join("geometry/collision.smscolgeom").is_file());
     assert!(managed.join("textures/texture-0000.rgba8").is_file());
+}
+
+#[test]
+fn managed_catalog_load_downscales_legacy_textures_to_gx_limits() {
+    let project = tempfile::tempdir().unwrap();
+    let catalog = ModelAssetCatalog::open_project(project.path()).unwrap();
+    let mut document = test_document("Legacy oversized texture");
+    document.textures[0].width = 2048;
+    document.textures[0].height = 1;
+    document.textures[0].rgba8 = [17, 34, 51, 255].repeat(2048);
+
+    let entry = catalog
+        .create_asset("Models/LegacyOversized", &document)
+        .unwrap();
+    let loaded = catalog.load_asset(entry.id).unwrap();
+
+    assert_eq!(loaded.textures[0].width, GX_MAX_TEXTURE_DIMENSION);
+    assert_eq!(loaded.textures[0].height, 1);
+    assert_eq!(
+        loaded.textures[0].rgba8.len(),
+        GX_MAX_TEXTURE_DIMENSION as usize * 4
+    );
+    assert!(loaded
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == DiagnosticCode::TextureDownscaledForGx));
 }
 
 #[test]

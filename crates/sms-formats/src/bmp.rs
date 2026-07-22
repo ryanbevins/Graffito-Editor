@@ -27,8 +27,11 @@ pub struct BmpFile {
     /// Bottom-up scanlines in the BMP's native row-stride encoding.
     pub encoded_pixels: Vec<u8>,
     /// Retail pollution bitmaps contain a file-creator terminator after the
-    /// final scanline. Only zero-filled terminators are accepted.
+    /// final scanline. The count remains for compatibility with older semantic
+    /// project documents; newly imported files preserve the exact bytes below.
     pub trailing_zero_bytes: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trailing_bytes: Vec<u8>,
 }
 
 impl BmpFile {
@@ -103,13 +106,6 @@ impl BmpFile {
             return Err(invalid_offset(pixel_end, bytes.len()));
         }
         let trailing = &bytes[pixel_end..];
-        if trailing.iter().any(|byte| *byte != 0) {
-            return Err(FormatError::Unsupported {
-                format: FORMAT,
-                message: "non-zero file-creator bytes follow the final scanline".to_string(),
-            });
-        }
-
         Ok(Self {
             reserved_1: le_u16(bytes, 6)?,
             reserved_2: le_u16(bytes, 8)?,
@@ -127,6 +123,7 @@ impl BmpFile {
             encoded_pixels: bytes[pixel_offset..pixel_end].to_vec(),
             trailing_zero_bytes: u32::try_from(trailing.len())
                 .map_err(|_| resource_limit("trailing terminator bytes", trailing.len()))?,
+            trailing_bytes: trailing.to_vec(),
         })
     }
 
@@ -141,9 +138,14 @@ impl BmpFile {
             .checked_add(INFO_HEADER_SIZE)
             .and_then(|size| size.checked_add(palette_bytes))
             .ok_or_else(|| resource_limit("bitmap bytes", usize::MAX))?;
+        let trailing_size = if self.trailing_bytes.is_empty() {
+            self.trailing_zero_bytes as usize
+        } else {
+            self.trailing_bytes.len()
+        };
         let file_size = pixel_offset
             .checked_add(self.encoded_pixels.len())
-            .and_then(|size| size.checked_add(self.trailing_zero_bytes as usize))
+            .and_then(|size| size.checked_add(trailing_size))
             .ok_or_else(|| resource_limit("bitmap bytes", usize::MAX))?;
         let file_size_u32 =
             u32::try_from(file_size).map_err(|_| resource_limit("bitmap bytes", file_size))?;
@@ -173,11 +175,98 @@ impl BmpFile {
         }
         bytes[pixel_offset..pixel_offset + self.encoded_pixels.len()]
             .copy_from_slice(&self.encoded_pixels);
+        if !self.trailing_bytes.is_empty() {
+            let start = pixel_offset + self.encoded_pixels.len();
+            bytes[start..start + self.trailing_bytes.len()].copy_from_slice(&self.trailing_bytes);
+        }
         Ok(bytes)
     }
 
     pub fn row_stride(&self) -> Result<usize> {
         row_stride(self.width, self.bits_per_pixel)
+    }
+
+    /// Returns the semantic 8-bit image without BMP row padding, ordered from
+    /// the top-left corner. Sunshine's pollution loader stores its source BMP
+    /// bottom-up, while editor painting and YMP coordinates are naturally
+    /// top-down.
+    pub fn top_down_indices(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let width = self.width as usize;
+        let height = self.height.unsigned_abs() as usize;
+        let stride = self.row_stride()?;
+        let mut output = vec![0; width * height];
+        for y in 0..height {
+            let source_y = if self.height > 0 { height - 1 - y } else { y };
+            let source = source_y * stride;
+            output[y * width..(y + 1) * width]
+                .copy_from_slice(&self.encoded_pixels[source..source + width]);
+        }
+        Ok(output)
+    }
+
+    /// Replaces the semantic 8-bit image while retaining every imported BMP
+    /// header, palette, padding byte, and creator terminator.
+    pub fn set_top_down_indices(&mut self, indices: &[u8]) -> Result<()> {
+        self.validate()?;
+        let width = self.width as usize;
+        let height = self.height.unsigned_abs() as usize;
+        let expected = width
+            .checked_mul(height)
+            .ok_or_else(|| resource_limit("pixel indices", usize::MAX))?;
+        if indices.len() != expected {
+            return Err(FormatError::Unsupported {
+                format: FORMAT,
+                message: format!(
+                    "top-down pixel allocation has {} bytes, expected {expected}",
+                    indices.len()
+                ),
+            });
+        }
+        let stride = self.row_stride()?;
+        for y in 0..height {
+            let target_y = if self.height > 0 { height - 1 - y } else { y };
+            let target = target_y * stride;
+            self.encoded_pixels[target..target + width]
+                .copy_from_slice(&indices[y * width..(y + 1) * width]);
+        }
+        Ok(())
+    }
+
+    /// Builds the canonical 8-bit BMP consumed by
+    /// `TPollutionLayer::initTexImage`. A 256-entry palette places the pixel
+    /// allocation at the runtime's hard-coded offset 0x436.
+    pub fn new_pollution_mask(width: u16, height: u16, indices: Vec<u8>) -> Result<Self> {
+        if width == 0 || height == 0 {
+            return Err(FormatError::Unsupported {
+                format: FORMAT,
+                message: "pollution masks must have non-zero dimensions".to_string(),
+            });
+        }
+        let stride = row_stride(i32::from(width), 8)?;
+        let allocation = stride
+            .checked_mul(usize::from(height))
+            .ok_or_else(|| resource_limit("pixel bytes", usize::MAX))?;
+        let mut bitmap = Self {
+            reserved_1: 0,
+            reserved_2: 0,
+            width: i32::from(width),
+            height: i32::from(height),
+            planes: 1,
+            bits_per_pixel: 8,
+            compression: 0,
+            declared_image_size: allocation as u32,
+            horizontal_pixels_per_meter: 3_780,
+            vertical_pixels_per_meter: 3_780,
+            colors_used: 256,
+            important_colors: 0,
+            palette: (0..=255).map(|value| [value, value, value, 0]).collect(),
+            encoded_pixels: vec![0; allocation],
+            trailing_zero_bytes: 0,
+            trailing_bytes: Vec::new(),
+        };
+        bitmap.set_top_down_indices(&indices)?;
+        Ok(bitmap)
     }
 
     fn validate(&self) -> Result<()> {
@@ -308,6 +397,7 @@ mod tests {
             palette: vec![[0, 0, 0, 0], [0xFF, 0xFF, 0xFF, 0]],
             encoded_pixels: vec![0, 1, 0, 0, 1, 0, 0, 0],
             trailing_zero_bytes: 2,
+            trailing_bytes: Vec::new(),
         };
         let mut source = bitmap.encode().unwrap();
         let expected = source.clone();
@@ -316,6 +406,33 @@ mod tests {
         assert_eq!(parsed.encode().unwrap(), expected);
         parsed.encoded_pixels[0] ^= 1;
         assert_ne!(parsed.encode().unwrap(), expected);
+    }
+
+    #[test]
+    fn imported_trailing_bytes_round_trip_verbatim() {
+        let mut bitmap = BmpFile::new_pollution_mask(8, 4, vec![0; 32]).unwrap();
+        bitmap.trailing_bytes = vec![0xde, 0xad, 0xbe, 0xef];
+        let bytes = bitmap.encode().unwrap();
+        let parsed = BmpFile::parse(&bytes).unwrap();
+        assert_eq!(parsed.trailing_bytes, vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(parsed.encode().unwrap(), bytes);
+    }
+
+    #[test]
+    fn top_down_pixels_normalize_both_bmp_row_orientations() {
+        let pixels = (0u8..32).collect::<Vec<_>>();
+        let bottom_up = BmpFile::new_pollution_mask(8, 4, pixels.clone()).unwrap();
+        assert_eq!(bottom_up.top_down_indices().unwrap(), pixels);
+
+        let mut top_down = bottom_up;
+        top_down.height = -top_down.height;
+        let replacement = (32u8..64).collect::<Vec<_>>();
+        top_down.set_top_down_indices(&replacement).unwrap();
+        assert_eq!(top_down.top_down_indices().unwrap(), replacement);
+        assert_eq!(
+            BmpFile::parse(top_down.encode().unwrap()).unwrap(),
+            top_down
+        );
     }
 
     #[test]
@@ -333,6 +450,23 @@ mod tests {
         assert_eq!(bitmap.encode().unwrap(), expected);
         bitmap.encoded_pixels[0] ^= 1;
         assert_ne!(bitmap.encode().unwrap(), expected);
+    }
+
+    #[test]
+    fn canonical_pollution_mask_uses_runtime_pixel_offset_and_top_down_pixels() {
+        let pixels = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let mut bitmap = BmpFile::new_pollution_mask(4, 2, pixels.clone()).unwrap();
+        let encoded = bitmap.encode().unwrap();
+        assert_eq!(
+            u32::from_le_bytes(encoded[10..14].try_into().unwrap()),
+            0x436
+        );
+        assert_eq!(bitmap.top_down_indices().unwrap(), pixels);
+
+        bitmap
+            .set_top_down_indices(&[8, 7, 6, 5, 4, 3, 2, 1])
+            .unwrap();
+        assert_eq!(bitmap.top_down_indices().unwrap(), [8, 7, 6, 5, 4, 3, 2, 1]);
     }
 
     #[test]

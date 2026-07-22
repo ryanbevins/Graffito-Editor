@@ -43,6 +43,7 @@ mod direct_boot;
 mod document_commands;
 mod game_content_index;
 mod game_text;
+mod goop;
 mod gpu_viewport;
 mod managed_build;
 mod model_assets;
@@ -66,6 +67,7 @@ use content_browser::*;
 use content_thumbnails::*;
 use game_content_index::*;
 use game_text::*;
+use goop::*;
 use model_assets::*;
 use music_library::*;
 use outliner::*;
@@ -104,6 +106,7 @@ enum EditorTool {
     Move,
     Rotate,
     Scale,
+    Goop,
     Place,
 }
 
@@ -163,6 +166,7 @@ impl EditorTool {
             Self::Move => "Move",
             Self::Rotate => "Rotate",
             Self::Scale => "Scale",
+            Self::Goop => "Goop",
             Self::Place => "Place",
         }
     }
@@ -422,6 +426,7 @@ enum BackgroundResult {
     Open(Result<Box<LoadedStage>, String>),
     CreateStage(Result<Box<LoadedStage>, String>),
     RetailSkybox(Result<RetailSkyboxSelection, String>),
+    GoopRebuild(Result<Box<GoopRebuildOutcome>, String>),
     Build(Result<managed_build::ManagedGameBuildOutcome, String>),
     BuildAndRun {
         mode: DolphinLaunchMode,
@@ -779,6 +784,8 @@ struct SmsEditorApp {
     scene_archives: Vec<SceneArchiveInfo>,
     scene_labels: BTreeMap<String, SceneArchiveLabel>,
     retail_skyboxes: Vec<RetailSkyboxEntry>,
+    retail_goop_templates: Vec<RetailGoopTemplate>,
+    goop_templates_indexed: bool,
     retail_music: Vec<RetailMusicEntry>,
     retail_sounds: Vec<RetailSoundEntry>,
     retail_stage_audio: Vec<RetailStageAudioProfile>,
@@ -834,6 +841,22 @@ struct SmsEditorApp {
     pending_auto_refresh_root: Option<String>,
     last_auto_refresh_attempt_root: String,
     tool: EditorTool,
+    selected_goop_layer: usize,
+    selected_goop_template: usize,
+    show_incompatible_goop_templates: bool,
+    goop_brush_radius: f32,
+    goop_brush_hardness: f32,
+    goop_brush_opacity: f32,
+    goop_fill_mode: bool,
+    goop_use_custom_region: bool,
+    goop_region_min_x: f32,
+    goop_region_min_z: f32,
+    goop_region_width_cells: u16,
+    goop_region_height_cells: u16,
+    goop_cursor_world: Option<[f32; 3]>,
+    goop_stroke: Option<GoopStroke>,
+    goop_undo_stack: VecDeque<GoopUndoRecord>,
+    goop_redo_stack: VecDeque<GoopUndoRecord>,
     view_mode: ViewMode,
     bottom_tab: BottomTab,
     show_project_settings: bool,
@@ -995,6 +1018,8 @@ impl Default for SmsEditorApp {
             scene_archives: Vec::new(),
             scene_labels: BTreeMap::new(),
             retail_skyboxes: Vec::new(),
+            retail_goop_templates: Vec::new(),
+            goop_templates_indexed: false,
             retail_music: Vec::new(),
             retail_sounds: Vec::new(),
             retail_stage_audio: Vec::new(),
@@ -1050,6 +1075,22 @@ impl Default for SmsEditorApp {
             pending_auto_refresh_root: None,
             last_auto_refresh_attempt_root: String::new(),
             tool: EditorTool::Select,
+            selected_goop_layer: 0,
+            selected_goop_template: 0,
+            show_incompatible_goop_templates: false,
+            goop_brush_radius: 200.0,
+            goop_brush_hardness: 0.65,
+            goop_brush_opacity: 1.0,
+            goop_fill_mode: false,
+            goop_use_custom_region: false,
+            goop_region_min_x: 0.0,
+            goop_region_min_z: 0.0,
+            goop_region_width_cells: 8,
+            goop_region_height_cells: 4,
+            goop_cursor_world: None,
+            goop_stroke: None,
+            goop_undo_stack: VecDeque::new(),
+            goop_redo_stack: VecDeque::new(),
             view_mode: ViewMode::Lit,
             bottom_tab: BottomTab::Content,
             show_project_settings: false,
@@ -1192,6 +1233,9 @@ impl eframe::App for SmsEditorApp {
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Q)) {
             self.tool = EditorTool::Select;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::G)) {
+            self.tool = EditorTool::Goop;
         }
     }
 
@@ -1683,6 +1727,8 @@ impl SmsEditorApp {
                             let music_count = scan.retail_music.len();
                             let sound_count = scan.retail_sounds.len();
                             self.scene_archives = scan.archives;
+                            self.retail_goop_templates.clear();
+                            self.goop_templates_indexed = false;
                             self.scene_labels = scan.labels;
                             self.retail_skyboxes = scan.retail_skyboxes;
                             self.retail_music = scan.retail_music;
@@ -1771,6 +1817,13 @@ impl SmsEditorApp {
                         Err(err) => self
                             .log
                             .push(format!("Retail skybox selection failed: {err}")),
+                    },
+                    BackgroundResult::GoopRebuild(result) => match result {
+                        Ok(outcome) => self.apply_goop_rebuild(*outcome),
+                        Err(err) if err == "goop rebuild cancelled" => {
+                            self.log.push("Goop rebuild cancelled.".to_string())
+                        }
+                        Err(err) => self.log.push(format!("Goop rebuild failed: {err}")),
                     },
                     BackgroundResult::Build(result) => match result {
                         Ok(outcome) => {
@@ -1969,6 +2022,13 @@ impl SmsEditorApp {
             });
         self.install_object_authoring_catalog_cache(object_authoring_catalog_cache);
         self.scene_archives = archives;
+        self.retail_goop_templates.clear();
+        self.goop_templates_indexed = false;
+        self.selected_goop_layer = 0;
+        self.selected_goop_template = 0;
+        self.goop_stroke = None;
+        self.goop_undo_stack.clear();
+        self.goop_redo_stack.clear();
         self.scene_labels = scene_labels;
         self.retail_skyboxes = retail_skyboxes;
         self.retail_music = retail_music;
@@ -2103,7 +2163,12 @@ impl SmsEditorApp {
                     &asset.path.to_string_lossy(),
                 ))
             })
-            .filter(|asset| map_static_model_is_active(document, &asset.path.to_string_lossy()))
+            .filter(|asset| {
+                generated_goop_model_visibility(document, &asset.path.to_string_lossy())
+                    .unwrap_or_else(|| {
+                        map_static_model_is_active(document, &asset.path.to_string_lossy())
+                    })
+            })
             .filter(|asset| {
                 mirror_surface_model_is_active(
                     &document.stage_id,
@@ -2156,6 +2221,7 @@ impl SmsEditorApp {
         let mut texture_srt_animations = Vec::new();
         let mut texture_pattern_animations = Vec::new();
         let mut material_animation_bindings = Vec::new();
+        let mut pollution_texture_indices = BTreeMap::<usize, Vec<usize>>::new();
         let mut animated_flags = Vec::new();
         let mut level_transform_models = Vec::new();
         let mut level_transform_particles = Vec::new();
@@ -2241,6 +2307,25 @@ impl SmsEditorApp {
                         mirror_model_slots.insert(model_index, slot);
                     }
                     let texture_base = push_preview_textures(&mut textures, &preview);
+                    if let (Some(layer_index), Some(dynamic_name)) = (
+                        pollution_layer_model_index(&asset_path),
+                        preview
+                            .textures
+                            .first()
+                            .map(|texture| texture.name.as_str()),
+                    ) {
+                        pollution_texture_indices.insert(
+                            layer_index,
+                            preview
+                                .textures
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(index, texture)| {
+                                    (texture.name == dynamic_name).then_some(texture_base + index)
+                                })
+                                .collect(),
+                        );
+                    }
                     let material_base =
                         push_preview_materials(&mut materials, &preview, texture_base);
                     material_animation_bindings.resize_with(materials.len(), Vec::new);
@@ -3093,6 +3178,7 @@ impl SmsEditorApp {
             texture_srt_animations,
             texture_pattern_animations,
             material_animation_bindings,
+            pollution_texture_indices,
             bounds_min,
             bounds_max,
             camera_bounds_min,
@@ -4681,6 +4767,26 @@ fn pollution_layer_model_index(path: &str) -> Option<usize> {
         }
         _ => None,
     }
+}
+
+fn generated_goop_model_visibility(document: &StageDocument, path: &str) -> Option<bool> {
+    let path = path.replace('\\', "/");
+    let stem = Path::new(
+        path.rsplit_once("!/")
+            .map_or(path.as_str(), |(_, path)| path),
+    )
+    .file_stem()?
+    .to_str()?;
+    document
+        .goop_authoring
+        .as_ref()?
+        .layers
+        .iter()
+        .find_map(|layer| {
+            (layer.origin == sms_scene::GoopLayerOrigin::Generated
+                && layer.resource_stem.eq_ignore_ascii_case(stem))
+            .then_some(layer.visible)
+        })
 }
 
 fn model_loader_flags_for_path(path: &str) -> u32 {

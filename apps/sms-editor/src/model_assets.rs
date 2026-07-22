@@ -29,8 +29,8 @@ use super::*;
 const MODEL_INSTANCE_MANIFEST_VERSION: u32 = 1;
 const MODEL_INSTANCE_MANIFEST_NAME: &str = ".sms-model-instances.json";
 const MAX_MODEL_UNDO_RECORDS: usize = 40;
-const STANDALONE_ACTOR_BMD_SAFETY_BUDGET: u64 = 12 * 1024 * 1024;
-const STANDALONE_ACTOR_TEX1_SAFETY_BUDGET: u64 = 8 * 1024 * 1024;
+const RUNTIME_BMD_SAFETY_BUDGET: u64 = 12 * 1024 * 1024;
+const RUNTIME_TEX1_SAFETY_BUDGET: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum ContentBrowserKind {
@@ -362,10 +362,10 @@ fn check_model_export_cancelled(cancelled: Option<&AtomicBool>) -> Result<(), St
     }
 }
 
-fn validate_standalone_actor_model_budget(
-    placement: &ModelInstancePlacement,
+fn validate_runtime_model_budget(
     model: &J3dRebuildDocument,
     target: &str,
+    subject: &str,
 ) -> Result<(), String> {
     let total_size = 0x20u64
         + model
@@ -378,19 +378,13 @@ fn validate_standalone_actor_model_budget(
         .iter()
         .find(|section| section.tag() == *b"TEX1")
         .map_or(0, |section| u64::from(section.declared_size));
-    if total_size <= STANDALONE_ACTOR_BMD_SAFETY_BUDGET
-        && tex1_size <= STANDALONE_ACTOR_TEX1_SAFETY_BUDGET
-    {
+    if total_size <= RUNTIME_BMD_SAFETY_BUDGET && tex1_size <= RUNTIME_TEX1_SAFETY_BUDGET {
         return Ok(());
     }
     Err(format!(
-        "model instance {} (asset {}) compiles to a {}-byte BMD3 with a {}-byte TEX1, exceeding the Graffito-Editor standalone {target} safety budget ({} bytes total / {} bytes TEX1) for Sunshine's 24 MiB MEM1. This is an editor safety budget, not a BMD format limit; prune unused textures, downsize them, or use map-terrain mode when the model is intentionally the stage terrain",
-        placement.instance_id,
-        placement.asset_id,
-        total_size,
-        tex1_size,
-        STANDALONE_ACTOR_BMD_SAFETY_BUDGET,
-        STANDALONE_ACTOR_TEX1_SAFETY_BUDGET,
+        "{subject} compiles to a {total_size}-byte BMD3 with a {tex1_size}-byte TEX1, exceeding the Graffito-Editor {target} runtime safety budget ({} bytes total / {} bytes TEX1) for Sunshine's 24 MiB MEM1. Prune unused textures or downsize them before building the stage",
+        RUNTIME_BMD_SAFETY_BUDGET,
+        RUNTIME_TEX1_SAFETY_BUDGET,
     ))
 }
 
@@ -1545,6 +1539,7 @@ impl SmsEditorApp {
                 self.log.push(error);
             }
         }
+        self.refresh_goop_stale_from_final_terrain();
         self.rebuild_gpu_viewport_scene();
         self.clear_viewport_preview_cache();
     }
@@ -1750,18 +1745,6 @@ impl SmsEditorApp {
                         instance.placement.instance_id, instance.placement.asset_id
                     )
                 })?;
-            let unacknowledged = asset.unacknowledged_required_diagnostics();
-            if !unacknowledged.is_empty() {
-                let codes = unacknowledged
-                    .iter()
-                    .map(|diagnostic| format!("{:?}", diagnostic.code))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(format!(
-                    "model instance {} uses asset {} with unacknowledged import diagnostics ({codes}); review and save the asset before export",
-                    instance.placement.instance_id, instance.placement.asset_id
-                ));
-            }
             let resolved = ResolvedModelInstance {
                 placement: instance.placement.clone(),
                 asset,
@@ -1809,7 +1792,11 @@ impl SmsEditorApp {
                     .find(|resolved| resolved.placement.asset_id == asset_id)
                     .expect("the deduplicated separate asset came from a placement")
                     .placement;
-                validate_standalone_actor_model_budget(placement, &model, "SmJ3DAct")?;
+                let subject = format!(
+                    "model instance {} (asset {})",
+                    placement.instance_id, placement.asset_id
+                );
+                validate_runtime_model_budget(&model, "SmJ3DAct", &subject)?;
                 edits.upsert_model(
                     format!("mapobj/{resource_key}/default.bmd").into_bytes(),
                     model,
@@ -1981,7 +1968,11 @@ impl SmsEditorApp {
                     )
                 })?;
                 check_model_export_cancelled(cancelled)?;
-                validate_standalone_actor_model_budget(placement, &model, "MapObjBase")?;
+                let subject = format!(
+                    "model instance {} (asset {})",
+                    placement.instance_id, placement.asset_id
+                );
+                validate_runtime_model_budget(&model, "MapObjBase", &subject)?;
                 edits.upsert_model(model_path, model);
                 edits.insert_placement(
                     b"map/scene.bin".to_vec(),
@@ -2075,6 +2066,8 @@ impl SmsEditorApp {
                 .compile_bmd_document()
                 .map_err(|error| format!("could not compile replacement map BMD3: {error}"))?;
             check_model_export_cancelled(cancelled)?;
+            let subject = format!("merged map-terrain model ({} instances)", map_terrain.len());
+            validate_runtime_model_budget(&model, "map-terrain", &subject)?;
             // This mode is deliberately opt-in: replacing the terrain BMD is
             // destructive and remains distinct from the safe runtime-object
             // path above.
@@ -2101,6 +2094,11 @@ impl SmsEditorApp {
                     resolved.placement.asset_id
                 )
             })?;
+            let subject = format!(
+                "model instance {} (asset {})",
+                resolved.placement.instance_id, resolved.placement.asset_id
+            );
+            validate_runtime_model_budget(&model, "TSky", &subject)?;
             edits.upsert_model(b"map/map/sky.bmd".to_vec(), model);
 
             let archive = archive.ok_or_else(|| {
@@ -2995,28 +2993,6 @@ impl SmsEditorApp {
                 format!("{:?} [{:?}]", diagnostic.severity, diagnostic.code),
             );
             ui.label(&diagnostic.message);
-            if diagnostic.acknowledgement_required {
-                let code = diagnostic.code;
-                let mut acknowledged = self
-                    .selected_model_document
-                    .as_ref()
-                    .is_some_and(|document| document.acknowledged_diagnostics.contains(&code));
-                if ui
-                    .checkbox(
-                        &mut acknowledged,
-                        "I acknowledge this unmapped source input",
-                    )
-                    .changed()
-                {
-                    self.mutate_model_asset("Reviewed import diagnostic", move |document| {
-                        if acknowledged {
-                            document.acknowledged_diagnostics.insert(code);
-                        } else {
-                            document.acknowledged_diagnostics.remove(&code);
-                        }
-                    });
-                }
-            }
             ui.separator();
         }
         let target = self.model_target_diagnostics();
@@ -4067,6 +4043,7 @@ fn empty_authored_model_preview() -> ModelPreview {
         texture_srt_animations: Vec::new(),
         texture_pattern_animations: Vec::new(),
         material_animation_bindings: Vec::new(),
+        pollution_texture_indices: BTreeMap::new(),
         bounds_min: [0.0; 3],
         bounds_max: [1.0; 3],
         camera_bounds_min: [0.0; 3],
@@ -4323,6 +4300,7 @@ mod tests {
             archive_edits: sms_scene::StageArchiveEdits::default(),
             registry: None,
             route_authoring: None,
+            goop_authoring: None,
             load_issues: Vec::new(),
             lighting: sms_scene::StageLighting::default(),
             actor_previews: BTreeMap::new(),
@@ -5029,6 +5007,7 @@ mod tests {
             stage_archive_source_path: Some(source_path),
             archive_edits: sms_scene::StageArchiveEdits::default(),
             route_authoring: None,
+            goop_authoring: None,
             registry: None,
             load_issues: Vec::new(),
             lighting: sms_scene::StageLighting::default(),
@@ -5116,12 +5095,6 @@ mod tests {
             sms_authoring::import_model(source, &sms_authoring::ModelImportOptions::default())
                 .unwrap()
                 .asset;
-        imported.acknowledged_diagnostics = imported
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.acknowledgement_required)
-            .map(|diagnostic| diagnostic.code)
-            .collect();
         imported.materials[0].gx.indirect.enabled = true;
         let diagnostics =
             loader_diagnostics_for_document(&imported, SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS);
@@ -5149,7 +5122,7 @@ mod tests {
     }
 
     #[test]
-    fn standalone_actor_budget_rejects_oversized_tex1_but_not_map_terrain() {
+    fn runtime_model_budget_rejects_oversized_tex1_for_every_export_target() {
         let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
             "../../crates/sms-authoring/tests/fixtures/gltf/valid/minimal-external/model.gltf",
         );
@@ -5163,22 +5136,18 @@ mod tests {
             .iter_mut()
             .find(|section| section.tag() == *b"TEX1")
             .unwrap()
-            .declared_size = (STANDALONE_ACTOR_TEX1_SAFETY_BUDGET + 0x20) as u32;
+            .declared_size = (RUNTIME_TEX1_SAFETY_BUDGET + 0x20) as u32;
         let placement = ModelInstancePlacement::new(AssetId::new(), "oversized");
-        let error =
-            validate_standalone_actor_model_budget(&placement, &model, "SmJ3DAct").unwrap_err();
-        assert!(error.contains("24 MiB MEM1"), "{error}");
-        assert!(error.contains("not a BMD format limit"), "{error}");
-        assert!(error.contains("map-terrain mode"), "{error}");
-
-        // Map-terrain export intentionally does not call the standalone actor
-        // budget check because it replaces the stage's world model.
-        let mut terrain = placement;
-        terrain.export_mode = ModelInstanceExportMode::MapTerrain;
-        assert_eq!(
-            model_instance_loader_flags(&terrain, None).unwrap(),
-            SMS_MAP_MODEL_LOAD_FLAGS
+        let subject = format!(
+            "model instance {} (asset {})",
+            placement.instance_id, placement.asset_id
         );
+        for target in ["SmJ3DAct", "MapObjBase", "map-terrain", "TSky"] {
+            let error = validate_runtime_model_budget(&model, target, &subject).unwrap_err();
+            assert!(error.contains("24 MiB MEM1"), "{error}");
+            assert!(error.contains(target), "{error}");
+            assert!(!error.contains("map-terrain mode"), "{error}");
+        }
     }
 
     #[test]
@@ -5489,39 +5458,30 @@ mod tests {
     }
 
     #[test]
-    fn stage_export_requires_persisted_import_diagnostic_acknowledgements() {
+    fn legacy_import_acknowledgement_flags_do_not_block_stage_export() {
         let temporary = tempfile::tempdir().unwrap();
         let content = temporary.path().join("Content");
         let catalog = ModelAssetCatalog::open_content_root(&content).unwrap();
         let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../crates/sms-authoring/tests/fixtures/gltf/valid/pbr-diagnostics/model.glb");
-        let imported =
+        let mut imported =
             sms_authoring::import_model(source, &sms_authoring::ModelImportOptions::default())
                 .unwrap()
                 .asset;
-        assert!(!imported.unacknowledged_required_diagnostics().is_empty());
+        assert!(imported.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == sms_authoring::DiagnosticCode::UnmappedMetallicRoughness
+        }));
+        // Simulate an asset persisted by an older editor. Legacy diagnostic
+        // flags remain readable but no longer participate in export policy.
+        for diagnostic in &mut imported.diagnostics {
+            diagnostic.acknowledgement_required = true;
+        }
         let entry = catalog.create_asset("pbr.smsmodel", &imported).unwrap();
         let instance = EditorModelInstance {
             stage_id: "test11".to_string(),
             placement: ModelInstancePlacement::new(entry.id, "PbrInstance"),
             local_bounds: model_document_bounds(&imported).unwrap(),
         };
-        let error = SmsEditorApp::stage_edits_with_model_instances(
-            &content,
-            std::slice::from_ref(&instance),
-            &sms_scene::StageArchiveEdits::default(),
-        )
-        .unwrap_err();
-        assert!(error.contains("unacknowledged import diagnostics"));
-
-        let mut acknowledged = catalog.load_asset(entry.id).unwrap();
-        acknowledged.acknowledged_diagnostics = acknowledged
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.acknowledgement_required)
-            .map(|diagnostic| diagnostic.code)
-            .collect();
-        catalog.save_asset(entry.id, &acknowledged).unwrap();
         let archive = runtime_export_test_archive();
         SmsEditorApp::stage_edits_with_model_instances_for_archive(
             &content,

@@ -20,6 +20,7 @@ use sms_schema::{
 use thiserror::Error;
 
 mod blank_stage;
+mod goop_authoring;
 mod object_authoring;
 mod object_parameters;
 mod project_store;
@@ -35,6 +36,13 @@ pub use blank_stage::{
     BlankStageSkyboxPreset, BlankStageTargetMetadata, BLANK_STAGE_BOOTSTRAP_REQUIREMENTS,
     BLANK_STAGE_CAMERA_DIRECTORY_MARKER_PATH, BLANK_STAGE_COIN_PARTICLE_PATH,
     BLANK_STAGE_PRESET_VERSION, DEFAULT_BLANK_STAGE_TARGET_SLOT,
+};
+pub use goop_authoring::{
+    generate_floor_depth_map, generate_floor_pollution_model, terrain_fingerprint,
+    whole_terrain_region, GoopAuthoringDocument, GoopBehavior, GoopLayerAuthoring, GoopLayerOrigin,
+    GoopPlane, GoopRegion, GoopRenderTriangle, GoopStyleSource, GoopTerrainTriangle,
+    GOOP_AUTHORING_FORMAT_VERSION, GOOP_CELL_SIZE, GOOP_MAX_DIMENSION, GOOP_MAX_LAYERS,
+    GOOP_RESOURCE_PATH,
 };
 pub use object_authoring::{
     ObjectAuthoringCatalog, ObjectAuthoringCatalogBuild, ObjectAuthoringCatalogWarning,
@@ -213,6 +221,9 @@ pub struct StageDocument {
     /// Project-only control points and Bezier handles for `map/scene.ral`.
     /// The compiled retail representation remains an authored Rail resource.
     pub route_authoring: Option<RouteAuthoringDocument>,
+    /// Project-side goop layers and masks. Runtime YMP/BMP/BMD resources are
+    /// compiled into the semantic archive overlay.
+    pub goop_authoring: Option<GoopAuthoringDocument>,
     pub load_issues: Vec<ValidationIssue>,
     pub lighting: StageLighting,
     pub actor_previews: BTreeMap<String, ActorPreview>,
@@ -331,6 +342,7 @@ impl StageDocument {
             registry: None,
             load_issues,
             route_authoring: None,
+            goop_authoring: None,
             lighting,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
@@ -376,6 +388,7 @@ impl StageDocument {
             registry: None,
             load_issues,
             route_authoring: None,
+            goop_authoring: None,
             lighting,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
@@ -443,6 +456,7 @@ impl StageDocument {
         self.load_issues = load_issues;
         self.lighting = lighting;
         self.route_authoring = None;
+        self.goop_authoring = None;
         self.actor_previews.clear();
         if let Some(registry) = registry {
             self.set_registry(registry);
@@ -586,11 +600,7 @@ impl StageDocument {
                         "map/scene.ral is not a RAL resource".to_string(),
                     ));
                 }
-                None => sms_formats::RalDocument {
-                    graphs: Vec::new(),
-                    file_size: 0,
-                    padding: Vec::new(),
-                },
+                None => sms_formats::RalDocument::empty_canonical(),
             };
             self.route_authoring = Some(RouteAuthoringDocument::lift(ROUTE_RESOURCE_PATH, &rail));
         }
@@ -1145,6 +1155,7 @@ impl StageDocument {
             archive_edits: self.archive_edits.clone(),
             lighting: Some(self.lighting.clone()),
             route_authoring: self.route_authoring.clone(),
+            goop_authoring: self.goop_authoring.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&overlay)?;
         self.mark_changed_file(path, bytes)?;
@@ -1238,6 +1249,8 @@ pub struct EditorSceneOverlay {
     ///
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_authoring: Option<RouteAuthoringDocument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goop_authoring: Option<GoopAuthoringDocument>,
     /// `None` preserves compatibility with older overlays, whose lighting is
     /// inherited from the semantic stage baseline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3106,6 +3119,7 @@ mod tests {
             archive_edits: StageArchiveEdits::default(),
             registry: None,
             route_authoring: None,
+            goop_authoring: None,
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
             actor_previews: BTreeMap::new(),
@@ -3202,6 +3216,7 @@ mod tests {
             archive_edits: StageArchiveEdits::default(),
             registry: None,
             route_authoring: None,
+            goop_authoring: None,
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
             actor_previews: BTreeMap::new(),
@@ -3332,6 +3347,7 @@ mod tests {
             archive_edits: StageArchiveEdits::default(),
             registry: None,
             route_authoring: None,
+            goop_authoring: None,
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
             actor_previews: BTreeMap::new(),
@@ -3362,6 +3378,7 @@ mod tests {
         let overlay: EditorSceneOverlay = serde_json::from_slice(bytes).unwrap();
         assert_eq!(overlay.stage_id, "dolpic");
         assert!(overlay.objects.is_empty());
+        assert!(overlay.goop_authoring.is_none());
     }
 
     #[test]
@@ -3382,6 +3399,7 @@ mod tests {
         assert!(overlay.objects.is_empty());
         assert_eq!(overlay.archive_edits, StageArchiveEdits::default());
         assert!(overlay.lighting.is_none());
+        assert!(overlay.goop_authoring.is_none());
     }
 
     #[test]
@@ -4153,7 +4171,7 @@ mod tests {
     }
 
     #[test]
-    fn project_export_blocks_validation_errors_before_writing() {
+    fn project_save_preserves_invalid_authoring_for_later_repair() {
         let root = std::env::temp_dir().join(format!(
             "sms-editor-invalid-project-test-{}-{}",
             std::process::id(),
@@ -4167,11 +4185,43 @@ mod tests {
         doc.objects.push(SceneObject::new("duplicate", "coin"));
         doc.queue_editor_overlay_change().unwrap();
 
+        doc.save_project_folder(&root).unwrap();
+        assert!(root.join("sms-project.toml").is_file());
         assert!(matches!(
-            doc.save_project_folder(&root).unwrap_err(),
+            doc.validate_for_export().unwrap_err(),
             SceneError::ValidationFailed(_)
         ));
-        assert!(!root.exists());
+
+        let overlay: EditorSceneOverlay = serde_json::from_slice(
+            &fs::read(root.join("files/editor/stages/dolpic.scene.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(overlay.objects.len(), 2);
+        assert_eq!(overlay.objects[0].id, "duplicate");
+        assert_eq!(overlay.objects[1].id, "duplicate");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_load_normalizes_empty_route_authoring_when_ral_is_absent() {
+        let root = unique_test_project_root("empty-route-authoring");
+        let mut saved = empty_document("dolpic");
+        saved.route_authoring = Some(RouteAuthoringDocument::lift(
+            ROUTE_RESOURCE_PATH,
+            &sms_formats::RalDocument::empty_canonical(),
+        ));
+        saved.save_project_folder(&root).unwrap();
+
+        let mut reopened = empty_document("dolpic");
+        assert!(reopened.load_project_folder(&root).unwrap());
+        assert!(reopened.route_authoring.is_none());
+        assert!(!reopened
+            .validate()
+            .iter()
+            .any(|issue| issue.code == "route-authoring-resource-missing"));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4235,6 +4285,7 @@ mod tests {
             archive_edits: StageArchiveEdits::default(),
             registry: None,
             route_authoring: None,
+            goop_authoring: None,
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
             actor_previews: BTreeMap::new(),

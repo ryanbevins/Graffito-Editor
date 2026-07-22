@@ -1572,6 +1572,7 @@ fn preview_for_texture_alpha(has_alpha: bool, has_translucent_alpha: bool) -> Mo
         texture_srt_animations: Vec::new(),
         texture_pattern_animations: Vec::new(),
         material_animation_bindings: Vec::new(),
+        pollution_texture_indices: BTreeMap::new(),
         bounds_min: [0.0, 0.0, 0.0],
         bounds_max: [1.0, 1.0, 1.0],
         camera_bounds_min: [0.0, 0.0, 0.0],
@@ -2725,6 +2726,7 @@ fn updating_object_transform_moves_cached_preview_mesh() {
             texture_srt_animations: Vec::new(),
             texture_pattern_animations: Vec::new(),
             material_animation_bindings: Vec::new(),
+            pollution_texture_indices: BTreeMap::new(),
             bounds_min: [0.0, 0.0, 0.0],
             bounds_max: [1.0, 2.0, 3.0],
             camera_bounds_min: [0.0, 0.0, 0.0],
@@ -2840,6 +2842,41 @@ fn project_save_uses_the_same_trimmed_project_path_as_project_load() {
 
     assert!(app.save_project());
     assert!(root.join("sms-project.toml").is_file());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn project_save_succeeds_with_stage_validation_errors() {
+    let root = std::env::temp_dir().join(format!(
+        "sms-editor-app-invalid-stage-save-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut app = SmsEditorApp {
+        base_root: ".".to_string(),
+        project_root: root.to_string_lossy().into_owned(),
+        document: Some(test_document(vec![
+            SceneObject::new("duplicate", "Coin"),
+            SceneObject::new("duplicate", "Coin"),
+        ])),
+        document_dirty: true,
+        ..SmsEditorApp::default()
+    };
+
+    assert!(app.save_project());
+    assert!(!app.document_dirty);
+    assert!(app
+        .issues
+        .iter()
+        .any(|issue| issue.severity == ValidationSeverity::Error));
+    assert!(app.log.iter().any(|message| {
+        message.contains("Saved with") && message.contains("build and launch remain blocked")
+    }));
+    assert!(root.join("sms-project.toml").is_file());
+
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -3487,6 +3524,7 @@ fn test_document(objects: Vec<SceneObject>) -> StageDocument {
         archive_edits: sms_scene::StageArchiveEdits::default(),
         registry: None,
         route_authoring: None,
+        goop_authoring: None,
         load_issues: Vec::new(),
         lighting: Default::default(),
         actor_previews: BTreeMap::new(),

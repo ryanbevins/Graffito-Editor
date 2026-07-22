@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 use crate::Diagnostic;
 
 pub const MODEL_ASSET_FORMAT_VERSION: u32 = 1;
+/// GX texture dimensions are stored as 10-bit width-minus-one and
+/// height-minus-one fields by `GXInitTexObj`.
+pub const GX_MAX_TEXTURE_DIMENSION: u32 = 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -33,7 +36,9 @@ pub struct ModelAssetDocument {
     pub collision: Option<CollisionDocument>,
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
-    /// Import warning categories the author explicitly accepted after review.
+    /// Legacy import-warning acknowledgements retained for native-asset format
+    /// compatibility. Import diagnostics are informational and do not gate
+    /// compilation or export.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub acknowledged_diagnostics: BTreeSet<crate::DiagnosticCode>,
 }
@@ -55,14 +60,59 @@ impl ModelAssetDocument {
         }
     }
 
-    pub fn unacknowledged_required_diagnostics(&self) -> Vec<&Diagnostic> {
-        self.diagnostics
-            .iter()
-            .filter(|diagnostic| {
-                diagnostic.acknowledgement_required
-                    && !self.acknowledged_diagnostics.contains(&diagnostic.code)
-            })
-            .collect()
+    /// Downscales textures that cannot be represented by GX's 10-bit texture
+    /// dimensions. This is a compatibility migration for assets imported by
+    /// early editor builds, which accepted dimensions up to 16384.
+    pub(crate) fn migrate_oversized_textures_for_gx(&mut self) -> bool {
+        let mut changed = false;
+        for texture in &mut self.textures {
+            if texture.width <= GX_MAX_TEXTURE_DIMENSION
+                && texture.height <= GX_MAX_TEXTURE_DIMENSION
+            {
+                continue;
+            }
+            let old_width = texture.width;
+            let old_height = texture.height;
+            let (new_width, new_height) = if old_width >= old_height {
+                (
+                    GX_MAX_TEXTURE_DIMENSION,
+                    ((u64::from(old_height) * u64::from(GX_MAX_TEXTURE_DIMENSION)
+                        / u64::from(old_width))
+                    .max(1)) as u32,
+                )
+            } else {
+                (
+                    ((u64::from(old_width) * u64::from(GX_MAX_TEXTURE_DIMENSION)
+                        / u64::from(old_height))
+                    .max(1)) as u32,
+                    GX_MAX_TEXTURE_DIMENSION,
+                )
+            };
+            let source = image::RgbaImage::from_raw(
+                old_width,
+                old_height,
+                std::mem::take(&mut texture.rgba8),
+            )
+            .expect("validated model texture has exact RGBA8 storage");
+            let resized = image::imageops::resize(
+                &source,
+                new_width,
+                new_height,
+                image::imageops::FilterType::Lanczos3,
+            );
+            texture.width = new_width;
+            texture.height = new_height;
+            texture.rgba8 = resized.into_raw();
+            self.diagnostics.push(Diagnostic::info(
+                crate::DiagnosticCode::TextureDownscaledForGx,
+                format!(
+                    "downscaled texture from {old_width}x{old_height} to {new_width}x{new_height} for GX's 1024x1024 hardware limit"
+                ),
+                Some(texture.name.clone()),
+            ));
+            changed = true;
+        }
+        changed
     }
 
     /// Migrates geometry imported with the original reflected-Z basis to the

@@ -3840,6 +3840,8 @@ fn material_tev_stage_uses_previous_texture_mask(
 ) -> bool {
     material_tev_stage_color_args(bytes, init_offset, tev_stage_info_offset, stage)
         .is_some_and(tev_args_are_previous_texture_modulate)
+        || material_tev_stage_alpha_args(bytes, init_offset, tev_stage_info_offset, stage)
+            .is_some_and(tev_alpha_args_pass_previous)
 }
 
 fn material_tev_stage_raster_combine(
@@ -3922,6 +3924,10 @@ fn tev_alpha_args_are_texture_konst_modulate(args: TevAlphaArgs) -> bool {
         && args.d == GX_CA_ZERO
         && ((args.b == GX_CA_TEXA && args.c == GX_CA_KONST)
             || (args.b == GX_CA_KONST && args.c == GX_CA_TEXA))
+}
+
+fn tev_alpha_args_pass_previous(args: TevAlphaArgs) -> bool {
+    args.a == GX_CA_ZERO && args.b == GX_CA_ZERO && args.c == GX_CA_ZERO && args.d == GX_CA_APREV
 }
 
 fn tev_args_are_texture_raster_modulate(args: TevColorArgs) -> bool {

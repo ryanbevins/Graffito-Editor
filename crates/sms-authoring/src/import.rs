@@ -133,8 +133,11 @@ pub fn import_model(
         diagnostics.extend(result.diagnostics);
         asset.collision = Some(result.collision);
     }
-    asset.diagnostics = diagnostics.clone();
+    asset.diagnostics = diagnostics;
     asset.validate()?;
+    asset.migrate_oversized_textures_for_gx();
+    asset.validate()?;
+    let diagnostics = asset.diagnostics.clone();
     Ok(ImportResult { asset, diagnostics })
 }
 
@@ -401,7 +404,6 @@ fn import_meshes(
                             DiagnosticCode::GeneratedNormals,
                             "generated smooth normals because the primitive has no NORMAL accessor",
                             Some(context.clone()),
-                            false,
                         ));
                         generate_normals(&positions, &indices)
                     };
@@ -458,7 +460,6 @@ fn import_meshes(
                             DiagnosticCode::EmptyPrimitive,
                             "primitive contains no complete triangles",
                             Some(context),
-                            false,
                         ));
                     }
                     Ok(ModelPrimitive {
@@ -491,7 +492,6 @@ fn import_nodes(
             DiagnosticCode::MultipleScenes,
             format!("glTF contains {scene_count} scenes; only the default scene is active"),
             None,
-            false,
         ));
     }
     let active_scene = gltf
@@ -1148,7 +1148,7 @@ fn node_matches(name: &str, prefix: &str, selected_nodes: &BTreeSet<String>) -> 
 }
 
 fn unmapped_material_diagnostic(code: DiagnosticCode, material: &str, message: &str) -> Diagnostic {
-    Diagnostic::warning(code, message, Some(material.to_string()), true)
+    Diagnostic::warning(code, message, Some(material.to_string()))
 }
 
 fn read_bounded(path: &Path, max_bytes: usize) -> AuthoringResult<Vec<u8>> {

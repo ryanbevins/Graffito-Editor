@@ -160,6 +160,7 @@ impl SmsEditorApp {
                 EditorTool::Move,
                 EditorTool::Rotate,
                 EditorTool::Scale,
+                EditorTool::Goop,
             ] {
                 if ui
                     .selectable_label(self.tool == tool, tool.label())
@@ -1231,6 +1232,10 @@ impl SmsEditorApp {
     }
 
     pub(super) fn inspector_panel(&mut self, ui: &mut egui::Ui) {
+        if self.tool == EditorTool::Goop {
+            self.goop_inspector_panel(ui);
+            return;
+        }
         if self.content_browser_inspector_panel(ui) {
             return;
         }
@@ -2150,6 +2155,7 @@ fn tool_shortcut(tool: EditorTool) -> &'static str {
         EditorTool::Move => "W",
         EditorTool::Rotate => "E",
         EditorTool::Scale => "R",
+        EditorTool::Goop => "G",
         EditorTool::Place => "Content Browser",
     }
 }

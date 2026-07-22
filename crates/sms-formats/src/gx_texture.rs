@@ -177,6 +177,77 @@ pub struct GxEncodedTexture {
 }
 
 impl GxEncodedTexture {
+    /// Reconstructs an encoded texture from a parsed J3D TEX1 record without
+    /// decoding or re-encoding its native GX payload.
+    pub fn from_j3d_record(name: impl Into<String>, record: &J3dTextureRecord) -> Result<Self> {
+        let format = match record.format {
+            0 => GxTextureFormat::I4,
+            1 => GxTextureFormat::I8,
+            2 => GxTextureFormat::Ia4,
+            3 => GxTextureFormat::Ia8,
+            4 => GxTextureFormat::Rgb565,
+            5 => GxTextureFormat::Rgb5A3,
+            6 => GxTextureFormat::Rgba8,
+            8 => GxTextureFormat::C4,
+            9 => GxTextureFormat::C8,
+            10 => GxTextureFormat::C14X2,
+            14 => GxTextureFormat::Cmpr,
+            value => return Err(unsupported(format!("unknown GX texture format {value}"))),
+        };
+        let palette_format = match record.palette_format {
+            0 => GxPaletteFormat::Ia8,
+            1 => GxPaletteFormat::Rgb565,
+            2 => GxPaletteFormat::Rgb5A3,
+            value => return Err(unsupported(format!("unknown GX palette format {value}"))),
+        };
+        let palette_bytes = record
+            .encoded_palette
+            .as_ref()
+            .map_or(&[][..], |block| block.bytes.as_slice());
+        if !palette_bytes.len().is_multiple_of(2) {
+            return Err(unsupported("TEX1 palette has an odd byte length"));
+        }
+        let palette = palette_bytes
+            .chunks_exact(2)
+            .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+            .collect::<Vec<_>>();
+        if palette.len() != usize::from(record.palette_entry_count) {
+            return Err(unsupported(format!(
+                "TEX1 palette contains {} entries but declares {}",
+                palette.len(),
+                record.palette_entry_count
+            )));
+        }
+        let texture = Self {
+            name: name.into(),
+            format,
+            palette_format,
+            transparency: record.transparency,
+            width: record.width,
+            height: record.height,
+            sampler: GxSampler {
+                wrap_s: record.wrap_s,
+                wrap_t: record.wrap_t,
+                min_filter: record.min_filter,
+                mag_filter: record.mag_filter,
+                edge_lod: record.edge_lod != 0,
+                bias_clamp: record.bias_clamp != 0,
+                max_anisotropy: record.max_anisotropy,
+                min_lod: record.min_lod,
+                max_lod: record.max_lod,
+                lod_bias: record.lod_bias,
+            },
+            palette,
+            encoded_mips: record
+                .encoded_mip_levels
+                .iter()
+                .map(|block| block.bytes.clone())
+                .collect(),
+        };
+        texture.validate()?;
+        Ok(texture)
+    }
+
     pub fn encode_rgba(
         name: impl Into<String>,
         image: &RgbaImage,
