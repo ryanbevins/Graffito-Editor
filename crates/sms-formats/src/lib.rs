@@ -32,7 +32,11 @@ mod stage_misc;
 mod yaz0;
 
 pub use bas::{BasFile, BasSoundCue};
-pub use bmg::{BmgEntry, BmgFile, BmgMessage, BmgMessageToken};
+pub use bmg::{
+    BmgEntry, BmgFile, BmgMessage, BmgMessageToken, BmgStableEdit, BmgStableEditLayout,
+    SmsBmgControl, SmsBmgDynamicValue, SMS_BMG_CHOICE_TEXT_MAX_SHIFT_JIS_BYTES, SMS_BMG_ENTRY_SIZE,
+    SMS_BMG_RUNTIME_MESSAGE_LIMIT, SMS_TALK_SOUND_LIMIT,
+};
 pub use bmp::BmpFile;
 pub use bti::BtiFile;
 pub use col::{ColFile, ColGroup, ColHeader, ColTriangle, ColVertex};

@@ -7,38 +7,7 @@ impl ObjectUndoRecord {
         before_archive_edits: &StageArchiveEdits,
         after_archive_edits: &StageArchiveEdits,
     ) -> Self {
-        let before_by_id = before
-            .iter()
-            .enumerate()
-            .map(|(index, object)| (object.id.as_str(), (index, object)))
-            .collect::<BTreeMap<_, _>>();
-        let after_by_id = after
-            .iter()
-            .enumerate()
-            .map(|(index, object)| (object.id.as_str(), (index, object)))
-            .collect::<BTreeMap<_, _>>();
-        let mut deltas = Vec::new();
-        for (id, (index, object)) in &before_by_id {
-            match after_by_id.get(id) {
-                None => deltas.push(ObjectDelta::Remove {
-                    index: *index,
-                    object: (*object).clone(),
-                }),
-                Some((_, after)) if *object != *after => deltas.push(ObjectDelta::Update {
-                    before: Box::new((*object).clone()),
-                    after: Box::new((*after).clone()),
-                }),
-                Some(_) => {}
-            }
-        }
-        for (id, (index, object)) in after_by_id {
-            if !before_by_id.contains_key(id) {
-                deltas.push(ObjectDelta::Insert {
-                    index,
-                    object: object.clone(),
-                });
-            }
-        }
+        let deltas = object_deltas_between(before, after);
         Self {
             deltas,
             resource_deltas: resource_edit_deltas_between(
@@ -46,8 +15,32 @@ impl ObjectUndoRecord {
                 after_archive_edits,
             ),
             route_delta: None,
+            dialogue_delta: None,
         }
     }
+
+    pub(super) fn dialogue_edit(
+        before_objects: &[SceneObject],
+        after_objects: &[SceneObject],
+        before_authoring: Option<DialogueAuthoringDocument>,
+        after_authoring: Option<DialogueAuthoringDocument>,
+        before_library: ProjectDialogueLibrary,
+        after_library: ProjectDialogueLibrary,
+    ) -> Self {
+        let changed = before_authoring != after_authoring || before_library != after_library;
+        Self {
+            deltas: object_deltas_between(before_objects, after_objects),
+            resource_deltas: Vec::new(),
+            route_delta: None,
+            dialogue_delta: changed.then_some(DialogueAuthoringDelta {
+                before_authoring,
+                after_authoring,
+                before_library,
+                after_library,
+            }),
+        }
+    }
+
     pub(super) fn route_edit(
         before_objects: &[SceneObject],
         after_objects: &[SceneObject],
@@ -71,10 +64,32 @@ impl ObjectUndoRecord {
         record
     }
 
+    fn affects_dialogue_routing(&self) -> bool {
+        if !self.resource_deltas.is_empty() {
+            return true;
+        }
+
+        self.deltas.iter().any(|delta| match delta {
+            ObjectDelta::Insert { .. } | ObjectDelta::Remove { .. } => true,
+            ObjectDelta::Update { before, after } => {
+                before.source != after.source
+                    || before.placement != after.placement
+                    || before.factory_name != after.factory_name
+                    || before.class_name != after.class_name
+                    || before.raw_param("name") != after.raw_param("name")
+                    || before.transform.scale != after.transform.scale
+            }
+        })
+    }
+
     fn apply_forward(&self, document: &mut StageDocument) {
         self.apply_resource_edits(document, false);
         if let Some(delta) = &self.route_delta {
             document.route_authoring = delta.after.clone();
+        }
+        if let Some(delta) = &self.dialogue_delta {
+            document.dialogue_authoring = delta.after_authoring.clone();
+            document.dialogue_library = delta.after_library.clone();
         }
         let objects = &mut document.objects;
         let mut removals = self
@@ -142,6 +157,10 @@ impl ObjectUndoRecord {
         if let Some(delta) = &self.route_delta {
             document.route_authoring = delta.before.clone();
         }
+        if let Some(delta) = &self.dialogue_delta {
+            document.dialogue_authoring = delta.before_authoring.clone();
+            document.dialogue_library = delta.before_library.clone();
+        }
         self.apply_resource_edits(document, true);
     }
 
@@ -161,8 +180,47 @@ impl ObjectUndoRecord {
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.deltas.is_empty() && self.resource_deltas.is_empty() && self.route_delta.is_none()
+        self.deltas.is_empty()
+            && self.resource_deltas.is_empty()
+            && self.route_delta.is_none()
+            && self.dialogue_delta.is_none()
     }
+}
+
+fn object_deltas_between(before: &[SceneObject], after: &[SceneObject]) -> Vec<ObjectDelta> {
+    let before_by_id = before
+        .iter()
+        .enumerate()
+        .map(|(index, object)| (object.id.as_str(), (index, object)))
+        .collect::<BTreeMap<_, _>>();
+    let after_by_id = after
+        .iter()
+        .enumerate()
+        .map(|(index, object)| (object.id.as_str(), (index, object)))
+        .collect::<BTreeMap<_, _>>();
+    let mut deltas = Vec::new();
+    for (id, (index, object)) in &before_by_id {
+        match after_by_id.get(id) {
+            None => deltas.push(ObjectDelta::Remove {
+                index: *index,
+                object: (*object).clone(),
+            }),
+            Some((_, after)) if *object != *after => deltas.push(ObjectDelta::Update {
+                before: Box::new((*object).clone()),
+                after: Box::new((*after).clone()),
+            }),
+            Some(_) => {}
+        }
+    }
+    for (id, (index, object)) in after_by_id {
+        if !before_by_id.contains_key(id) {
+            deltas.push(ObjectDelta::Insert {
+                index,
+                object: object.clone(),
+            });
+        }
+    }
+    deltas
 }
 
 fn resource_edit_state(edits: &StageArchiveEdits, raw_resource_path: &[u8]) -> ResourceEditState {
@@ -584,6 +642,7 @@ fn repair_authored_catalog_resources(
             deltas: Vec::new(),
             resource_deltas,
             route_delta: None,
+            dialogue_delta: None,
         }
         .apply_forward(document);
     }
@@ -1497,6 +1556,18 @@ impl SmsEditorApp {
     }
 
     pub(super) fn save_project(&mut self) -> bool {
+        self.commit_dialogue_undo_transaction("Updated dialogue text");
+        let resume_dialogue_consumer_rebuild =
+            self.dialogue_consumer_receiver.is_some() && self.dialogue_consumer_index.is_none();
+        self.cancel_dialogue_consumer_index_rebuild();
+        let saved = self.save_project_inner();
+        if resume_dialogue_consumer_rebuild && self.document.is_some() {
+            self.schedule_dialogue_consumer_index_rebuild();
+        }
+        saved
+    }
+
+    fn save_project_inner(&mut self) -> bool {
         let had_selected_model_asset = self.selected_model_asset.is_some();
         let mut validation_error_count = 0usize;
         if let Some(document) = &self.document {
@@ -1536,6 +1607,8 @@ impl SmsEditorApp {
                     self.saved_objects = document.objects.clone();
                     self.saved_lighting = document.lighting.clone();
                     self.saved_archive_edits = document.archive_edits.clone();
+                    self.saved_dialogue_authoring = document.dialogue_authoring.clone();
+                    self.saved_dialogue_library = document.dialogue_library.clone();
                     self.document_dirty = false;
                     self.log.push(format!(
                         "Saved editor project with {} file(s).",
@@ -1592,6 +1665,7 @@ impl SmsEditorApp {
     }
 
     fn start_managed_stage_build(&mut self, launch_mode: Option<DolphinLaunchMode>) {
+        self.commit_dialogue_undo_transaction("Updated dialogue text");
         if self.background_receiver.is_some() {
             self.log
                 .push("Another background operation is already running.".to_string());
@@ -1635,7 +1709,103 @@ impl SmsEditorApp {
             );
             return;
         }
-        if !self.save_project() {
+        let has_dialogue_authoring = self.document.as_ref().is_some_and(|document| {
+            document
+                .dialogue_authoring
+                .as_ref()
+                .is_some_and(|authoring| !authoring.objects.is_empty())
+                || !document.dialogue_library.is_empty()
+        });
+        let compiled_dialogue = if has_dialogue_authoring {
+            if let Some(document) = self.document.as_ref() {
+                if document.requires_game_dialogue_consumer_validation() {
+                    let presentation_result = self
+                        .dialogue_consumer_index
+                        .as_ref()
+                        .ok_or_else(|| {
+                            self.dialogue_consumer_error
+                                .as_deref()
+                                .map(|error| {
+                                    format!("the base-wide dialogue consumer index failed: {error}")
+                                })
+                                .unwrap_or_else(|| {
+                                    "the base-wide dialogue consumer index is still loading"
+                                        .to_string()
+                                })
+                        })
+                        .and_then(|consumers| {
+                            document
+                                .validate_game_dialogue_consumer_presentations(consumers)
+                                .map_err(|error| error.to_string())
+                        });
+                    if let Err(error) = presentation_result {
+                        self.log.push(format!(
+                            "Stage build stopped while validating shared dialogue pages: {error}."
+                        ));
+                        return;
+                    }
+                }
+            }
+            let Some(route_index) = self.dialogue_route_index.as_ref() else {
+                let detail = self
+                    .dialogue_index_error
+                    .as_deref()
+                    .map(|error| format!(": {error}"))
+                    .unwrap_or_else(|| {
+                        "; the asynchronous route index is still loading".to_string()
+                    });
+                self.log.push(format!(
+                    "Stage build stopped because dialogue routes are unavailable{detail}."
+                ));
+                return;
+            };
+            let mut candidate = self
+                .document
+                .clone()
+                .expect("dialogue authoring requires the open document");
+            let before_allocation_objects = candidate.objects.clone();
+            let before_allocation_authoring = candidate.dialogue_authoring.clone();
+            let before_allocation_library = candidate.dialogue_library.clone();
+            let compiled = match candidate.compile_dialogue_authoring(route_index) {
+                Ok(compiled) => compiled,
+                Err(error) => {
+                    self.log.push(format!(
+                        "Stage build stopped while compiling dialogue: {error}"
+                    ));
+                    return;
+                }
+            };
+            let allocation_record = ObjectUndoRecord::dialogue_edit(
+                &before_allocation_objects,
+                &candidate.objects,
+                before_allocation_authoring,
+                candidate.dialogue_authoring.clone(),
+                before_allocation_library,
+                candidate.dialogue_library.clone(),
+            );
+            if let Some(document) = self.document.as_mut() {
+                document.dialogue_authoring = candidate.dialogue_authoring;
+                document.dialogue_library = candidate.dialogue_library;
+                self.document_dirty = stage_document_differs_from_saved(
+                    document,
+                    &self.saved_objects,
+                    &self.saved_lighting,
+                    &self.saved_archive_edits,
+                    &self.saved_dialogue_authoring,
+                    &self.saved_dialogue_library,
+                );
+            }
+            if !allocation_record.is_empty() {
+                self.push_undo_record(allocation_record);
+                self.log
+                    .push("Reserved stable dialogue message allocations.".to_string());
+            }
+            self.flush_document_change();
+            compiled
+        } else {
+            sms_scene::CompiledDialogueEdits::default()
+        };
+        if self.is_dirty() && !self.save_project() {
             self.log
                 .push("Stage build stopped because the project could not be saved.".to_string());
             return;
@@ -1690,6 +1860,10 @@ impl SmsEditorApp {
                 .and_then(|edits| {
                     managed_build::check_cancelled(&task_cancel)?;
                     let mut finalized_document = document.clone();
+                    let edits = managed_build::merge_compiled_dialogue_stage_edits(
+                        &edits,
+                        &compiled_dialogue,
+                    )?;
                     finalized_document.archive_edits = edits.clone();
                     finalized_document
                         .refresh_goop_stale_status()
@@ -1699,20 +1873,34 @@ impl SmsEditorApp {
                             format!("final terrain/goop validation failed: {error}")
                         })?;
                     }
-                    finalized_document
-                        .build_stage_archive_with_edits(&edits)
-                        .map_err(|error| error.to_string())
+                    let archive_bytes = finalized_document
+                        .build_stage_archive_with_compiled_dialogue_edits(&edits)
+                        .map_err(|error| error.to_string())?;
+                    Ok((finalized_document, archive_bytes))
                 });
-            let result = result.and_then(|archive_bytes| {
-                managed_build::check_cancelled(&task_cancel)?;
-                managed_build::build_managed_game(&project, &document, &archive_bytes, &task_cancel)
-            });
             if let Some(mode) = launch_mode {
-                let result = result.and_then(|build| {
-                    managed_build::prepare_managed_game_launch(build, &task_cancel)
+                let result = result.and_then(|(finalized_document, archive_bytes)| {
+                    managed_build::check_cancelled(&task_cancel)?;
+                    managed_build::build_managed_game_for_launch_with_compiled_dialogue(
+                        &project,
+                        &finalized_document,
+                        &archive_bytes,
+                        &compiled_dialogue,
+                        &task_cancel,
+                    )
                 });
                 let _ = sender.send(BackgroundResult::BuildAndRun { mode, result });
             } else {
+                let result = result.and_then(|(finalized_document, archive_bytes)| {
+                    managed_build::check_cancelled(&task_cancel)?;
+                    managed_build::build_managed_game_with_compiled_dialogue(
+                        &project,
+                        &finalized_document,
+                        &archive_bytes,
+                        &compiled_dialogue,
+                        &task_cancel,
+                    )
+                });
                 let _ = sender.send(BackgroundResult::Build(result));
             }
         });
@@ -2102,6 +2290,8 @@ impl SmsEditorApp {
                 &self.saved_objects,
                 &self.saved_lighting,
                 &self.saved_archive_edits,
+                &self.saved_dialogue_authoring,
+                &self.saved_dialogue_library,
             )
         });
         self.flush_document_change();
@@ -2162,6 +2352,46 @@ impl SmsEditorApp {
             .iter()
             .find(|object| object.factory_name == factory_name && object.placement.is_some())
             .cloned();
+        let factory_is_talk_capable = self
+            .registry
+            .as_ref()
+            .is_some_and(|registry| registry.is_dialogue_instance_eligible(&factory_name));
+        let same_stage_dialogue_source_is_authored =
+            same_stage_template.as_ref().is_some_and(|object| {
+                document
+                    .dialogue_authoring
+                    .as_ref()
+                    .is_some_and(|authoring| authoring.objects.contains_key(&object.id))
+            });
+        if same_stage_template.is_some()
+            && factory_is_talk_capable
+            && !same_stage_dialogue_source_is_authored
+            && self.dialogue_route_index.is_none()
+        {
+            let detail = self
+                .dialogue_index_error
+                .as_deref()
+                .map(|error| format!("route analysis failed: {error}"))
+                .unwrap_or_else(|| "route analysis is still running".to_string());
+            self.log.push(format!(
+                "Could not place class '{factory_name}': dialogue routes for its existing stage instance are unavailable ({detail}). Wait for dialogue analysis before duplicating this NPC."
+            ));
+            return;
+        }
+        let dialogue_source = same_stage_template.as_ref().map(|object| {
+            let has_resolved_routes = self
+                .dialogue_route_index
+                .as_ref()
+                .is_some_and(|index| !index.variants_for_object(&object.id).is_empty());
+            let has_authored_routes = document
+                .dialogue_authoring
+                .as_ref()
+                .is_some_and(|authoring| authoring.objects.contains_key(&object.id));
+            (
+                object.id.clone(),
+                has_resolved_routes || has_authored_routes,
+            )
+        });
         let catalog_template = same_stage_template
             .is_none()
             .then(|| self.object_authoring_catalog.find(&factory_name).cloned())
@@ -2317,11 +2547,50 @@ impl SmsEditorApp {
             .document
             .as_ref()
             .map_or(0, |document| document.objects.len());
+        let dialogue_delta = {
+            let document = self
+                .document
+                .as_ref()
+                .expect("document was checked before dialogue initialization");
+            let is_talk_capable = factory_is_talk_capable;
+            if !is_talk_capable {
+                None
+            } else {
+                let mut after = document.clone();
+                after.objects.push(object.clone());
+                if let Some((source_object_id, true)) = dialogue_source.as_ref() {
+                    if let Err(error) = after.duplicate_dialogue_authoring(source_object_id, &id) {
+                        self.log.push(format!(
+                            "Could not inherit dialogue for new '{factory_name}': {error}"
+                        ));
+                        return;
+                    }
+                } else {
+                    if let Err(error) = after.initialize_dialogue_for_new_object(&id) {
+                        self.log.push(format!(
+                            "Could not initialize dialogue for new '{factory_name}': {error}"
+                        ));
+                        return;
+                    }
+                }
+                object = after
+                    .objects
+                    .pop()
+                    .expect("new dialogue object was appended last");
+                Some(DialogueAuthoringDelta {
+                    before_authoring: document.dialogue_authoring.clone(),
+                    after_authoring: after.dialogue_authoring,
+                    before_library: document.dialogue_library.clone(),
+                    after_library: after.dialogue_library,
+                })
+            }
+        };
         self.apply_object_edit(
             "Added object",
             ObjectUndoRecord {
                 deltas: vec![ObjectDelta::Insert { index, object }],
                 route_delta: None,
+                dialogue_delta,
                 resource_deltas: catalog_resource_deltas,
             },
         );
@@ -2381,6 +2650,8 @@ impl SmsEditorApp {
             &self.saved_objects,
             &self.saved_lighting,
             &self.saved_archive_edits,
+            &self.saved_dialogue_authoring,
+            &self.saved_dialogue_library,
         );
         self.flush_document_change();
         self.rebuild_gpu_viewport_scene();
@@ -2391,6 +2662,32 @@ impl SmsEditorApp {
         let Some(source) = self.selected_object().cloned() else {
             return;
         };
+        let source_object_id = source.id.clone();
+        let source_is_talk_capable = self
+            .registry
+            .as_ref()
+            .is_some_and(|registry| registry.is_dialogue_instance_eligible(&source.factory_name));
+        let source_dialogue_is_authored = self.document.as_ref().is_some_and(|document| {
+            document
+                .dialogue_authoring
+                .as_ref()
+                .is_some_and(|authoring| authoring.objects.contains_key(&source_object_id))
+        });
+        if source_is_talk_capable
+            && !source_dialogue_is_authored
+            && self.dialogue_route_index.is_none()
+        {
+            let detail = self
+                .dialogue_index_error
+                .as_deref()
+                .map(|error| format!("route analysis failed: {error}"))
+                .unwrap_or_else(|| "route analysis is still running".to_string());
+            self.log.push(format!(
+                "Could not duplicate '{}': its dialogue routes are unavailable ({detail}). Wait for dialogue analysis so the duplicate can inherit every player-initiated variant.",
+                source.factory_name
+            ));
+            return;
+        }
         let Some((id, next_object_serial)) = self.next_available_object_id() else {
             self.log.push(
                 "Could not duplicate object: no unique editor object id is available.".to_string(),
@@ -2418,6 +2715,60 @@ impl SmsEditorApp {
             .document
             .as_ref()
             .map_or(0, |document| document.objects.len());
+        let dialogue_delta = {
+            let document = self
+                .document
+                .as_ref()
+                .expect("selected object belongs to a document");
+            let has_resolved_routes = self
+                .dialogue_route_index
+                .as_ref()
+                .is_some_and(|index| !index.variants_for_object(&source_object_id).is_empty());
+            let has_authored_routes = document
+                .dialogue_authoring
+                .as_ref()
+                .is_some_and(|authoring| authoring.objects.contains_key(&source_object_id));
+            let is_talk_capable = self.registry.as_ref().is_some_and(|registry| {
+                registry.is_dialogue_instance_eligible(&clone.factory_name)
+            });
+            if !is_talk_capable {
+                None
+            } else {
+                let before_authoring = document.dialogue_authoring.clone();
+                let before_library = document.dialogue_library.clone();
+                let mut dialogue_document = document.clone();
+                dialogue_document.objects.push(clone.clone());
+                if has_resolved_routes || has_authored_routes {
+                    if let Err(error) =
+                        dialogue_document.duplicate_dialogue_authoring(&source_object_id, &id)
+                    {
+                        self.log.push(format!(
+                            "Could not inherit dialogue for duplicated '{}': {error}",
+                            clone.factory_name
+                        ));
+                        return;
+                    }
+                } else {
+                    if let Err(error) = dialogue_document.initialize_dialogue_for_new_object(&id) {
+                        self.log.push(format!(
+                            "Could not initialize dialogue for duplicated '{}': {error}",
+                            clone.factory_name
+                        ));
+                        return;
+                    }
+                }
+                clone = dialogue_document
+                    .objects
+                    .pop()
+                    .expect("duplicated dialogue object was appended last");
+                Some(DialogueAuthoringDelta {
+                    before_authoring,
+                    after_authoring: dialogue_document.dialogue_authoring,
+                    before_library: before_library.clone(),
+                    after_library: before_library,
+                })
+            }
+        };
         self.apply_object_edit(
             "Duplicated object",
             ObjectUndoRecord {
@@ -2427,6 +2778,7 @@ impl SmsEditorApp {
                 }],
                 resource_deltas: Vec::new(),
                 route_delta: None,
+                dialogue_delta,
             },
         );
         self.selected_object_id = Some(id);
@@ -2450,12 +2802,95 @@ impl SmsEditorApp {
         }) else {
             return;
         };
+        let dialogue_delta = self.document.as_ref().and_then(|document| {
+            let mut after_authoring = document.dialogue_authoring.clone();
+            let mut after_library = document.dialogue_library.clone();
+            let mut library_changed = false;
+            for allocation in &mut after_library.stable_allocations {
+                if allocation.stage_id == document.stage_id
+                    && allocation.object_id == selected_id
+                    && allocation.content.take().is_some()
+                {
+                    // Preserve the allocated common/balloon ordinal as a
+                    // tombstone without retaining the deleted actor's clone.
+                    library_changed = true;
+                }
+            }
+            let Some(authoring) = after_authoring.as_mut() else {
+                return library_changed.then_some(DialogueAuthoringDelta {
+                    before_authoring: document.dialogue_authoring.clone(),
+                    after_authoring,
+                    before_library: document.dialogue_library.clone(),
+                    after_library,
+                });
+            };
+            let removed = authoring.objects.remove(&selected_id);
+            let dependents = authoring
+                .objects
+                .iter()
+                .filter(|(_, authored)| {
+                    authored.inherited_from_object_id.as_deref() == Some(selected_id.as_str())
+                })
+                .map(|(object_id, _)| object_id.clone())
+                .collect::<Vec<_>>();
+            if removed.is_none() && dependents.is_empty() && !library_changed {
+                return None;
+            }
+            for dependent_id in dependents {
+                let Some(dependent) = authoring.objects.get_mut(&dependent_id) else {
+                    continue;
+                };
+                dependent.inherited_from_object_id = removed
+                    .as_ref()
+                    .and_then(|source| source.inherited_from_object_id.clone());
+                if let Some(source) = removed.as_ref() {
+                    for inherited in source.overrides.iter().filter(|override_| {
+                        override_.route_kind != sms_scene::DialogueRouteKind::Forced
+                            && override_.scope == sms_scene::DialogueEditScope::Instance
+                    }) {
+                        if !dependent
+                            .overrides
+                            .iter()
+                            .any(|existing| existing.key == inherited.key)
+                        {
+                            dependent.overrides.push(inherited.clone());
+                        }
+                    }
+                    dependent
+                        .overrides
+                        .sort_by(|left, right| left.key.cmp(&right.key));
+                }
+            }
+            if let Some(stable_allocations) = removed
+                .as_ref()
+                .map(|source| source.stable_allocations.clone())
+                .filter(|allocations| !allocations.is_empty())
+            {
+                // Allocation-only records are intentional tombstones. Keep
+                // their stage BMG ordinals reserved after actor deletion so a
+                // later NPC can never silently inherit an old routed index.
+                authoring.objects.insert(
+                    selected_id.clone(),
+                    sms_scene::DialogueObjectAuthoring {
+                        stable_allocations,
+                        ..sms_scene::DialogueObjectAuthoring::default()
+                    },
+                );
+            }
+            Some(DialogueAuthoringDelta {
+                before_authoring: document.dialogue_authoring.clone(),
+                after_authoring,
+                before_library: document.dialogue_library.clone(),
+                after_library,
+            })
+        });
         self.apply_object_edit(
             "Deleted object",
             ObjectUndoRecord {
                 deltas: vec![ObjectDelta::Remove { index, object }],
                 resource_deltas: Vec::new(),
                 route_delta: None,
+                dialogue_delta,
             },
         );
         self.selected_object_id = None;
@@ -2486,6 +2921,7 @@ impl SmsEditorApp {
                 }],
                 resource_deltas: Vec::new(),
                 route_delta: None,
+                dialogue_delta: None,
             },
         );
         let has_rendered_model = self
@@ -2593,6 +3029,7 @@ impl SmsEditorApp {
             "Updated object parameter",
             ObjectUndoRecord {
                 route_delta: None,
+                dialogue_delta: None,
                 deltas: vec![ObjectDelta::Update {
                     before: Box::new(before),
                     after: Box::new(after),
@@ -2670,6 +3107,7 @@ impl SmsEditorApp {
                 }],
                 resource_deltas: Vec::new(),
                 route_delta: None,
+                dialogue_delta: None,
             },
         );
     }
@@ -2713,6 +3151,8 @@ impl SmsEditorApp {
                     &self.saved_objects,
                     &self.saved_lighting,
                     &self.saved_archive_edits,
+                    &self.saved_dialogue_authoring,
+                    &self.saved_dialogue_library,
                 )
             })
         };
@@ -2726,6 +3166,7 @@ impl SmsEditorApp {
         if record.is_empty() {
             return;
         }
+        let rebuild_dialogue_index = record.affects_dialogue_routing();
         let in_transaction = self.undo_transaction.is_some();
         let registry = (!record.resource_deltas.is_empty())
             .then(|| self.registry.clone())
@@ -2745,11 +3186,17 @@ impl SmsEditorApp {
                 &self.saved_objects,
                 &self.saved_lighting,
                 &self.saved_archive_edits,
+                &self.saved_dialogue_authoring,
+                &self.saved_dialogue_library,
             )
         };
         if !in_transaction {
             self.push_undo_record(record);
             self.flush_document_change();
+            if rebuild_dialogue_index {
+                self.schedule_dialogue_index_rebuild();
+                self.schedule_dialogue_consumer_index_rebuild();
+            }
             self.log.push(format!("{label}."));
         }
     }
@@ -2824,6 +3271,7 @@ impl SmsEditorApp {
                         .collect(),
                     resource_deltas: Vec::new(),
                     route_delta: None,
+                    dialogue_delta: None,
                 }
             } else {
                 ObjectUndoRecord {
@@ -2833,6 +3281,7 @@ impl SmsEditorApp {
                     }],
                     resource_deltas: Vec::new(),
                     route_delta: None,
+                    dialogue_delta: None,
                 }
             }
         });
@@ -2842,13 +3291,20 @@ impl SmsEditorApp {
                 &self.saved_objects,
                 &self.saved_lighting,
                 &self.saved_archive_edits,
+                &self.saved_dialogue_authoring,
+                &self.saved_dialogue_library,
             )
         });
         let Some(record) = record.filter(|record| !record.is_empty()) else {
             return;
         };
+        let rebuild_dialogue_index = record.affects_dialogue_routing();
         self.push_undo_record(record);
         self.flush_document_change();
+        if rebuild_dialogue_index {
+            self.schedule_dialogue_index_rebuild();
+            self.schedule_dialogue_consumer_index_rebuild();
+        }
         self.log.push(format!("{label}."));
     }
 
@@ -2864,6 +3320,7 @@ impl SmsEditorApp {
     }
 
     pub(super) fn undo(&mut self) {
+        self.commit_dialogue_undo_transaction("Updated dialogue text");
         if self.tool == EditorTool::Goop && self.undo_goop() {
             return;
         }
@@ -2884,6 +3341,7 @@ impl SmsEditorApp {
         let Some(record) = self.undo_stack.pop_back() else {
             return;
         };
+        let rebuild_dialogue_index = record.affects_dialogue_routing();
         let registry = (!record.resource_deltas.is_empty())
             .then(|| self.registry.clone())
             .flatten();
@@ -2897,16 +3355,23 @@ impl SmsEditorApp {
                 &self.saved_objects,
                 &self.saved_lighting,
                 &self.saved_archive_edits,
+                &self.saved_dialogue_authoring,
+                &self.saved_dialogue_library,
             );
         }
         self.redo_stack.push_back(record);
         self.flush_document_change();
         self.ensure_selection_exists();
         self.rebuild_model_preview_from_document();
+        if rebuild_dialogue_index {
+            self.schedule_dialogue_index_rebuild();
+            self.schedule_dialogue_consumer_index_rebuild();
+        }
         self.log.push("Undo.".to_string());
     }
 
     pub(super) fn redo(&mut self) {
+        self.commit_dialogue_undo_transaction("Updated dialogue text");
         if self.tool == EditorTool::Goop && self.redo_goop() {
             return;
         }
@@ -2927,6 +3392,7 @@ impl SmsEditorApp {
         let Some(record) = self.redo_stack.pop_back() else {
             return;
         };
+        let rebuild_dialogue_index = record.affects_dialogue_routing();
         let registry = (!record.resource_deltas.is_empty())
             .then(|| self.registry.clone())
             .flatten();
@@ -2940,12 +3406,18 @@ impl SmsEditorApp {
                 &self.saved_objects,
                 &self.saved_lighting,
                 &self.saved_archive_edits,
+                &self.saved_dialogue_authoring,
+                &self.saved_dialogue_library,
             );
         }
         self.undo_stack.push_back(record);
         self.flush_document_change();
         self.ensure_selection_exists();
         self.rebuild_model_preview_from_document();
+        if rebuild_dialogue_index {
+            self.schedule_dialogue_index_rebuild();
+            self.schedule_dialogue_consumer_index_rebuild();
+        }
         self.log.push("Redo.".to_string());
     }
 
@@ -3330,8 +3802,9 @@ fn preview_triangle_ranges_for_model_index(
 mod tests {
     use super::*;
     use sms_formats::{
-        decode_bti_texture, J3dFile, JDramaDocument, JDramaField, JDramaFieldValue, JDramaRecord,
-        JDramaRecordPayload, PrmFile,
+        decode_bti_texture, BmgEntry, BmgFile, BmgMessage, BmgMessageToken, J3dFile,
+        JDramaDocument, JDramaField, JDramaFieldValue, JDramaRecord, JDramaRecordPayload, PrmFile,
+        RarcBuilder, SpcDataEntry, SpcDocument, SpcInstruction, SpcSymbol,
     };
 
     fn command_test_document(objects: Vec<SceneObject>) -> StageDocument {
@@ -3347,11 +3820,141 @@ mod tests {
             registry: None,
             route_authoring: None,
             goop_authoring: None,
+            dialogue_authoring: None,
+            dialogue_library: Default::default(),
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         }
+    }
+
+    #[test]
+    fn npc_scale_changes_invalidate_adult_child_dialogue_routes() {
+        let before = SceneObject::new("npc", "NPCMonteM");
+        let mut after = before.clone();
+        after.transform.scale = [0.5, 0.5, 0.5];
+        let record = ObjectUndoRecord::between(
+            &[before],
+            &[after],
+            &StageArchiveEdits::default(),
+            &StageArchiveEdits::default(),
+        );
+
+        assert!(record.affects_dialogue_routing());
+    }
+
+    #[test]
+    fn dialogue_content_only_undo_does_not_invalidate_derived_route_indexes() {
+        let object = SceneObject::new("npc", "NPCMonteM");
+        let record = ObjectUndoRecord::dialogue_edit(
+            std::slice::from_ref(&object),
+            std::slice::from_ref(&object),
+            None,
+            Some(DialogueAuthoringDocument::default()),
+            ProjectDialogueLibrary::default(),
+            ProjectDialogueLibrary::default(),
+        );
+
+        assert!(!record.is_empty());
+        assert!(!record.affects_dialogue_routing());
+    }
+
+    fn talk_capable_registry(factory_name: &str) -> ObjectRegistry {
+        ObjectRegistry {
+            npc_factory_actor_types: vec![sms_schema::NpcFactoryActorTypeDefinition {
+                factory_name: factory_name.to_string(),
+                // A neutral non-proxy TBaseNPC identity. This fixture tests
+                // generic dialogue authoring, not the retail Monte happy path.
+                actor_type: 0x0400_00fe,
+                source_file: "dialogue fixture".to_string(),
+            }],
+            ..ObjectRegistry::default()
+        }
+    }
+
+    fn placed_dialogue_fixture(id: &str, factory_name: &str) -> SceneObject {
+        let mut object = SceneObject::new(id, factory_name);
+        object.placement = Some(sms_scene::PlacementBinding::Existing(
+            sms_scene::PlacementAddress {
+                raw_resource_path: b"map/scene.bin".to_vec(),
+                record_path: vec![4, 0],
+            },
+        ));
+        object
+    }
+
+    fn shared_system_dialogue_script(runtime_name: &str) -> SpcDocument {
+        let instructions = vec![
+            SpcInstruction::String(0),
+            SpcInstruction::Builtin {
+                symbol_index: 0,
+                argument_count: 1,
+            },
+            SpcInstruction::IntZero,
+            SpcInstruction::Builtin {
+                symbol_index: 1,
+                argument_count: 2,
+            },
+            SpcInstruction::Pop,
+            SpcInstruction::End,
+        ];
+        SpcDocument {
+            text_offset: 0x1c,
+            text_length: instructions
+                .iter()
+                .map(SpcInstruction::encoded_len)
+                .sum::<usize>() as u32,
+            data_offset: 0x40,
+            symbol_offset: 0x50,
+            initial_storage_count: 1,
+            instructions,
+            data: vec![SpcDataEntry {
+                offset: 0,
+                value: runtime_name.to_string(),
+            }],
+            symbols: vec![
+                SpcSymbol {
+                    symbol_type: 0,
+                    name_offset: 0,
+                    data: 0,
+                    name_hash: 0,
+                    native_call: 0,
+                    name: "getNameRefHandle".to_string(),
+                },
+                SpcSymbol {
+                    symbol_type: 0,
+                    name_offset: 17,
+                    data: 1,
+                    name_hash: 0,
+                    native_call: 0,
+                    name: "setTalkMsgID".to_string(),
+                },
+            ],
+            file_size: 0x100,
+            padding: Vec::new(),
+        }
+    }
+
+    fn system_dialogue_bmg(text: &str) -> BmgFile {
+        let mut document = BmgFile {
+            header_reserved: [0; 16],
+            info_section_size: 0x20,
+            data_section_size: 0x20,
+            entry_size: 12,
+            group_id: 0,
+            default_color: 0,
+            info_reserved: 0,
+            entries: vec![BmgEntry {
+                message_offset: 0,
+                attributes: vec![0, 0, 0, 0, 2, 0, 0, 0],
+                message: BmgMessage {
+                    tokens: vec![BmgMessageToken::Text(text.to_string())],
+                },
+            }],
+        };
+        document.canonicalize_layout().unwrap();
+        document
     }
 
     fn empty_parameter_document() -> StageResourceDocument {
@@ -3587,6 +4190,559 @@ mod tests {
     }
 
     #[test]
+    fn inspector_generated_dialogue_identity_and_authoring_undo_together() {
+        let object = placed_dialogue_fixture("npc", "NPCFixture");
+        let mut app = SmsEditorApp {
+            stage_id: "fixture0".to_string(),
+            selected_object_id: Some(object.id.clone()),
+            document: Some(command_test_document(vec![object])),
+            ..SmsEditorApp::default()
+        };
+
+        app.initialize_empty_dialogue("npc");
+
+        let generated_name = app.document.as_ref().unwrap().objects[0]
+            .raw_param("name")
+            .unwrap()
+            .to_string();
+        assert!(generated_name.starts_with("GraffitoDlg_"));
+        assert!(app
+            .document
+            .as_ref()
+            .unwrap()
+            .dialogue_authoring
+            .as_ref()
+            .is_some_and(|authoring| authoring.objects["npc"].overrides.len() == 1));
+        assert_eq!(app.undo_stack.len(), 1);
+
+        app.undo();
+        assert_eq!(
+            app.document.as_ref().unwrap().objects[0].raw_param("name"),
+            None
+        );
+        assert!(app.document.as_ref().unwrap().dialogue_authoring.is_none());
+
+        app.redo();
+        assert_eq!(
+            app.document.as_ref().unwrap().objects[0].raw_param("name"),
+            Some(generated_name.as_str())
+        );
+        assert!(app
+            .document
+            .as_ref()
+            .unwrap()
+            .dialogue_authoring
+            .as_ref()
+            .is_some_and(|authoring| authoring.objects["npc"].overrides.len() == 1));
+    }
+
+    #[test]
+    fn spawned_talk_actor_keeps_generated_identity_in_atomic_undo_record() {
+        let factory_name = "NPCFixture";
+        let template = placed_dialogue_fixture("fixture0-obj-0001", factory_name);
+        let registry = talk_capable_registry(factory_name);
+        let mut document = command_test_document(vec![template]);
+        document.registry = Some(registry.clone());
+        let mut app = SmsEditorApp {
+            stage_id: "fixture0".to_string(),
+            registry: Some(registry),
+            document: Some(document),
+            dialogue_route_index: Some(DialogueRouteIndex::default()),
+            ..SmsEditorApp::default()
+        };
+
+        app.spawn_object_at(factory_name.to_string(), [10.0, 20.0, 30.0]);
+
+        let spawned_id = "fixture0-obj-0002";
+        let spawned_name = app
+            .document
+            .as_ref()
+            .unwrap()
+            .objects
+            .iter()
+            .find(|object| object.id == spawned_id)
+            .and_then(|object| object.raw_param("name"))
+            .unwrap()
+            .to_string();
+        assert!(spawned_name.starts_with("GraffitoDlg_"));
+        assert!(app
+            .document
+            .as_ref()
+            .unwrap()
+            .dialogue_authoring
+            .as_ref()
+            .is_some_and(|authoring| authoring.objects[spawned_id].overrides.len() == 1));
+        assert_eq!(app.undo_stack.len(), 1);
+
+        app.undo();
+        assert_eq!(app.document.as_ref().unwrap().objects.len(), 1);
+        assert!(app.document.as_ref().unwrap().dialogue_authoring.is_none());
+
+        app.redo();
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.objects.len(), 2);
+        assert_eq!(
+            document.objects[1].raw_param("name"),
+            Some(spawned_name.as_str())
+        );
+        assert!(document
+            .dialogue_authoring
+            .as_ref()
+            .is_some_and(|authoring| { authoring.objects[spawned_id].overrides.len() == 1 }));
+    }
+
+    #[test]
+    fn duplicated_talk_actor_keeps_generated_identity_in_atomic_undo_record() {
+        let factory_name = "NPCFixture";
+        let source = placed_dialogue_fixture("source-object", factory_name);
+        let registry = talk_capable_registry(factory_name);
+        let mut document = command_test_document(vec![source.clone()]);
+        document.registry = Some(registry.clone());
+        let mut app = SmsEditorApp {
+            stage_id: "fixture0".to_string(),
+            selected_object_id: Some(source.id.clone()),
+            registry: Some(registry),
+            document: Some(document),
+            dialogue_route_index: Some(DialogueRouteIndex::default()),
+            ..SmsEditorApp::default()
+        };
+
+        app.duplicate_selected();
+
+        let duplicate_id = "fixture0-obj-0001";
+        let duplicate_name = app.document.as_ref().unwrap().objects[1]
+            .raw_param("name")
+            .unwrap()
+            .to_string();
+        assert!(duplicate_name.starts_with("GraffitoDlg_"));
+        assert!(app
+            .document
+            .as_ref()
+            .unwrap()
+            .dialogue_authoring
+            .as_ref()
+            .is_some_and(|authoring| authoring.objects[duplicate_id].overrides.len() == 1));
+        assert_eq!(app.undo_stack.len(), 1);
+
+        app.undo();
+        assert_eq!(app.document.as_ref().unwrap().objects, [source]);
+        assert!(app.document.as_ref().unwrap().dialogue_authoring.is_none());
+
+        app.redo();
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.objects.len(), 2);
+        assert_eq!(
+            document.objects[1].raw_param("name"),
+            Some(duplicate_name.as_str())
+        );
+        assert!(document
+            .dialogue_authoring
+            .as_ref()
+            .is_some_and(|authoring| { authoring.objects[duplicate_id].overrides.len() == 1 }));
+    }
+
+    #[test]
+    fn dummy_proxy_spawn_and_duplicate_never_initialize_dialogue() {
+        let factory_name = "NPCDummy";
+        let mut registry = talk_capable_registry(factory_name);
+        registry.npc_factory_actor_types[0].actor_type = 0x0400_001c;
+
+        let template = placed_dialogue_fixture("fixture0-obj-0001", factory_name);
+        let mut spawn_document = command_test_document(vec![template]);
+        spawn_document.registry = Some(registry.clone());
+        let mut spawn_app = SmsEditorApp {
+            stage_id: "fixture0".to_string(),
+            registry: Some(registry.clone()),
+            document: Some(spawn_document),
+            ..SmsEditorApp::default()
+        };
+
+        spawn_app.spawn_object_at(factory_name.to_string(), [10.0, 20.0, 30.0]);
+
+        let spawn_document = spawn_app.document.as_ref().unwrap();
+        assert_eq!(spawn_document.objects.len(), 2);
+        assert!(spawn_document.dialogue_authoring.is_none());
+        assert!(spawn_document.objects.iter().all(|object| {
+            !object
+                .raw_param("name")
+                .is_some_and(|name| name.starts_with("GraffitoDlg_"))
+        }));
+
+        let source = placed_dialogue_fixture("source-object", factory_name);
+        let mut duplicate_document = command_test_document(vec![source.clone()]);
+        duplicate_document.registry = Some(registry.clone());
+        let mut duplicate_app = SmsEditorApp {
+            stage_id: "fixture0".to_string(),
+            selected_object_id: Some(source.id),
+            registry: Some(registry),
+            document: Some(duplicate_document),
+            ..SmsEditorApp::default()
+        };
+
+        duplicate_app.duplicate_selected();
+
+        let duplicate_document = duplicate_app.document.as_ref().unwrap();
+        assert_eq!(duplicate_document.objects.len(), 2);
+        assert!(duplicate_document.dialogue_authoring.is_none());
+        assert!(duplicate_document.objects.iter().all(|object| {
+            !object
+                .raw_param("name")
+                .is_some_and(|name| name.starts_with("GraffitoDlg_"))
+        }));
+    }
+
+    #[test]
+    fn talk_actor_spawn_waits_for_route_index_instead_of_synthesizing_dialogue() {
+        let factory_name = "NPCFixture";
+        let template = placed_dialogue_fixture("fixture0-obj-0001", factory_name);
+        let registry = talk_capable_registry(factory_name);
+        let mut document = command_test_document(vec![template.clone()]);
+        document.registry = Some(registry.clone());
+        let mut app = SmsEditorApp {
+            stage_id: "fixture0".to_string(),
+            registry: Some(registry),
+            document: Some(document),
+            ..SmsEditorApp::default()
+        };
+
+        app.spawn_object_at(factory_name.to_string(), [10.0, 20.0, 30.0]);
+
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.objects, [template]);
+        assert!(document.dialogue_authoring.is_none());
+        assert!(app.undo_stack.is_empty());
+        assert!(app.log.iter().any(|message| {
+            message.contains("dialogue routes for its existing stage instance are unavailable")
+        }));
+    }
+
+    #[test]
+    fn talk_actor_duplicate_waits_for_route_index_instead_of_synthesizing_dialogue() {
+        let factory_name = "NPCFixture";
+        let source = placed_dialogue_fixture("source-object", factory_name);
+        let registry = talk_capable_registry(factory_name);
+        let mut document = command_test_document(vec![source.clone()]);
+        document.registry = Some(registry.clone());
+        let mut app = SmsEditorApp {
+            stage_id: "fixture0".to_string(),
+            selected_object_id: Some(source.id.clone()),
+            registry: Some(registry),
+            document: Some(document),
+            ..SmsEditorApp::default()
+        };
+
+        app.duplicate_selected();
+
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.objects, [source]);
+        assert!(document.dialogue_authoring.is_none());
+        assert!(app.undo_stack.is_empty());
+        assert!(app.log.iter().any(|message| {
+            message.contains("Wait for dialogue analysis so the duplicate can inherit")
+        }));
+    }
+
+    #[test]
+    fn duplicate_of_generated_actor_gets_unique_identity_and_copy_on_write_route() {
+        let factory_name = "NPCFixture";
+        let mut source = placed_dialogue_fixture("source-object", factory_name);
+        let registry = talk_capable_registry(factory_name);
+        let mut document = command_test_document(vec![source.clone()]);
+        document.registry = Some(registry.clone());
+        let source_key = document
+            .initialize_dialogue_for_new_object(&source.id)
+            .unwrap();
+        document
+            .set_dialogue_override(
+                &source.id,
+                source_key.clone(),
+                sms_scene::DialogueEditScope::Instance,
+                sms_scene::DialogueRouteKind::Generated,
+                "New normal conversation",
+                sms_scene::DialogueContent {
+                    message: sms_formats::BmgMessage {
+                        tokens: vec![sms_formats::BmgMessageToken::Text(
+                            "Shared generated line".to_string(),
+                        )],
+                    },
+                    authored_tokens: None,
+                    attributes: vec![0; 8],
+                    voice_index: Some(0),
+                },
+            )
+            .unwrap();
+        source = document.objects[0].clone();
+        let source_name = source.raw_param("name").unwrap().to_string();
+        let before_authoring = document.dialogue_authoring.clone();
+        let mut app = SmsEditorApp {
+            stage_id: "fixture0".to_string(),
+            selected_object_id: Some(source.id.clone()),
+            registry: Some(registry),
+            document: Some(document),
+            ..SmsEditorApp::default()
+        };
+
+        app.duplicate_selected();
+
+        let duplicate_id = "fixture0-obj-0001";
+        let document = app.document.as_mut().unwrap();
+        let duplicate_name = document.objects[1].raw_param("name").unwrap().to_string();
+        assert!(duplicate_name.starts_with("GraffitoDlg_"));
+        assert_ne!(duplicate_name, source_name);
+        let duplicate_authoring =
+            &document.dialogue_authoring.as_ref().unwrap().objects[duplicate_id];
+        assert_eq!(
+            duplicate_authoring.inherited_from_object_id.as_deref(),
+            Some(source.id.as_str())
+        );
+        assert!(duplicate_authoring.overrides.is_empty());
+
+        let index = document.build_dialogue_route_index().unwrap();
+        let duplicate_variant = index
+            .variants_for_object(duplicate_id)
+            .iter()
+            .find(|variant| variant.route_kind == sms_scene::DialogueRouteKind::Generated)
+            .unwrap();
+        assert_eq!(duplicate_variant.key, source_key);
+        assert_eq!(
+            document
+                .effective_dialogue_content(&index, duplicate_id, &duplicate_variant.key)
+                .unwrap()
+                .message
+                .tokens,
+            [sms_formats::BmgMessageToken::Text(
+                "Shared generated line".to_string()
+            )]
+        );
+        let compiled = document.compile_dialogue_authoring(&index).unwrap();
+        let generated_bmg = compiled
+            .stage_edits
+            .resources
+            .iter()
+            .find_map(|edit| match &edit.document {
+                StageResourceDocument::Message(message)
+                    if edit.raw_resource_path == sms_scene::STAGE_DIALOGUE_MESSAGE_PATH =>
+                {
+                    Some(message)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(generated_bmg.entries.len(), 1);
+        assert_eq!(app.undo_stack.len(), 1);
+
+        app.undo();
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.objects, [source]);
+        assert_eq!(document.dialogue_authoring, before_authoring);
+
+        app.redo();
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.objects.len(), 2);
+        assert_eq!(
+            document.objects[1].raw_param("name"),
+            Some(duplicate_name.as_str())
+        );
+        assert!(
+            document.dialogue_authoring.as_ref().unwrap().objects[duplicate_id]
+                .overrides
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn shared_dialogue_edit_undo_restores_instance_allocation_and_common_library() {
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let base_root = std::env::temp_dir().join(format!("graffito-dialogue-{suffix}"));
+        let common_path = base_root.join("files/data/common.szs");
+        std::fs::create_dir_all(common_path.parent().unwrap()).unwrap();
+        let mut common = RarcBuilder::new(b"common".to_vec()).unwrap();
+        common
+            .insert_file(
+                b"2d/sys_message.bmg",
+                StageResourceDocument::Message(system_dialogue_bmg("Retail shared line"))
+                    .to_bytes()
+                    .unwrap(),
+            )
+            .unwrap();
+        std::fs::write(&common_path, common.build().unwrap().to_bytes().unwrap()).unwrap();
+
+        let runtime_name = "Shared NPC";
+        let mut object = placed_dialogue_fixture("npc", "NPCFixture");
+        object.insert_source_raw_param("name", runtime_name);
+        let mut registry = talk_capable_registry("NPCFixture");
+        registry.npc_factory_actor_types[0].actor_type = 0x0400_001d;
+        let mut document = command_test_document(vec![object.clone()]);
+        document.base_root = base_root.clone();
+        document.registry = Some(registry.clone());
+        document.archive_edits.upsert_resource(
+            b"map/sp/shared.sb".to_vec(),
+            StageResourceDocument::Script(shared_system_dialogue_script(runtime_name)),
+        );
+        let index = document.build_dialogue_route_index().unwrap();
+        let variant = index.variants_for_object(&object.id)[0].clone();
+        assert_eq!(
+            variant.message.as_ref().unwrap().domain,
+            sms_scene::DialogueDomain::System
+        );
+        let mut app = SmsEditorApp {
+            stage_id: "fixture0".to_string(),
+            selected_object_id: Some(object.id.clone()),
+            registry: Some(registry),
+            dialogue_route_index: Some(index),
+            document: Some(document),
+            ..SmsEditorApp::default()
+        };
+
+        let mut instance_content = variant.content.clone();
+        instance_content.message = BmgMessage {
+            tokens: vec![BmgMessageToken::Text("Only this NPC".to_string())],
+        };
+        app.update_dialogue_content(
+            &object.id,
+            variant.key.clone(),
+            sms_scene::DialogueEditScope::Instance,
+            instance_content,
+            false,
+        );
+        let allocation = app
+            .document
+            .as_ref()
+            .unwrap()
+            .dialogue_authoring
+            .as_ref()
+            .unwrap()
+            .objects[&object.id]
+            .stable_allocations[0]
+            .clone();
+
+        let mut shared_content = variant.content.clone();
+        shared_content.message = BmgMessage {
+            tokens: vec![BmgMessageToken::Text("All shared users".to_string())],
+        };
+        app.apply_dialogue_shared_content(&object.id, variant.key.clone(), shared_content);
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.dialogue_library.common_overrides.len(), 1);
+        let shared_marker =
+            &document.dialogue_authoring.as_ref().unwrap().objects[&object.id].overrides;
+        assert_eq!(shared_marker.len(), 1);
+        assert_eq!(shared_marker[0].scope, sms_scene::DialogueEditScope::Shared);
+        assert_eq!(
+            document.dialogue_authoring.as_ref().unwrap().objects[&object.id].stable_allocations,
+            std::slice::from_ref(&allocation)
+        );
+
+        app.undo();
+        let document = app.document.as_ref().unwrap();
+        assert!(document.dialogue_library.common_overrides.is_empty());
+        assert_eq!(
+            document.dialogue_authoring.as_ref().unwrap().objects[&object.id]
+                .overrides
+                .len(),
+            1
+        );
+        assert_eq!(
+            document.dialogue_authoring.as_ref().unwrap().objects[&object.id].stable_allocations,
+            std::slice::from_ref(&allocation)
+        );
+
+        app.redo();
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.dialogue_library.common_overrides.len(), 1);
+        let shared_marker =
+            &document.dialogue_authoring.as_ref().unwrap().objects[&object.id].overrides;
+        assert_eq!(shared_marker.len(), 1);
+        assert_eq!(shared_marker[0].scope, sms_scene::DialogueEditScope::Shared);
+        assert_eq!(
+            document.dialogue_authoring.as_ref().unwrap().objects[&object.id].stable_allocations,
+            [allocation]
+        );
+        std::fs::remove_dir_all(base_root).unwrap();
+    }
+
+    #[test]
+    fn deleting_dialogue_actor_retains_stage_allocation_tombstone_atomically() {
+        let source = placed_dialogue_fixture("source-object", "NPCFixture");
+        let mut document = command_test_document(vec![source.clone()]);
+        let key = sms_scene::DialogueVariantKey::generated_for_object(&source.id);
+        let mut authoring = sms_scene::DialogueAuthoringDocument::default();
+        authoring.objects.insert(
+            source.id.clone(),
+            sms_scene::DialogueObjectAuthoring {
+                inherited_from_object_id: None,
+                prior_runtime_name: None,
+                overrides: Vec::new(),
+                stable_allocations: vec![sms_scene::DialogueStableAllocation {
+                    key: key.clone(),
+                    message_index: 42,
+                }],
+            },
+        );
+        document.dialogue_authoring = Some(authoring.clone());
+        let balloon_key = sms_scene::DialogueVariantKey {
+            source: key.source,
+            original_message: Some(sms_scene::DialogueMessageRef {
+                domain: sms_scene::DialogueDomain::Balloon,
+                raw_resource_path: sms_scene::BALLOON_DIALOGUE_MESSAGE_PATH.to_vec(),
+                full_message_id: 0,
+                entry_index: 0,
+            }),
+        };
+        document
+            .dialogue_library
+            .stable_allocations
+            .push(sms_scene::ProjectDialogueAllocation {
+                stage_id: document.stage_id.clone(),
+                object_id: source.id.clone(),
+                key: balloon_key,
+                message_index: 7,
+                domain: sms_scene::DialogueDomain::Balloon,
+                raw_resource_path: sms_scene::BALLOON_DIALOGUE_MESSAGE_PATH.to_vec(),
+                content: Some(sms_scene::DialogueContent {
+                    message: sms_formats::BmgMessage {
+                        tokens: vec![sms_formats::BmgMessageToken::Text(
+                            "Deleted clone".to_string(),
+                        )],
+                    },
+                    authored_tokens: None,
+                    attributes: vec![0; 8],
+                    voice_index: Some(0),
+                }),
+            });
+        let before_library = document.dialogue_library.clone();
+        let mut app = SmsEditorApp {
+            selected_object_id: Some(source.id.clone()),
+            document: Some(document),
+            ..SmsEditorApp::default()
+        };
+
+        app.delete_selected();
+
+        let document = app.document.as_ref().unwrap();
+        assert!(document.objects.is_empty());
+        let tombstone = &document.dialogue_authoring.as_ref().unwrap().objects[&source.id];
+        assert!(tombstone.overrides.is_empty());
+        assert!(tombstone.inherited_from_object_id.is_none());
+        assert_eq!(tombstone.stable_allocations[0].message_index, 42);
+        assert!(document.dialogue_library.stable_allocations[0]
+            .content
+            .is_none());
+
+        app.undo();
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.objects, [source]);
+        assert_eq!(document.dialogue_authoring, Some(authoring));
+        assert_eq!(document.dialogue_library, before_library);
+    }
+
+    #[test]
     fn duplicate_skips_loaded_object_id_collisions() {
         let source = SceneObject::new("source-object", "FixtureEnemy");
         let occupied_one = SceneObject::new("fixture0-obj-0001", "OtherFixture");
@@ -3666,6 +4822,8 @@ mod tests {
             archive_edits: sms_scene::StageArchiveEdits::default(),
             route_authoring: None,
             goop_authoring: None,
+            dialogue_authoring: None,
+            dialogue_library: Default::default(),
             registry: None,
             load_issues: Vec::new(),
             lighting: sms_scene::StageLighting::default(),
@@ -3742,6 +4900,8 @@ mod tests {
             stage_archive_source_path: Some(PathBuf::from("custom0.szs")),
             route_authoring: None,
             goop_authoring: None,
+            dialogue_authoring: None,
+            dialogue_library: Default::default(),
             archive_edits: sms_scene::StageArchiveEdits::default(),
             registry: None,
             load_issues: Vec::new(),
@@ -4005,6 +5165,7 @@ mod tests {
             deltas: Vec::new(),
             resource_deltas: catalog_resource_edit_deltas(&document, preflight.writes),
             route_delta: None,
+            dialogue_delta: None,
         }
         .apply_forward(&mut document);
 
@@ -4483,6 +5644,7 @@ mod tests {
             deltas: Vec::new(),
             resource_deltas: catalog_resource_edit_deltas(&document, preflight.writes),
             route_delta: None,
+            dialogue_delta: None,
         };
         edit.apply_forward(&mut document);
         assert_eq!(
@@ -4530,6 +5692,7 @@ mod tests {
                 deltas: vec![ObjectDelta::Insert { index: 0, object }],
                 resource_deltas,
                 route_delta: None,
+                dialogue_delta: None,
             },
         );
 
@@ -4614,6 +5777,7 @@ mod tests {
                 deltas: Vec::new(),
                 resource_deltas,
                 route_delta: None,
+                dialogue_delta: None,
             },
         );
 
@@ -4667,6 +5831,7 @@ mod tests {
                 deltas: Vec::new(),
                 resource_deltas,
                 route_delta: None,
+                dialogue_delta: None,
             },
         );
         assert!(app.document_dirty);
@@ -4694,6 +5859,8 @@ mod tests {
             &document.objects,
             &document.lighting,
             &saved_archive_edits,
+            &document.dialogue_authoring,
+            &document.dialogue_library,
         ));
 
         document.archive_edits.resources[0].mode = sms_scene::StageResourceEditMode::Insert;
@@ -4702,6 +5869,8 @@ mod tests {
             &document.objects,
             &document.lighting,
             &saved_archive_edits,
+            &document.dialogue_authoring,
+            &document.dialogue_library,
         ));
     }
 

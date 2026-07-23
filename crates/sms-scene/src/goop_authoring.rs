@@ -1838,6 +1838,8 @@ mod tests {
                 layers: vec![layer],
                 ..Default::default()
             }),
+            dialogue_authoring: None,
+            dialogue_library: Default::default(),
             load_issues: Vec::new(),
             lighting: Default::default(),
             actor_previews: std::collections::BTreeMap::new(),

@@ -301,6 +301,21 @@ impl StageDocument {
     /// Also applies explicitly supplied model, collision, and placement
     /// documents.
     pub fn build_stage_archive_with_edits(&self, edits: &StageArchiveEdits) -> Result<Vec<u8>> {
+        self.reject_uncompiled_dialogue_export()?;
+        Ok(self.build_stage_archive_inner(edits)?.rebuilt)
+    }
+
+    /// Rebuilds a stage after the caller has compiled dialogue authoring and
+    /// merged [`CompiledDialogueEdits::stage_edits`] into `edits`.
+    ///
+    /// This explicit boundary prevents generic stage-only exporters from
+    /// silently dropping common-BMG or managed-DOL work. Callers using this
+    /// method are responsible for applying those non-stage outputs as part of
+    /// the same managed build transaction.
+    pub fn build_stage_archive_with_compiled_dialogue_edits(
+        &self,
+        edits: &StageArchiveEdits,
+    ) -> Result<Vec<u8>> {
         Ok(self.build_stage_archive_inner(edits)?.rebuilt)
     }
 
@@ -318,6 +333,7 @@ impl StageDocument {
         output_path: impl AsRef<Path>,
         edits: &StageArchiveEdits,
     ) -> Result<StageArchiveExportOutcome> {
+        self.reject_uncompiled_dialogue_export()?;
         let built = self.build_stage_archive_inner(edits)?;
         let output_path = checked_external_output(&self.base_root, output_path.as_ref())?;
         let mut output = OpenOptions::new()
@@ -332,6 +348,21 @@ impl StageDocument {
             size_bytes: built.rebuilt.len(),
             changed: built.changed,
         })
+    }
+
+    fn reject_uncompiled_dialogue_export(&self) -> Result<()> {
+        let has_stage_overrides = self.dialogue_authoring.as_ref().is_some_and(|authoring| {
+            authoring
+                .objects
+                .values()
+                .any(|object| !object.overrides.is_empty() || !object.stable_allocations.is_empty())
+        });
+        if has_stage_overrides || !self.dialogue_library.is_empty() {
+            return Err(stage_export_error(
+                "dialogue authoring cannot be emitted by a stage-only export; compile it and use the managed game build so stage, common.szs, and DOL outputs remain atomic",
+            ));
+        }
+        Ok(())
     }
 
     fn build_stage_archive_inner(&self, edits: &StageArchiveEdits) -> Result<BuiltStageArchive> {
@@ -2443,7 +2474,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use sms_formats::{
-        ColGroup, ColTriangle, ColVertex, JDramaAmbient, JDramaDocument, JDramaField,
+        BmgMessage, ColGroup, ColTriangle, ColVertex, JDramaAmbient, JDramaDocument, JDramaField,
         JDramaFieldValue, JDramaLight, JDramaLightMap, PrmEntry, PrmFile, PrmValue, RarcDocument,
         RarcEntryRecord, RarcLayout, RarcNodeRecord,
     };
@@ -4007,6 +4038,67 @@ mod tests {
         fs::remove_dir_all(project_root).unwrap();
     }
 
+    #[test]
+    fn stage_only_export_rejects_uncompiled_dialogue_authoring() {
+        let fixture = StageFixture::new("uncompiled-dialogue-export");
+        let mut document = fixture.document();
+        document
+            .dialogue_library
+            .common_overrides
+            .push(crate::ProjectDialogueOverride {
+                message: crate::DialogueMessageRef {
+                    domain: crate::DialogueDomain::System,
+                    raw_resource_path: crate::SYSTEM_DIALOGUE_MESSAGE_PATH.to_vec(),
+                    full_message_id: 1,
+                    entry_index: 1,
+                },
+                content: crate::DialogueContent {
+                    message: BmgMessage::default(),
+                    authored_tokens: None,
+                    attributes: vec![0; 8],
+                    voice_index: Some(0),
+                },
+            });
+
+        let error = document.build_stage_archive().unwrap_err().to_string();
+        assert!(error.contains("stage-only export"), "{error}");
+        assert!(error.contains("common.szs"), "{error}");
+
+        document
+            .build_stage_archive_with_compiled_dialogue_edits(&document.archive_edits)
+            .expect("managed caller can rebuild after compiling external dialogue outputs");
+    }
+
+    #[test]
+    fn stage_only_export_rejects_allocation_only_dialogue_tombstones() {
+        let fixture = StageFixture::new("uncompiled-dialogue-allocation-export");
+        let mut document = fixture.document();
+        let object_id = document.objects[0].id.clone();
+        let key = crate::DialogueVariantKey::generated_for_object(&object_id);
+        document.dialogue_authoring = Some(crate::DialogueAuthoringDocument::default());
+        document
+            .dialogue_authoring
+            .as_mut()
+            .unwrap()
+            .objects
+            .insert(
+                object_id,
+                crate::DialogueObjectAuthoring {
+                    inherited_from_object_id: None,
+                    prior_runtime_name: None,
+                    overrides: Vec::new(),
+                    stable_allocations: vec![crate::DialogueStableAllocation {
+                        key,
+                        message_index: 7,
+                    }],
+                },
+            );
+
+        let error = document.build_stage_archive().unwrap_err().to_string();
+        assert!(error.contains("stage-only export"), "{error}");
+        assert!(error.contains("DOL outputs remain atomic"), "{error}");
+    }
+
     struct StageFixture {
         root: PathBuf,
         archive_path: PathBuf,
@@ -4041,6 +4133,8 @@ mod tests {
                 registry: None,
                 route_authoring: None,
                 goop_authoring: None,
+                dialogue_authoring: None,
+                dialogue_library: Default::default(),
                 load_issues: Vec::new(),
                 lighting: crate::StageLighting::default(),
                 actor_previews: BTreeMap::new(),

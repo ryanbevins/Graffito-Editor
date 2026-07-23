@@ -579,7 +579,10 @@ fn parse_strict_payload(
             field("flags", JDramaFieldValue::I32(cursor.i32()?)),
             field("weight", JDramaFieldValue::U32(cursor.u32()?)),
         ]),
-        "DrawBufObj" => Some(vec![
+        // TMirrorMapDrawBuf overrides only `perform`; the decomp confirms that
+        // it inherits TDrawBufObj::load and therefore consumes the same two
+        // u32 stream fields.
+        "DrawBufObj" | "MirrorMapDrawBuf" => Some(vec![
             field("draw_buffer_flags", JDramaFieldValue::U32(cursor.u32()?)),
             field("draw_buffer_size", JDramaFieldValue::U32(cursor.u32()?)),
         ]),
@@ -3136,6 +3139,29 @@ mod tests {
     }
 
     #[test]
+    fn strict_parser_uses_inherited_draw_buffer_payload_for_mirror_map_draw_buffers() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&3_u32.to_be_bytes());
+        payload.extend_from_slice(&32_u32.to_be_bytes());
+        let bytes = name_ref_record("MirrorMapDrawBuf", "DrawBuf MirrorSky Opa", &payload);
+
+        let document = parse_jdrama_document(&bytes).expect("parse mirror draw buffer");
+        assert_eq!(
+            document.to_bytes().expect("rebuild mirror draw buffer"),
+            bytes
+        );
+        assert_eq!(
+            document.root.payload,
+            JDramaRecordPayload::Fields {
+                fields: vec![
+                    field("draw_buffer_flags", JDramaFieldValue::U32(3)),
+                    field("draw_buffer_size", JDramaFieldValue::U32(32)),
+                ],
+            }
+        );
+    }
+
+    #[test]
     fn key_code_uses_encoded_shift_jis_bytes() {
         let encoded = encode_shift_jis("全体シーン").unwrap();
         let expected = encoded.iter().fold(0_u32, |key, byte| {
@@ -3953,6 +3979,22 @@ mod tests {
 
         assert_eq!(value, "バルーンヘルプv1");
         assert_eq!(next, bytes.len());
+    }
+
+    #[test]
+    #[ignore = "requires an extracted retail base root"]
+    fn strict_retail_scene_common_is_byte_identical() {
+        let base_root = std::env::var_os("SMS_BASE_ROOT")
+            .map(std::path::PathBuf::from)
+            .expect("set SMS_BASE_ROOT to the extracted game's root");
+        let bytes = std::fs::read(base_root.join("files/data/scenecmn.bin"))
+            .expect("read retail scenecmn.bin");
+        let document = parse_jdrama_document(&bytes).expect("strict parse retail scenecmn.bin");
+        assert_eq!(
+            document.to_bytes().expect("rebuild retail scenecmn.bin"),
+            bytes,
+            "retail scenecmn.bin must round-trip byte-identically"
+        );
     }
 
     #[test]

@@ -25,7 +25,8 @@ use sms_render::{
     gx_blend_compatibility, GxBlendCompatibility, RenderScene, RendererConfig, ViewportRenderer,
 };
 use sms_scene::{
-    AssetRef, AssetRole, ObjectAuthoringCatalog, ObjectAuthoringCatalogWarning,
+    AssetRef, AssetRole, DialogueAuthoringDocument, DialogueGameConsumerIndex, DialogueRouteIndex,
+    ObjectAuthoringCatalog, ObjectAuthoringCatalogWarning, ProjectDialogueLibrary,
     RouteAuthoringDocument, SceneError, SceneObject, StageArchiveEdits, StageDocument,
     StageLighting, StageResourceDocument, StageResourceEdit, Transform, ValidationIssue,
     ValidationSeverity,
@@ -39,6 +40,7 @@ mod browser_settings;
 mod camera;
 mod content_browser;
 mod content_thumbnails;
+mod dialogue;
 mod direct_boot;
 mod document_commands;
 mod dolphin_graphics;
@@ -66,6 +68,7 @@ use audio_preview::*;
 use browser_settings::*;
 use content_browser::*;
 use content_thumbnails::*;
+use dialogue::*;
 use game_content_index::*;
 use game_text::*;
 use goop::*;
@@ -458,10 +461,14 @@ fn stage_document_differs_from_saved(
     saved_objects: &[SceneObject],
     saved_lighting: &StageLighting,
     saved_archive_edits: &StageArchiveEdits,
+    saved_dialogue_authoring: &Option<DialogueAuthoringDocument>,
+    saved_dialogue_library: &ProjectDialogueLibrary,
 ) -> bool {
     document.objects != saved_objects
         || document.lighting != *saved_lighting
         || document.archive_edits != *saved_archive_edits
+        || document.dialogue_authoring != *saved_dialogue_authoring
+        || document.dialogue_library != *saved_dialogue_library
 }
 
 fn validation_issues_for_preview(
@@ -742,11 +749,20 @@ struct RouteAuthoringDelta {
     after: Option<RouteAuthoringDocument>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DialogueAuthoringDelta {
+    before_authoring: Option<DialogueAuthoringDocument>,
+    after_authoring: Option<DialogueAuthoringDocument>,
+    before_library: ProjectDialogueLibrary,
+    after_library: ProjectDialogueLibrary,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct ObjectUndoRecord {
     deltas: Vec<ObjectDelta>,
     resource_deltas: Vec<ResourceEditDelta>,
     route_delta: Option<RouteAuthoringDelta>,
+    dialogue_delta: Option<DialogueAuthoringDelta>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -804,6 +820,7 @@ struct SmsEditorApp {
     goop_templates_indexed: bool,
     retail_music: Vec<RetailMusicEntry>,
     retail_sounds: Vec<RetailSoundEntry>,
+    retail_dialogue_voices: Vec<RetailDialogueVoiceEntry>,
     retail_stage_audio: Vec<RetailStageAudioProfile>,
     game_content_index: GameContentIndexState,
     content_thumbnails: ContentThumbnailService,
@@ -906,6 +923,15 @@ struct SmsEditorApp {
     route_curve_confirmation: Option<(String, String)>,
     pending_route_assignment: Option<(String, String)>,
     route_handle_drag: Option<RouteHandleDrag>,
+    dialogue_route_index: Option<DialogueRouteIndex>,
+    dialogue_consumer_index: Option<DialogueGameConsumerIndex>,
+    dialogue_index_receiver: Option<Receiver<DialogueIndexBuildResult>>,
+    dialogue_consumer_receiver: Option<Receiver<Result<DialogueGameConsumerIndex, String>>>,
+    dialogue_consumer_cancel: Option<Arc<AtomicBool>>,
+    dialogue_index_error: Option<String>,
+    dialogue_consumer_error: Option<String>,
+    dialogue_shared_confirmation: Option<DialogueSharedConfirmation>,
+    dialogue_undo_transaction: Option<DialogueUndoTransaction>,
     startup_focus_object: Option<String>,
     startup_camera_distance: Option<f32>,
     startup_camera_yaw: Option<f32>,
@@ -922,6 +948,8 @@ struct SmsEditorApp {
     saved_objects: Vec<SceneObject>,
     saved_lighting: StageLighting,
     saved_archive_edits: StageArchiveEdits,
+    saved_dialogue_authoring: Option<DialogueAuthoringDocument>,
+    saved_dialogue_library: ProjectDialogueLibrary,
     document_dirty: bool,
     undo_stack: VecDeque<ObjectUndoRecord>,
     redo_stack: VecDeque<ObjectUndoRecord>,
@@ -1038,6 +1066,7 @@ impl Default for SmsEditorApp {
             goop_templates_indexed: false,
             retail_music: Vec::new(),
             retail_sounds: Vec::new(),
+            retail_dialogue_voices: Vec::new(),
             retail_stage_audio: Vec::new(),
             game_content_index: GameContentIndexState::default(),
             content_thumbnails: ContentThumbnailService::default(),
@@ -1139,6 +1168,15 @@ impl Default for SmsEditorApp {
             route_curve_confirmation: None,
             pending_route_assignment: None,
             route_handle_drag: None,
+            dialogue_route_index: None,
+            dialogue_consumer_index: None,
+            dialogue_index_receiver: None,
+            dialogue_consumer_receiver: None,
+            dialogue_consumer_cancel: None,
+            dialogue_index_error: None,
+            dialogue_consumer_error: None,
+            dialogue_shared_confirmation: None,
+            dialogue_undo_transaction: None,
             startup_camera_focus: args.camera_focus,
             startup_focus_object: args.focus_object,
             startup_camera_distance: args.camera_distance,
@@ -1156,6 +1194,8 @@ impl Default for SmsEditorApp {
             saved_objects: Vec::new(),
             saved_lighting: StageLighting::default(),
             saved_archive_edits: StageArchiveEdits::default(),
+            saved_dialogue_authoring: None,
+            saved_dialogue_library: ProjectDialogueLibrary::default(),
             document_dirty: false,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
@@ -1194,7 +1234,9 @@ impl SmsEditorApp {
 
 impl eframe::App for SmsEditorApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.finish_dialogue_transaction_if_selection_changed();
         self.poll_background_task(ctx, Some(frame));
+        self.poll_dialogue_index(ctx);
         self.sync_game_content_index();
         self.poll_game_content_index(ctx);
         self.poll_content_thumbnails(ctx);
@@ -1707,6 +1749,8 @@ impl SmsEditorApp {
                                     &self.saved_objects,
                                     &self.saved_lighting,
                                     &self.saved_archive_edits,
+                                    &self.saved_dialogue_authoring,
+                                    &self.saved_dialogue_library,
                                 );
                                 self.issues = document.validate();
                             }
@@ -2048,6 +2092,15 @@ impl SmsEditorApp {
         self.scene_labels = scene_labels;
         self.retail_skyboxes = retail_skyboxes;
         self.retail_music = retail_music;
+        self.retail_dialogue_voices =
+            match index_retail_dialogue_voices(Path::new(&self.repo_root), &retail_sounds) {
+                Ok(voices) => voices,
+                Err(error) => {
+                    self.log
+                        .push(format!("Dialogue voice choices are unavailable: {error}"));
+                    Vec::new()
+                }
+            };
         self.retail_sounds = retail_sounds;
         self.retail_stage_audio = retail_stage_audio;
         self.last_scanned_base_root = self.base_root.trim().to_string();
@@ -2116,9 +2169,19 @@ impl SmsEditorApp {
         self.saved_objects = document.objects.clone();
         self.saved_lighting = document.lighting.clone();
         self.saved_archive_edits = document.archive_edits.clone();
+        self.saved_dialogue_authoring = document.dialogue_authoring.clone();
+        self.saved_dialogue_library = document.dialogue_library.clone();
         self.document_dirty = false;
         self.stage_id = document.stage_id.clone();
         self.document = Some(document);
+        self.dialogue_route_index = None;
+        self.dialogue_consumer_index = None;
+        self.dialogue_index_error = None;
+        self.dialogue_consumer_error = None;
+        self.dialogue_shared_confirmation = None;
+        self.dialogue_undo_transaction = None;
+        self.schedule_dialogue_index_rebuild();
+        self.schedule_dialogue_consumer_index_rebuild();
         self.rebuild_audio_cube_helpers_cache();
         self.render_scene = Some(scene);
         self.reset_authored_model_preview_base();

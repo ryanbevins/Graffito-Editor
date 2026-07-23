@@ -82,6 +82,7 @@ pub enum SchemaExtractor {
     ParticleResources,
     ParticleBindings,
     NpcResources,
+    NpcActorTypes,
     NpcInitData,
     NpcRootColors,
     NpcActionPresets,
@@ -110,6 +111,7 @@ impl std::fmt::Display for SchemaExtractor {
             Self::ParticleResources => "particle resource",
             Self::ParticleBindings => "particle binding",
             Self::NpcResources => "NPC model resource",
+            Self::NpcActorTypes => "NPC actor type",
             Self::NpcInitData => "NPC initialization",
             Self::NpcRootColors => "NPC root color",
             Self::NpcActionPresets => "NPC action preset",
@@ -175,6 +177,11 @@ pub struct ObjectRegistry {
     pub actor_particle_bindings: Vec<ActorParticleBinding>,
     #[serde(default)]
     pub npc_actors: Vec<NpcActorDefinition>,
+    /// Exact `TBaseNPC` actor type constructed for each registered NPC factory.
+    /// Dialogue runtime guards use this identity instead of guessing from the
+    /// factory spelling, which is not retained by the live actor.
+    #[serde(default)]
+    pub npc_factory_actor_types: Vec<NpcFactoryActorTypeDefinition>,
     /// Stage-local resource directories opened directly by NPC manager animation loaders.
     #[serde(default)]
     pub npc_resource_folders: Vec<NpcResourceFolderDefinition>,
@@ -226,6 +233,23 @@ impl ObjectRegistry {
             .iter()
             .filter(|definition| actor_key.starts_with(&definition.actor_key))
             .max_by_key(|definition| definition.actor_key.len())
+    }
+
+    pub fn find_npc_actor_type(&self, factory_name: &str) -> Option<u32> {
+        self.npc_factory_actor_types
+            .iter()
+            .find(|definition| definition.factory_name == factory_name)
+            .map(|definition| definition.actor_type)
+    }
+
+    /// Returns whether a decomp-identified NPC factory owns placed-instance
+    /// dialogue. `NPCDummy`'s `0x0400001c` actor is the hidden proxy wired by
+    /// `connectDummyNpc`; dialogue belongs to the connected visible actor.
+    pub fn is_dialogue_instance_eligible(&self, factory_name: &str) -> bool {
+        const NPC_DUMMY_PROXY_ACTOR_TYPE: u32 = 0x0400_001c;
+
+        self.find_npc_actor_type(factory_name)
+            .is_some_and(|actor_type| actor_type != NPC_DUMMY_PROXY_ACTOR_TYPE)
     }
 
     pub fn npc_resource_folders_for<'a>(
@@ -736,6 +760,13 @@ pub struct NpcActorDefinition {
     pub actor_key: String,
     pub source_file: String,
     pub parts: Vec<NpcPartDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NpcFactoryActorTypeDefinition {
+    pub factory_name: String,
+    pub actor_type: u32,
+    pub source_file: String,
 }
 
 /// A complete archive directory passed to an NPC manager's animation-data loader.
@@ -1840,6 +1871,14 @@ impl SchemaGenerator {
             registry.objects.len() - before,
             "NPC actor and manager registrations",
         )?;
+        registry.npc_factory_actor_types =
+            extract_npc_factory_actor_types(factory_text, factory_path);
+        ensure_extracted(
+            SchemaExtractor::NpcActorTypes,
+            self.repo_root.join(factory_path),
+            registry.npc_factory_actor_types.len(),
+            "TBaseNPC factory actor types",
+        )?;
 
         let manager_path = "src/NPC/NpcManager.cpp";
         let manager_text = sources.required(manager_path)?.text();
@@ -1992,6 +2031,30 @@ fn extract_npc_actor_definitions(text: &str, source_file: &str) -> Vec<NpcActorD
         });
     }
     actors
+}
+
+fn extract_npc_factory_actor_types(
+    text: &str,
+    source_file: &str,
+) -> Vec<NpcFactoryActorTypeDefinition> {
+    let constructor_re = Regex::new(
+        r#"(?s)if\s*\(\s*strcmp\s*\(\s*name\s*,\s*\"([^\"]+)\"\s*\)\s*==\s*0\s*\)\s*return\s+new\s+TBaseNPC\s*\(\s*([^,\s]+)\s*,"#,
+    )
+    .expect("valid NPC actor-type factory regex");
+    let mut definitions = constructor_re
+        .captures_iter(text)
+        .filter_map(|captures| {
+            let actor_type = parse_cpp_u32(captures.get(2)?.as_str())?;
+            Some(NpcFactoryActorTypeDefinition {
+                factory_name: captures[1].to_string(),
+                actor_type,
+                source_file: source_file.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    definitions.sort_by(|left, right| left.factory_name.cmp(&right.factory_name));
+    definitions.dedup_by(|left, right| left.factory_name == right.factory_name);
+    definitions
 }
 
 fn extract_npc_material_color_definitions(
@@ -4394,6 +4457,24 @@ fn dedup_registry(registry: &mut ObjectRegistry) -> Result<()> {
     registry
         .npc_actors
         .dedup_by(|a, b| a.actor_key == b.actor_key);
+    registry
+        .npc_factory_actor_types
+        .sort_by(|a, b| a.factory_name.cmp(&b.factory_name));
+    for duplicate in registry.npc_factory_actor_types.windows(2) {
+        if duplicate[0].factory_name == duplicate[1].factory_name
+            && duplicate[0].actor_type != duplicate[1].actor_type
+        {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "NPC factory {} resolves to conflicting actor types {:#010x} and {:#010x}",
+                    duplicate[0].factory_name, duplicate[0].actor_type, duplicate[1].actor_type
+                ),
+            });
+        }
+    }
+    registry
+        .npc_factory_actor_types
+        .dedup_by(|a, b| a.factory_name == b.factory_name);
     registry.npc_resource_folders.sort_by(|a, b| {
         a.factory_name
             .cmp(&b.factory_name)
@@ -4532,6 +4613,20 @@ fn validate_registry(registry: &ObjectRegistry) -> Result<()> {
                 detail: format!(
                     "NPC resource folder {} has no registered factory {}",
                     folder.folder, folder.factory_name
+                ),
+            });
+        }
+    }
+    for definition in &registry.npc_factory_actor_types {
+        if definition.actor_type == 0
+            || definition.source_file.is_empty()
+            || !definition.factory_name.starts_with("NPC")
+            || !objects.contains_key(definition.factory_name.as_str())
+        {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "NPC factory actor type {} -> {:#010x} has an invalid identity, registration, or provenance",
+                    definition.factory_name, definition.actor_type
                 ),
             });
         }
@@ -5753,6 +5848,47 @@ mod tests {
         extract_calc_particle_bindings(actor, "src/MoveBG/Example.cpp", &mut registry);
 
         assert!(registry.actor_particle_bindings.is_empty());
+    }
+
+    #[test]
+    fn extracts_exact_npc_factory_actor_types() {
+        let text = r#"
+            if (strcmp(name, "NPCMonteM") == 0)
+                return new TBaseNPC(0x04000001, "?");
+            if (strcmp(name, "NPCBoard") == 0)
+                return new TBaseNPC(0x0400001D, "?");
+            if (strcmp(name, "MonteMManager") == 0)
+                return new TMonteMManager;
+        "#;
+        let definitions = extract_npc_factory_actor_types(text, "src/System/MarNameRefGen_NPC.cpp");
+        assert_eq!(definitions.len(), 2);
+        assert_eq!(definitions[0].factory_name, "NPCBoard");
+        assert_eq!(definitions[0].actor_type, 0x0400_001D);
+        assert_eq!(definitions[1].factory_name, "NPCMonteM");
+        assert_eq!(definitions[1].actor_type, 0x0400_0001);
+    }
+
+    #[test]
+    fn dialogue_instance_eligibility_excludes_the_hidden_dummy_proxy() {
+        let registry = ObjectRegistry {
+            npc_factory_actor_types: vec![
+                NpcFactoryActorTypeDefinition {
+                    factory_name: "NPCDummy".to_string(),
+                    actor_type: 0x0400_001c,
+                    source_file: "src/System/MarNameRefGen_NPC.cpp".to_string(),
+                },
+                NpcFactoryActorTypeDefinition {
+                    factory_name: "NPCMonteM".to_string(),
+                    actor_type: 0x0400_0001,
+                    source_file: "src/System/MarNameRefGen_NPC.cpp".to_string(),
+                },
+            ],
+            ..ObjectRegistry::default()
+        };
+
+        assert!(!registry.is_dialogue_instance_eligible("NPCDummy"));
+        assert!(registry.is_dialogue_instance_eligible("NPCMonteM"));
+        assert!(!registry.is_dialogue_instance_eligible("UnknownFactory"));
     }
 
     #[test]

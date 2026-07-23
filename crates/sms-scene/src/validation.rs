@@ -252,6 +252,9 @@ pub(super) fn validate_document(document: &StageDocument) -> Vec<ValidationIssue
     let mut issues = document.load_issues.clone();
     validate_runtime_actor_links(document, &mut issues);
     validate_routes(document, &mut issues);
+    issues.extend(super::dialogue_authoring::validate_dialogue_document(
+        document,
+    ));
     if let Some(goop) = &document.goop_authoring {
         if let Err(error) = goop.validate() {
             issues.push(ValidationIssue::error(

@@ -1517,6 +1517,7 @@ impl SmsEditorApp {
                         }
                     });
             }
+            self.dialogue_inspector_panel(ui, &object);
         } else {
             ui.heading("Inspector");
             if self.document.is_some() {

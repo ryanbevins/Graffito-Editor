@@ -3,6 +3,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+#[cfg(windows)]
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
@@ -14,11 +17,27 @@ pub(super) const PROJECT_KIND: &str = "sms-editor-project";
 pub(super) const PROJECT_FORMAT_VERSION: u32 = 4;
 const MAX_PROJECT_MANIFEST_BYTES: u64 = 1024 * 1024;
 static PROJECT_TRANSACTION_COUNTER: AtomicU64 = AtomicU64::new(0);
+static PROJECT_OPERATION_GATES: OnceLock<Mutex<BTreeMap<String, Weak<Mutex<()>>>>> =
+    OnceLock::new();
+#[cfg(windows)]
+const PROJECT_RENAME_RETRY_DELAYS: [Duration; 7] = [
+    Duration::from_millis(10),
+    Duration::from_millis(25),
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(800),
+];
 
 pub(super) fn save_project_folder(
     document: &StageDocument,
     project_root: &Path,
 ) -> Result<(ProjectSaveOutcome, u128)> {
+    let project_operation = project_operation_gate(project_root)?;
+    let _project_operation_guard = project_operation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if project_root
         .components()
         .any(|component| matches!(component, Component::ParentDir))
@@ -80,11 +99,15 @@ pub(super) fn save_project_folder(
     fs::create_dir(&staging_root)?;
     let staged_manifest = (|| -> Result<(EditorProjectManifest, u128)> {
         if existing_manifest.is_some() {
-            copy_unmanaged_project_entries(
-                project_root,
-                &staging_root,
-                document.changed_files.keys(),
-            )?;
+            let mut replaced_files = document.changed_files.keys().cloned().collect::<Vec<_>>();
+            if document.dialogue_library.is_empty() {
+                // An optional managed file being cleared is an intentional
+                // deletion. Exclude its old payload from unmanaged copying so
+                // the atomic staging swap cannot resurrect it outside the new
+                // manifest and block a later re-add.
+                replaced_files.push(document.dialogue_library_path());
+            }
+            copy_unmanaged_project_entries(project_root, &staging_root, replaced_files.iter())?;
         }
 
         let files_root = staging_root.join("files");
@@ -94,6 +117,12 @@ pub(super) fn save_project_folder(
             .as_ref()
             .map(|manifest| manifest.changed_files.clone())
             .unwrap_or_default();
+        if document.dialogue_library.is_empty() {
+            let dialogue_library = document.dialogue_library_path();
+            changed_files.retain(|path| {
+                project_relative_key(path) != project_relative_key(&dialogue_library)
+            });
+        }
         for (relative_path, bytes) in &document.changed_files {
             validate_project_relative_path(relative_path)?;
             let out_path = files_root.join(relative_path);
@@ -162,7 +191,7 @@ pub(super) fn save_project_folder(
     }
     let had_existing_root = original_snapshot.exists;
     if had_existing_root {
-        if let Err(err) = fs::rename(project_root, &backup_root) {
+        if let Err(err) = rename_project_directory(project_root, &backup_root) {
             let cleanup_error = fs::remove_dir_all(&staging_root).err();
             let mut message = format!("could not move the existing project aside: {err}");
             if let Some(cleanup_error) = cleanup_error {
@@ -210,7 +239,7 @@ pub(super) fn save_project_folder(
             });
         }
     }
-    if let Err(err) = fs::rename(&staging_root, project_root) {
+    if let Err(err) = rename_project_directory(&staging_root, project_root) {
         let rollback_error = if had_existing_root && backup_root.exists() {
             fs::rename(&backup_root, project_root).err()
         } else {
@@ -292,6 +321,10 @@ pub(super) fn load_project_overlay(
     document: &mut StageDocument,
     project_root: &Path,
 ) -> Result<bool> {
+    let project_operation = project_operation_gate(project_root)?;
+    let _project_operation_guard = project_operation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let initial_snapshot = snapshot_project_root(project_root)?;
     let Some(manifest) = inspect_existing_project(project_root)? else {
         return Ok(false);
@@ -328,6 +361,25 @@ pub(super) fn load_project_overlay(
         .changed_files
         .iter()
         .any(|path| project_relative_key(path) == project_relative_key(&relative_overlay));
+    let relative_dialogue_library = document.dialogue_library_path();
+    let dialogue_library_is_managed = manifest
+        .changed_files
+        .iter()
+        .any(|path| project_relative_key(path) == project_relative_key(&relative_dialogue_library));
+    if dialogue_library_is_managed {
+        let library_path = project_root.join("files").join(&relative_dialogue_library);
+        let metadata = fs::symlink_metadata(&library_path)
+            .map_err(|_| SceneError::UnsupportedProjectEntry(library_path.clone()))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(SceneError::UnsupportedProjectEntry(library_path));
+        }
+        document.dialogue_library = serde_json::from_slice(&read_file_bounded(
+            &library_path,
+            MAX_PROJECT_DIALOGUE_LIBRARY_BYTES,
+        )?)?;
+    } else {
+        document.dialogue_library = super::ProjectDialogueLibrary::default();
+    }
     if !overlay_is_managed {
         let canonical_project_root = fs::canonicalize(project_root)?;
         let project_fingerprint =
@@ -339,7 +391,7 @@ pub(super) fn load_project_overlay(
             revision: manifest.revision,
             project_fingerprint,
         });
-        return Ok(baseline_is_managed);
+        return Ok(baseline_is_managed || dialogue_library_is_managed);
     }
 
     let overlay_path = project_root.join("files").join(&relative_overlay);
@@ -379,6 +431,7 @@ pub(super) fn load_project_overlay(
     document.archive_edits = overlay.archive_edits;
     document.route_authoring = overlay.route_authoring;
     document.goop_authoring = overlay.goop_authoring;
+    document.dialogue_authoring = overlay.dialogue_authoring;
     if let Some(authoring) = &mut document.goop_authoring {
         authoring.stale |= authoring.requires_generator_upgrade();
     }
@@ -437,6 +490,10 @@ pub(super) fn load_authored_stage_baseline(
     stage_id: &str,
     project_root: &Path,
 ) -> Result<Option<super::SourceFreeStageArchive>> {
+    let project_operation = project_operation_gate(project_root)?;
+    let _project_operation_guard = project_operation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     super::validate_stage_id(stage_id)?;
     let Some(manifest) = inspect_existing_project(project_root)? else {
         return Ok(None);
@@ -468,6 +525,10 @@ pub(super) fn load_authored_stage_baseline(
 }
 
 pub(super) fn discover_authored_stage_ids(project_root: &Path) -> Result<Vec<String>> {
+    let project_operation = project_operation_gate(project_root)?;
+    let _project_operation_guard = project_operation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(manifest) = inspect_existing_project(project_root)? else {
         return Ok(Vec::new());
     };
@@ -712,8 +773,16 @@ enum ProjectEntryFingerprint {
 
 const MAX_PROJECT_OVERLAY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PROJECT_STAGE_BASELINE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PROJECT_DIALOGUE_LIBRARY_BYTES: u64 = 64 * 1024 * 1024;
 
 fn snapshot_project_root(project_root: &Path) -> Result<ProjectSnapshot> {
+    snapshot_project_root_with_hasher(project_root, hash_file)
+}
+
+fn snapshot_project_root_with_hasher(
+    project_root: &Path,
+    mut hash: impl FnMut(&Path) -> Result<u128>,
+) -> Result<ProjectSnapshot> {
     let root_metadata = match fs::symlink_metadata(project_root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -731,8 +800,12 @@ fn snapshot_project_root(project_root: &Path) -> Result<ProjectSnapshot> {
     let mut entries = BTreeMap::new();
     let mut pending = vec![(project_root.to_path_buf(), PathBuf::new())];
     while let Some((directory, relative_directory)) = pending.pop() {
-        for entry in fs::read_dir(directory)? {
-            let entry = entry?;
+        // A live ReadDir search handle prevents Windows from renaming this
+        // directory or any ancestor. Collect the inexpensive directory
+        // entries first so that handle is closed before potentially large
+        // project files are hashed.
+        let directory_entries = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
+        for entry in directory_entries {
             let relative_path = relative_directory.join(entry.file_name());
             let metadata = fs::symlink_metadata(entry.path())?;
             if metadata.file_type().is_symlink() {
@@ -746,7 +819,7 @@ fn snapshot_project_root(project_root: &Path) -> Result<ProjectSnapshot> {
                     relative_path,
                     ProjectEntryFingerprint::File {
                         length: metadata.len(),
-                        hash: hash_file(&entry.path())?,
+                        hash: hash(&entry.path())?,
                     },
                 );
             } else {
@@ -758,6 +831,36 @@ fn snapshot_project_root(project_root: &Path) -> Result<ProjectSnapshot> {
         exists: true,
         entries,
     })
+}
+
+#[cfg(windows)]
+fn rename_project_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
+    retry_windows_permission_denied(|| fs::rename(source, destination), std::thread::sleep)
+}
+
+#[cfg(not(windows))]
+fn rename_project_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn retry_windows_permission_denied(
+    mut operation: impl FnMut() -> std::io::Result<()>,
+    mut sleep: impl FnMut(Duration),
+) -> std::io::Result<()> {
+    let mut retry_index = 0usize;
+    loop {
+        match operation() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    && retry_index < PROJECT_RENAME_RETRY_DELAYS.len() =>
+            {
+                sleep(PROJECT_RENAME_RETRY_DELAYS[retry_index]);
+                retry_index += 1;
+            }
+            result => return result,
+        }
+    }
 }
 
 fn hash_file(path: &Path) -> Result<u128> {
@@ -1219,6 +1322,20 @@ fn normalized_absolute_for_comparison(path: &Path) -> Result<String> {
     }
 }
 
+fn project_operation_gate(project_root: &Path) -> Result<Arc<Mutex<()>>> {
+    let key = normalized_absolute_for_comparison(project_root)?;
+    let gates = PROJECT_OPERATION_GATES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut gates = gates
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
+        return Ok(gate);
+    }
+    let gate = Arc::new(Mutex::new(()));
+    gates.insert(key, Arc::downgrade(&gate));
+    Ok(gate)
+}
+
 fn canonicalize_with_missing_tail(path: &Path) -> PathBuf {
     let mut existing = path;
     let mut missing = Vec::new();
@@ -1248,4 +1365,208 @@ fn path_is_same_or_child(path: &str, parent: &str) -> bool {
         || path
             .strip_prefix(parent)
             .is_some_and(|suffix| suffix.starts_with(separator))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    fn unique_test_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "graffito-project-store-{label}-{}",
+            new_project_id()
+        ))
+    }
+
+    #[test]
+    fn project_operation_gate_blocks_transactional_save_while_reader_is_active() {
+        let fixture_root = unique_test_root("operation-gate");
+        let base_root = fixture_root.join("base");
+        let project_root = fixture_root.join("project");
+        fs::create_dir_all(&base_root).unwrap();
+        let mut document = StageDocument {
+            stage_id: "dolpic".to_string(),
+            base_root,
+            assets: Vec::new(),
+            objects: Vec::new(),
+            changed_files: BTreeMap::new(),
+            stage_archive: None,
+            stage_archive_source_path: None,
+            archive_edits: Default::default(),
+            registry: None,
+            route_authoring: None,
+            goop_authoring: None,
+            dialogue_authoring: None,
+            dialogue_library: Default::default(),
+            load_issues: Vec::new(),
+            lighting: Default::default(),
+            actor_previews: BTreeMap::new(),
+            loaded_project: None,
+        };
+        document.save_project_folder(&project_root).unwrap();
+
+        let reader_gate = project_operation_gate(&project_root).unwrap();
+        let reader_guard = reader_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (saved_tx, saved_rx) = std::sync::mpsc::channel();
+        let worker_root = project_root.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            document.save_project_folder(&worker_root).unwrap();
+            saved_tx.send(()).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(
+            saved_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "a transactional save must wait for the active project reader"
+        );
+        drop(reader_guard);
+        saved_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the queued save should resume after the project reader releases");
+        worker.join().unwrap();
+        fs::remove_dir_all(fixture_root).unwrap();
+    }
+
+    #[test]
+    fn snapshot_releases_directory_search_handle_before_hashing_children() {
+        let root = unique_test_root("snapshot-enumerator");
+        let moved = root.with_extension("moved");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("large-project-file.bin"), b"fixture").unwrap();
+
+        let (hash_started_tx, hash_started_rx) = std::sync::mpsc::channel();
+        let (resume_hash_tx, resume_hash_rx) = std::sync::mpsc::channel();
+        let snapshot_root = root.clone();
+        let worker = std::thread::spawn(move || {
+            snapshot_project_root_with_hasher(&snapshot_root, |_path| {
+                hash_started_tx.send(()).unwrap();
+                resume_hash_rx.recv().unwrap();
+                Ok(0x1234)
+            })
+        });
+
+        hash_started_rx.recv().unwrap();
+        let rename_result = fs::rename(&root, &moved);
+        resume_hash_tx.send(()).unwrap();
+        let snapshot = worker.join().unwrap().unwrap();
+
+        rename_result.expect(
+            "hashing a collected child must not retain the Windows directory search handle",
+        );
+        assert_eq!(
+            snapshot.entries.get(Path::new("large-project-file.bin")),
+            Some(&ProjectEntryFingerprint::File {
+                length: 7,
+                hash: 0x1234,
+            })
+        );
+        fs::remove_dir_all(moved).unwrap();
+    }
+
+    #[test]
+    fn windows_rename_retry_outlives_a_transient_directory_search_lock() {
+        let root = unique_test_root("rename-lock");
+        let moved = root.with_extension("moved");
+        let files = root.join("files");
+        fs::create_dir_all(&files).unwrap();
+        fs::write(files.join("entry.bin"), b"fixture").unwrap();
+
+        let (enumeration_ready_tx, enumeration_ready_rx) = std::sync::mpsc::channel();
+        let (release_enumeration_tx, release_enumeration_rx) = std::sync::mpsc::channel();
+        let (enumeration_dropped_tx, enumeration_dropped_rx) = std::sync::mpsc::channel();
+        let holder_files = files.clone();
+        let holder = std::thread::spawn(move || {
+            let mut enumeration = fs::read_dir(holder_files).unwrap();
+            assert!(enumeration.next().is_some());
+            enumeration_ready_tx.send(()).unwrap();
+            release_enumeration_rx.recv().unwrap();
+            drop(enumeration);
+            enumeration_dropped_tx.send(()).unwrap();
+        });
+        enumeration_ready_rx.recv().unwrap();
+
+        let mut attempts = 0usize;
+        let mut release = Some(release_enumeration_tx);
+        let mut dropped = Some(enumeration_dropped_rx);
+        let result = retry_windows_permission_denied(
+            || {
+                attempts += 1;
+                fs::rename(&root, &moved)
+            },
+            |_delay| {
+                if let Some(release) = release.take() {
+                    release.send(()).unwrap();
+                    dropped.take().unwrap().recv().unwrap();
+                }
+            },
+        );
+        if let Some(release) = release.take() {
+            release.send(()).unwrap();
+            dropped.take().unwrap().recv().unwrap();
+        }
+        holder.join().unwrap();
+
+        result.expect("the retry must succeed after the transient search handle closes");
+        assert!(
+            attempts >= 2,
+            "the live search handle must exercise the PermissionDenied retry"
+        );
+        assert!(moved.join("files/entry.bin").is_file());
+        fs::remove_dir_all(moved).unwrap();
+    }
+
+    #[test]
+    fn windows_rename_retry_is_permission_denied_only_and_bounded() {
+        let mut attempts = 0usize;
+        let mut sleeps = Vec::new();
+        retry_windows_permission_denied(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(std::io::Error::from_raw_os_error(5))
+                } else {
+                    Ok(())
+                }
+            },
+            |delay| sleeps.push(delay),
+        )
+        .unwrap();
+        assert_eq!(attempts, 3);
+        assert_eq!(sleeps, PROJECT_RENAME_RETRY_DELAYS[..2]);
+
+        let mut not_found_attempts = 0usize;
+        let mut not_found_sleeps = 0usize;
+        let error = retry_windows_permission_denied(
+            || {
+                not_found_attempts += 1;
+                Err(std::io::Error::from_raw_os_error(2))
+            },
+            |_delay| not_found_sleeps += 1,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(not_found_attempts, 1);
+        assert_eq!(not_found_sleeps, 0);
+
+        let mut denied_attempts = 0usize;
+        let mut denied_sleeps = 0usize;
+        let error = retry_windows_permission_denied(
+            || {
+                denied_attempts += 1;
+                Err(std::io::Error::from_raw_os_error(5))
+            },
+            |_delay| denied_sleeps += 1,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            denied_attempts,
+            PROJECT_RENAME_RETRY_DELAYS.len().saturating_add(1)
+        );
+        assert_eq!(denied_sleeps, PROJECT_RENAME_RETRY_DELAYS.len());
+    }
 }

@@ -3473,6 +3473,7 @@ dependencies = [
 name = "sms-scene"
 version = "0.1.0"
 dependencies = [
+ "encoding_rs",
  "serde",
  "serde_json",
  "sms-formats",

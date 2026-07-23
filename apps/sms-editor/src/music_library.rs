@@ -3,7 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use regex::Regex;
-use sms_formats::parse_jdrama_scenario_archive_entries;
+use sms_formats::{parse_jdrama_scenario_archive_entries, SMS_TALK_SOUND_LIMIT};
 
 use crate::project::ProjectStageMusic;
 use crate::{SceneArchiveLabel, SmsEditorApp};
@@ -21,6 +21,13 @@ pub(super) struct RetailMusicEntry {
 pub(super) struct RetailSoundEntry {
     pub(super) sound_id: u32,
     pub(super) symbol: String,
+    pub(super) label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RetailDialogueVoiceEntry {
+    pub(super) index: u8,
+    pub(super) sound_id: u32,
     pub(super) label: String,
 }
 
@@ -195,6 +202,81 @@ fn load_retail_bgm_names(base_root: &Path) -> Result<BTreeMap<u32, String>, Stri
 pub(super) fn index_retail_sounds(base_root: &Path) -> Result<Vec<RetailSoundEntry>, String> {
     let bytes = load_retail_sound_assignment_bytes(base_root)?;
     extract_retail_sound_entries(&bytes)
+}
+
+/// Derives Sunshine's dialogue voice choices from the decomp's
+/// `scTalkSoundList` instead of maintaining a parallel editor table.
+pub(super) fn index_retail_dialogue_voices(
+    repo_root: &Path,
+    sounds: &[RetailSoundEntry],
+) -> Result<Vec<RetailDialogueVoiceEntry>, String> {
+    let source_path = repo_root.join("src/GC2D/Talk2D2.cpp");
+    let source = fs::read_to_string(&source_path)
+        .map_err(|error| format!("read {}: {error}", source_path.display()))?;
+    let sound_ids = extract_talk_voice_sound_ids(&source)?;
+    if sound_ids.len() != SMS_TALK_SOUND_LIMIT {
+        return Err(format!(
+            "{} contains {} dialogue voices; Sunshine's TTalk2D2 table requires exactly {}",
+            source_path.display(),
+            sound_ids.len(),
+            SMS_TALK_SOUND_LIMIT
+        ));
+    }
+    sound_ids
+        .into_iter()
+        .enumerate()
+        .map(|(index, sound_id)| {
+            let index = u8::try_from(index).map_err(|_| {
+                format!(
+                    "{} contains more dialogue voices than Sunshine's u8 voice index supports",
+                    source_path.display()
+                )
+            })?;
+            let label = sounds
+                .iter()
+                .find(|entry| entry.sound_id == sound_id)
+                .map(|entry| format!("{} ({})", entry.label, index))
+                .unwrap_or_else(|| {
+                    if sound_id == u32::MAX {
+                        format!("Silent ({index})")
+                    } else {
+                        format!("Voice {index} (0x{sound_id:08X})")
+                    }
+                });
+            Ok(RetailDialogueVoiceEntry {
+                index,
+                sound_id,
+                label,
+            })
+        })
+        .collect()
+}
+
+fn extract_talk_voice_sound_ids(source: &str) -> Result<Vec<u32>, String> {
+    let declaration = source
+        .find("scTalkSoundList")
+        .ok_or_else(|| "Talk2D2.cpp does not declare scTalkSoundList".to_string())?;
+    let body_start = source[declaration..]
+        .find('{')
+        .map(|offset| declaration + offset + 1)
+        .ok_or_else(|| "scTalkSoundList has no initializer".to_string())?;
+    let body_end = source[body_start..]
+        .find('}')
+        .map(|offset| body_start + offset)
+        .ok_or_else(|| "scTalkSoundList initializer is not terminated".to_string())?;
+    let literal = Regex::new(r"0[xX]([0-9A-Fa-f]+)")
+        .map_err(|error| format!("compile talk voice parser: {error}"))?;
+    let values = literal
+        .captures_iter(&source[body_start..body_end])
+        .map(|capture| {
+            u32::from_str_radix(&capture[1], 16)
+                .map_err(|error| format!("invalid scTalkSoundList value: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.is_empty() {
+        return Err("scTalkSoundList contains no voice entries".to_string());
+    }
+    Ok(values)
 }
 
 pub(super) fn index_retail_stage_audio_profiles(
@@ -792,6 +874,21 @@ mod tests {
         assert_eq!(entries[0].sound_id, 0x5000);
         assert_eq!(entries[0].symbol, "MSD_SE_EV_GLOBAL_SEA_L");
         assert_eq!(entries[0].label, "Ev Global Sea L");
+    }
+
+    #[test]
+    fn extracts_dialogue_voice_order_from_decomp_initializer() {
+        let source = r#"
+            static const u32 scTalkSoundList[] = {
+                0x00008850, 0xFFFFFFFF,
+                0X80010025,
+            };
+            static const u32 unrelated[] = { 0xDEADBEEF };
+        "#;
+        assert_eq!(
+            extract_talk_voice_sound_ids(source).unwrap(),
+            vec![0x8850, u32::MAX, 0x8001_0025]
+        );
     }
 
     #[test]

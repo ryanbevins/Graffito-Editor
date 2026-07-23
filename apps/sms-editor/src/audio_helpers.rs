@@ -447,6 +447,8 @@ impl SmsEditorApp {
             &self.saved_objects,
             &self.saved_lighting,
             &self.saved_archive_edits,
+            &self.saved_dialogue_authoring,
+            &self.saved_dialogue_library,
         );
         self.rebuild_audio_cube_helpers_cache();
         self.clear_viewport_preview_cache();

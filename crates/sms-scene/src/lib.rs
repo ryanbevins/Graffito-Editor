@@ -20,6 +20,7 @@ use sms_schema::{
 use thiserror::Error;
 
 mod blank_stage;
+mod dialogue_authoring;
 mod goop_authoring;
 mod object_authoring;
 mod object_parameters;
@@ -36,6 +37,20 @@ pub use blank_stage::{
     BlankStageSkyboxPreset, BlankStageTargetMetadata, BLANK_STAGE_BOOTSTRAP_REQUIREMENTS,
     BLANK_STAGE_CAMERA_DIRECTORY_MARKER_PATH, BLANK_STAGE_COIN_PARTICLE_PATH,
     BLANK_STAGE_PRESET_VERSION, DEFAULT_BLANK_STAGE_TARGET_SLOT,
+};
+pub use dialogue_authoring::{
+    CommonDialogueResourceEdit, CompiledDialogueEdits, DialogueAuthoringDocument,
+    DialogueAuthoringToken, DialogueCallsiteClassification, DialogueCallsiteStatus,
+    DialogueConsumer, DialogueContent, DialogueDomain, DialogueEditScope,
+    DialogueGameConsumerIndex, DialogueMessageRef, DialogueObjectAuthoring, DialogueProvenance,
+    DialogueResolutionIssue, DialogueResolutionSeverity, DialogueRouteIndex, DialogueRouteKind,
+    DialogueSourceAnchor, DialogueStableAllocation, DialogueVariant, DialogueVariantKey,
+    DialogueVariantOverride, ProjectDialogueAllocation, ProjectDialogueLibrary,
+    ProjectDialogueOverride, RuntimeDialogueGuard, RuntimeDialogueOverride,
+    RuntimeDialogueOverrideRequest, BALLOON_DIALOGUE_MESSAGE_PATH,
+    DIALOGUE_AUTHORING_FORMAT_VERSION, GENERATED_DIALOGUE_SCRIPT_MARKER,
+    GENERATED_DIALOGUE_SCRIPT_PATH, PROJECT_DIALOGUE_LIBRARY_FORMAT_VERSION,
+    PROJECT_DIALOGUE_LIBRARY_PATH, STAGE_DIALOGUE_MESSAGE_PATH, SYSTEM_DIALOGUE_MESSAGE_PATH,
 };
 pub use goop_authoring::{
     generate_floor_depth_map, generate_floor_pollution_model, terrain_fingerprint,
@@ -224,6 +239,11 @@ pub struct StageDocument {
     /// Project-side goop layers and masks. Runtime YMP/BMP/BMD resources are
     /// compiled into the semantic archive overlay.
     pub goop_authoring: Option<GoopAuthoringDocument>,
+    /// Per-stage dialogue deltas. The route index is always derived from the
+    /// effective scripts and messages and is never serialized.
+    pub dialogue_authoring: Option<DialogueAuthoringDocument>,
+    /// Project-global common-message deltas and stable allocations.
+    pub dialogue_library: ProjectDialogueLibrary,
     pub load_issues: Vec<ValidationIssue>,
     pub lighting: StageLighting,
     pub actor_previews: BTreeMap<String, ActorPreview>,
@@ -343,6 +363,8 @@ impl StageDocument {
             load_issues,
             route_authoring: None,
             goop_authoring: None,
+            dialogue_authoring: None,
+            dialogue_library: ProjectDialogueLibrary::default(),
             lighting,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
@@ -389,6 +411,8 @@ impl StageDocument {
             load_issues,
             route_authoring: None,
             goop_authoring: None,
+            dialogue_authoring: None,
+            dialogue_library: ProjectDialogueLibrary::default(),
             lighting,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
@@ -457,6 +481,7 @@ impl StageDocument {
         self.lighting = lighting;
         self.route_authoring = None;
         self.goop_authoring = None;
+        self.dialogue_authoring = None;
         self.actor_previews.clear();
         if let Some(registry) = registry {
             self.set_registry(registry);
@@ -1156,6 +1181,7 @@ impl StageDocument {
             lighting: Some(self.lighting.clone()),
             route_authoring: self.route_authoring.clone(),
             goop_authoring: self.goop_authoring.clone(),
+            dialogue_authoring: self.dialogue_authoring.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&overlay)?;
         self.mark_changed_file(path, bytes)?;
@@ -1167,6 +1193,19 @@ impl StageDocument {
         Ok(PathBuf::from("editor")
             .join("stages")
             .join(format!("{}.stage.json", self.stage_id)))
+    }
+
+    pub fn dialogue_library_path(&self) -> PathBuf {
+        PathBuf::from(PROJECT_DIALOGUE_LIBRARY_PATH)
+    }
+
+    fn queue_dialogue_library_change(&mut self) -> Result<()> {
+        if self.dialogue_library.is_empty() {
+            self.changed_files.remove(&self.dialogue_library_path());
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec_pretty(&self.dialogue_library)?;
+        self.mark_changed_file(self.dialogue_library_path(), bytes)
     }
 
     fn queue_authored_stage_baseline_change(&mut self) -> Result<()> {
@@ -1194,6 +1233,7 @@ impl StageDocument {
         project_root: impl AsRef<Path>,
     ) -> Result<ProjectSaveOutcome> {
         self.queue_editor_overlay_change()?;
+        self.queue_dialogue_library_change()?;
         self.queue_authored_stage_baseline_change()?;
         let project_root = project_root.as_ref();
         let loaded_root = if project_root.is_absolute() {
@@ -1251,6 +1291,8 @@ pub struct EditorSceneOverlay {
     pub route_authoring: Option<RouteAuthoringDocument>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goop_authoring: Option<GoopAuthoringDocument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialogue_authoring: Option<DialogueAuthoringDocument>,
     /// `None` preserves compatibility with older overlays, whose lighting is
     /// inherited from the semantic stage baseline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3120,6 +3162,8 @@ mod tests {
             registry: None,
             route_authoring: None,
             goop_authoring: None,
+            dialogue_authoring: None,
+            dialogue_library: ProjectDialogueLibrary::default(),
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
             actor_previews: BTreeMap::new(),
@@ -3217,6 +3261,8 @@ mod tests {
             registry: None,
             route_authoring: None,
             goop_authoring: None,
+            dialogue_authoring: None,
+            dialogue_library: ProjectDialogueLibrary::default(),
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
             actor_previews: BTreeMap::new(),
@@ -3348,6 +3394,8 @@ mod tests {
             registry: None,
             route_authoring: None,
             goop_authoring: None,
+            dialogue_authoring: None,
+            dialogue_library: ProjectDialogueLibrary::default(),
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
             actor_previews: BTreeMap::new(),
@@ -4286,6 +4334,8 @@ mod tests {
             registry: None,
             route_authoring: None,
             goop_authoring: None,
+            dialogue_authoring: None,
+            dialogue_library: ProjectDialogueLibrary::default(),
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
             actor_previews: BTreeMap::new(),

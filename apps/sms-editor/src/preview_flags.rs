@@ -625,6 +625,8 @@ mod tests {
             registry: Some(registry),
             route_authoring: None,
             goop_authoring: None,
+            dialogue_authoring: None,
+            dialogue_library: Default::default(),
             load_issues: Vec::new(),
             lighting: Default::default(),
             actor_previews: BTreeMap::new(),
