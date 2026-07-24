@@ -2,7 +2,7 @@
 
 # Graffito Editor
 
-**A native, data-driven level editor for _Super Mario Sunshine_.**
+**An integrated, data-driven authoring environment for _Super Mario Sunshine_.**
 
 [![CI](https://github.com/ryanbevins/Graffito-Editor/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ryanbevins/Graffito-Editor/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -21,10 +21,11 @@
 > before the first release. Keep backups and manually verify built stages in
 > Dolphin before relying on them.
 
-Graffito Editor is a Rust-native scene editor, asset pipeline, and managed build
-system for _Super Mario Sunshine_. The current source can inspect retail stages,
-create source-free custom stages, author game-backed content, build a protected
-runnable copy of the game, and launch the open stage directly in Dolphin.
+Graffito Editor is a Rust-native toolchain for authoring, compiling, building,
+and testing _Super Mario Sunshine_ content. The current source can inspect
+retail stages, create source-free custom stages, author game-backed content,
+build a protected runnable copy of the game, and launch the open stage directly
+in Dolphin.
 
 The editor works from a user-supplied, legally obtained game extraction. It does
 not include Nintendo assets, and it never edits the extracted base game.
