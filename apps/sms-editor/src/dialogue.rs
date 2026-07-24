@@ -762,6 +762,12 @@ impl SmsEditorApp {
                 ui.label("Voice");
                 let mut selected_voice = content.voice_index;
                 let previous_voice = selected_voice;
+                let previous_preview_target = selected_voice.and_then(|index| {
+                    self.retail_dialogue_voices
+                        .iter()
+                        .find(|entry| entry.index == index)
+                        .and_then(|entry| dialogue_voice_preview_target(entry.sound_id))
+                });
                 let selected_label = selected_voice
                     .and_then(|index| {
                         self.retail_dialogue_voices
@@ -773,7 +779,7 @@ impl SmsEditorApp {
                     .unwrap_or_else(|| "Unspecified".to_string());
                 egui::ComboBox::from_id_salt("dialogue-voice")
                     .selected_text(selected_label)
-                    .width((ui.available_width() - 8.0).max(120.0))
+                    .width((ui.available_width() - 82.0).max(120.0))
                     .show_ui(ui, |ui| {
                         if selected_voice.is_none() {
                             ui.selectable_value(&mut selected_voice, None, "Unspecified");
@@ -797,7 +803,51 @@ impl SmsEditorApp {
                     {
                         *attribute = voice;
                     }
+                    if previous_preview_target
+                        .is_some_and(|target| self.audio_preview_target_is_active(target))
+                    {
+                        self.stop_audio_preview();
+                    }
                     edit.discrete_change();
+                }
+                let selected_sound = selected_voice.and_then(|index| {
+                    self.retail_dialogue_voices
+                        .iter()
+                        .find(|entry| entry.index == index)
+                        .map(|entry| entry.sound_id)
+                });
+                let preview_target = selected_sound.and_then(dialogue_voice_preview_target);
+                let previewing = preview_target
+                    .is_some_and(|target| self.audio_preview_target_is_active(target));
+                let loading = preview_target
+                    .is_some_and(|target| self.audio_preview_target_is_loading(target));
+                let preview_response = ui.add_enabled(
+                    preview_target.is_some(),
+                    egui::Button::new(if previewing || loading {
+                        "Stop"
+                    } else {
+                        "Preview"
+                    })
+                    .small(),
+                );
+                if preview_response
+                    .on_hover_text(dialogue_voice_preview_tooltip(
+                        selected_voice,
+                        selected_sound,
+                        loading,
+                    ))
+                    .clicked()
+                {
+                    if previewing || loading {
+                        self.stop_audio_preview();
+                    } else if let Some(target) = preview_target {
+                        match target {
+                            AudioPreviewTarget::Music(bgm_id) => self.preview_bgm_now(bgm_id),
+                            AudioPreviewTarget::Sound(sound_id) => {
+                                self.preview_sound_now(sound_id)
+                            }
+                        }
+                    }
                 }
             });
             if self.retail_dialogue_voices.is_empty() {
@@ -1282,6 +1332,38 @@ fn dialogue_message_is_empty(content: &DialogueContent) -> bool {
     })
 }
 
+fn dialogue_voice_preview_target(sound_id: u32) -> Option<AudioPreviewTarget> {
+    if sound_id == u32::MAX {
+        None
+    } else if sound_id & 0x8000_0000 != 0 {
+        Some(AudioPreviewTarget::Music(sound_id))
+    } else {
+        Some(AudioPreviewTarget::Sound(sound_id))
+    }
+}
+
+fn dialogue_voice_preview_tooltip(
+    voice_index: Option<u8>,
+    sound_id: Option<u32>,
+    loading: bool,
+) -> String {
+    match (voice_index, sound_id) {
+        (Some(index), Some(u32::MAX)) => {
+            format!("TTalk2D2 voice {index} is silent and has no sample to preview")
+        }
+        (Some(index), Some(sound_id)) if loading => {
+            format!("Rendering TTalk2D2 voice {index} from Sunshine sound 0x{sound_id:08X}")
+        }
+        (Some(index), Some(sound_id)) => {
+            format!("Preview TTalk2D2 voice {index} from Sunshine sound 0x{sound_id:08X}")
+        }
+        (Some(index), None) => {
+            format!("Voice {index} is not present in the decomp-derived voice catalog")
+        }
+        (None, _) => "Select a dialogue voice to preview it".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1345,6 +1427,26 @@ mod tests {
             Some([DialogueAuthoringToken::Control(SmsBmgControl::Choice { text, .. })])
                 if text.ends_with('\u{1F600}')
         ));
+    }
+
+    #[test]
+    fn dialogue_voice_preview_matches_talk2d_dispatch_semantics() {
+        assert_eq!(
+            dialogue_voice_preview_target(0x0000_8850),
+            Some(AudioPreviewTarget::Sound(0x0000_8850))
+        );
+        assert_eq!(
+            dialogue_voice_preview_target(0x8001_0025),
+            Some(AudioPreviewTarget::Music(0x8001_0025))
+        );
+        assert_eq!(dialogue_voice_preview_target(u32::MAX), None);
+    }
+
+    #[test]
+    fn dialogue_voice_preview_tooltip_explains_silent_and_missing_entries() {
+        assert!(dialogue_voice_preview_tooltip(Some(70), Some(u32::MAX), false).contains("silent"));
+        assert!(dialogue_voice_preview_tooltip(Some(4), None, false).contains("not present"));
+        assert!(dialogue_voice_preview_tooltip(None, None, false).contains("Select"));
     }
 
     #[test]

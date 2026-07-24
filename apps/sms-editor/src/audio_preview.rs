@@ -58,11 +58,13 @@ impl SmsEditorApp {
     }
 
     pub(super) fn sound_preview_is_active(&self, sound_id: u32) -> bool {
+        self.audio_preview_target_is_active(AudioPreviewTarget::Sound(sound_id))
+    }
+
+    pub(super) fn audio_preview_target_is_active(&self, target: AudioPreviewTarget) -> bool {
         self.audio_preview_playback
             .as_ref()
-            .is_some_and(|playback| {
-                playback.target == AudioPreviewTarget::Sound(sound_id) && !playback.player.empty()
-            })
+            .is_some_and(|playback| playback.target == target && !playback.player.empty())
     }
 
     pub(super) fn audio_preview_is_loading(&self) -> bool {
@@ -328,6 +330,7 @@ struct InstrumentRegion {
     wave_id: u16,
     volume: f32,
     pitch: f32,
+    key_scaled: bool,
     pan: f32,
     fxmix: f32,
     oscillators: Vec<OscillatorSpec>,
@@ -337,6 +340,7 @@ struct InstrumentRegion {
 struct RegionParameters {
     volume: f32,
     pitch: f32,
+    key_scaled: bool,
     pan: f32,
     fxmix: f32,
     oscillators: Vec<OscillatorSpec>,
@@ -501,6 +505,7 @@ impl AudioAssets {
                 RegionParameters {
                     volume: inst_volume * effects.volume,
                     pitch: inst_pitch * effects.pitch,
+                    key_scaled: true,
                     pan: effects.pan.unwrap_or(0.5),
                     fxmix: effects.fxmix.unwrap_or(0.0),
                     oscillators,
@@ -565,6 +570,7 @@ impl AudioAssets {
                 RegionParameters {
                     volume: volume * effects.volume,
                     pitch: pitch * effects.pitch,
+                    key_scaled: false,
                     pan: effects.pan.unwrap_or(pan),
                     fxmix: effects.fxmix.unwrap_or(0.0),
                     oscillators: Vec::new(),
@@ -947,6 +953,16 @@ fn jaudio_random(state: &mut u32) -> f32 {
     f32::from_bits((*state >> 9) | 0x3f80_0000) - 1.0
 }
 
+fn jaudio_key_pitch_ratio(note: u8, root_key: u8, key_scaled: bool) -> f64 {
+    if !key_scaled {
+        // JASDrumSet marks its regions as percussion. The key chooses a
+        // sample, but JASBankMgr does not apply the C5 pitch table to it.
+        return 1.0;
+    }
+    let table_index = (i32::from(note) + 60 - i32::from(root_key)).clamp(0, 127);
+    2.0f64.powf(f64::from(table_index - 60) / 12.0)
+}
+
 fn parse_vmap(
     bytes: &[u8],
     offset: usize,
@@ -956,6 +972,7 @@ fn parse_vmap(
         wave_id: be_u32(bytes, offset + 4, "wave id")? as u16,
         volume: parameters.volume * be_f32(bytes, offset + 8, "region volume")?,
         pitch: parameters.pitch * be_f32(bytes, offset + 0x0c, "region pitch")?,
+        key_scaled: parameters.key_scaled,
         pan: parameters.pan,
         fxmix: parameters.fxmix,
         oscillators: parameters.oscillators,
@@ -1118,8 +1135,10 @@ const RESAMPLE_FILTER: [i16; 256] = [
 struct Track {
     pc: usize,
     wait: u32,
+    wait_for_note_end: bool,
     finished: bool,
-    transpose: i16,
+    local_transpose: i16,
+    effective_transpose: i16,
     registers: [u16; 64],
     volume: f32,
     pitch: f32,
@@ -1155,6 +1174,7 @@ struct Track {
     interrupt_timer_remaining: u32,
     timed_moves: [Option<TimedMove>; 12],
     pending_closes: Vec<usize>,
+    pending_port_writes: Vec<PendingPortWrite>,
 }
 
 #[derive(Clone, Copy)]
@@ -1171,8 +1191,10 @@ impl Track {
         Self {
             pc,
             wait: 0,
+            wait_for_note_end: false,
             finished: false,
-            transpose: 0,
+            local_transpose: 0,
+            effective_transpose: 0,
             registers,
             volume: 1.0,
             pitch: 0.0,
@@ -1206,6 +1228,7 @@ impl Track {
             interrupt_timer_remaining: 0,
             timed_moves: [None; 12],
             pending_closes: Vec::new(),
+            pending_port_writes: Vec::new(),
         }
     }
 
@@ -1215,10 +1238,23 @@ impl Track {
         child.tempo = parent.tempo;
         child.timebase = parent.timebase;
         child.inherit_parent_mix = mode & 1 == 0;
+        child.effective_transpose = parent.effective_transpose;
         if mode & 2 == 0 {
             child.registers = parent.registers;
         }
         child
+    }
+
+    fn refresh_effective_transpose(&mut self, parent_effective_transpose: i16) {
+        self.effective_transpose = self
+            .local_transpose
+            .wrapping_add(parent_effective_transpose);
+    }
+
+    fn set_local_transpose(&mut self, transpose: i16) {
+        let parent_transpose = self.effective_transpose.wrapping_sub(self.local_transpose);
+        self.local_transpose = transpose;
+        self.refresh_effective_transpose(parent_transpose);
     }
 
     fn reg(&self, register: u8) -> u16 {
@@ -1502,14 +1538,18 @@ impl Track {
     }
 
     fn write_import_port(&mut self, port: usize, value: u16) {
+        self.write_import_port_direct(port, value);
+        if port <= 1 {
+            self.pending_interrupts |= 1 << if port == 0 { 3 } else { 4 };
+        }
+    }
+
+    fn write_import_port_direct(&mut self, port: usize, value: u16) {
         if port >= self.port_values.len() {
             return;
         }
         self.port_values[port] = value;
         self.import_flags |= 1 << port;
-        if port <= 1 {
-            self.pending_interrupts |= 1 << if port == 0 { 3 } else { 4 };
-        }
     }
 
     fn read_import_port(&mut self, port: usize) -> u16 {
@@ -1861,12 +1901,26 @@ enum TrackRelation {
     Sibling,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PendingTrack {
     offset: usize,
     slot: u8,
     mode: u8,
     relation: TrackRelation,
+    initial_ports: Vec<(usize, u16)>,
+}
+
+#[derive(Clone, Copy)]
+enum PendingPortTarget {
+    Parent,
+    Child(usize),
+}
+
+#[derive(Clone, Copy)]
+struct PendingPortWrite {
+    target: PendingPortTarget,
+    port: usize,
+    value: u16,
 }
 
 fn render_bgm_preview(base_root: &Path, bgm_id: u32, seconds: f32) -> Result<Vec<f32>, String> {
@@ -1901,6 +1955,8 @@ fn render_sequence_preview(
     let mut sequence_frame_clock = 0.0f64;
     let mut mixed_sequence_frames = 0usize;
     let mut sound_triggered = sound_trigger.is_none();
+    let mut sound_trigger_track = None;
+    let mut sound_trigger_candidates = String::new();
     let mut voice_errors = Vec::new();
 
     while output.len() / 2 < max_frames && tracks.iter().any(|track| !track.finished) {
@@ -1913,11 +1969,18 @@ fn render_sequence_preview(
                 track_index += 1;
                 continue;
             }
+            let parent_transpose = tracks[track_index]
+                .parent
+                .map(|parent| tracks[parent].effective_transpose)
+                .unwrap_or(0);
+            tracks[track_index].refresh_effective_transpose(parent_transpose);
             advanced[track_index] = true;
             tracks[track_index].advance_interrupts();
             let mut children = Vec::new();
             let interrupted = tracks[track_index].begin_pending_interrupt();
-            if interrupted || sequence_tick_ready(&mut tracks[track_index]) {
+            let waiting_for_note = !interrupted
+                && track_waiting_for_note_end(&mut tracks[track_index], track_index, &voices);
+            if interrupted || (!waiting_for_note && sequence_tick_ready(&mut tracks[track_index])) {
                 process_track(
                     &sequence,
                     &mut tracks[track_index],
@@ -1936,6 +1999,16 @@ fn render_sequence_preview(
                         hex_preview(&sequence, tracks[track_index].pc.saturating_sub(32), 64)
                     )
                 })?;
+            }
+            let pending_port_writes = std::mem::take(&mut tracks[track_index].pending_port_writes);
+            for write in pending_port_writes {
+                let target = match write.target {
+                    PendingPortTarget::Parent => tracks[track_index].parent,
+                    PendingPortTarget::Child(slot) => tracks[track_index].children[slot],
+                };
+                if let Some(target) = target {
+                    tracks[target].write_import_port_direct(write.port, write.value);
+                }
             }
             let pending_closes = std::mem::take(&mut tracks[track_index].pending_closes);
             for child in pending_closes {
@@ -1959,12 +2032,15 @@ fn render_sequence_preview(
                 }
                 // JASTrack::mainProc visits a newly opened child later in the
                 // same sequence update, so it must not lose its first tick.
-                let child = Track::new_child(
+                let mut child = Track::new_child(
                     pending.offset,
                     parent_index,
                     &tracks[parent_index],
                     pending.mode,
                 );
+                for (port, value) in pending.initial_ports {
+                    child.write_import_port_direct(port, value);
+                }
                 let child_index = if let Some(previous) = previous {
                     tracks[previous] = child;
                     previous
@@ -1993,6 +2069,22 @@ fn render_sequence_preview(
             let category = ((trigger.id >> 12) & 0x0f) as u16;
             let candidate = sound_dispatcher_track(&tracks, category);
             if let Some(index) = candidate {
+                sound_trigger_candidates = tracks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, track)| {
+                        track.export_flags & (1 << 9) != 0 && track.port_values[9] == category
+                    })
+                    .map(|(index, track)| {
+                        format!(
+                            "{index}/route={:?}/status={}/pc=0x{:X}",
+                            sound_dispatcher_global_index(&tracks, index),
+                            track.port_values[0],
+                            track.pc
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
                 tracks[index].external_volume = trigger.volume;
                 tracks[index].external_pitch = trigger.pitch;
                 tracks[index].external_fxmix = trigger.fxmix;
@@ -2003,6 +2095,7 @@ fn render_sequence_preview(
                 tracks[index].write_import_port(6, 0);
                 tracks[index].write_import_port(4, (trigger.id & 0x3ff) as u16);
                 tracks[index].write_import_port(0, 1);
+                sound_trigger_track = Some(index);
                 sound_triggered = true;
             }
         }
@@ -2024,20 +2117,23 @@ fn render_sequence_preview(
     if output.is_empty() {
         return Err("the selected sequence produced no preview audio".to_string());
     }
-    if sound_trigger.is_some() && !output.iter().any(|sample| sample.abs() > 0.0001) {
-        let detail = if voice_errors.is_empty() {
-            "the retail event did not emit a playable note without its in-game scene or actor parameters"
-                .to_string()
-        } else {
-            voice_errors.join("; ")
-        };
-        return Err(format!(
-            "the sound-effect dispatcher produced silence: {detail}"
-        ));
+    if !output.iter().any(|sample| sample.abs() > 0.0001) {
+        if let Some(trigger) = sound_trigger {
+            let trigger_id = trigger.id;
+            let detail = if voice_errors.is_empty() {
+                "the retail event did not emit a playable note without its in-game scene or actor parameters"
+                    .to_string()
+            } else {
+                voice_errors.join("; ")
+            };
+            return Err(format!(
+                "the sound-effect dispatcher produced silence for resolved ID 0x{trigger_id:08X} sent to track {sound_trigger_track:?} among [{sound_trigger_candidates}]: {detail}"
+            ));
+        }
     }
     apply_jaudio_reverb(&mut output, &reverb_send, &assets.fx_lines);
     if sound_trigger.is_some() {
-        apply_preview_peak_guard(&mut output);
+        normalize_sound_preview_peak(&mut output);
     }
     for sample in &mut output {
         *sample = sample.clamp(-1.0, 32767.0 / 32768.0);
@@ -2050,10 +2146,32 @@ fn sound_dispatcher_track(tracks: &[Track], category: u16) -> Option<usize> {
         .iter()
         .enumerate()
         .skip(1)
-        .find_map(|(index, track)| {
-            (track.export_flags & (1 << 9) != 0 && track.port_values[9] == category)
-                .then_some(index)
+        .filter_map(|(index, track)| {
+            let published_category =
+                track.export_flags & (1 << 9) != 0 && track.port_values[9] == category;
+            let published_status = track.export_flags & 1 != 0;
+            (published_category && published_status)
+                .then(|| (sound_dispatcher_global_index(tracks, index), index))
         })
+        .min_by_key(|(global_index, index)| (global_index.unwrap_or(usize::MAX), *index))
+        .map(|(_, index)| index)
+}
+
+fn sound_dispatcher_global_index(tracks: &[Track], track_index: usize) -> Option<usize> {
+    let parent_index = tracks.get(track_index)?.parent?;
+    let parent = tracks.get(parent_index)?;
+    if parent.parent != Some(0) {
+        return None;
+    }
+    let parent_slot = tracks[0]
+        .children
+        .iter()
+        .position(|child| *child == Some(parent_index))?;
+    let child_slot = parent
+        .children
+        .iter()
+        .position(|child| *child == Some(track_index))?;
+    Some(parent_slot * 16 + child_slot)
 }
 
 fn hex_preview(bytes: &[u8], offset: usize, size: usize) -> String {
@@ -2147,12 +2265,16 @@ fn apply_jaudio_reverb(
     }
 }
 
-fn apply_preview_peak_guard(samples: &mut [f32]) {
-    const TARGET_PEAK: f32 = 0.95;
+fn normalize_sound_preview_peak(samples: &mut [f32]) {
+    // Retail SE attenuation includes actor distance, category, and nested
+    // dispatcher-track gains. Those values are meaningful in the game mix,
+    // but can make an isolated browser sample effectively inaudible. Preserve
+    // the rendered waveform while normalizing only its final audition gain.
+    const TARGET_PEAK: f32 = 0.8;
     let peak = samples
         .iter()
         .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
-    if peak <= TARGET_PEAK {
+    if peak <= f32::EPSILON {
         return;
     }
     let gain = TARGET_PEAK / peak;
@@ -2264,12 +2386,15 @@ fn process_track(
         *commands += 1;
         trace.rotate_left(1);
         trace[15] = track.pc;
+        let command_offset = track.pc;
         let flag = read_u8(sequence, &mut track.pc, "sequence command")?;
         if flag < 0x80 {
             let mode = read_u8(sequence, &mut track.pc, "note mode")?;
-            let mut note = flag.wrapping_add(track.transpose as u8);
+            let mut note = flag.wrapping_add(track.effective_transpose as u8);
             if mode & 0x80 != 0 {
-                note = track.reg(note).wrapping_add(track.transpose as u16) as u8;
+                note = track
+                    .reg(note)
+                    .wrapping_add(track.effective_transpose as u16) as u8;
             }
             let velocity_raw = read_u8(sequence, &mut track.pc, "note velocity")?;
             let velocity = if velocity_raw >= 0x80 {
@@ -2303,14 +2428,12 @@ fn process_track(
             };
             let bank = (track.registers[6] >> 8) as u8;
             let program = track.registers[6] as u8;
-            let gate_ticks =
-                duration.map(|duration| (duration as u64 * gate as u64 / 100).max(1) as u32);
+            let gate_ticks = note_gate_ticks(duration, gate);
             match assets.instrument_region(bank, program, note, velocity) {
                 Ok((wave_bank, region)) => match assets.decoded_wave(wave_bank, region.wave_id) {
                     Ok(wave) => {
-                        let semitones = note as f32 - wave.root_key as f32;
                         let base_step = wave.sample_rate as f64 / OUTPUT_RATE as f64
-                            * 2.0f64.powf(semitones as f64 / 12.0)
+                            * jaudio_key_pitch_ratio(note, wave.root_key, region.key_scaled)
                             * region.pitch as f64;
                         let id = *next_voice_id;
                         *next_voice_id += 1;
@@ -2348,10 +2471,26 @@ fn process_track(
                     }
                     Err(error) => push_voice_error(voice_errors, error),
                 },
-                Err(error) => push_voice_error(voice_errors, error),
+                Err(error) => push_voice_error(
+                    voice_errors,
+                    format!(
+                        "{error} for track {track_index} at 0x{command_offset:X}, note command 0x{flag:02X}/0x{mode:02X}, bank {bank}, program 0x{program:02X}, key {note}, velocity {velocity}, local transpose {}, effective transpose {}, registers {:04X?}",
+                        track.local_transpose,
+                        track.effective_transpose,
+                        &track.registers[..16]
+                    ),
+                ),
             }
             if let Some(duration) = duration {
-                track.wait = duration.max(1);
+                // TChannel::play turns a zero DSP duration into -1. JASTrack
+                // then waits until slot zero's channel naturally finishes.
+                // Dialogue voices use this form for full one-shot playback.
+                if duration == 0 {
+                    track.wait_for_note_end = true;
+                    track.wait = 0;
+                } else {
+                    track.wait = duration;
+                }
                 return Ok(());
             }
         } else if flag & 0xf0 == 0x80 && flag & 7 == 0 {
@@ -2429,6 +2568,29 @@ fn push_voice_error(errors: &mut Vec<String>, error: String) {
     if errors.len() < 8 && !errors.contains(&error) {
         errors.push(error);
     }
+}
+
+fn note_gate_ticks(duration: Option<u32>, gate: u8) -> Option<u32> {
+    duration.and_then(|duration| {
+        (duration != 0).then(|| (duration as u64 * gate as u64 / 100).max(1) as u32)
+    })
+}
+
+fn track_waiting_for_note_end(track: &mut Track, track_index: usize, voices: &[Voice]) -> bool {
+    if !track.wait_for_note_end {
+        return false;
+    }
+    let voice_is_active = track.slots[0].is_some_and(|id| {
+        voices
+            .iter()
+            .any(|voice| voice.id == id && voice.owner_track == track_index)
+    });
+    if voice_is_active {
+        return true;
+    }
+    track.wait_for_note_end = false;
+    track.slots[0] = None;
+    false
 }
 
 const COMMAND_ARGS: [(u16, u16); 64] = [
@@ -2574,10 +2736,8 @@ fn process_command(
                 } else {
                     TrackRelation::Sibling
                 },
+                initial_ports: Vec::new(),
             });
-            // Opening is immediate in JASTrack. Yield so the owning track list
-            // can install the child before this sequence observes register 0x2c.
-            return Ok(true);
         }
         0xc6 if condition_matches(track.reg(3), args[0] as u8) => {
             if let Some(pc) = track.call_stack.pop() {
@@ -2620,10 +2780,30 @@ fn process_command(
             track.wait = args[0];
             return Ok(track.wait > 0);
         }
+        0xd1 => track.pending_port_writes.push(PendingPortWrite {
+            target: PendingPortTarget::Parent,
+            port: args[0] as usize & 0x0f,
+            value: args[1] as u16,
+        }),
+        0xd2 => {
+            let slot = args[0] as usize >> 4;
+            let port = args[0] as usize & 0x0f;
+            if let Some(pending) = children.iter_mut().rev().find(|pending| {
+                matches!(pending.relation, TrackRelation::Child) && pending.slot as usize == slot
+            }) {
+                pending.initial_ports.push((port, args[1] as u16));
+            } else {
+                track.pending_port_writes.push(PendingPortWrite {
+                    target: PendingPortTarget::Child(slot),
+                    port,
+                    value: args[1] as u16,
+                });
+            }
+        }
         0xd6 => track.set_simple_oscillator(args[0] as u8),
         0xd7 => track.set_simple_envelope(sequence, args[0] as u8, args[1] as usize)?,
         0xd8 => track.set_simple_adsr(&args[..5]),
-        0xd9 => track.transpose = args[0] as u8 as i8 as i16,
+        0xd9 => track.set_local_transpose(args[0] as u8 as i8 as i16),
         0xda => {
             let slot = (args[0] as usize).min(15);
             if let Some(child) = track.children[slot].take() {
@@ -2741,7 +2921,7 @@ fn parse_register_param(sequence: &[u8], track: &mut Track, mut mode: u8) -> Res
         operation = mode & 0xf0;
     }
     let destination = read_u8(sequence, &mut track.pc, "register destination")?;
-    let source = match source_kind {
+    let mut source = match source_kind {
         0 => {
             let reg = read_u8(sequence, &mut track.pc, "register source")?;
             track.reg(reg) as i16 as i32
@@ -2757,6 +2937,12 @@ fn parse_register_param(sequence: &[u8], track: &mut Track, mut mode: u8) -> Res
         }
         _ => read_be_value(sequence, &mut track.pc, 2, "register immediate")? as u16 as i16 as i32,
     };
+    // JASTrack::writeRegParam only sign-extends the compact one-byte
+    // immediate for arithmetic where that byte represents a delta. Direct
+    // assignment and bitwise operations retain its unsigned value.
+    if source_kind == 4 && matches!(operation, 1 | 0x10 | 0x20) {
+        source = i32::from(source as u8 as i8);
+    }
     let current = track.reg(destination) as i16 as i32;
     if operation == 2 {
         let product = current.wrapping_mul(source);
@@ -3163,17 +3349,75 @@ mod tests {
     }
 
     #[test]
+    fn zero_duration_notes_play_until_the_one_shot_wave_finishes() {
+        assert_eq!(note_gate_ticks(Some(0), 100), None);
+        assert_eq!(note_gate_ticks(Some(20), 50), Some(10));
+
+        let mut track = Track::new(0);
+        track.wait_for_note_end = true;
+        track.slots[0] = Some(7);
+        assert!(!track_waiting_for_note_end(&mut track, 2, &[]));
+        assert!(!track.wait_for_note_end);
+        assert_eq!(track.slots[0], None);
+    }
+
+    #[test]
     fn sound_dispatch_never_falls_back_to_the_wrong_category() {
         let root = Track::new(0);
         let mut category_zero = Track::new(0);
-        category_zero.export_flags = 1 << 9;
+        category_zero.export_flags = (1 << 9) | 1;
         category_zero.port_values[9] = 0;
         let mut category_three = Track::new(0);
-        category_three.export_flags = 1 << 9;
+        category_three.export_flags = (1 << 9) | 1;
         category_three.port_values[9] = 3;
         let tracks = [root, category_zero, category_three];
         assert_eq!(sound_dispatcher_track(&tracks, 3), Some(2));
         assert_eq!(sound_dispatcher_track(&tracks, 5), None);
+    }
+
+    #[test]
+    fn sound_dispatch_waits_for_the_track_status_export() {
+        let root = Track::new(0);
+        let mut initializing = Track::new(0);
+        initializing.export_flags = 1 << 9;
+        initializing.port_values[9] = 8;
+        let mut ready = initializing.clone();
+        ready.export_flags |= 1;
+        let tracks = [root, initializing];
+        assert_eq!(sound_dispatcher_track(&tracks, 8), None);
+        let tracks = [Track::new(0), ready];
+        assert_eq!(sound_dispatcher_track(&tracks, 8), Some(1));
+    }
+
+    #[test]
+    fn sound_dispatch_uses_the_lowest_retail_route_slot() {
+        let mut root = Track::new(0);
+        let mut parent_zero = Track::new(0);
+        parent_zero.parent = Some(0);
+        let mut parent_one = Track::new(0);
+        parent_one.parent = Some(0);
+        let mut later_allocated_low_slot = Track::new(0);
+        later_allocated_low_slot.parent = Some(1);
+        later_allocated_low_slot.export_flags = (1 << 9) | 1;
+        later_allocated_low_slot.port_values[9] = 8;
+        let mut earlier_allocated_high_slot = later_allocated_low_slot.clone();
+        earlier_allocated_high_slot.parent = Some(2);
+
+        root.children[0] = Some(1);
+        root.children[1] = Some(2);
+        parent_zero.children[5] = Some(4);
+        parent_one.children[0] = Some(3);
+        let tracks = [
+            root,
+            parent_zero,
+            parent_one,
+            earlier_allocated_high_slot,
+            later_allocated_low_slot,
+        ];
+
+        assert_eq!(sound_dispatcher_global_index(&tracks, 3), Some(16));
+        assert_eq!(sound_dispatcher_global_index(&tracks, 4), Some(5));
+        assert_eq!(sound_dispatcher_track(&tracks, 8), Some(4));
     }
 
     #[test]
@@ -3191,6 +3435,69 @@ mod tests {
     }
 
     #[test]
+    fn direct_track_port_writes_do_not_request_interrupts() {
+        let mut track = Track::new(0);
+        track.write_import_port_direct(0, 0x50);
+        assert_eq!(track.port_values[0], 0x50);
+        assert_eq!(track.import_flags & 1, 1);
+        assert_eq!(track.pending_interrupts, 0);
+    }
+
+    #[test]
+    fn child_port_command_forwards_a_register_value() {
+        let mut track = Track::new(0);
+        track.set_reg(4, 0x50);
+        let mut children = Vec::new();
+        let mut voices = Vec::new();
+        process_command(
+            &[0x00, 0x04],
+            &mut track,
+            0,
+            0xd2,
+            0,
+            &mut children,
+            &mut voices,
+        )
+        .unwrap();
+        let write = track.pending_port_writes.pop().unwrap();
+        assert!(matches!(write.target, PendingPortTarget::Child(0)));
+        assert_eq!(write.port, 0);
+        assert_eq!(write.value, 0x50);
+    }
+
+    #[test]
+    fn newly_opened_child_receives_ports_before_its_first_tick() {
+        let mut track = Track::new(0);
+        track.set_reg(4, 0x50);
+        let mut children = Vec::new();
+        let mut voices = Vec::new();
+        process_command(
+            &[0x00, 0x00, 0x98, 0x1e],
+            &mut track,
+            0,
+            0xc1,
+            0,
+            &mut children,
+            &mut voices,
+        )
+        .unwrap();
+        track.pc = 0;
+        process_command(
+            &[0x00, 0x04],
+            &mut track,
+            0,
+            0xd2,
+            0,
+            &mut children,
+            &mut voices,
+        )
+        .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].initial_ports, [(0, 0x50)]);
+        assert!(track.pending_port_writes.is_empty());
+    }
+
+    #[test]
     fn child_local_tempo_uses_jaudio_parent_ratio() {
         let root = Track::new(0);
         let mut child = Track::new_child(1, 0, &root, 0);
@@ -3200,6 +3507,29 @@ mod tests {
         let advanced = [true, false];
         assert!(!track_tick_due(&mut tracks, 1, &advanced));
         assert!(track_tick_due(&mut tracks, 1, &advanced));
+    }
+
+    #[test]
+    fn child_effective_transpose_includes_the_parent_chain() {
+        let mut root = Track::new(0);
+        root.set_local_transpose(-64);
+        let mut child = Track::new_child(1, 0, &root, 0);
+        assert_eq!(child.effective_transpose, -64);
+
+        child.set_local_transpose(4);
+        assert_eq!(child.effective_transpose, -60);
+        root.set_local_transpose(-32);
+        child.refresh_effective_transpose(root.effective_transpose);
+        assert_eq!(child.effective_transpose, -28);
+    }
+
+    #[test]
+    fn register_add_sign_extends_compact_immediates() {
+        let mut track = Track::new(0);
+        track.set_reg(4, 0x50);
+        let sequence = [4, 0xa0];
+        parse_register_param(&sequence, &mut track, 0x05).unwrap();
+        assert_eq!(track.reg(4), 0xfff0);
     }
 
     #[test]
@@ -3315,11 +3645,23 @@ mod tests {
     }
 
     #[test]
-    fn sound_preview_peak_guard_prevents_hard_clipping() {
+    fn sound_preview_peak_normalization_makes_quiet_samples_audible() {
+        let mut quiet = [0.002, -0.001, 0.0005];
+        normalize_sound_preview_peak(&mut quiet);
+        assert!((quiet[0] - 0.8).abs() < f32::EPSILON);
+        assert!((quiet[1] + 0.4).abs() < f32::EPSILON);
+
         let mut samples = [2.0, -1.0, 0.5];
-        apply_preview_peak_guard(&mut samples);
-        assert!((samples[0] - 0.95).abs() < f32::EPSILON);
-        assert!((samples[1] + 0.475).abs() < f32::EPSILON);
+        normalize_sound_preview_peak(&mut samples);
+        assert!((samples[0] - 0.8).abs() < f32::EPSILON);
+        assert!((samples[1] + 0.4).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn jaudio_pitch_scaling_distinguishes_instruments_from_percussion() {
+        assert_eq!(jaudio_key_pitch_ratio(0, 60, false), 1.0);
+        assert_eq!(jaudio_key_pitch_ratio(60, 60, true), 1.0);
+        assert!((jaudio_key_pitch_ratio(0, 60, true) - 0.03125).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -3341,7 +3683,30 @@ mod tests {
             .unwrap_or(0x19);
         let samples = render_sound_preview(Path::new(&root), sound_id, 8.0).unwrap();
         assert_eq!(samples.len(), OUTPUT_RATE as usize * 16);
-        assert!(samples.iter().any(|sample| sample.abs() > 0.0001));
+        let peak = samples
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        let first_audible_frame = samples
+            .chunks_exact(2)
+            .position(|frame| frame.iter().any(|sample| sample.abs() > 0.001))
+            .unwrap();
+        let last_audible_frame = samples
+            .chunks_exact(2)
+            .rposition(|frame| frame.iter().any(|sample| sample.abs() > 0.001))
+            .unwrap();
+        eprintln!(
+            "sound 0x{sound_id:08X}: peak={peak:.6}, audible={:.3}s..{:.3}s",
+            first_audible_frame as f32 / OUTPUT_RATE as f32,
+            last_audible_frame as f32 / OUTPUT_RATE as f32,
+        );
+        let middle = &samples[(OUTPUT_RATE as usize / 10 * 2)..(OUTPUT_RATE as usize / 2 * 2)];
+        let middle_rms =
+            (middle.iter().map(|sample| sample * sample).sum::<f32>() / middle.len() as f32).sqrt();
+        eprintln!("middle 0.1s..0.5s rms={middle_rms:.6}");
+        assert!(peak > 0.01);
+        assert!(first_audible_frame < OUTPUT_RATE as usize);
+        assert!(last_audible_frame.saturating_sub(first_audible_frame) > OUTPUT_RATE as usize / 10);
+        assert!(middle_rms > 0.005);
     }
 
     #[test]
