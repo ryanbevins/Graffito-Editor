@@ -1678,6 +1678,7 @@ fn render_isolated_noki(
             light_position: lighting.position,
             light_color: gpu_viewport::color_u8_to_f32(lighting.color),
             ambient_color: Some(gpu_viewport::color_u8_to_f32(lighting.ambient)),
+            show_grid: false,
         },
         size,
     )

@@ -441,7 +441,19 @@ pub(super) fn rasterize_depth_tested_segment(
         let stored_depth = depth[index];
         let tolerance = (stored_depth.abs() * 0.001).max(0.5);
         if segment_depth <= stored_depth + tolerance {
-            image.pixels[index] = color;
+            let src = color32_to_rgba(color);
+            let alpha = src[3];
+            if alpha >= 0.98 {
+                image.pixels[index] = color;
+                continue;
+            }
+            let dst = color32_to_rgba(image.pixels[index]);
+            image.pixels[index] = rgba_to_color32([
+                src[0] * alpha + dst[0] * (1.0 - alpha),
+                src[1] * alpha + dst[1] * (1.0 - alpha),
+                src[2] * alpha + dst[2] * (1.0 - alpha),
+                1.0,
+            ]);
         }
     }
 }

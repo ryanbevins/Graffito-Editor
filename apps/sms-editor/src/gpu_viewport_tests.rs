@@ -104,6 +104,14 @@ fn offscreen_cache_tracks_camera_lighting_and_mirror_projection_state() {
         GpuOffscreenFrameState::new(frame, Some(48.0), TEST_RENDER_TARGET_SIZE),
         GpuOffscreenInvalidation::default()
     ));
+
+    let mut grid_enabled = frame;
+    grid_enabled.show_grid = true;
+    assert!(offscreen_render_required(
+        Some(state),
+        GpuOffscreenFrameState::new(grid_enabled, None, TEST_RENDER_TARGET_SIZE),
+        GpuOffscreenInvalidation::default()
+    ));
 }
 
 #[test]
@@ -1017,6 +1025,7 @@ fn repository_authored_textured_import_renders_non_black() {
             light_position: camera_position,
             light_color: [1.0; 4],
             ambient_color: Some([1.0; 4]),
+            show_grid: false,
         },
         [512, 512],
     )
@@ -1442,6 +1451,70 @@ fn gx_composite_matches_eframe_depth_attachment_without_writing_it() {
     assert_eq!(depth.format, wgpu::TextureFormat::Depth24Plus);
     assert_eq!(depth.depth_write_enabled, Some(false));
     assert_eq!(depth.depth_compare, Some(wgpu::CompareFunction::Always));
+}
+
+#[test]
+fn world_grid_tests_scene_depth_without_writing_it() {
+    let depth = world_grid_depth_stencil_state();
+    assert_eq!(depth.format, wgpu::TextureFormat::Depth24Plus);
+    assert_eq!(depth.depth_write_enabled, Some(false));
+    assert_eq!(depth.depth_compare, Some(wgpu::CompareFunction::LessEqual));
+    assert_eq!(WORLD_GRID_VERTEX_COUNT, 88);
+}
+
+#[test]
+fn world_grid_is_occluded_by_nearer_geometry() {
+    let mut preview = geometry_update_preview();
+    preview.triangles[0].vertices = [
+        [-100.0, 100.0, -100.0],
+        [100.0, 100.0, -100.0],
+        [100.0, 100.0, 100.0],
+    ];
+    preview.triangles[1].vertices = [
+        [-100.0, 100.0, -100.0],
+        [100.0, 100.0, 100.0],
+        [-100.0, 100.0, 100.0],
+    ];
+    for triangle in &mut preview.triangles {
+        triangle.normals = Some([[0.0, 1.0, 0.0]; 3]);
+        triangle.model_index = 1;
+        triangle.packet_index = 0;
+    }
+
+    let frame = GpuViewportFrame {
+        camera_position: [0.0, 1000.0, 0.0],
+        right: [1.0, 0.0, 0.0],
+        up: [0.0, 0.0, 1.0],
+        forward: [0.0, -1.0, 0.0],
+        focal: 128.0,
+        viewport_size: [256.0, 256.0],
+        near: 1.0,
+        light_position: [0.0, 1000.0, 0.0],
+        light_color: [1.0; 4],
+        ambient_color: Some([1.0; 4]),
+        ..Default::default()
+    };
+    let without_grid =
+        render_preview_offscreen(&preview, frame, [256, 256]).expect("render geometry");
+    let with_grid = render_preview_offscreen(
+        &preview,
+        GpuViewportFrame {
+            show_grid: true,
+            ..frame
+        },
+        [256, 256],
+    )
+    .expect("render geometry and grid");
+
+    let center = 128 * 256 + 128;
+    assert_eq!(
+        with_grid.pixels[center], without_grid.pixels[center],
+        "the grid axis behind the raised quad must fail the scene depth test"
+    );
+    assert!(
+        with_grid.pixels != without_grid.pixels,
+        "the grid must still render where no geometry occludes it"
+    );
 }
 
 #[test]

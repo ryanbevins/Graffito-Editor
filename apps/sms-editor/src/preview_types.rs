@@ -400,6 +400,7 @@ pub(super) struct ModelFramebufferKey {
     pub(super) camera_distance: u32,
     pub(super) viewport_pan: [u32; 2],
     pub(super) viewport_zoom: u32,
+    pub(super) show_grid: bool,
     pub(super) triangle_count: usize,
     pub(super) texture_count: usize,
     pub(super) source_triangles: usize,

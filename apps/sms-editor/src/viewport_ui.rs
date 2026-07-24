@@ -11,6 +11,33 @@ const GIZMO_AXIS_LENGTH_PIXELS: f32 = 78.0;
 const GIZMO_RING_RADIUS_PIXELS: f32 = 64.0;
 const GIZMO_HIT_RADIUS_PIXELS: f32 = 10.0;
 
+fn visit_world_grid_segments(mut visitor: impl FnMut([f32; 3], [f32; 3], egui::Color32, f32)) {
+    let minor = egui::Color32::from_rgba_unmultiplied(178, 186, 178, 32);
+    let major = egui::Color32::from_rgba_unmultiplied(213, 200, 160, 58);
+    for i in -10..=10 {
+        let offset = i as f32 * 500.0;
+        let (color, width) = if i % 5 == 0 {
+            (major, 1.5)
+        } else {
+            (minor, 1.0)
+        };
+        visitor([offset, 0.0, -5000.0], [offset, 0.0, 5000.0], color, width);
+        visitor([-5000.0, 0.0, offset], [5000.0, 0.0, offset], color, width);
+    }
+    visitor(
+        [-5200.0, 0.0, 0.0],
+        [5200.0, 0.0, 0.0],
+        egui::Color32::from_rgb(206, 82, 82),
+        2.0,
+    );
+    visitor(
+        [0.0, 0.0, -5200.0],
+        [0.0, 0.0, 5200.0],
+        egui::Color32::from_rgb(82, 168, 110),
+        2.0,
+    );
+}
+
 pub(super) fn collision_surface_color(surface_type: u16) -> egui::Color32 {
     const PALETTE: [[u8; 3]; 12] = [
         [76, 184, 168],
@@ -768,14 +795,15 @@ impl SmsEditorApp {
     ) {
         painter.add(egui::Shape::mesh(viewport_background_mesh(rect)));
 
+        let grid_is_depth_rendered = self.world_grid_is_depth_rendered(rect);
         if self.model_preview.is_some() || self.view_mode == ViewMode::Collision {
             self.paint_model_preview(ui.ctx(), painter, rect);
         } else {
             self.paint_stage_silhouette(painter, rect);
         }
-        // The grid is an editor aid rather than part of Sunshine's EFB. Keep it
-        // above the source-accurate offscreen game render.
-        if self.renderer.config().show_grid {
+        // Triangle previews render the grid against their depth buffer. Keep
+        // this painter fallback only for empty or synthetic previews.
+        if self.renderer.config().show_grid && !grid_is_depth_rendered {
             self.paint_grid(painter, rect);
         }
         self.paint_model_instances(painter, rect);
@@ -963,48 +991,15 @@ impl SmsEditorApp {
 
     pub(super) fn paint_grid(&self, painter: &egui::Painter, rect: egui::Rect) {
         let projection = self.camera_projection(rect);
-        let minor = egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgba_unmultiplied(178, 186, 178, 32),
-        );
-        let major = egui::Stroke::new(
-            1.5,
-            egui::Color32::from_rgba_unmultiplied(213, 200, 160, 58),
-        );
-
-        for i in -10..=10 {
-            let v = i as f32 * 500.0;
-            let stroke = if i % 5 == 0 { major } else { minor };
+        visit_world_grid_segments(|start, end, color, width| {
             Self::paint_world_segment(
                 painter,
                 &projection,
-                [v, 0.0, -5000.0],
-                [v, 0.0, 5000.0],
-                stroke,
+                start,
+                end,
+                egui::Stroke::new(width, color),
             );
-            Self::paint_world_segment(
-                painter,
-                &projection,
-                [-5000.0, 0.0, v],
-                [5000.0, 0.0, v],
-                stroke,
-            );
-        }
-
-        Self::paint_world_segment(
-            painter,
-            &projection,
-            [-5200.0, 0.0, 0.0],
-            [5200.0, 0.0, 0.0],
-            egui::Stroke::new(2.0, egui::Color32::from_rgb(206, 82, 82)),
-        );
-        Self::paint_world_segment(
-            painter,
-            &projection,
-            [0.0, 0.0, -5200.0],
-            [0.0, 0.0, 5200.0],
-            egui::Stroke::new(2.0, egui::Color32::from_rgb(82, 168, 110)),
-        );
+        });
     }
 
     fn paint_world_segment(
@@ -1614,6 +1609,7 @@ impl SmsEditorApp {
                 .map(|lighting| gpu_viewport::color_u8_to_f32(lighting.color))
                 .unwrap_or([1.0; 4]),
             ambient_color: lighting.map(|lighting| gpu_viewport::color_u8_to_f32(lighting.ambient)),
+            show_grid: self.renderer.config().show_grid,
         })
     }
 
@@ -1716,6 +1712,9 @@ impl SmsEditorApp {
         for projected in translucent {
             rasterize_projected_preview_triangle(preview, &mut image, &mut depth, projected, false);
         }
+        if self.renderer.config().show_grid {
+            self.rasterize_world_grid(rect, size, &mut image, &depth);
+        }
 
         Some(image)
     }
@@ -1749,6 +1748,9 @@ impl SmsEditorApp {
             projected_triangles.push(screen);
         }
 
+        if self.renderer.config().show_grid {
+            self.rasterize_world_grid(rect, size, &mut image, &depth);
+        }
         let edge_color = egui::Color32::from_rgb(24, 31, 33);
         for screen in projected_triangles {
             for [start, end] in [
@@ -1776,6 +1778,7 @@ impl SmsEditorApp {
             camera_distance: camera.distance.to_bits(),
             viewport_pan: [self.viewport_pan.x.to_bits(), self.viewport_pan.y.to_bits()],
             viewport_zoom: self.viewport_zoom.to_bits(),
+            show_grid: self.renderer.config().show_grid,
             triangle_count: preview.triangles.len(),
             texture_count: preview.textures.len(),
             source_triangles: preview.source_triangles,
@@ -1829,6 +1832,44 @@ impl SmsEditorApp {
             depth,
             inv_depth: 1.0 / depth,
         })
+    }
+
+    fn world_grid_is_depth_rendered(&self, rect: egui::Rect) -> bool {
+        if rect.width() < 2.0 || rect.height() < 2.0 {
+            return false;
+        }
+        let Some(preview) = self.model_preview.as_ref() else {
+            return false;
+        };
+        if self.view_mode == ViewMode::Collision {
+            self.renderer.config().show_collision && !preview.collision_triangles.is_empty()
+        } else {
+            !preview.triangles.is_empty()
+        }
+    }
+
+    fn rasterize_world_grid(
+        &self,
+        rect: egui::Rect,
+        size: [usize; 2],
+        image: &mut egui::ColorImage,
+        depth: &[f32],
+    ) {
+        let camera = self.camera_frame();
+        visit_world_grid_segments(|start, end, color, _| {
+            let Some([start, end]) =
+                clip_world_segment_to_near_plane(camera, start, end, VIEWPORT_NEAR_CLIP)
+            else {
+                return;
+            };
+            let Some(start) = self.world_to_framebuffer(rect, size, start) else {
+                return;
+            };
+            let Some(end) = self.world_to_framebuffer(rect, size, end) else {
+                return;
+            };
+            rasterize_depth_tested_segment(image, depth, start, end, color);
+        });
     }
 
     pub(super) fn paint_preview_bounds(

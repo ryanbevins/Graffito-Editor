@@ -3813,3 +3813,35 @@ fn renderer_validation_reports_unsupported_texture_lod_flags() {
     assert!(issue.message.contains("edge LOD"));
     assert!(issue.message.contains("LOD bias clamp"));
 }
+
+#[test]
+fn software_grid_segments_respect_geometry_depth() {
+    let black = egui::Color32::BLACK;
+    let mut image = egui::ColorImage::filled([3, 1], black);
+    let geometry_depth = [5.0; 3];
+    let segment = |depth: f32, x: f32| ProjectedVertex {
+        x,
+        y: 0.0,
+        depth,
+        inv_depth: 1.0 / depth,
+    };
+    let grid_color = egui::Color32::from_rgba_unmultiplied(206, 82, 82, 128);
+
+    rasterize_depth_tested_segment(
+        &mut image,
+        &geometry_depth,
+        segment(10.0, 0.0),
+        segment(10.0, 2.0),
+        grid_color,
+    );
+    assert_eq!(image.pixels, vec![black; 3]);
+
+    rasterize_depth_tested_segment(
+        &mut image,
+        &geometry_depth,
+        segment(4.0, 0.0),
+        segment(4.0, 2.0),
+        grid_color,
+    );
+    assert!(image.pixels.iter().all(|pixel| *pixel != black));
+}

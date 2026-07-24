@@ -30,6 +30,8 @@ static NEXT_SCENE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 const J3D_SHADER: &str = include_str!("shaders/j3d.wgsl");
 const COMPOSITE_SHADER: &str = include_str!("shaders/composite.wgsl");
+const GRID_SHADER: &str = include_str!("shaders/grid.wgsl");
+const WORLD_GRID_VERTEX_COUNT: u32 = 88;
 
 #[derive(Clone)]
 pub struct GpuViewportScene {
@@ -164,7 +166,12 @@ pub(super) fn render_preview_offscreen(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("Noki rendering test encoder"),
     });
-    resources.render_scene(&mut encoder, active_mirror_slot, mirror_plane_y);
+    resources.render_scene(
+        &mut encoder,
+        active_mirror_slot,
+        mirror_plane_y,
+        frame.show_grid,
+    );
     let target = resources
         .viewport_target
         .as_ref()
@@ -230,6 +237,7 @@ pub struct GpuViewportFrame {
     pub light_position: [f32; 3],
     pub light_color: [f32; 4],
     pub ambient_color: Option<[f32; 4]>,
+    pub show_grid: bool,
 }
 
 impl Default for GpuViewportFrame {
@@ -247,6 +255,7 @@ impl Default for GpuViewportFrame {
             light_position: [200_000.0, 500_000.0, 200_000.0],
             light_color: [1.0; 4],
             ambient_color: None,
+            show_grid: false,
         }
     }
 }
@@ -332,7 +341,12 @@ impl CallbackTrait for GpuViewportCallback {
         };
         if offscreen_render_required(resources.offscreen_frame_state, frame_state, invalidation) {
             resources.write_frame(queue, shared.frame, &shared.scene, mirror_plane_y);
-            resources.render_scene(egui_encoder, active_mirror_slot, mirror_plane_y);
+            resources.render_scene(
+                egui_encoder,
+                active_mirror_slot,
+                mirror_plane_y,
+                shared.frame.show_grid,
+            );
             resources.offscreen_frame_state = Some(frame_state);
         }
         Vec::new()
@@ -2005,6 +2019,7 @@ struct GpuCameraUniform {
 struct GpuOffscreenFrameState {
     camera: GpuCameraUniform,
     mirror_camera: GpuCameraUniform,
+    show_grid: bool,
 }
 
 impl GpuOffscreenFrameState {
@@ -2019,6 +2034,7 @@ impl GpuOffscreenFrameState {
                 mirror_viewport_frame(frame, mirror_plane_y),
                 render_target_size,
             ),
+            show_grid: frame.show_grid,
         }
     }
 }
@@ -2102,6 +2118,7 @@ struct GpuViewportResources {
     material_layout: wgpu::BindGroupLayout,
     j3d_shader: wgpu::ShaderModule,
     wave_mask_pipeline: wgpu::RenderPipeline,
+    grid_pipeline: wgpu::RenderPipeline,
     composite_layout: wgpu::BindGroupLayout,
     composite_pipeline: wgpu::RenderPipeline,
     composite_sampler: wgpu::Sampler,
@@ -2184,6 +2201,7 @@ impl GpuViewportResources {
             source: wgpu::ShaderSource::Wgsl(J3D_SHADER.into()),
         });
         let wave_mask_pipeline = create_wave_mask_pipeline(device, &pipeline_layout, &j3d_shader);
+        let grid_pipeline = create_grid_pipeline(device, &camera_layout);
         let composite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("sms viewport composite layout"),
             entries: &[
@@ -2259,6 +2277,7 @@ impl GpuViewportResources {
             material_layout,
             j3d_shader,
             wave_mask_pipeline,
+            grid_pipeline,
             composite_layout,
             composite_pipeline,
             composite_sampler,
@@ -2660,6 +2679,7 @@ impl GpuViewportResources {
         encoder: &mut wgpu::CommandEncoder,
         active_mirror_slot: Option<usize>,
         mirror_plane_y: Option<f32>,
+        show_grid: bool,
     ) {
         let Some(target) = &self.viewport_target else {
             return;
@@ -2796,6 +2816,9 @@ impl GpuViewportResources {
                 render_pass.set_bind_group(1, material, &[]);
                 draw_gpu_batch(&mut render_pass, batch);
             }
+            if show_grid && !has_post_snapshot {
+                self.draw_world_grid(&mut render_pass);
+            }
         }
 
         let wave_mask_view = if self.has_wave_mask_sources {
@@ -2912,6 +2935,14 @@ impl GpuViewportResources {
             render_pass.set_bind_group(1, material, &[]);
             draw_gpu_batch(&mut render_pass, batch);
         }
+        if show_grid {
+            self.draw_world_grid(&mut render_pass);
+        }
+    }
+
+    fn draw_world_grid<'pass>(&'pass self, render_pass: &mut wgpu::RenderPass<'pass>) {
+        render_pass.set_pipeline(&self.grid_pipeline);
+        render_pass.draw(0..WORLD_GRID_VERTEX_COUNT, 0..1);
     }
 
     fn composite(&self, render_pass: &mut wgpu::RenderPass<'static>) {
@@ -3353,6 +3384,64 @@ fn create_composite_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+fn create_grid_pipeline(
+    device: &wgpu::Device,
+    camera_layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("sms viewport world grid pipeline layout"),
+        bind_group_layouts: &[Some(camera_layout)],
+        immediate_size: 0,
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("sms viewport world grid shader"),
+        source: wgpu::ShaderSource::Wgsl(GRID_SHADER.into()),
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("sms viewport world grid pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: GX_COLOR_FORMAT,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Cw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(world_grid_depth_stencil_state()),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn world_grid_depth_stencil_state() -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        format: DEPTH_FORMAT,
+        depth_write_enabled: Some(false),
+        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+        stencil: Default::default(),
+        bias: Default::default(),
+    }
 }
 
 fn composite_fragment_entry(target_format: wgpu::TextureFormat) -> &'static str {
