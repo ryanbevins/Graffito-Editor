@@ -1867,6 +1867,20 @@ pub fn discover_authored_project_stage_ids(project_root: impl AsRef<Path>) -> Re
     project_store::discover_authored_stage_ids(project_root.as_ref())
 }
 
+/// Creates or validates the ownership manifest for a descriptor-backed editor
+/// project before other authoring systems create content beneath it.
+///
+/// A pre-existing directory tree containing only directories can be claimed so
+/// a fresh project can recover from catalog scaffolding created by older editor
+/// builds. Any unowned file or symlink keeps the directory protected.
+pub fn initialize_editor_project_folder(
+    base_root: impl AsRef<Path>,
+    project_root: impl AsRef<Path>,
+    project_id: &str,
+) -> Result<EditorProjectManifest> {
+    project_store::initialize_project_folder(base_root.as_ref(), project_root.as_ref(), project_id)
+}
+
 fn authored_stage_assets(
     base_root: &Path,
     source_path: &Path,
@@ -4157,6 +4171,53 @@ mod tests {
             fs::read(root.join("important.txt")).unwrap(),
             b"do not delete"
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_initialization_claims_only_directory_scaffolding() {
+        let root = unique_test_project_root("initialize-directory-scaffold");
+        let base_root = root.join("base");
+        let project_root = root.join("Fresh.smsdata");
+        fs::create_dir_all(&base_root).unwrap();
+        fs::create_dir_all(project_root.join("Content/Models/.managed/.staging")).unwrap();
+        fs::create_dir_all(project_root.join("Content/Models/.managed/.backup")).unwrap();
+
+        let manifest =
+            initialize_editor_project_folder(&base_root, &project_root, "descriptor-project-id")
+                .unwrap();
+
+        assert_eq!(manifest.project_id, "descriptor-project-id");
+        assert_eq!(manifest.base_path, fs::canonicalize(&base_root).unwrap());
+        assert!(project_root.join("files").is_dir());
+        assert!(project_root.join("sms-project.toml").is_file());
+        assert!(discover_authored_project_stage_ids(&project_root)
+            .unwrap()
+            .is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_initialization_preserves_unowned_files() {
+        let root = unique_test_project_root("initialize-unowned-file");
+        let base_root = root.join("base");
+        let project_root = root.join("Fresh.smsdata");
+        fs::create_dir_all(&base_root).unwrap();
+        fs::create_dir_all(&project_root).unwrap();
+        fs::write(project_root.join("important.txt"), b"do not delete").unwrap();
+
+        assert!(matches!(
+            initialize_editor_project_folder(&base_root, &project_root, "descriptor-project-id")
+                .unwrap_err(),
+            SceneError::UnownedProjectRoot(path) if path == project_root
+        ));
+        assert_eq!(
+            fs::read(project_root.join("important.txt")).unwrap(),
+            b"do not delete"
+        );
+        assert!(!project_root.join("sms-project.toml").exists());
 
         fs::remove_dir_all(root).unwrap();
     }

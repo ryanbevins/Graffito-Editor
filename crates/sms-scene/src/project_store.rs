@@ -30,6 +30,66 @@ const PROJECT_RENAME_RETRY_DELAYS: [Duration; 7] = [
     Duration::from_millis(800),
 ];
 
+pub(super) fn initialize_project_folder(
+    base_root: &Path,
+    project_root: &Path,
+    project_id: &str,
+) -> Result<EditorProjectManifest> {
+    let project_operation = project_operation_gate(project_root)?;
+    let _project_operation_guard = project_operation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if project_root
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(SceneError::InvalidProjectRoot(project_root.to_path_buf()));
+    }
+
+    let base_comparison = normalized_absolute_for_comparison(base_root)?;
+    let project_comparison = normalized_absolute_for_comparison(project_root)?;
+    if path_is_same_or_child(&project_comparison, &base_comparison)
+        || path_is_same_or_child(&base_comparison, &project_comparison)
+    {
+        return Err(SceneError::ProjectOverlapsBase(project_root.to_path_buf()));
+    }
+    let manifest_base_path = fs::canonicalize(base_root)?;
+
+    match inspect_existing_project(project_root) {
+        Ok(Some(manifest)) => {
+            let manifest_base = normalized_absolute_for_comparison(&manifest.base_path)?;
+            if manifest_base != base_comparison {
+                return Err(SceneError::ProjectBaseMismatch {
+                    path: project_root.join("sms-project.toml"),
+                    manifest_base: manifest.base_path,
+                    open_base: base_root.to_path_buf(),
+                });
+            }
+            return Ok(manifest);
+        }
+        Ok(None) => {}
+        Err(SceneError::UnownedProjectRoot(path))
+            if path == project_root && project_root_contains_only_directories(project_root)? => {}
+        Err(error) => return Err(error),
+    }
+
+    fs::create_dir_all(project_root.join("files"))?;
+    if !project_root_contains_only_directories(project_root)? {
+        return Err(SceneError::UnownedProjectRoot(project_root.to_path_buf()));
+    }
+
+    let project_id = if project_id.trim().is_empty() {
+        new_project_id()
+    } else {
+        project_id.to_string()
+    };
+    let manifest =
+        EditorProjectManifest::new(manifest_base_path, PathBuf::from("files"), project_id);
+    let manifest_bytes = toml::to_string_pretty(&manifest)?.into_bytes();
+    write_file_synced(&project_root.join("sms-project.toml"), &manifest_bytes)?;
+    Ok(manifest)
+}
+
 pub(super) fn save_project_folder(
     document: &StageDocument,
     project_root: &Path,
@@ -1057,6 +1117,31 @@ fn inspect_existing_project(project_root: &Path) -> Result<Option<EditorProjectM
         })?;
     }
     Ok(Some(manifest))
+}
+
+fn project_root_contains_only_directories(project_root: &Path) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(project_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+
+    let mut pending = vec![project_root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                pending.push(entry.path());
+            } else {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn validate_managed_file_entry(

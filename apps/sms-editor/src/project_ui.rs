@@ -557,6 +557,10 @@ impl SmsEditorApp {
     }
 
     fn activate_project(&mut self, project: OpenProject) {
+        if let Err(error) = project.initialize_data_root() {
+            self.project_hub_error = Some(error);
+            return;
+        }
         self.base_root = project
             .descriptor
             .base_game_root
@@ -800,5 +804,58 @@ fn paths_refer_to_same_location(left: &Path, right: &Path) -> bool {
     #[cfg(not(windows))]
     {
         left == right
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sms_authoring::ModelAssetCatalog;
+    use std::time::Duration;
+
+    #[test]
+    fn activating_fresh_project_repairs_catalog_scaffold_and_scans_retail_levels() {
+        let root = tempfile::tempdir().unwrap();
+        let base_root = root.path().join("SMS-Disk");
+        let scene_root = base_root.join("files/data/scene");
+        std::fs::create_dir_all(&scene_root).unwrap();
+        std::fs::write(scene_root.join("airport0.szs"), b"not needed for discovery").unwrap();
+
+        let descriptor_path = root.path().join("New SMS Project.sms");
+        let descriptor = SmsProjectFile::new(
+            "New SMS Project",
+            std::fs::canonicalize(&base_root).unwrap(),
+            default_project_data_root(&descriptor_path),
+            None,
+        );
+        descriptor.save(&descriptor_path).unwrap();
+        let project = OpenProject::load(&descriptor_path).unwrap();
+        let project_root = project.data_root();
+
+        ModelAssetCatalog::open_content_root(project_root.join("Content")).unwrap();
+        assert!(!project_root.join("sms-project.toml").exists());
+
+        let mut app = SmsEditorApp {
+            show_project_hub: true,
+            ..SmsEditorApp::default()
+        };
+        app.activate_project(project);
+
+        assert!(app.project_hub_error.is_none());
+        assert!(project_root.join("sms-project.toml").is_file());
+        app.scan_scenes();
+        let receiver = app
+            .background_receiver
+            .take()
+            .expect("scene scan should start");
+        let result = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("scene scan should finish");
+        let BackgroundResult::Scan { result, .. } = result else {
+            panic!("scene scan returned the wrong background result");
+        };
+        let scan = result.expect("fresh project scene scan should succeed");
+        assert_eq!(scan.archives.len(), 1);
+        assert_eq!(scan.archives[0].stage_id, "airport0");
     }
 }

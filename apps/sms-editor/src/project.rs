@@ -602,6 +602,22 @@ impl OpenProject {
         self.descriptor.resolved_data_root(&self.descriptor_path)
     }
 
+    pub(super) fn initialize_data_root(&self) -> Result<(), String> {
+        let data_root = self.data_root();
+        sms_scene::initialize_editor_project_folder(
+            &self.descriptor.base_game_root,
+            &data_root,
+            &self.descriptor.project_id,
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "Could not initialize project data '{}': {error}",
+                data_root.display()
+            )
+        })
+    }
+
     pub(super) fn managed_build_root(&self) -> PathBuf {
         self.descriptor
             .resolved_managed_build_root(&self.descriptor_path)
