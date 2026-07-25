@@ -3499,6 +3499,7 @@ name = "sms-xtask"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "sms-schema",
 ]
 
 [[package]]

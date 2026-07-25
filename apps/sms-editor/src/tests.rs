@@ -3592,6 +3592,20 @@ fn completed_stage_load_is_discarded_when_the_selected_stage_changed() {
 }
 
 #[test]
+fn missing_decomp_source_uses_the_shipped_schema_bundle() {
+    let root = tempfile::tempdir().unwrap();
+    let missing_decomp = root.path().join("missing-decomp");
+
+    let selection = generate_editor_schema(&missing_decomp).unwrap();
+
+    assert!(!selection.registry.objects.is_empty());
+    assert!(!selection.registry.npc_actors.is_empty());
+    assert!(!selection.registry.enemy_actors.is_empty());
+    assert!(selection.status.contains("bundled object entries"));
+    assert!(selection.status.contains("source was unavailable"));
+}
+
+#[test]
 fn object_authoring_catalog_cache_identity_tracks_retail_inventory_and_registry() {
     let root = tempfile::tempdir().unwrap();
     let archive_path = root.path().join("files/data/scene/dolpic0.szs");
@@ -3723,6 +3737,7 @@ fn schema_refresh_updates_derived_preview_metadata_without_marking_the_document_
         .send(BackgroundResult::Schema(Box::new(Ok(LoadedSchema {
             registry,
             object_authoring_catalog_cache: None,
+            status: "Loaded test schema.".to_string(),
         }))))
         .unwrap();
     app.background_receiver = Some(receiver);

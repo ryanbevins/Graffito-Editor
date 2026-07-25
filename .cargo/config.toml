@@ -1,6 +1,7 @@
 [alias]
 regression = "run --package sms-xtask -- regression"
 gltf-fixtures = "run --package sms-xtask -- gltf-fixtures"
+schema-bundle = "run --package sms-xtask -- schema-bundle"
 
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld"

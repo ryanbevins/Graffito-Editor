@@ -142,6 +142,22 @@ impl SourceInventory {
         })
     }
 
+    /// Hashes the normalized source paths and exact source contents.
+    ///
+    /// Unlike the opportunistic cache fingerprint, this value is independent
+    /// of the checkout location, timestamps, and filesystem metadata, making it
+    /// suitable for a reproducible shipped schema artifact.
+    pub(crate) fn content_fingerprint(&self) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+        self.files.values().fold(FNV_OFFSET, |hash, file| {
+            let hash = fnv1a_bytes(hash, file.relative_path.as_bytes());
+            let hash = fnv1a_bytes(hash, &[0]);
+            let hash = fnv1a_bytes(hash, file.text.as_bytes());
+            fnv1a_bytes(hash, &[0xff])
+        })
+    }
+
     pub(crate) fn required(&self, relative_path: &str) -> Result<&SourceFile> {
         self.files
             .get(relative_path)
@@ -251,6 +267,34 @@ mod tests {
             initial
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn content_fingerprint_is_path_and_metadata_independent() {
+        let first = fixture_root("content-fingerprint-first");
+        let second = fixture_root("content-fingerprint-second");
+        for root in [&first, &second] {
+            fs::create_dir_all(root.join("src")).unwrap();
+            fs::create_dir_all(root.join("include")).unwrap();
+            fs::write(root.join("src/example.cpp"), "same source").unwrap();
+            fs::write(root.join("include/example.hpp"), "same header").unwrap();
+        }
+
+        let first_inventory = SourceInventory::build(&first).unwrap();
+        let second_inventory = SourceInventory::build(&second).unwrap();
+        assert_eq!(
+            first_inventory.content_fingerprint(),
+            second_inventory.content_fingerprint()
+        );
+
+        fs::write(second.join("src/example.cpp"), "changed source").unwrap();
+        let changed_inventory = SourceInventory::build(&second).unwrap();
+        assert_ne!(
+            first_inventory.content_fingerprint(),
+            changed_inventory.content_fingerprint()
+        );
+        fs::remove_dir_all(first).unwrap();
+        fs::remove_dir_all(second).unwrap();
     }
 
     fn fixture_root(label: &str) -> PathBuf {

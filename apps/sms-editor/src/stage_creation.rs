@@ -224,8 +224,8 @@ impl SmsEditorApp {
                     (Some(registry), None)
                 } else {
                     match generate_editor_schema(Path::new(&repo_root)) {
-                        Ok(registry) => (Some(registry), None),
-                        Err(error) => (None, Some(error.to_string())),
+                        Ok(selection) => (Some(selection.registry), None),
+                        Err(error) => (None, Some(error)),
                     }
                 };
                 if let Some(registry) = registry.clone() {

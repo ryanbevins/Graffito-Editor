@@ -31,7 +31,10 @@ use sms_scene::{
     StageLighting, StageResourceDocument, StageResourceEdit, Transform, ValidationIssue,
     ValidationSeverity,
 };
-use sms_schema::{ObjectDefinition, ObjectRegistry, ParticleBindingTarget, SchemaGenerator};
+use sms_schema::{
+    bundled_object_registry, ObjectDefinition, ObjectRegistry, ParticleBindingTarget,
+    SchemaGenerator,
+};
 
 mod active_placement;
 mod audio_helpers;
@@ -271,6 +274,12 @@ struct ObjectAuthoringCatalogCache {
 struct LoadedSchema {
     registry: ObjectRegistry,
     object_authoring_catalog_cache: Option<ObjectAuthoringCatalogCache>,
+    status: String,
+}
+
+struct EditorSchemaSelection {
+    registry: ObjectRegistry,
+    status: String,
 }
 
 struct ProjectLoadSelection {
@@ -415,11 +424,37 @@ fn editor_schema_cache_path(repo_root: &Path) -> Option<PathBuf> {
     )
 }
 
-fn generate_editor_schema(repo_root: &Path) -> sms_schema::Result<ObjectRegistry> {
+fn generate_editor_schema(repo_root: &Path) -> Result<EditorSchemaSelection, String> {
     let generator = SchemaGenerator::new(repo_root);
-    match editor_schema_cache_path(repo_root) {
+    let generated = match editor_schema_cache_path(repo_root) {
         Some(cache_path) => generator.generate_cached(cache_path),
         None => generator.generate(),
+    };
+    match generated {
+        Ok(registry) => Ok(EditorSchemaSelection {
+            status: format!(
+                "Generated {} object entries from the configured decomp source.",
+                registry.objects.len()
+            ),
+            registry,
+        }),
+        Err(live_error) => {
+            let bundle = bundled_object_registry().map_err(|bundle_error| {
+                format!(
+                    "configured decomp schema failed ({live_error}); bundled schema failed \
+                     validation ({bundle_error})"
+                )
+            })?;
+            Ok(EditorSchemaSelection {
+                status: format!(
+                    "Loaded {} bundled object entries from decomp revision {} because the \
+                     configured decomp source was unavailable: {live_error}",
+                    bundle.registry.objects.len(),
+                    bundle.source_revision
+                ),
+                registry: bundle.registry,
+            })
+        }
     }
 }
 
@@ -1486,11 +1521,21 @@ impl SmsEditorApp {
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let result = if force {
-                SchemaGenerator::new(&repo_root).generate()
+                SchemaGenerator::new(&repo_root)
+                    .generate()
+                    .map(|registry| EditorSchemaSelection {
+                        status: format!(
+                            "Generated {} object entries from the configured decomp source.",
+                            registry.objects.len()
+                        ),
+                        registry,
+                    })
+                    .map_err(|error| error.to_string())
             } else {
                 generate_editor_schema(Path::new(&repo_root))
             }
-            .map(|registry| {
+            .map(|selection| {
+                let EditorSchemaSelection { registry, status } = selection;
                 let object_authoring_catalog_cache = (!base_root.is_empty()
                     && archives.iter().any(|archive| archive.size_bytes > 0))
                 .then(|| {
@@ -1499,9 +1544,9 @@ impl SmsEditorApp {
                 LoadedSchema {
                     registry,
                     object_authoring_catalog_cache,
+                    status,
                 }
-            })
-            .map_err(|err| err.to_string());
+            });
             let _ = sender.send(BackgroundResult::Schema(Box::new(result)));
         });
         self.background_receiver = Some(receiver);
@@ -1785,11 +1830,9 @@ impl SmsEditorApp {
                             let LoadedSchema {
                                 registry,
                                 object_authoring_catalog_cache,
+                                status,
                             } = loaded_schema;
-                            self.log.push(format!(
-                                "Generated {} object entries.",
-                                registry.objects.len()
-                            ));
+                            self.log.push(status);
                             if let Some(document) = &mut self.document {
                                 document.refresh_registry_derived_object_fields(
                                     &mut self.saved_objects,

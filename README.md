@@ -135,8 +135,9 @@ see the [project format documentation](docs/project-format.md).
 - Windows 10 or 11 for the primary supported desktop workflow
 - A current Vulkan, DirectX 12, or OpenGL-capable GPU and driver
 - A legally obtained, extracted copy of _Super Mario Sunshine_
-- A local checkout of the SMS decompilation project for the complete
-  decomp-derived schema and metadata workflow
+- A local checkout of the SMS decompilation project only when refreshing or
+  developing the generated schema metadata; normal builds ship a validated,
+  source-free metadata snapshot
 - Dolphin for playtesting, and optionally `nodtool` for CLI-based disc extraction
 
 Clone and run the normal development build:
@@ -156,6 +157,21 @@ cargo build --locked --profile fast-release -p graffito-editor
 The executable is written to
 `target\fast-release\graffito-editor.exe`. The `fast-release` profile uses Thin
 LTO and incremental compilation for practical iteration.
+
+Graffito first uses a configured decomp checkout when one is available, so
+schema developers can test current extractor changes. Installed and
+source-without-decomp builds automatically fall back to the versioned registry
+in `crates/sms-schema/generated/object-registry.json`. Maintainers refresh and
+verify that artifact from a clean decomp revision with:
+
+```powershell
+cargo schema-bundle --decomp-root ..
+cargo schema-bundle --decomp-root .. --check
+```
+
+An exported source tree without `.git` can be used with an explicit
+`--source-revision`. The artifact records both that revision and a
+location-independent fingerprint of the scanned source contents.
 
 For a fully optimized local distributable build:
 

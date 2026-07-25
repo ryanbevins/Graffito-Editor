@@ -13,7 +13,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("regression failed: {error}");
+            eprintln!("xtask failed: {error}");
             ExitCode::FAILURE
         }
     }
@@ -29,9 +29,179 @@ fn run() -> Result<(), String> {
     match arguments.first().and_then(|argument| argument.to_str()) {
         Some("regression") => run_regression(repo_root, RegressionOptions::parse(arguments)?),
         Some("gltf-fixtures") => gltf_fixtures::run(repo_root, &arguments[1..]),
+        Some("schema-bundle") => {
+            run_schema_bundle(repo_root, SchemaBundleOptions::parse(arguments)?)
+        }
         Some(command) => Err(usage(&format!("unknown command '{command}'"))),
         None => Err(usage("missing command")),
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SchemaBundleOptions {
+    decomp_root: PathBuf,
+    source_revision: Option<String>,
+    check: bool,
+}
+
+impl SchemaBundleOptions {
+    fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Self, String> {
+        let mut arguments = arguments.into_iter();
+        let command = arguments.next().ok_or_else(|| usage("missing command"))?;
+        if command != OsStr::new("schema-bundle") {
+            return Err(usage("expected the schema-bundle command"));
+        }
+
+        let mut decomp_root = None;
+        let mut source_revision = None;
+        let mut check = false;
+        while let Some(argument) = arguments.next() {
+            match argument.to_str() {
+                Some("--decomp-root") => {
+                    let path = arguments
+                        .next()
+                        .ok_or_else(|| usage("--decomp-root requires a path"))?;
+                    decomp_root = Some(PathBuf::from(path));
+                }
+                Some("--source-revision") => {
+                    let revision = arguments
+                        .next()
+                        .and_then(|value| value.into_string().ok())
+                        .ok_or_else(|| usage("--source-revision requires a Unicode value"))?;
+                    if revision.trim().is_empty() {
+                        return Err(usage("--source-revision cannot be empty"));
+                    }
+                    source_revision = Some(revision);
+                }
+                Some("--check") => check = true,
+                Some("--help" | "-h") => return Err(usage("")),
+                Some(other) => return Err(usage(&format!("unknown argument '{other}'"))),
+                None => return Err(usage("arguments must be valid Unicode")),
+            }
+        }
+
+        Ok(Self {
+            decomp_root: decomp_root
+                .ok_or_else(|| usage("--decomp-root is required for schema-bundle"))?,
+            source_revision,
+            check,
+        })
+    }
+}
+
+fn run_schema_bundle(repo_root: &Path, options: SchemaBundleOptions) -> Result<(), String> {
+    let decomp_root = fs::canonicalize(&options.decomp_root).map_err(|error| {
+        format!(
+            "could not resolve decomp root {}: {error}",
+            options.decomp_root.display()
+        )
+    })?;
+    let source_revision = resolve_source_revision(&decomp_root, options.source_revision)?;
+    let bundle = sms_schema::SchemaGenerator::new(&decomp_root)
+        .generate_bundle(source_revision)
+        .map_err(|error| format!("schema generation failed: {error}"))?;
+    let bytes = bundle
+        .to_pretty_vec()
+        .map_err(|error| format!("could not serialize schema bundle: {error}"))?;
+    let output_path = repo_root
+        .join("crates")
+        .join("sms-schema")
+        .join("generated")
+        .join("object-registry.json");
+
+    if options.check {
+        let committed = fs::read(&output_path).map_err(|error| {
+            format!(
+                "could not read bundled schema {}: {error}",
+                output_path.display()
+            )
+        })?;
+        if committed != bytes {
+            return Err(format!(
+                "bundled schema is stale; regenerate {} from decomp revision {}",
+                output_path.display(),
+                bundle.source_revision
+            ));
+        }
+        println!(
+            "Bundled schema matches decomp revision {} ({:#018x}).",
+            bundle.source_revision, bundle.source_fingerprint
+        );
+        return Ok(());
+    }
+
+    fs::write(&output_path, bytes).map_err(|error| {
+        format!(
+            "could not write bundled schema {}: {error}",
+            output_path.display()
+        )
+    })?;
+    println!(
+        "Wrote {} from decomp revision {} ({:#018x}); {} objects, {} NPC families, {} enemy actors.",
+        output_path.display(),
+        bundle.source_revision,
+        bundle.source_fingerprint,
+        bundle.registry.objects.len(),
+        bundle.registry.npc_actors.len(),
+        bundle.registry.enemy_actors.len()
+    );
+    Ok(())
+}
+
+fn clean_git_revision(repo_root: &Path) -> Result<String, String> {
+    let status = Command::new("git")
+        .current_dir(repo_root)
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output()
+        .map_err(|error| format!("could not inspect decomp git status: {error}"))?;
+    if !status.status.success() {
+        return Err("could not inspect decomp git status".to_string());
+    }
+    if !status.stdout.is_empty() {
+        return Err(
+            "decomp checkout has tracked changes; generate from a clean checkout or a clean \
+             exported source tree"
+                .to_string(),
+        );
+    }
+
+    let revision = Command::new("git")
+        .current_dir(repo_root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|error| format!("could not resolve decomp revision: {error}"))?;
+    if !revision.status.success() {
+        return Err("could not resolve decomp revision".to_string());
+    }
+    let revision = String::from_utf8(revision.stdout)
+        .map_err(|_| "decomp revision was not valid UTF-8".to_string())?;
+    let revision = revision.trim().to_string();
+    if revision.is_empty() {
+        return Err("decomp revision was empty".to_string());
+    }
+    Ok(revision)
+}
+
+fn resolve_source_revision(
+    repo_root: &Path,
+    requested_revision: Option<String>,
+) -> Result<String, String> {
+    if repo_root.join(".git").exists() {
+        let actual_revision = clean_git_revision(repo_root)?;
+        if let Some(requested_revision) = requested_revision {
+            if requested_revision != actual_revision {
+                return Err(format!(
+                    "requested source revision {requested_revision} does not match clean checkout \
+                     revision {actual_revision}"
+                ));
+            }
+        }
+        return Ok(actual_revision);
+    }
+
+    requested_revision.ok_or_else(|| {
+        "an exported decomp source tree requires an explicit --source-revision".to_string()
+    })
 }
 
 fn run_regression(repo_root: &Path, options: RegressionOptions) -> Result<(), String> {
@@ -125,7 +295,9 @@ fn usage(error: &str) -> String {
         format!("{error}\n\n")
     };
     format!(
-        "{prefix}usage:\n  cargo regression [--code-only | --base-root <EXTRACTED_US_ROOT>]\n  cargo gltf-fixtures [--check]"
+        "{prefix}usage:\n  cargo regression [--code-only | --base-root <EXTRACTED_US_ROOT>]\n  \
+         cargo gltf-fixtures [--check]\n  \
+         cargo schema-bundle --decomp-root <DECOMP_ROOT> [--source-revision <REVISION>] [--check]"
     )
 }
 
@@ -258,5 +430,31 @@ mod tests {
         ])
         .unwrap_err();
         assert!(error.contains("cannot be combined"));
+    }
+
+    #[test]
+    fn parses_schema_bundle_options() {
+        assert_eq!(
+            SchemaBundleOptions::parse([
+                OsString::from("schema-bundle"),
+                OsString::from("--decomp-root"),
+                OsString::from("../decomp"),
+                OsString::from("--source-revision"),
+                OsString::from("abc123"),
+                OsString::from("--check"),
+            ])
+            .unwrap(),
+            SchemaBundleOptions {
+                decomp_root: PathBuf::from("../decomp"),
+                source_revision: Some("abc123".to_string()),
+                check: true,
+            }
+        );
+    }
+
+    #[test]
+    fn schema_bundle_requires_decomp_root() {
+        let error = SchemaBundleOptions::parse([OsString::from("schema-bundle")]).unwrap_err();
+        assert!(error.contains("--decomp-root is required"));
     }
 }

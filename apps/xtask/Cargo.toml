@@ -8,3 +8,4 @@ repository.workspace = true
 
 [dependencies]
 serde_json.workspace = true
+sms-schema.workspace = true
