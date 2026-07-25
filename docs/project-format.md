@@ -8,10 +8,10 @@ A Graffito-Editor project is identified by one UTF-8 TOML descriptor with the
 game assets. It points to an extracted, read-only copy of *Super Mario
 Sunshine* and to a separate managed project-data folder.
 
-## Version 1
+## Version 2
 
 ```toml
-format_version = 1
+format_version = 2
 kind = "sms-editor-project"
 name = "Isle Delfino"
 project_id = "019f..."
@@ -23,10 +23,20 @@ schema_source_root = "C:\\src\\sms"
 last_stage = "dolpic0"
 
 [stage_music.dolpic0]
+transition = "inside_crossfade"
+
+[stage_music.dolpic0.main]
+mode = "track"
 bgm_id = 0x80010002
 wave_scene_id = 0x202
-secondary_bgm_id = 0x80010023
-secondary_wave_scene_id = 0x204
+
+[stage_music.dolpic0.entrance]
+mode = "silent"
+
+[stage_music.dolpic0.inside]
+mode = "track"
+bgm_id = 0x80010023
+wave_scene_id = 0x204
 
 [sound_assignments."map_static:SoundObjRiver"]
 kind = "map_static"
@@ -42,7 +52,7 @@ dolphin_user_directory = "C:\\DolphinProfiles\\SMS-Modding"
 
 Required fields are:
 
-- `format_version`: currently `1`;
+- `format_version`: currently `2`;
 - `kind`: always `sms-editor-project` (retained as a compatibility identifier);
 - `name`: the user-facing project name;
 - `project_id`: a stable identity generated when the descriptor is created;
@@ -51,9 +61,13 @@ Required fields are:
 - `project_data_root`: the directory containing editor-owned overlay data.
 
 `managed_build_root`, `schema_source_root`, `last_stage`, and every value under
-`launch` are optional. `stage_music` is also optional and stores the selected
-decomp-derived BGM, matching wave-scene identifier, and optional secondary
-crossfade BGM plus its own wave-scene identifier by stage ID. `sound_assignments` stores named map-static or graph
+`launch` are optional. `stage_music` is also optional. Each stage profile can
+override `main`, `entrance`, `inside`, `switch_a`, and `switch_b` independently.
+An omitted role means Game Default, `mode = "silent"` explicitly disables that
+role, and `mode = "track"` stores a decomp-derived BGM with its wave-scene
+identifier. `transition` may be `game_default`, `disabled`,
+`inside_crossfade`, or `switch_region`; Game Default is omitted when saved.
+`sound_assignments` stores named map-static or graph
 emitter overrides; these are global runtime table bindings rather than
 per-placement values. Music preview uses the actual JAudio resources in the
 selected base game rather than storing substitute clips. The same entry shape
@@ -61,6 +75,11 @@ is used for retail and source-free custom stages. The editor updates `last_stage
 reopening the project can restore the working context. When
 `managed_build_root` is omitted, it defaults to a `.smsbuild` sibling of the
 descriptor.
+
+Version 1 descriptors are accepted and migrated in memory automatically. Their
+primary BGM becomes the v2 Main role. A v1 secondary BGM becomes the Inside role
+with `inside_crossfade`; other roles remain Game Default. The next project save
+writes the migrated descriptor as version 2.
 
 ## Path resolution
 

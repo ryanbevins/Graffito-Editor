@@ -1880,7 +1880,9 @@ impl SmsEditorApp {
                 },
                 selected_in_scene: self
                     .current_stage_music()
-                    .is_some_and(|music| music.bgm_id == entry.bgm_id),
+                    .and_then(|music| music.main)
+                    .and_then(|role| role.track())
+                    .is_some_and(|track| track.bgm_id == entry.bgm_id),
             });
         }
 
@@ -2455,14 +2457,11 @@ impl SmsEditorApp {
             }
             ContentBrowserCommand::Inspect => {}
             ContentBrowserCommand::AssignMusic(entry) => {
-                let current = self.current_stage_music();
-                self.set_current_stage_music(Some(ProjectStageMusic {
-                    bgm_id: entry.bgm_id,
-                    wave_scene_id: entry.wave_scene_id,
-                    secondary_bgm_id: current.and_then(|music| music.secondary_bgm_id),
-                    secondary_wave_scene_id: current
-                        .and_then(|music| music.secondary_wave_scene_id),
-                }));
+                let mut profile = self.current_stage_music().unwrap_or_default();
+                profile.main = Some(ProjectMusicRoleOverride::track_override(
+                    ProjectMusicTrack::resolved(entry.bgm_id, entry.wave_scene_id),
+                ));
+                self.set_current_stage_music(Some(profile));
             }
             ContentBrowserCommand::AssignSound(sound_id) => {
                 self.assign_sound_to_selected_helper(sound_id);

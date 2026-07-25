@@ -47,13 +47,53 @@ pub(super) struct RuntimeStageTarget {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RuntimeMusicRoleOverride {
+    GameDefault,
+    Silent,
+    Track {
+        bgm_id: u32,
+        wave_scene_id: Option<u32>,
+    },
+}
+
+impl RuntimeMusicRoleOverride {
+    fn bgm_id(self) -> Option<u32> {
+        match self {
+            Self::GameDefault => None,
+            Self::Silent => Some(0xffff_fff0),
+            Self::Track { bgm_id, .. } => Some(bgm_id),
+        }
+    }
+
+    fn track(self) -> Option<(u32, Option<u32>)> {
+        match self {
+            Self::Track {
+                bgm_id,
+                wave_scene_id,
+            } => Some((bgm_id, wave_scene_id)),
+            Self::GameDefault | Self::Silent => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RuntimeStageMusicTransition {
+    GameDefault,
+    Disabled,
+    InsideCrossfade,
+    SwitchRegion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RuntimeStageMusicOverride {
     pub(super) area_index: u8,
     pub(super) scenario_index: u8,
-    pub(super) bgm_id: u32,
-    pub(super) wave_scene_id: u32,
-    pub(super) secondary_bgm_id: Option<u32>,
-    pub(super) secondary_wave_scene_id: Option<u32>,
+    pub(super) main: RuntimeMusicRoleOverride,
+    pub(super) entrance: RuntimeMusicRoleOverride,
+    pub(super) inside: RuntimeMusicRoleOverride,
+    pub(super) switch_a: RuntimeMusicRoleOverride,
+    pub(super) switch_b: RuntimeMusicRoleOverride,
+    pub(super) transition: RuntimeStageMusicTransition,
 }
 
 /// A fully resolved runtime dialogue redirect.
@@ -148,6 +188,11 @@ pub(super) struct StageMusicDol {
     pub(super) bytes: Vec<u8>,
     pub(super) hook_address: u32,
     pub(super) stub_address: u32,
+}
+
+struct StageMusicStub {
+    words: Vec<u32>,
+    wrapper_word: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1656,30 +1701,23 @@ pub(super) fn patch_sms_stage_music_dol(
                 override_.area_index, override_.scenario_index
             ));
         }
-        if override_.bgm_id & 0xffff_0000 != 0x8001_0000 || override_.wave_scene_id == u32::MAX {
-            return Err(format!(
-                "Stage music area {}, scenario {} has invalid BGM/wave identifiers",
-                override_.area_index, override_.scenario_index
-            ));
-        }
-        if override_
-            .secondary_bgm_id
-            .is_some_and(|bgm_id| bgm_id & 0xffff_0000 != 0x8001_0000)
-        {
-            return Err(format!(
-                "Stage music area {}, scenario {} has an invalid secondary BGM identifier",
-                override_.area_index, override_.scenario_index
-            ));
-        }
-        if (override_.secondary_bgm_id.is_none() && override_.secondary_wave_scene_id.is_some())
-            || override_
-                .secondary_wave_scene_id
-                .is_some_and(|wave| wave > u16::MAX.into())
-        {
-            return Err(format!(
-                "Stage music area {}, scenario {} has an invalid secondary wave-scene identifier",
-                override_.area_index, override_.scenario_index
-            ));
+        for (name, role) in [
+            ("main", override_.main),
+            ("entrance", override_.entrance),
+            ("inside", override_.inside),
+            ("switch A", override_.switch_a),
+            ("switch B", override_.switch_b),
+        ] {
+            if let Some((bgm_id, wave_scene_id)) = role.track() {
+                if bgm_id & 0xffff_0000 != 0x8001_0000
+                    || wave_scene_id.is_some_and(|wave| wave > u16::MAX.into())
+                {
+                    return Err(format!(
+                        "Stage music area {}, scenario {} has an invalid {name} BGM/wave identifier",
+                        override_.area_index, override_.scenario_index
+                    ));
+                }
+            }
         }
     }
 
@@ -1696,25 +1734,6 @@ pub(super) fn patch_sms_stage_music_dol(
         .ok_or_else(|| "The DOL has no unused text section for stage music".to_string())?;
     let file_offset = align_up_usize(source.len(), FILE_ALIGNMENT as usize)?;
     let stack_top = find_stack_top(source, &image)?;
-    let preload_count = overrides
-        .iter()
-        .filter(|override_| {
-            override_.secondary_wave_scene_id.is_some()
-                && override_.secondary_wave_scene_id != Some(override_.wave_scene_id)
-        })
-        .count();
-    let word_count = overrides
-        .len()
-        .checked_mul(18)
-        .and_then(|count| count.checked_add(2))
-        .and_then(|count| count.checked_add(14))
-        .and_then(|count| count.checked_add(preload_count.checked_mul(8)?))
-        .ok_or_else(|| "Stage music dispatcher word count overflows usize".to_string())?;
-    let unaligned_payload_size = word_count
-        .checked_mul(4)
-        .and_then(|size| size.checked_add(STAGE_MUSIC_MARKER.len()))
-        .ok_or_else(|| "Stage music payload size overflows usize".to_string())?;
-    let payload_size = align_up_usize(unaligned_payload_size, 4)?;
     let loaded_end = image
         .sections
         .iter()
@@ -1727,8 +1746,14 @@ pub(super) fn patch_sms_stage_music_dol(
     // Extending the loaded image keeps the dispatcher outside the arena without changing
     // Sunshine's linker-defined startup stack or any runtime stack metadata derived from it.
     let stub_address = align_up_u32(loaded_end, FILE_ALIGNMENT)?;
-    let words = build_stage_music_stub(stub_address, hook, wave_loader, overrides)?;
-    debug_assert_eq!(words.len(), word_count);
+    let stub = build_stage_music_stub(stub_address, hook, wave_loader, overrides)?;
+    let unaligned_payload_size = stub
+        .words
+        .len()
+        .checked_mul(4)
+        .and_then(|size| size.checked_add(STAGE_MUSIC_MARKER.len()))
+        .ok_or_else(|| "Stage music payload size overflows usize".to_string())?;
+    let payload_size = align_up_usize(unaligned_payload_size, 4)?;
     let stub_end = stub_address
         .checked_add(u32::try_from(payload_size).map_err(|_| {
             "Stage music payload size does not fit the DOL address space".to_string()
@@ -1747,7 +1772,7 @@ pub(super) fn patch_sms_stage_music_dol(
     let hook_address = hook.dispatch_anchor.address()?;
     let mut bytes = source.to_vec();
     bytes.resize(file_offset, 0);
-    for word in words {
+    for word in stub.words {
         bytes.extend_from_slice(&word.to_be_bytes());
     }
     bytes.extend_from_slice(STAGE_MUSIC_MARKER);
@@ -1777,7 +1802,7 @@ pub(super) fn patch_sms_stage_music_dol(
     )?;
     let wrapper_address = stub_address
         .checked_add(
-            u32::try_from((overrides.len() * 18 + 2) * 4)
+            u32::try_from(stub.wrapper_word * 4)
                 .map_err(|_| "Stage music wrapper address does not fit u32".to_string())?,
         )
         .ok_or_else(|| "Stage music wrapper address overflows u32".to_string())?;
@@ -2105,8 +2130,8 @@ fn build_stage_music_stub(
     hook: SoundStageHook,
     wave_loader: u32,
     overrides: &[RuntimeStageMusicOverride],
-) -> Result<Vec<u32>, String> {
-    const ENTRY_WORDS: usize = 18;
+) -> Result<StageMusicStub, String> {
+    const BGM_NONE: u32 = 0xffff_fff0;
     let stage_bgm_offset = hook
         .ms_stg_offset
         .checked_add(8)
@@ -2122,58 +2147,131 @@ fn build_stage_music_stub(
         .ms_stg_offset
         .checked_add(20)
         .ok_or_else(|| "MSStageInfo::fadeEvent SDA offset overflows i16".to_string())?;
-    let tail_word = overrides
-        .len()
-        .checked_mul(ENTRY_WORDS)
-        .ok_or_else(|| "Stage music dispatcher word count overflows usize".to_string())?;
-    let tail_address = stub_address
-        .checked_add(
-            u32::try_from(tail_word)
-                .map_err(|_| "Stage music dispatcher offset does not fit u32".to_string())?
-                .checked_mul(4)
-                .ok_or_else(|| "Stage music dispatcher byte offset overflows u32".to_string())?,
-        )
-        .ok_or_else(|| "Stage music dispatcher tail address overflows u32".to_string())?;
-    let mut words = Vec::new();
-    for (index, override_) in overrides.iter().enumerate() {
-        let entry_address = stub_address
+    let demo_bgm_offset = hook
+        .ms_stg_offset
+        .checked_add(4)
+        .ok_or_else(|| "MSStageInfo::demoBgm SDA offset overflows i16".to_string())?;
+    let switch_bgm_offset = hook
+        .ms_stg_offset
+        .checked_add(24)
+        .ok_or_else(|| "MSStageInfo::switchBgm SDA offset overflows i16".to_string())?;
+    let switch_bgm2_offset = hook
+        .ms_stg_offset
+        .checked_add(28)
+        .ok_or_else(|| "MSStageInfo::switchBgm2 SDA offset overflows i16".to_string())?;
+    let word_address = |index: usize| {
+        stub_address
             .checked_add(
-                u32::try_from(index * ENTRY_WORDS * 4)
-                    .map_err(|_| "Stage music entry address does not fit u32".to_string())?,
+                u32::try_from(index)
+                    .map_err(|_| "Stage music word index does not fit u32".to_string())?
+                    .checked_mul(4)
+                    .ok_or_else(|| "Stage music word offset overflows u32".to_string())?,
             )
-            .ok_or_else(|| "Stage music entry address overflows u32".to_string())?;
-        let next_address = entry_address
-            .checked_add((ENTRY_WORDS * 4) as u32)
-            .ok_or_else(|| "Stage music next-entry address overflows u32".to_string())?;
+            .ok_or_else(|| "Stage music word address overflows u32".to_string())
+    };
+    let mut words = Vec::new();
+    let mut tail_branches = Vec::new();
+    for override_ in overrides {
+        let entry_word = words.len();
         words.push(encode_cmpwi(
             hook.area_register,
             i16::from(override_.area_index),
         ));
-        words.push(encode_bne(entry_address + 4, next_address)?);
+        let area_mismatch = words.len();
+        words.push(0);
         words.push(encode_cmpwi(
             hook.scenario_register,
             i16::from(override_.scenario_index),
         ));
-        words.push(encode_bne(entry_address + 12, next_address)?);
-        words.extend(encode_u32(0, override_.bgm_id));
-        words.push(encode_d_form(36, 0, 13, stage_bgm_offset));
-        words.extend(encode_u32(0, override_.wave_scene_id));
-        words.push(encode_d_form(36, 0, 13, hook.ms_stg_offset));
-        if let Some(secondary_bgm_id) = override_.secondary_bgm_id {
-            words.extend(encode_u32(0, secondary_bgm_id));
-            words.push(encode_d_form(36, 0, 13, stage_bgm_silent_offset));
-            words.push(encode_li(0, 2));
-            words.push(encode_d_form(38, 0, 13, stage_bgm_silent_status_offset));
-            words.push(encode_li(0, 2));
-            words.push(encode_d_form(38, 0, 13, fade_event_offset));
-        } else {
-            words.extend(std::iter::repeat_n(0x6000_0000, 7));
+        let scenario_mismatch = words.len();
+        words.push(0);
+
+        if let Some(main_bgm_id) = override_.main.bgm_id() {
+            // Snapshot the retail primary before replacing it. Any Game Default
+            // role that aliases this non-silent cue follows the authored Main cue.
+            words.push(encode_d_form(32, 11, 13, stage_bgm_offset));
+            words.extend(encode_u32(0, main_bgm_id));
+            words.push(encode_d_form(36, 0, 13, stage_bgm_offset));
+            if let RuntimeMusicRoleOverride::Track {
+                wave_scene_id: Some(wave_scene_id),
+                ..
+            } = override_.main
+            {
+                words.extend(encode_u32(12, wave_scene_id));
+                words.push(encode_d_form(36, 12, 13, hook.ms_stg_offset));
+            }
+            words.extend(encode_u32(12, BGM_NONE));
+            words.push(encode_cmplw(11, 12));
+            let original_silent = words.len();
+            words.push(0);
+            for (role, offset) in [
+                (override_.entrance, demo_bgm_offset),
+                (override_.inside, stage_bgm_silent_offset),
+                (override_.switch_a, switch_bgm_offset),
+                (override_.switch_b, switch_bgm2_offset),
+            ] {
+                if role != RuntimeMusicRoleOverride::GameDefault {
+                    continue;
+                }
+                words.push(encode_d_form(32, 12, 13, offset));
+                words.push(encode_cmplw(12, 11));
+                let not_alias = words.len();
+                words.push(0);
+                words.push(encode_d_form(36, 0, 13, offset));
+                let after_store = words.len();
+                words[not_alias] =
+                    encode_bne(word_address(not_alias)?, word_address(after_store)?)?;
+            }
+            let after_aliases = words.len();
+            words[original_silent] =
+                encode_beq(word_address(original_silent)?, word_address(after_aliases)?)?;
         }
-        words.push(encode_branch(entry_address + 68, tail_address, false)?);
+
+        for (role, offset) in [
+            (override_.entrance, demo_bgm_offset),
+            (override_.inside, stage_bgm_silent_offset),
+            (override_.switch_a, switch_bgm_offset),
+            (override_.switch_b, switch_bgm2_offset),
+        ] {
+            if let Some(bgm_id) = role.bgm_id() {
+                words.extend(encode_u32(0, bgm_id));
+                words.push(encode_d_form(36, 0, 13, offset));
+            }
+        }
+
+        match override_.transition {
+            RuntimeStageMusicTransition::GameDefault => {}
+            RuntimeStageMusicTransition::Disabled => {
+                words.push(encode_li(0, 0));
+                words.push(encode_d_form(38, 0, 13, fade_event_offset));
+            }
+            RuntimeStageMusicTransition::InsideCrossfade => {
+                words.push(encode_li(0, 2));
+                words.push(encode_d_form(38, 0, 13, stage_bgm_silent_status_offset));
+                words.push(encode_d_form(38, 0, 13, fade_event_offset));
+            }
+            RuntimeStageMusicTransition::SwitchRegion => {
+                words.push(encode_li(0, 3));
+                words.push(encode_d_form(38, 0, 13, fade_event_offset));
+            }
+        }
+
+        let tail_branch = words.len();
+        words.push(0);
+        tail_branches.push(tail_branch);
+        let next_word = words.len();
+        words[area_mismatch] = encode_bne(word_address(area_mismatch)?, word_address(next_word)?)?;
+        words[scenario_mismatch] =
+            encode_bne(word_address(scenario_mismatch)?, word_address(next_word)?)?;
+        debug_assert!(next_word > entry_word);
+    }
+    let tail_word = words.len();
+    for branch in tail_branches {
+        words[branch] = encode_branch(word_address(branch)?, word_address(tail_word)?, false)?;
     }
     words.push(encode_d_form(32, 4, 13, hook.ms_stg_offset));
     words.push(encode_branch(
-        tail_address + 4,
+        word_address(tail_word + 1)?,
         hook.dispatch_anchor
             .address()?
             .checked_add(4)
@@ -2181,12 +2279,8 @@ fn build_stage_music_stub(
         false,
     )?);
 
-    let wrapper_address = stub_address
-        .checked_add(
-            u32::try_from(words.len() * 4)
-                .map_err(|_| "Stage music wrapper offset does not fit u32".to_string())?,
-        )
-        .ok_or_else(|| "Stage music wrapper address overflows u32".to_string())?;
+    let wrapper_word = words.len();
+    let wrapper_address = word_address(wrapper_word)?;
     words.extend([
         0x7c08_02a6, // mflr r0
         0x9001_0004, // stw r0, 4(r1)
@@ -2202,30 +2296,64 @@ fn build_stage_music_stub(
         hook.enter_stage_target,
         true,
     )?);
-    let preload_overrides = overrides
-        .iter()
-        .filter_map(|override_| {
-            let secondary = override_.secondary_wave_scene_id?;
-            (secondary != override_.wave_scene_id).then_some((override_, secondary))
-        })
-        .collect::<Vec<_>>();
-    let epilogue_address = wrapper_address
-        .checked_add(
-            u32::try_from((8 + preload_overrides.len() * 8) * 4)
-                .map_err(|_| "Stage music epilogue offset does not fit u32".to_string())?,
-        )
-        .ok_or_else(|| "Stage music epilogue address overflows u32".to_string())?;
-    for (index, (override_, wave_scene)) in preload_overrides.iter().enumerate() {
-        let entry_address = wrapper_address + u32::try_from((8 + index * 8) * 4).unwrap();
-        let next_address = entry_address + 8 * 4;
-        words.push(encode_cmpwi(30, i16::from(override_.area_index)));
-        words.push(encode_bne(entry_address + 4, next_address)?);
-        words.push(encode_cmpwi(31, i16::from(override_.scenario_index)));
-        words.push(encode_bne(entry_address + 12, next_address)?);
-        words.push(encode_li(3, (wave_scene >> 8) as i16));
-        words.push(encode_li(4, (wave_scene & 0xff) as i16));
-        words.push(encode_branch(entry_address + 24, wave_loader, true)?);
-        words.push(encode_branch(entry_address + 28, epilogue_address, false)?);
+    for override_ in overrides {
+        let main_wave = override_.main.track().and_then(|(_, wave)| wave);
+        let mut preload_waves = std::collections::BTreeSet::new();
+        let active_roles = [
+            Some(override_.entrance),
+            matches!(
+                override_.transition,
+                RuntimeStageMusicTransition::GameDefault
+                    | RuntimeStageMusicTransition::InsideCrossfade
+            )
+            .then_some(override_.inside),
+            matches!(
+                override_.transition,
+                RuntimeStageMusicTransition::GameDefault
+                    | RuntimeStageMusicTransition::SwitchRegion
+            )
+            .then_some(override_.switch_a),
+            matches!(
+                override_.transition,
+                RuntimeStageMusicTransition::GameDefault
+                    | RuntimeStageMusicTransition::SwitchRegion
+            )
+            .then_some(override_.switch_b),
+        ];
+        for role in active_roles.into_iter().flatten() {
+            if let Some((_, Some(wave))) = role.track() {
+                if Some(wave) != main_wave {
+                    preload_waves.insert(wave);
+                }
+            }
+        }
+        for wave_scene in preload_waves {
+            let entry_word = words.len();
+            let entry_address = word_address(entry_word)?;
+            words.push(encode_cmpwi(30, i16::from(override_.area_index)));
+            let area_mismatch = words.len();
+            words.push(0);
+            words.push(encode_cmpwi(31, i16::from(override_.scenario_index)));
+            let scenario_mismatch = words.len();
+            words.push(0);
+            words.push(encode_d_form(32, 0, 13, hook.ms_stg_offset));
+            words.extend(encode_u32(11, wave_scene));
+            words.push(encode_cmplw(0, 11));
+            let already_loaded = words.len();
+            words.push(0);
+            words.push(encode_li(3, (wave_scene >> 8) as i16));
+            words.push(encode_li(4, (wave_scene & 0xff) as i16));
+            words.push(encode_branch(
+                word_address(words.len())?,
+                wave_loader,
+                true,
+            )?);
+            let next_word = words.len();
+            let next_address = word_address(next_word)?;
+            words[area_mismatch] = encode_bne(entry_address + 4, next_address)?;
+            words[scenario_mismatch] = encode_bne(word_address(scenario_mismatch)?, next_address)?;
+            words[already_loaded] = encode_beq(word_address(already_loaded)?, next_address)?;
+        }
     }
     words.extend([
         0x8001_0024, // lwz r0, 36(r1)
@@ -2235,7 +2363,10 @@ fn build_stage_music_stub(
         0x3821_0020, // addi r1, r1, 32
         PPC_BLR,
     ]);
-    Ok(words)
+    Ok(StageMusicStub {
+        words,
+        wrapper_word,
+    })
 }
 
 fn parse_dol(source: &[u8]) -> Result<DolImage, String> {
@@ -3913,6 +4044,300 @@ mod tests {
         assert_eq!(hook.ms_stg_offset, -0x5ff8);
     }
 
+    fn stage_music_test_hook() -> SoundStageHook {
+        let section = DolSection {
+            text: true,
+            slot: 0,
+            file_offset: 0,
+            address: 0x8000_0000,
+            size: 0x4000,
+        };
+        SoundStageHook {
+            dispatch_anchor: WordAnchor {
+                section,
+                word_index: 0x100,
+            },
+            enter_stage_anchor: WordAnchor {
+                section,
+                word_index: 0x110,
+            },
+            enter_stage_target: 0x8000_0800,
+            area_register: 28,
+            scenario_register: 29,
+            ms_stg_offset: -0x5ff8,
+        }
+    }
+
+    #[derive(Debug)]
+    struct StageMusicInterpreter {
+        registers: [u32; 32],
+        fields: [u8; 32],
+        equal: bool,
+        writes: Vec<(usize, usize)>,
+    }
+
+    impl StageMusicInterpreter {
+        fn new(area: u8, scenario: u8) -> Self {
+            let mut registers = [0_u32; 32];
+            registers[28] = u32::from(area);
+            registers[29] = u32::from(scenario);
+            Self {
+                registers,
+                fields: [0; 32],
+                equal: false,
+                writes: Vec::new(),
+            }
+        }
+
+        fn set_word(&mut self, offset: usize, value: u32) {
+            self.fields[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+        }
+
+        fn word(&self, offset: usize) -> u32 {
+            u32::from_be_bytes(self.fields[offset..offset + 4].try_into().unwrap())
+        }
+
+        fn run(
+            &mut self,
+            stub_address: u32,
+            words: &[u32],
+            hook: SoundStageHook,
+        ) -> Result<(), String> {
+            let end_address = stub_address + u32::try_from(words.len() * 4).unwrap();
+            let mut pc = stub_address;
+            for _ in 0..2_000 {
+                if pc < stub_address || pc >= end_address {
+                    return Ok(());
+                }
+                let index = usize::try_from((pc - stub_address) / 4).unwrap();
+                let word = words[index];
+                let mut next = pc + 4;
+                match opcode(word) {
+                    11 => {
+                        self.equal = self.registers[usize::from(register_a(word))]
+                            == immediate_i16(word) as i32 as u32;
+                    }
+                    14 => {
+                        let source = register_a(word);
+                        let base = if source == 0 {
+                            0
+                        } else {
+                            self.registers[usize::from(source)]
+                        };
+                        self.registers[usize::from(register_t(word))] =
+                            base.wrapping_add_signed(i32::from(immediate_i16(word)));
+                    }
+                    15 => {
+                        let source = register_a(word);
+                        let base = if source == 0 {
+                            0
+                        } else {
+                            self.registers[usize::from(source)]
+                        };
+                        self.registers[usize::from(register_t(word))] = base
+                            .wrapping_add_signed(i32::from(immediate_i16(word)).wrapping_shl(16));
+                    }
+                    16 => {
+                        let take = (is_beq(word) && self.equal) || (is_bne(word) && !self.equal);
+                        if take {
+                            next = decode_conditional_branch_target(word, pc)?;
+                        }
+                    }
+                    18 => {
+                        next = decode_branch_target(word, pc)?;
+                    }
+                    24 => {
+                        self.registers[usize::from(register_a(word))] = self.registers
+                            [usize::from(register_t(word))]
+                            | u32::from(immediate_u16(word));
+                    }
+                    31 if ((word >> 1) & 0x3ff) == 32 => {
+                        let right = ((word >> 11) & 0x1f) as usize;
+                        self.equal =
+                            self.registers[usize::from(register_a(word))] == self.registers[right];
+                    }
+                    32 | 36 | 38 => {
+                        if register_a(word) != 13 {
+                            return Err(format!(
+                                "test interpreter encountered unsupported D-form base in 0x{word:08X}"
+                            ));
+                        }
+                        let relative =
+                            i32::from(immediate_i16(word)) - i32::from(hook.ms_stg_offset);
+                        let offset = usize::try_from(relative).map_err(|_| {
+                            format!("test interpreter field offset {relative} is negative")
+                        })?;
+                        match opcode(word) {
+                            32 => {
+                                self.registers[usize::from(register_t(word))] = self.word(offset);
+                            }
+                            36 => {
+                                let value = self.registers[usize::from(register_t(word))];
+                                self.set_word(offset, value);
+                                self.writes.push((offset, 4));
+                            }
+                            38 => {
+                                self.fields[offset] =
+                                    self.registers[usize::from(register_t(word))] as u8;
+                                self.writes.push((offset, 1));
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    _ => {
+                        return Err(format!(
+                            "test interpreter encountered unsupported instruction 0x{word:08X}"
+                        ));
+                    }
+                }
+                pc = next;
+            }
+            Err("test interpreter exceeded its instruction budget".to_string())
+        }
+    }
+
+    fn default_runtime_music_override() -> RuntimeStageMusicOverride {
+        RuntimeStageMusicOverride {
+            area_index: 24,
+            scenario_index: 0,
+            main: RuntimeMusicRoleOverride::GameDefault,
+            entrance: RuntimeMusicRoleOverride::GameDefault,
+            inside: RuntimeMusicRoleOverride::GameDefault,
+            switch_a: RuntimeMusicRoleOverride::GameDefault,
+            switch_b: RuntimeMusicRoleOverride::GameDefault,
+            transition: RuntimeStageMusicTransition::GameDefault,
+        }
+    }
+
+    #[test]
+    fn stage_music_dispatcher_preserves_aliases_and_explicit_role_precedence() {
+        const STUB: u32 = 0x8000_2000;
+        let hook = stage_music_test_hook();
+        let mut override_ = default_runtime_music_override();
+        override_.main = RuntimeMusicRoleOverride::Track {
+            bgm_id: 0x8001_000d,
+            wave_scene_id: Some(0x210),
+        };
+        override_.inside = RuntimeMusicRoleOverride::Silent;
+        let stub = build_stage_music_stub(STUB, hook, 0x8000_0900, &[override_]).unwrap();
+        let mut machine = StageMusicInterpreter::new(24, 0);
+        machine.set_word(0, 0x204);
+        machine.set_word(4, 0x8001_0021);
+        machine.set_word(8, 0x8001_0021);
+        machine.set_word(12, 0x8001_0021);
+        machine.set_word(24, 0x8001_0008);
+        machine.set_word(28, 0x8001_0009);
+        machine
+            .run(STUB, &stub.words[..stub.wrapper_word], hook)
+            .unwrap();
+
+        assert_eq!(machine.word(0), 0x210);
+        assert_eq!(machine.word(8), 0x8001_000d);
+        assert_eq!(machine.word(4), 0x8001_000d);
+        assert_eq!(machine.word(12), 0xffff_fff0);
+        assert_eq!(machine.word(24), 0x8001_0008);
+        assert_eq!(machine.word(28), 0x8001_0009);
+
+        let mut silent = default_runtime_music_override();
+        silent.main = RuntimeMusicRoleOverride::Silent;
+        let stub = build_stage_music_stub(STUB, hook, 0x8000_0900, &[silent]).unwrap();
+        let mut machine = StageMusicInterpreter::new(24, 0);
+        machine.set_word(0, 0x204);
+        machine.set_word(4, 0x8001_0021);
+        machine.set_word(8, 0x8001_0021);
+        machine
+            .run(STUB, &stub.words[..stub.wrapper_word], hook)
+            .unwrap();
+        assert_eq!(machine.word(0), 0x204);
+        assert_eq!(machine.word(8), 0xffff_fff0);
+        assert_eq!(machine.word(4), 0xffff_fff0);
+    }
+
+    #[test]
+    fn stage_music_transition_modes_write_only_their_runtime_fields() {
+        const STUB: u32 = 0x8000_2000;
+        let hook = stage_music_test_hook();
+        for (transition, expected_writes, expected_status, expected_fade) in [
+            (
+                RuntimeStageMusicTransition::GameDefault,
+                Vec::<(usize, usize)>::new(),
+                7,
+                9,
+            ),
+            (RuntimeStageMusicTransition::Disabled, vec![(20, 1)], 7, 0),
+            (
+                RuntimeStageMusicTransition::InsideCrossfade,
+                vec![(16, 1), (20, 1)],
+                2,
+                2,
+            ),
+            (
+                RuntimeStageMusicTransition::SwitchRegion,
+                vec![(20, 1)],
+                7,
+                3,
+            ),
+        ] {
+            let mut override_ = default_runtime_music_override();
+            override_.transition = transition;
+            let stub = build_stage_music_stub(STUB, hook, 0x8000_0900, &[override_]).unwrap();
+            let mut machine = StageMusicInterpreter::new(24, 0);
+            machine.fields[16] = 7;
+            machine.fields[20] = 9;
+            machine
+                .run(STUB, &stub.words[..stub.wrapper_word], hook)
+                .unwrap();
+            assert_eq!(machine.writes, expected_writes);
+            assert_eq!(machine.fields[16], expected_status);
+            assert_eq!(machine.fields[20], expected_fade);
+        }
+    }
+
+    #[test]
+    fn stage_music_wave_preloads_are_active_deduplicated_and_branch_valid() {
+        const STUB: u32 = 0x8000_2000;
+        const WAVE_LOADER: u32 = 0x8000_0900;
+        let hook = stage_music_test_hook();
+        let mut override_ = default_runtime_music_override();
+        override_.main = RuntimeMusicRoleOverride::Track {
+            bgm_id: 0x8001_0002,
+            wave_scene_id: Some(0x202),
+        };
+        override_.entrance = RuntimeMusicRoleOverride::Track {
+            bgm_id: 0x8001_0003,
+            wave_scene_id: Some(0x203),
+        };
+        override_.inside = RuntimeMusicRoleOverride::Track {
+            bgm_id: 0x8001_0004,
+            wave_scene_id: Some(0x206),
+        };
+        override_.switch_a = RuntimeMusicRoleOverride::Track {
+            bgm_id: 0x8001_0005,
+            wave_scene_id: Some(0x203),
+        };
+        override_.switch_b = RuntimeMusicRoleOverride::Track {
+            bgm_id: 0x8001_0006,
+            wave_scene_id: Some(0x204),
+        };
+        override_.transition = RuntimeStageMusicTransition::SwitchRegion;
+        let stub = build_stage_music_stub(STUB, hook, WAVE_LOADER, &[override_]).unwrap();
+        let end = STUB + u32::try_from(stub.words.len() * 4).unwrap();
+        let mut wave_calls = 0;
+        for (index, word) in stub.words.iter().copied().enumerate() {
+            let address = STUB + u32::try_from(index * 4).unwrap();
+            if opcode(word) == 16 {
+                let target = decode_conditional_branch_target(word, address).unwrap();
+                assert!((STUB..=end).contains(&target));
+            } else if opcode(word) == 18 {
+                let target = decode_branch_target(word, address).unwrap();
+                if word & 1 != 0 && target == WAVE_LOADER {
+                    wave_calls += 1;
+                }
+            }
+        }
+        assert_eq!(wave_calls, 2);
+    }
+
     #[test]
     fn empty_dialogue_and_balloon_overrides_are_byte_identical() {
         let source = b"not even a DOL because an empty patch must not inspect it";
@@ -4349,6 +4774,53 @@ mod tests {
 
     #[test]
     #[ignore = "requires SMS_US_RETAIL_DOL"]
+    fn maximum_stage_music_profile_payload_fits_retail_stack_guard() {
+        let path = PathBuf::from(std::env::var_os("SMS_US_RETAIL_DOL").expect("SMS_US_RETAIL_DOL"));
+        let source = fs::read(&path).unwrap();
+        let overrides = (0..MAX_STAGE_MUSIC_OVERRIDES)
+            .map(|index| RuntimeStageMusicOverride {
+                area_index: u8::try_from(index / 8).unwrap(),
+                scenario_index: u8::try_from(index % 8).unwrap(),
+                main: RuntimeMusicRoleOverride::Track {
+                    bgm_id: 0x8001_0001,
+                    wave_scene_id: Some(0x200),
+                },
+                entrance: RuntimeMusicRoleOverride::Track {
+                    bgm_id: 0x8001_0002,
+                    wave_scene_id: Some(0x201),
+                },
+                inside: RuntimeMusicRoleOverride::Track {
+                    bgm_id: 0x8001_0003,
+                    wave_scene_id: Some(0x202),
+                },
+                switch_a: RuntimeMusicRoleOverride::Track {
+                    bgm_id: 0x8001_0004,
+                    wave_scene_id: Some(0x203),
+                },
+                switch_b: RuntimeMusicRoleOverride::Track {
+                    bgm_id: 0x8001_0005,
+                    wave_scene_id: Some(0x204),
+                },
+                transition: RuntimeStageMusicTransition::GameDefault,
+            })
+            .collect::<Vec<_>>();
+        let patched = patch_sms_stage_music_dol(&source, &overrides)
+            .unwrap_or_else(|error| panic!("maximum retail stage-music payload: {error}"));
+        let image = parse_dol(&patched.bytes).unwrap();
+        let section = image
+            .sections
+            .iter()
+            .find(|section| section.text && section.address == patched.stub_address)
+            .unwrap();
+        let stack_top = find_stack_top(&source, &parse_dol(&source).unwrap()).unwrap();
+        assert!(
+            section.address_end().unwrap() + MIN_STAGE_MUSIC_STACK_GAP <= stack_top,
+            "maximum stage-music payload crossed the retail stack guard"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SMS_US_RETAIL_DOL"]
     fn packaged_sound_music_dialogue_balloon_and_direct_boot_compose_on_retail_dol() {
         let path = PathBuf::from(std::env::var_os("SMS_US_RETAIL_DOL").expect("SMS_US_RETAIL_DOL"));
         let source = fs::read(&path).unwrap();
@@ -4376,18 +4848,31 @@ mod tests {
                 RuntimeStageMusicOverride {
                     area_index: 1,
                     scenario_index: 0,
-                    bgm_id: 0x8001_0002,
-                    wave_scene_id: 0x202,
-                    secondary_bgm_id: Some(0x8001_0003),
-                    secondary_wave_scene_id: Some(0x203),
+                    main: RuntimeMusicRoleOverride::Track {
+                        bgm_id: 0x8001_0002,
+                        wave_scene_id: Some(0x202),
+                    },
+                    entrance: RuntimeMusicRoleOverride::GameDefault,
+                    inside: RuntimeMusicRoleOverride::Track {
+                        bgm_id: 0x8001_0003,
+                        wave_scene_id: Some(0x203),
+                    },
+                    switch_a: RuntimeMusicRoleOverride::GameDefault,
+                    switch_b: RuntimeMusicRoleOverride::GameDefault,
+                    transition: RuntimeStageMusicTransition::InsideCrossfade,
                 },
                 RuntimeStageMusicOverride {
                     area_index: 17,
                     scenario_index: 1,
-                    bgm_id: 0x8001_0001,
-                    wave_scene_id: 0x201,
-                    secondary_bgm_id: None,
-                    secondary_wave_scene_id: None,
+                    main: RuntimeMusicRoleOverride::Track {
+                        bgm_id: 0x8001_0001,
+                        wave_scene_id: Some(0x201),
+                    },
+                    entrance: RuntimeMusicRoleOverride::GameDefault,
+                    inside: RuntimeMusicRoleOverride::GameDefault,
+                    switch_a: RuntimeMusicRoleOverride::GameDefault,
+                    switch_b: RuntimeMusicRoleOverride::GameDefault,
+                    transition: RuntimeStageMusicTransition::GameDefault,
                 },
             ],
         )

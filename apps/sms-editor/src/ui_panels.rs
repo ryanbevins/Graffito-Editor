@@ -4,6 +4,104 @@ use super::*;
 
 pub(super) const STAGE_MUSIC_PICKER_HEIGHT: f32 = 360.0;
 
+pub(super) fn stage_music_role_combo(
+    ui: &mut egui::Ui,
+    id: (&'static str, &str),
+    label: &str,
+    value: &mut Option<ProjectMusicRoleOverride>,
+    game_default_bgm: Option<u32>,
+    catalog: &[RetailMusicEntry],
+) {
+    let display_track = |track: ProjectMusicTrack| {
+        catalog
+            .iter()
+            .find(|entry| {
+                entry.bgm_id == track.bgm_id
+                    && track
+                        .wave_scene_id
+                        .is_none_or(|wave_scene| wave_scene == entry.wave_scene_id)
+            })
+            .map(|entry| entry.label.clone())
+            .unwrap_or_else(|| format!("BGM 0x{:08X}", track.bgm_id))
+    };
+    let default_text = game_default_bgm
+        .map(|bgm_id| {
+            let label = catalog
+                .iter()
+                .find(|entry| entry.bgm_id == bgm_id)
+                .map(|entry| entry.label.clone())
+                .unwrap_or_else(|| format!("BGM 0x{bgm_id:08X}"));
+            format!("Game default - {label}")
+        })
+        .unwrap_or_else(|| "Game default - no cue".to_string());
+    let selected_text = match *value {
+        None => default_text.clone(),
+        Some(ProjectMusicRoleOverride::Silent) => "Silent".to_string(),
+        Some(role) => role
+            .track()
+            .map(display_track)
+            .unwrap_or_else(|| "Silent".to_string()),
+    };
+    ui.label(label);
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected_text)
+        .width(ui.available_width())
+        .height(STAGE_MUSIC_PICKER_HEIGHT)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(value, None, default_text);
+            ui.selectable_value(value, Some(ProjectMusicRoleOverride::Silent), "Silent");
+            if let Some(role) = (*value).and_then(ProjectMusicRoleOverride::track) {
+                let mapped = catalog.iter().any(|entry| {
+                    entry.bgm_id == role.bgm_id
+                        && role
+                            .wave_scene_id
+                            .is_none_or(|wave_scene| wave_scene == entry.wave_scene_id)
+                });
+                if !mapped {
+                    ui.selectable_value(
+                        value,
+                        Some(ProjectMusicRoleOverride::track_override(role)),
+                        format!("BGM 0x{:08X}", role.bgm_id),
+                    );
+                }
+            }
+            for entry in catalog {
+                ui.selectable_value(
+                    value,
+                    Some(ProjectMusicRoleOverride::track_override(
+                        ProjectMusicTrack::resolved(entry.bgm_id, entry.wave_scene_id),
+                    )),
+                    &entry.label,
+                )
+                .on_hover_text(format!(
+                    "BGM 0x{:08X}; wave scene 0x{:X}",
+                    entry.bgm_id, entry.wave_scene_id
+                ));
+            }
+        });
+}
+
+fn fade_event_label(fade_event: u8) -> &'static str {
+    match fade_event {
+        0 => "disabled",
+        1 => "retail distance fade",
+        2 => "inside crossfade",
+        3 => "switch region",
+        _ => "unknown retail behavior",
+    }
+}
+
+fn effective_stage_music_role_bgm(
+    role: Option<ProjectMusicRoleOverride>,
+    game_default_bgm: Option<u32>,
+) -> Option<u32> {
+    match role {
+        None => game_default_bgm,
+        Some(ProjectMusicRoleOverride::Silent) => None,
+        Some(ProjectMusicRoleOverride::Track { bgm_id, .. }) => Some(bgm_id),
+    }
+}
+
 impl SmsEditorApp {
     pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -1181,14 +1279,17 @@ impl SmsEditorApp {
         let selected_world_member = self.selected_world_member;
         let stage_music_detail = self
             .current_stage_music()
-            .and_then(|music| {
+            .and_then(|music| music.main)
+            .and_then(|role| role.track())
+            .and_then(|track| {
                 self.retail_music
                     .iter()
                     .find(|entry| {
-                        entry.bgm_id == music.bgm_id && entry.wave_scene_id == music.wave_scene_id
+                        entry.bgm_id == track.bgm_id
+                            && Some(entry.wave_scene_id) == track.wave_scene_id
                     })
                     .map(|entry| entry.label.clone())
-                    .or_else(|| Some(format!("BGM 0x{:08X}", music.bgm_id)))
+                    .or_else(|| Some(format!("BGM 0x{:08X}", track.bgm_id)))
             })
             .unwrap_or_else(|| "Game default".to_string());
         let tree = self.document.as_ref().map(|document| {
@@ -1611,77 +1712,292 @@ impl SmsEditorApp {
             return;
         };
         let stage_id = document.stage_id.clone();
-        let current = self.current_stage_music();
-        let mut selected = current.map(|music| (music.bgm_id, music.wave_scene_id));
-        let current_is_mapped = current.is_some_and(|music| {
-            self.retail_music.iter().any(|entry| {
-                entry.bgm_id == music.bgm_id && entry.wave_scene_id == music.wave_scene_id
-            })
-        });
-        let selected_text = current
-            .and_then(|music| {
-                self.retail_music
-                    .iter()
-                    .find(|entry| {
-                        entry.bgm_id == music.bgm_id && entry.wave_scene_id == music.wave_scene_id
-                    })
-                    .map(|entry| entry.label.clone())
-                    .or_else(|| Some(format!("BGM 0x{:08X}", music.bgm_id)))
-            })
-            .unwrap_or_else(|| "Game default".to_string());
+        let current = self.current_stage_music().unwrap_or_default();
+        let defaults = self
+            .retail_stage_audio
+            .iter()
+            .find(|profile| profile.stage_id.eq_ignore_ascii_case(&stage_id))
+            .cloned();
+        let mut updated = current;
 
         ui.small(
-            "Sunshine resolves this stage-wide member through MSStageInfo. Build Game writes the selection into the managed game's main.dol.",
+            "Build Game writes this decomp-backed MSStageInfo profile into the managed main.dol. Scripted and boss-specific music remains unchanged.",
         );
-        ui.add_space(4.0);
-        ui.label("Music");
-        egui::ComboBox::from_id_salt(("stage-music", stage_id.as_str()))
-            .selected_text(selected_text)
+        ui.add_space(6.0);
+        ui.strong("Main");
+        stage_music_role_combo(
+            ui,
+            ("stage-music-main", stage_id.as_str()),
+            "Main cue",
+            &mut updated.main,
+            defaults.as_ref().and_then(|profile| profile.primary_bgm_id),
+            &self.retail_music,
+        );
+        self.bgm_preview_buttons(
+            ui,
+            effective_stage_music_role_bgm(
+                updated.main,
+                defaults.as_ref().and_then(|profile| profile.primary_bgm_id),
+            ),
+        );
+        if let Some(defaults) = &defaults {
+            let behavior = if defaults.entrance_follows_main() && defaults.flags & 2 == 0 {
+                "The game routes this stage's persistent music through the entrance cue; Game Default entrance follows an overridden Main cue."
+            } else if defaults.flags & 2 != 0 {
+                "The game starts the Main cue after its entrance sequence."
+            } else {
+                "The game does not directly start Main under its default entrance flags."
+            };
+            ui.small(behavior);
+        }
+
+        ui.add_space(8.0);
+        ui.strong("Entrance");
+        stage_music_role_combo(
+            ui,
+            ("stage-music-entrance", stage_id.as_str()),
+            "Entrance / persistent cue",
+            &mut updated.entrance,
+            defaults
+                .as_ref()
+                .and_then(|profile| profile.entrance_bgm_id),
+            &self.retail_music,
+        );
+        self.bgm_preview_buttons(
+            ui,
+            effective_stage_music_role_bgm(
+                updated.entrance,
+                defaults
+                    .as_ref()
+                    .and_then(|profile| profile.entrance_bgm_id),
+            ),
+        );
+        if let Some(defaults) = &defaults {
+            ui.small(if defaults.flags & 2 == 0 {
+                "Active and persistent under this stage's retail entrance behavior."
+            } else {
+                "Entrance-only under this stage's retail behavior; Main becomes active afterward."
+            });
+        }
+
+        ui.add_space(8.0);
+        ui.strong("Transitions");
+        egui::ComboBox::from_id_salt(("stage-music-transition", stage_id.as_str()))
+            .selected_text(match updated.transition {
+                ProjectStageMusicTransition::GameDefault => defaults.as_ref().map_or_else(
+                    || "Game default".to_string(),
+                    |profile| format!("Game default - {}", fade_event_label(profile.fade_event)),
+                ),
+                ProjectStageMusicTransition::Disabled => "Disabled".to_string(),
+                ProjectStageMusicTransition::InsideCrossfade => "Inside crossfade".to_string(),
+                ProjectStageMusicTransition::SwitchRegion => "Switch region".to_string(),
+            })
             .width(ui.available_width())
-            .height(STAGE_MUSIC_PICKER_HEIGHT)
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut selected, None, "Game default");
-                if let Some(music) = current.filter(|_| !current_is_mapped) {
-                    ui.selectable_value(
-                        &mut selected,
-                        Some((music.bgm_id, music.wave_scene_id)),
-                        format!("BGM 0x{:08X}", music.bgm_id),
-                    )
-                    .on_hover_text(format!(
-                        "BGM 0x{:08X}; wave scene 0x{:X}",
-                        music.bgm_id, music.wave_scene_id
+                ui.selectable_value(
+                    &mut updated.transition,
+                    ProjectStageMusicTransition::GameDefault,
+                    "Game default",
+                );
+                ui.selectable_value(
+                    &mut updated.transition,
+                    ProjectStageMusicTransition::Disabled,
+                    "Disabled",
+                );
+                ui.selectable_value(
+                    &mut updated.transition,
+                    ProjectStageMusicTransition::InsideCrossfade,
+                    "Inside crossfade",
+                );
+                ui.selectable_value(
+                    &mut updated.transition,
+                    ProjectStageMusicTransition::SwitchRegion,
+                    "Switch region",
+                );
+            });
+        match updated.transition {
+            ProjectStageMusicTransition::InsideCrossfade => {
+                stage_music_role_combo(
+                    ui,
+                    ("stage-music-inside", stage_id.as_str()),
+                    "Inside cue",
+                    &mut updated.inside,
+                    defaults
+                        .as_ref()
+                        .and_then(|profile| profile.secondary_bgm_id),
+                    &self.retail_music,
+                );
+                self.bgm_preview_buttons(
+                    ui,
+                    effective_stage_music_role_bgm(
+                        updated.inside,
+                        defaults
+                            .as_ref()
+                            .and_then(|profile| profile.secondary_bgm_id),
+                    ),
+                );
+            }
+            ProjectStageMusicTransition::SwitchRegion => {
+                stage_music_role_combo(
+                    ui,
+                    ("stage-music-switch-a", stage_id.as_str()),
+                    "Switch A",
+                    &mut updated.switch_a,
+                    defaults.as_ref().and_then(|profile| profile.switch_bgm_id),
+                    &self.retail_music,
+                );
+                self.bgm_preview_buttons(
+                    ui,
+                    effective_stage_music_role_bgm(
+                        updated.switch_a,
+                        defaults.as_ref().and_then(|profile| profile.switch_bgm_id),
+                    ),
+                );
+                stage_music_role_combo(
+                    ui,
+                    ("stage-music-switch-b", stage_id.as_str()),
+                    "Switch B",
+                    &mut updated.switch_b,
+                    defaults.as_ref().and_then(|profile| profile.switch_bgm2_id),
+                    &self.retail_music,
+                );
+                self.bgm_preview_buttons(
+                    ui,
+                    effective_stage_music_role_bgm(
+                        updated.switch_b,
+                        defaults.as_ref().and_then(|profile| profile.switch_bgm2_id),
+                    ),
+                );
+            }
+            ProjectStageMusicTransition::GameDefault | ProjectStageMusicTransition::Disabled => {}
+        }
+        if matches!(
+            updated.transition,
+            ProjectStageMusicTransition::InsideCrossfade
+                | ProjectStageMusicTransition::SwitchRegion
+        ) && !self.audio_cube_helpers_cache.iter().any(|helper| {
+            matches!(
+                &helper.kind,
+                AudioHelperKind::Cube {
+                    manager_kind: sms_schema::CubeManagerKind::SoundChange,
+                    ..
+                }
+            )
+        }) {
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 120, 100),
+                "Build blocked: this transition requires at least one SoundChange volume in map/tables.bin.",
+            );
+        }
+
+        egui::CollapsingHeader::new("Advanced role overrides")
+            .default_open(
+                updated.inside.is_some()
+                    || updated.switch_a.is_some()
+                    || updated.switch_b.is_some(),
+            )
+            .show(ui, |ui| {
+                stage_music_role_combo(
+                    ui,
+                    ("stage-music-inside-advanced", stage_id.as_str()),
+                    "Inside / secondary",
+                    &mut updated.inside,
+                    defaults
+                        .as_ref()
+                        .and_then(|profile| profile.secondary_bgm_id),
+                    &self.retail_music,
+                );
+                self.bgm_preview_buttons(
+                    ui,
+                    effective_stage_music_role_bgm(
+                        updated.inside,
+                        defaults
+                            .as_ref()
+                            .and_then(|profile| profile.secondary_bgm_id),
+                    ),
+                );
+                if let Some(defaults) = &defaults {
+                    let active = updated.transition == ProjectStageMusicTransition::InsideCrossfade
+                        || (updated.transition == ProjectStageMusicTransition::GameDefault
+                            && defaults.fade_event == 2);
+                    ui.small(format!(
+                        "{}; retail cue {} Main.",
+                        if active { "Active" } else { "Unused" },
+                        if defaults.inside_follows_main() {
+                            "aliases"
+                        } else {
+                            "is distinct from"
+                        }
                     ));
                 }
-                for entry in &self.retail_music {
-                    ui.selectable_value(
-                        &mut selected,
-                        Some((entry.bgm_id, entry.wave_scene_id)),
-                        &entry.label,
-                    )
-                    .on_hover_text(format!(
-                        "BGM 0x{:08X}; wave scene 0x{:X}",
-                        entry.bgm_id, entry.wave_scene_id
+                stage_music_role_combo(
+                    ui,
+                    ("stage-music-switch-a-advanced", stage_id.as_str()),
+                    "Switch A",
+                    &mut updated.switch_a,
+                    defaults.as_ref().and_then(|profile| profile.switch_bgm_id),
+                    &self.retail_music,
+                );
+                self.bgm_preview_buttons(
+                    ui,
+                    effective_stage_music_role_bgm(
+                        updated.switch_a,
+                        defaults.as_ref().and_then(|profile| profile.switch_bgm_id),
+                    ),
+                );
+                if let Some(defaults) = &defaults {
+                    let active = updated.transition == ProjectStageMusicTransition::SwitchRegion
+                        || (updated.transition == ProjectStageMusicTransition::GameDefault
+                            && defaults.fade_event == 3);
+                    ui.small(format!(
+                        "{}; retail cue {} Main.",
+                        if active { "Active" } else { "Unused" },
+                        if defaults.switch_a_follows_main() {
+                            "aliases"
+                        } else {
+                            "is distinct from"
+                        }
+                    ));
+                }
+                stage_music_role_combo(
+                    ui,
+                    ("stage-music-switch-b-advanced", stage_id.as_str()),
+                    "Switch B",
+                    &mut updated.switch_b,
+                    defaults.as_ref().and_then(|profile| profile.switch_bgm2_id),
+                    &self.retail_music,
+                );
+                self.bgm_preview_buttons(
+                    ui,
+                    effective_stage_music_role_bgm(
+                        updated.switch_b,
+                        defaults.as_ref().and_then(|profile| profile.switch_bgm2_id),
+                    ),
+                );
+                if let Some(defaults) = &defaults {
+                    let active = updated.transition == ProjectStageMusicTransition::SwitchRegion
+                        || (updated.transition == ProjectStageMusicTransition::GameDefault
+                            && defaults.fade_event == 3);
+                    ui.small(format!(
+                        "{}; retail cue {} Main.",
+                        if active { "Active" } else { "Unused" },
+                        if defaults.switch_b_follows_main() {
+                            "aliases"
+                        } else {
+                            "is distinct from"
+                        }
                     ));
                 }
             });
+
         if self.retail_music.is_empty() {
             ui.colored_label(
                 egui::Color32::from_rgb(255, 180, 90),
                 "No choices are available. Check the configured decomp source root, then reopen the stage.",
             );
         }
-        let updated = selected.map(|(bgm_id, wave_scene_id)| ProjectStageMusic {
-            bgm_id,
-            wave_scene_id,
-            secondary_bgm_id: current.and_then(|music| music.secondary_bgm_id),
-            secondary_wave_scene_id: current.and_then(|music| music.secondary_wave_scene_id),
-        });
         if updated != current {
-            self.set_current_stage_music(updated);
-        }
-        if let Some((bgm_id, _)) = selected {
-            ui.separator();
-            self.bgm_preview_transport(ui, bgm_id);
+            self.set_current_stage_music((!updated.is_default()).then_some(updated));
         }
     }
 

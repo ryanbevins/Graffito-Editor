@@ -265,6 +265,28 @@ fn invalid_values_unknown_keys_and_duplicates_are_rejected_atomically() {
 }
 
 #[test]
+fn matching_dirty_preview_alias_is_ignored_but_a_conflicting_alias_is_rejected() {
+    let prototype = actor_record(vec![field("action_flags", JDramaFieldValue::I32(101))]);
+    let mut object = SceneObject::new("retail-npc", "NPCMonteMA");
+    object.insert_source_raw_param("action_flags", "101");
+    object.set_raw_param("npc_action_flags", "101");
+
+    let mut matching = prototype.clone();
+    apply_object_parameter_edits(&mut matching, &object, ParameterApplyMode::DirtyOnly).unwrap();
+    assert_eq!(matching, prototype);
+
+    object.set_raw_param("npc_action_flags", "102");
+    let mut conflicting = prototype.clone();
+    let error =
+        apply_object_parameter_edits(&mut conflicting, &object, ParameterApplyMode::DirtyOnly)
+            .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("dirty unknown or synthetic parameter 'npc_action_flags'"));
+    assert_eq!(conflicting, prototype);
+}
+
+#[test]
 fn edited_record_round_trips_through_strict_jdrama_encoding() {
     let mut record = JDramaRecord {
         type_name: "Light".to_string(),

@@ -5,7 +5,7 @@ use std::path::Path;
 use regex::Regex;
 use sms_formats::{parse_jdrama_scenario_archive_entries, SMS_TALK_SOUND_LIMIT};
 
-use crate::project::ProjectStageMusic;
+use crate::project::ProjectStageMusicProfile;
 use crate::{SceneArchiveLabel, SmsEditorApp};
 
 const BGM_BASE: u32 = 0x8001_0000;
@@ -34,10 +34,35 @@ pub(super) struct RetailDialogueVoiceEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RetailStageAudioProfile {
     pub(super) stage_id: String,
+    pub(super) area_index: u32,
+    pub(super) scenario_index: u32,
     pub(super) primary_bgm_id: Option<u32>,
     pub(super) wave_scene_id: Option<u32>,
+    pub(super) entrance_bgm_id: Option<u32>,
     pub(super) secondary_bgm_id: Option<u32>,
+    pub(super) secondary_start_status: u8,
+    pub(super) flags: u8,
     pub(super) fade_event: u8,
+    pub(super) switch_bgm_id: Option<u32>,
+    pub(super) switch_bgm2_id: Option<u32>,
+}
+
+impl RetailStageAudioProfile {
+    pub(super) fn entrance_follows_main(&self) -> bool {
+        self.primary_bgm_id.is_some() && self.entrance_bgm_id == self.primary_bgm_id
+    }
+
+    pub(super) fn inside_follows_main(&self) -> bool {
+        self.primary_bgm_id.is_some() && self.secondary_bgm_id == self.primary_bgm_id
+    }
+
+    pub(super) fn switch_a_follows_main(&self) -> bool {
+        self.primary_bgm_id.is_some() && self.switch_bgm_id == self.primary_bgm_id
+    }
+
+    pub(super) fn switch_b_follows_main(&self) -> bool {
+        self.primary_bgm_id.is_some() && self.switch_bgm2_id == self.primary_bgm_id
+    }
 }
 
 pub(super) fn index_retail_music(
@@ -307,12 +332,19 @@ pub(super) fn index_retail_stage_audio_profiles(
         };
         profiles.push(RetailStageAudioProfile {
             stage_id: stage_id.to_ascii_lowercase(),
+            area_index: entry.area_index,
+            scenario_index: entry.scenario_index,
             primary_bgm_id: state.primary_bgm_id,
             wave_scene_id: state
                 .primary_bgm_id
                 .and_then(|bgm_id| scene_by_bgm.get(&bgm_id).copied()),
+            entrance_bgm_id: state.entrance_bgm_id,
             secondary_bgm_id: state.secondary_bgm_id,
+            secondary_start_status: state.secondary_start_status,
+            flags: state.flags,
             fade_event: state.fade_event,
+            switch_bgm_id: state.switch_bgm_id,
+            switch_bgm2_id: state.switch_bgm2_id,
         });
     }
     profiles.sort_by(|left, right| left.stage_id.cmp(&right.stage_id));
@@ -341,8 +373,13 @@ fn load_stage_archive_entries(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct EvaluatedStageAudio {
     primary_bgm_id: Option<u32>,
+    entrance_bgm_id: Option<u32>,
     secondary_bgm_id: Option<u32>,
+    secondary_start_status: u8,
+    flags: u8,
     fade_event: u8,
+    switch_bgm_id: Option<u32>,
+    switch_bgm2_id: Option<u32>,
 }
 
 fn evaluate_stage_audio_source(source: &str, map: u32, area: u32) -> Option<EvaluatedStageAudio> {
@@ -477,6 +514,9 @@ fn apply_audio_statement(statement: &str, state: &mut EvaluatedStageAudio) {
             "stageBgmSilent",
             &mut state.secondary_bgm_id as &mut Option<u32>,
         ),
+        ("demoBgm", &mut state.entrance_bgm_id),
+        ("switchBgm2", &mut state.switch_bgm2_id),
+        ("switchBgm", &mut state.switch_bgm_id),
         ("stageBgm", &mut state.primary_bgm_id),
     ] {
         let marker = format!("MSStageInfo::{field}");
@@ -504,14 +544,23 @@ fn apply_audio_statement(statement: &str, state: &mut EvaluatedStageAudio) {
         };
         return;
     }
-    if let Some(start) = statement.find("MSStageInfo::fadeEvent") {
-        if let Some(equal) = statement[start..].find('=') {
-            let rhs = statement[start + equal + 1..]
-                .trim()
-                .trim_end_matches(';')
-                .trim();
-            if let Ok(value) = rhs.parse::<u8>() {
-                state.fade_event = value;
+    for (field, destination) in [
+        (
+            "stageBgmSilentStartStatus",
+            &mut state.secondary_start_status,
+        ),
+        ("flags", &mut state.flags),
+        ("fadeEvent", &mut state.fade_event),
+    ] {
+        if let Some(start) = statement.find(&format!("MSStageInfo::{field}")) {
+            if let Some(equal) = statement[start..].find('=') {
+                let rhs = statement[start + equal + 1..]
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim();
+                if let Ok(value) = rhs.parse::<u8>() {
+                    *destination = value;
+                }
             }
         }
     }
@@ -755,7 +804,7 @@ fn parse_hex(value: &str) -> Result<u32, String> {
 }
 
 impl SmsEditorApp {
-    pub(super) fn current_stage_music(&self) -> Option<ProjectStageMusic> {
+    pub(super) fn current_stage_music(&self) -> Option<ProjectStageMusicProfile> {
         let stage_id = self.document.as_ref()?.stage_id.as_str();
         self.current_project
             .as_ref()?
@@ -766,7 +815,7 @@ impl SmsEditorApp {
             .map(|(_, music)| *music)
     }
 
-    pub(super) fn set_current_stage_music(&mut self, music: Option<ProjectStageMusic>) {
+    pub(super) fn set_current_stage_music(&mut self, music: Option<ProjectStageMusicProfile>) {
         let Some(stage_id) = self
             .document
             .as_ref()
@@ -784,7 +833,7 @@ impl SmsEditorApp {
             .descriptor
             .stage_music
             .retain(|stage, _| !stage.eq_ignore_ascii_case(&stage_id));
-        if let Some(music) = music {
+        if let Some(music) = music.filter(|music| !music.is_default()) {
             project
                 .descriptor
                 .stage_music
@@ -798,11 +847,11 @@ impl SmsEditorApp {
         }
         self.rebuild_audio_cube_helpers_cache();
         self.log.push(match music {
-            Some(music) => format!(
-                "Set stage '{stage_id}' music to BGM 0x{:08X} (wave scene 0x{:X}).",
-                music.bgm_id, music.wave_scene_id
-            ),
+            Some(music) if !music.is_default() => {
+                format!("Updated stage '{stage_id}' music profile.")
+            }
             None => format!("Restored stage '{stage_id}' to the game's default music."),
+            Some(_) => format!("Restored stage '{stage_id}' to the game's default music."),
         });
     }
 }
@@ -841,6 +890,36 @@ mod tests {
         assert_eq!(result[&0x8001_0001], BTreeSet::from([1]));
         assert_eq!(result[&0x8001_0002], BTreeSet::from([2, 3]));
         assert!(!result.contains_key(&0x8001_0016));
+    }
+
+    #[test]
+    fn evaluates_every_stage_audio_role_and_transition_field() {
+        let source = r#"
+            void MSMainProc::setMSoundEnterStage(unsigned char map, unsigned char area) {
+                unsigned long base = 0x80010000;
+                switch (map) {
+                case 24:
+                    MSStageInfo::stageBgm = base + 0x21;
+                    MSStageInfo::demoBgm = base + 0x21;
+                    MSStageInfo::stageBgmSilent = base + 0x23;
+                    MSStageInfo::stageBgmSilentStartStatus = 2;
+                    MSStageInfo::switchBgm = base + 0x08;
+                    MSStageInfo::switchBgm2 = base + 0x09;
+                    MSStageInfo::flags = 0;
+                    MSStageInfo::fadeEvent = 3;
+                    break;
+                }
+            }
+        "#;
+        let profile = evaluate_stage_audio_source(source, 24, 0).unwrap();
+        assert_eq!(profile.primary_bgm_id, Some(0x8001_0021));
+        assert_eq!(profile.entrance_bgm_id, Some(0x8001_0021));
+        assert_eq!(profile.secondary_bgm_id, Some(0x8001_0023));
+        assert_eq!(profile.secondary_start_status, 2);
+        assert_eq!(profile.switch_bgm_id, Some(0x8001_0008));
+        assert_eq!(profile.switch_bgm2_id, Some(0x8001_0009));
+        assert_eq!(profile.flags, 0);
+        assert_eq!(profile.fade_event, 3);
     }
 
     #[test]
@@ -949,5 +1028,24 @@ mod tests {
             .unwrap_or_else(|| panic!("no Pinna crossfade profile in {profiles:#?}"));
         assert_eq!(pinna.wave_scene_id, Some(0x204));
         assert_eq!(pinna.fade_event, 2);
+    }
+
+    #[test]
+    #[ignore = "requires SMS_DECOMP_ROOT and SMS_BASE_ROOT"]
+    fn evaluates_dolpic_ex4_persistent_demo_alias() {
+        let repo_root = std::env::var_os("SMS_DECOMP_ROOT").expect("SMS_DECOMP_ROOT");
+        let base_root = std::env::var_os("SMS_BASE_ROOT").expect("SMS_BASE_ROOT");
+        let profiles =
+            index_retail_stage_audio_profiles(Path::new(&repo_root), Path::new(&base_root))
+                .unwrap();
+        let profile = profiles
+            .iter()
+            .find(|profile| profile.stage_id == "dolpic_ex4")
+            .unwrap_or_else(|| panic!("no dolpic_ex4 profile in {profiles:#?}"));
+        assert_eq!(profile.primary_bgm_id, Some(0x8001_0021));
+        assert_eq!(profile.entrance_bgm_id, profile.primary_bgm_id);
+        assert!(profile.entrance_follows_main());
+        assert_eq!(profile.flags, 0);
+        assert_eq!((profile.area_index, profile.scenario_index), (24, 0));
     }
 }

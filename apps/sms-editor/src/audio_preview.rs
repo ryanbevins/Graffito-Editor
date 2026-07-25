@@ -90,34 +90,42 @@ impl SmsEditorApp {
     }
 
     pub(super) fn bgm_preview_transport(&mut self, ui: &mut egui::Ui, bgm_id: u32) {
-        let is_playing = self
-            .audio_preview_playback
-            .as_ref()
-            .is_some_and(|playback| playback.is_playing(bgm_id));
-        let is_loading = self.audio_preview_target_is_loading(AudioPreviewTarget::Music(bgm_id));
+        self.bgm_preview_buttons(ui, Some(bgm_id));
+        ui.small("Preview uses the actual Sunshine sequence, banks, and AW samples from this project's base game.");
+    }
+
+    pub(super) fn bgm_preview_buttons(&mut self, ui: &mut egui::Ui, bgm_id: Option<u32>) {
+        let is_playing = bgm_id.is_some_and(|bgm_id| {
+            self.audio_preview_playback
+                .as_ref()
+                .is_some_and(|playback| playback.is_playing(bgm_id))
+        });
+        let is_loading = bgm_id.is_some_and(|bgm_id| {
+            self.audio_preview_target_is_loading(AudioPreviewTarget::Music(bgm_id))
+        });
+        let can_stop =
+            self.audio_preview_receiver.is_some() || self.audio_preview_playback.is_some();
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    !is_playing && !is_loading,
+                    bgm_id.is_some() && !is_playing && !is_loading,
                     egui::Button::new(if is_loading { "Loading..." } else { "Preview" }),
                 )
                 .on_hover_text("Render this track from Sunshine's sequence, instrument-bank, and AW sample data")
                 .clicked()
             {
-                if let Err(error) =
-                    self.start_audio_preview_render(AudioPreviewTarget::Music(bgm_id))
-                {
-                    self.log.push(format!("Could not preview Sunshine BGM: {error}"));
+                if let Some(bgm_id) = bgm_id {
+                    if let Err(error) =
+                        self.start_audio_preview_render(AudioPreviewTarget::Music(bgm_id))
+                    {
+                        self.log.push(format!("Could not preview Sunshine BGM: {error}"));
+                    }
                 }
             }
-            if ui
-                .add_enabled(is_playing || is_loading, egui::Button::new("Stop"))
-                .clicked()
-            {
+            if ui.add_enabled(can_stop, egui::Button::new("Stop")).clicked() {
                 self.stop_audio_preview();
             }
         });
-        ui.small("Preview uses the actual Sunshine sequence, banks, and AW samples from this project's base game.");
     }
 
     pub(super) fn se_preview_notice(&self, ui: &mut egui::Ui) {

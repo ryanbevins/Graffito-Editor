@@ -14,6 +14,19 @@ use crate::{
 
 pub const OBJECT_PARAMETER_NAME: &str = "name";
 pub const OBJECT_PARAMETER_CHARACTER_NAME: &str = "character_name";
+const SOURCE_PARAMETER_ALIASES: [(&str, &str); 11] = [
+    (OBJECT_PARAMETER_CHARACTER_NAME, "stream_string_0"),
+    ("item_selector", "nozzle_box_item"),
+    ("body_color_index", "npc_body_color_index"),
+    ("cloth_color_index", "npc_cloth_color_index"),
+    ("pollution_amount", "npc_pollution_amount"),
+    ("parts_color_index_0", "npc_parts_color_index_0"),
+    ("parts_color_index_1", "npc_parts_color_index_1"),
+    ("parts_color_index_2", "npc_parts_color_index_2"),
+    ("parts_mask", "npc_parts_mask"),
+    ("action_flags", "npc_action_flags"),
+    ("blade_count", "grass_blade_count"),
+];
 
 /// The exact scalar/vector type stored in a strict JDrama record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,7 +280,9 @@ pub fn seed_scene_object_parameters(object: &mut SceneObject, record: &JDramaRec
 /// Aliases are always source values. Editing an alias directly is rejected by
 /// [`apply_object_parameter_edits`]; callers should edit its canonical field.
 pub fn sync_scene_object_parameter_aliases(object: &mut SceneObject) {
-    sync_alias(object, OBJECT_PARAMETER_CHARACTER_NAME, "stream_string_0");
+    for (canonical, alias) in SOURCE_PARAMETER_ALIASES {
+        sync_alias(object, canonical, alias);
+    }
 
     let actor_tail = object
         .raw_param("resource_name")
@@ -276,16 +291,6 @@ pub fn sync_scene_object_parameter_aliases(object: &mut SceneObject) {
     if let Some(value) = actor_tail {
         object.insert_source_raw_param("actor_tail_string", value);
     }
-    sync_alias(object, "item_selector", "nozzle_box_item");
-    sync_alias(object, "body_color_index", "npc_body_color_index");
-    sync_alias(object, "cloth_color_index", "npc_cloth_color_index");
-    sync_alias(object, "pollution_amount", "npc_pollution_amount");
-    sync_alias(object, "parts_color_index_0", "npc_parts_color_index_0");
-    sync_alias(object, "parts_color_index_1", "npc_parts_color_index_1");
-    sync_alias(object, "parts_color_index_2", "npc_parts_color_index_2");
-    sync_alias(object, "parts_mask", "npc_parts_mask");
-    sync_alias(object, "action_flags", "npc_action_flags");
-    sync_alias(object, "blade_count", "grass_blade_count");
 }
 
 /// Applies canonical object parameter values with the requested persistence policy.
@@ -302,6 +307,17 @@ pub fn apply_object_parameter_edits(
 
     for (key, parameter) in &object.raw_params {
         if parameter.is_dirty() && !schema.contains_key(key.as_str()) {
+            let matches_canonical_alias =
+                SOURCE_PARAMETER_ALIASES.iter().any(|(canonical, alias)| {
+                    *alias == key
+                        && object
+                            .raw_params
+                            .get(*canonical)
+                            .is_some_and(|canonical| canonical.raw() == parameter.raw())
+                });
+            if matches_canonical_alias {
+                continue;
+            }
             return Err(parameter_error(format!(
                 "object '{}' has a dirty unknown or synthetic parameter '{key}'",
                 object.id

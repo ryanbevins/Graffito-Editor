@@ -10,7 +10,8 @@ use sms_scene::EditorProjectManifest;
 
 pub(super) const SMS_PROJECT_EXTENSION: &str = "sms";
 const SMS_PROJECT_KIND: &str = "sms-editor-project";
-const SMS_PROJECT_FORMAT_VERSION: u32 = 1;
+const SMS_PROJECT_FORMAT_VERSION: u32 = 2;
+const SMS_PROJECT_LEGACY_FORMAT_VERSION: u32 = 1;
 const RECENT_PROJECTS_KIND: &str = "sms-editor-recent-projects";
 const RECENT_PROJECTS_FORMAT_VERSION: u32 = 1;
 const MAX_PROJECT_FILE_BYTES: u64 = 1024 * 1024;
@@ -28,13 +29,128 @@ pub(super) struct ProjectLaunchConfiguration {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct ProjectStageMusic {
+pub(super) struct ProjectMusicTrack {
     pub(super) bgm_id: u32,
-    pub(super) wave_scene_id: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) secondary_bgm_id: Option<u32>,
+    pub(super) wave_scene_id: Option<u32>,
+}
+
+impl ProjectMusicTrack {
+    pub(super) fn resolved(bgm_id: u32, wave_scene_id: u32) -> Self {
+        Self {
+            bgm_id,
+            wave_scene_id: Some(wave_scene_id),
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        self.bgm_id & 0xffff_0000 == 0x8001_0000
+            && self
+                .wave_scene_id
+                .is_none_or(|wave_scene_id| wave_scene_id <= u16::MAX.into())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub(super) enum ProjectMusicRoleOverride {
+    Silent,
+    Track {
+        bgm_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wave_scene_id: Option<u32>,
+    },
+}
+
+impl ProjectMusicRoleOverride {
+    pub(super) fn track_override(track: ProjectMusicTrack) -> Self {
+        Self::Track {
+            bgm_id: track.bgm_id,
+            wave_scene_id: track.wave_scene_id,
+        }
+    }
+
+    pub(super) fn track(self) -> Option<ProjectMusicTrack> {
+        match self {
+            Self::Silent => None,
+            Self::Track {
+                bgm_id,
+                wave_scene_id,
+            } => Some(ProjectMusicTrack {
+                bgm_id,
+                wave_scene_id,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProjectStageMusicTransition {
+    #[default]
+    GameDefault,
+    Disabled,
+    InsideCrossfade,
+    SwitchRegion,
+}
+
+impl ProjectStageMusicTransition {
+    fn is_game_default(value: &Self) -> bool {
+        matches!(value, Self::GameDefault)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct ProjectStageMusicProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) secondary_wave_scene_id: Option<u32>,
+    pub(super) main: Option<ProjectMusicRoleOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) entrance: Option<ProjectMusicRoleOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) inside: Option<ProjectMusicRoleOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) switch_a: Option<ProjectMusicRoleOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) switch_b: Option<ProjectMusicRoleOverride>,
+    #[serde(
+        default,
+        skip_serializing_if = "ProjectStageMusicTransition::is_game_default"
+    )]
+    pub(super) transition: ProjectStageMusicTransition,
+}
+
+impl ProjectStageMusicProfile {
+    pub(super) fn is_default(&self) -> bool {
+        self.main.is_none()
+            && self.entrance.is_none()
+            && self.inside.is_none()
+            && self.switch_a.is_none()
+            && self.switch_b.is_none()
+            && self.transition == ProjectStageMusicTransition::GameDefault
+    }
+
+    fn is_valid(&self) -> bool {
+        [
+            self.main,
+            self.entrance,
+            self.inside,
+            self.switch_a,
+            self.switch_b,
+        ]
+        .into_iter()
+        .flatten()
+        .all(|role| role.track().is_none_or(|track| track.is_valid()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+struct LegacyProjectStageMusic {
+    bgm_id: u32,
+    wave_scene_id: u32,
+    #[serde(default)]
+    secondary_bgm_id: Option<u32>,
+    #[serde(default)]
+    secondary_wave_scene_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,11 +223,89 @@ pub(super) struct SmsProjectFile {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(super) stage_cameras: BTreeMap<String, ProjectCameraState>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(super) stage_music: BTreeMap<String, ProjectStageMusic>,
+    pub(super) stage_music: BTreeMap<String, ProjectStageMusicProfile>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(super) sound_assignments: BTreeMap<String, ProjectSoundAssignment>,
     #[serde(default)]
     pub(super) launch: ProjectLaunchConfiguration,
+}
+
+#[derive(Deserialize)]
+struct ProjectFormatHeader {
+    format_version: u32,
+}
+
+#[derive(Deserialize)]
+struct LegacySmsProjectFileV1 {
+    format_version: u32,
+    kind: String,
+    name: String,
+    project_id: String,
+    created_with: String,
+    base_game_root: PathBuf,
+    project_data_root: PathBuf,
+    #[serde(default)]
+    managed_build_root: Option<PathBuf>,
+    #[serde(default)]
+    schema_source_root: Option<PathBuf>,
+    #[serde(default)]
+    last_stage: Option<String>,
+    #[serde(default)]
+    stage_cameras: BTreeMap<String, ProjectCameraState>,
+    #[serde(default)]
+    stage_music: BTreeMap<String, LegacyProjectStageMusic>,
+    #[serde(default)]
+    sound_assignments: BTreeMap<String, ProjectSoundAssignment>,
+    #[serde(default)]
+    launch: ProjectLaunchConfiguration,
+}
+
+impl LegacySmsProjectFileV1 {
+    fn migrate(self) -> SmsProjectFile {
+        let stage_music = self
+            .stage_music
+            .into_iter()
+            .map(|(stage, music)| {
+                let inside = music.secondary_bgm_id.map(|bgm_id| {
+                    ProjectMusicRoleOverride::track_override(ProjectMusicTrack {
+                        bgm_id,
+                        wave_scene_id: music.secondary_wave_scene_id,
+                    })
+                });
+                (
+                    stage,
+                    ProjectStageMusicProfile {
+                        main: Some(ProjectMusicRoleOverride::track_override(
+                            ProjectMusicTrack::resolved(music.bgm_id, music.wave_scene_id),
+                        )),
+                        inside,
+                        transition: if inside.is_some() {
+                            ProjectStageMusicTransition::InsideCrossfade
+                        } else {
+                            ProjectStageMusicTransition::GameDefault
+                        },
+                        ..ProjectStageMusicProfile::default()
+                    },
+                )
+            })
+            .collect();
+        SmsProjectFile {
+            format_version: SMS_PROJECT_FORMAT_VERSION,
+            kind: self.kind,
+            name: self.name,
+            project_id: self.project_id,
+            created_with: self.created_with,
+            base_game_root: self.base_game_root,
+            project_data_root: self.project_data_root,
+            managed_build_root: self.managed_build_root,
+            schema_source_root: self.schema_source_root,
+            last_stage: self.last_stage,
+            stage_cameras: self.stage_cameras,
+            stage_music,
+            sound_assignments: self.sound_assignments,
+            launch: self.launch,
+        }
+    }
 }
 
 impl SmsProjectFile {
@@ -154,8 +348,31 @@ impl SmsProjectFile {
         }
         let text = fs::read_to_string(path)
             .map_err(|error| format!("Could not read project '{}': {error}", path.display()))?;
-        let project: Self = toml::from_str(&text)
+        let header: ProjectFormatHeader = toml::from_str(&text)
             .map_err(|error| format!("Could not parse project '{}': {error}", path.display()))?;
+        let project = match header.format_version {
+            SMS_PROJECT_FORMAT_VERSION => toml::from_str(&text).map_err(|error| {
+                format!("Could not parse project '{}': {error}", path.display())
+            })?,
+            SMS_PROJECT_LEGACY_FORMAT_VERSION => {
+                let legacy: LegacySmsProjectFileV1 = toml::from_str(&text).map_err(|error| {
+                    format!("Could not parse project '{}': {error}", path.display())
+                })?;
+                if legacy.format_version != SMS_PROJECT_LEGACY_FORMAT_VERSION {
+                    return Err(format!(
+                        "Project '{}' has inconsistent legacy format metadata",
+                        path.display()
+                    ));
+                }
+                legacy.migrate()
+            }
+            version => {
+                return Err(format!(
+                    "Project '{}' uses format version {version}; this editor supports versions {SMS_PROJECT_LEGACY_FORMAT_VERSION} and {SMS_PROJECT_FORMAT_VERSION}",
+                    path.display()
+                ));
+            }
+        };
         project.validate(path)?;
         project.validate_locations(path)?;
         Ok(project)
@@ -290,14 +507,8 @@ impl SmsProjectFile {
                 || !stage
                     .chars()
                     .all(|character| character.is_ascii_alphanumeric() || "_-".contains(character))
-                || music.bgm_id & 0xffff_0000 != 0x8001_0000
-                || music.wave_scene_id == u32::MAX
-                || music
-                    .secondary_bgm_id
-                    .is_some_and(|bgm_id| bgm_id & 0xffff_0000 != 0x8001_0000)
-                || music
-                    .secondary_wave_scene_id
-                    .is_some_and(|wave_scene_id| wave_scene_id == u32::MAX)
+                || music.is_default()
+                || !music.is_valid()
         }) {
             return Err(format!(
                 "Project '{}' has an invalid saved stage music override",
@@ -810,11 +1021,19 @@ mod tests {
         );
         project.stage_music.insert(
             "dolpic0".to_string(),
-            ProjectStageMusic {
-                bgm_id: 0x8001_0002,
-                wave_scene_id: 0x202,
-                secondary_bgm_id: Some(0x8001_0023),
-                secondary_wave_scene_id: Some(0x204),
+            ProjectStageMusicProfile {
+                main: Some(ProjectMusicRoleOverride::track_override(
+                    ProjectMusicTrack::resolved(0x8001_0002, 0x202),
+                )),
+                entrance: Some(ProjectMusicRoleOverride::Silent),
+                inside: Some(ProjectMusicRoleOverride::track_override(
+                    ProjectMusicTrack::resolved(0x8001_0023, 0x204),
+                )),
+                switch_a: Some(ProjectMusicRoleOverride::track_override(
+                    ProjectMusicTrack::resolved(0x8001_0003, 0x203),
+                )),
+                switch_b: None,
+                transition: ProjectStageMusicTransition::InsideCrossfade,
             },
         );
         project.sound_assignments.insert(
@@ -831,6 +1050,112 @@ mod tests {
 
         assert_eq!(reopened.descriptor, project);
         assert_eq!(reopened.data_root(), root.join("Isle Delfino.smsdata"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sms_project_v1_music_migrates_to_semantic_v2_roles() {
+        let root = temporary_path("v1-music-migration");
+        fs::create_dir_all(&root).unwrap();
+        let descriptor_path = root.join("Legacy.sms");
+        let base_root = root.join("SunshineExtract");
+        let project_data_root = root.join("Legacy.smsdata");
+        let text = format!(
+            r#"format_version = 1
+kind = "sms-editor-project"
+name = "Legacy"
+project_id = "legacy-project"
+created_with = "0.1.0"
+base_game_root = "{}"
+project_data_root = "{}"
+
+[stage_music.dolpic_ex4]
+bgm_id = 2147549197
+wave_scene_id = 528
+
+[stage_music.bianco0]
+bgm_id = 2147549186
+wave_scene_id = 514
+secondary_bgm_id = 2147549219
+secondary_wave_scene_id = 516
+"#,
+            base_root.display().to_string().replace('\\', "/"),
+            project_data_root.display().to_string().replace('\\', "/"),
+        );
+        fs::write(&descriptor_path, text).unwrap();
+
+        let migrated = SmsProjectFile::load(&descriptor_path).unwrap();
+        assert_eq!(migrated.format_version, SMS_PROJECT_FORMAT_VERSION);
+        assert_eq!(
+            migrated.stage_music["dolpic_ex4"],
+            ProjectStageMusicProfile {
+                main: Some(ProjectMusicRoleOverride::Track {
+                    bgm_id: 0x8001_000d,
+                    wave_scene_id: Some(0x210),
+                }),
+                ..ProjectStageMusicProfile::default()
+            }
+        );
+        assert_eq!(
+            migrated.stage_music["bianco0"],
+            ProjectStageMusicProfile {
+                main: Some(ProjectMusicRoleOverride::Track {
+                    bgm_id: 0x8001_0002,
+                    wave_scene_id: Some(0x202),
+                }),
+                inside: Some(ProjectMusicRoleOverride::Track {
+                    bgm_id: 0x8001_0023,
+                    wave_scene_id: Some(0x204),
+                }),
+                transition: ProjectStageMusicTransition::InsideCrossfade,
+                ..ProjectStageMusicProfile::default()
+            }
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sms_project_v2_round_trips_every_music_transition_mode() {
+        let root = temporary_path("v2-music-modes");
+        fs::create_dir_all(&root).unwrap();
+        let descriptor_path = root.join("Profiles.sms");
+        let mut project = SmsProjectFile::new(
+            "Profiles",
+            root.join("SunshineExtract"),
+            root.join("Profiles.smsdata"),
+            None,
+        );
+        for (index, transition) in [
+            ProjectStageMusicTransition::GameDefault,
+            ProjectStageMusicTransition::Disabled,
+            ProjectStageMusicTransition::InsideCrossfade,
+            ProjectStageMusicTransition::SwitchRegion,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            project.stage_music.insert(
+                format!("stage{index}"),
+                ProjectStageMusicProfile {
+                    main: Some(ProjectMusicRoleOverride::Track {
+                        bgm_id: 0x8001_0001 + index as u32,
+                        wave_scene_id: Some(0x201 + index as u32),
+                    }),
+                    entrance: Some(ProjectMusicRoleOverride::Silent),
+                    inside: Some(ProjectMusicRoleOverride::Track {
+                        bgm_id: 0x8001_0010 + index as u32,
+                        wave_scene_id: None,
+                    }),
+                    switch_a: None,
+                    switch_b: Some(ProjectMusicRoleOverride::Silent),
+                    transition,
+                },
+            );
+        }
+
+        project.save(&descriptor_path).unwrap();
+        let reopened = SmsProjectFile::load(&descriptor_path).unwrap();
+        assert_eq!(reopened, project);
         fs::remove_dir_all(root).unwrap();
     }
 

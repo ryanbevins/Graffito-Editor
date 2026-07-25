@@ -20,14 +20,14 @@ use sms_schema::ObjectRegistry;
 use crate::direct_boot::{
     patch_sms_dialogue_dol, patch_sms_direct_boot_dol, patch_sms_sound_assignments_dol,
     patch_sms_stage_music_dol, RuntimeBalloonOverride, RuntimeDialogueOverride,
-    RuntimeSoundAssignment, RuntimeSoundAssignmentKind, RuntimeStageMusicOverride,
-    RuntimeStageTarget,
+    RuntimeMusicRoleOverride, RuntimeSoundAssignment, RuntimeSoundAssignmentKind,
+    RuntimeStageMusicOverride, RuntimeStageMusicTransition, RuntimeStageTarget,
 };
 #[cfg(test)]
 use crate::project::ProjectSoundAssignment;
 use crate::project::{
     normalized_absolute_with_missing_tail, path_is_same_or_child, OpenProject,
-    ProjectSoundAssignmentKind,
+    ProjectMusicRoleOverride, ProjectSoundAssignmentKind, ProjectStageMusicTransition,
 };
 
 const MANAGED_BUILD_MARKER_NAME: &str = ".smsbuild-owner.toml";
@@ -452,6 +452,7 @@ fn build_managed_game_with_compiled_dialogue_inner(
         let direct_boot = install_managed_runtime_patches(
             project,
             &run,
+            document.registry.as_ref(),
             &runtime.talk,
             &runtime.balloon,
             direct_boot,
@@ -1072,15 +1073,149 @@ fn read_managed_runtime_stage_entries(
     })
 }
 
+fn runtime_music_role(role: Option<ProjectMusicRoleOverride>) -> RuntimeMusicRoleOverride {
+    match role {
+        None => RuntimeMusicRoleOverride::GameDefault,
+        Some(ProjectMusicRoleOverride::Silent) => RuntimeMusicRoleOverride::Silent,
+        Some(ProjectMusicRoleOverride::Track {
+            bgm_id,
+            wave_scene_id,
+        }) => RuntimeMusicRoleOverride::Track {
+            bgm_id,
+            wave_scene_id,
+        },
+    }
+}
+
+fn runtime_music_transition(
+    transition: ProjectStageMusicTransition,
+) -> RuntimeStageMusicTransition {
+    match transition {
+        ProjectStageMusicTransition::GameDefault => RuntimeStageMusicTransition::GameDefault,
+        ProjectStageMusicTransition::Disabled => RuntimeStageMusicTransition::Disabled,
+        ProjectStageMusicTransition::InsideCrossfade => {
+            RuntimeStageMusicTransition::InsideCrossfade
+        }
+        ProjectStageMusicTransition::SwitchRegion => RuntimeStageMusicTransition::SwitchRegion,
+    }
+}
+
+fn contains_sound_change_volume(record: &JDramaRecord, table_names: &BTreeSet<&str>) -> bool {
+    let is_sound_change_table = record
+        .type_name
+        .rsplit("::")
+        .next()
+        .is_some_and(|type_name| type_name == "CubeGeneralInfoTable")
+        && table_names.contains(record.name.as_str());
+    if is_sound_change_table {
+        let mut pending = vec![record];
+        while let Some(candidate) = pending.pop() {
+            if !std::ptr::eq(candidate, record)
+                && candidate
+                    .type_name
+                    .rsplit("::")
+                    .next()
+                    .is_some_and(|type_name| type_name == "CubeGeneralInfo")
+            {
+                return true;
+            }
+            if let JDramaRecordPayload::Group { children, .. } = &candidate.payload {
+                pending.extend(children);
+            }
+        }
+        return false;
+    }
+    match &record.payload {
+        JDramaRecordPayload::Group { children, .. } => children
+            .iter()
+            .any(|child| contains_sound_change_volume(child, table_names)),
+        JDramaRecordPayload::Empty
+        | JDramaRecordPayload::Fields { .. }
+        | JDramaRecordPayload::Actor { .. } => false,
+    }
+}
+
+fn validate_authored_stage_music_transitions(
+    project: &OpenProject,
+    run: &ManagedRunMirrorOutcome,
+    registry: Option<&ObjectRegistry>,
+) -> Result<(), String> {
+    let authored = project
+        .descriptor
+        .stage_music
+        .iter()
+        .filter(|(_, profile)| {
+            matches!(
+                profile.transition,
+                ProjectStageMusicTransition::InsideCrossfade
+                    | ProjectStageMusicTransition::SwitchRegion
+            )
+        })
+        .collect::<Vec<_>>();
+    if authored.is_empty() {
+        return Ok(());
+    }
+
+    let registry = registry.ok_or_else(|| {
+        "Stage Music uses an authored crossfade or switch transition, but the decomp-derived schema is unavailable; load the configured SMS source tree so Graffito can verify SoundChange volume data".to_string()
+    })?;
+    let table_names = registry
+        .cube_managers
+        .iter()
+        .filter(|manager| manager.kind == sms_schema::CubeManagerKind::SoundChange)
+        .map(|manager| manager.table_name.as_str())
+        .collect::<BTreeSet<_>>();
+    if table_names.is_empty() {
+        return Err(
+            "The decomp-derived schema has no SoundChange cube-manager table; authored Stage Music transitions cannot be built safely"
+                .to_string(),
+        );
+    }
+
+    for (stage_id, profile) in authored {
+        let stage = StageDocument::open(&run.run_root, stage_id.clone()).map_err(|error| {
+            format!(
+                "Stage Music transition validation could not open packaged stage '{stage_id}': {error}"
+            )
+        })?;
+        let tables = stage
+            .effective_resource_clone(b"map/tables.bin")
+            .map_err(|error| {
+                format!(
+                    "Stage Music transition validation could not read '{stage_id}' map/tables.bin: {error}"
+                )
+            })?;
+        let has_volume = matches!(
+            tables,
+            Some(StageResourceDocument::Placement(ref tables))
+                if contains_sound_change_volume(&tables.root, &table_names)
+        );
+        if !has_volume {
+            let behavior = match profile.transition {
+                ProjectStageMusicTransition::InsideCrossfade => "Inside Crossfade",
+                ProjectStageMusicTransition::SwitchRegion => "Switch Region",
+                ProjectStageMusicTransition::GameDefault
+                | ProjectStageMusicTransition::Disabled => unreachable!(),
+            };
+            return Err(format!(
+                "Stage Music for '{stage_id}' selects {behavior}, but the finalized packaged stage has no decomp-identified SoundChange volume in map/tables.bin"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn install_managed_runtime_patches(
     project: &OpenProject,
     run: &ManagedRunMirrorOutcome,
+    registry: Option<&ObjectRegistry>,
     dialogue_overrides: &[RuntimeDialogueOverride],
     balloon_overrides: &[RuntimeBalloonOverride],
     direct_boot: Option<(RuntimeStageTarget, usize)>,
     cancelled: &AtomicBool,
 ) -> Result<Option<ManagedDirectBootOutcome>, String> {
     check_cancelled(cancelled)?;
+    validate_authored_stage_music_transitions(project, run, registry)?;
     let mut overrides = Vec::new();
     if !project.descriptor.stage_music.is_empty() {
         let stage_table = find_case_insensitive_path(
@@ -1129,10 +1264,12 @@ fn install_managed_runtime_patches(
                             entry.scenario_index, stage_id
                         )
                     })?,
-                    bgm_id: music.bgm_id,
-                    wave_scene_id: music.wave_scene_id,
-                    secondary_bgm_id: music.secondary_bgm_id,
-                    secondary_wave_scene_id: music.secondary_wave_scene_id,
+                    main: runtime_music_role(music.main),
+                    entrance: runtime_music_role(music.entrance),
+                    inside: runtime_music_role(music.inside),
+                    switch_a: runtime_music_role(music.switch_a),
+                    switch_b: runtime_music_role(music.switch_b),
+                    transition: runtime_music_transition(music.transition),
                 });
             }
         }
@@ -1284,7 +1421,7 @@ fn install_managed_stage_music(
     run: &ManagedRunMirrorOutcome,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
-    install_managed_runtime_patches(project, run, &[], &[], None, cancelled).map(|_| ())
+    install_managed_runtime_patches(project, run, None, &[], &[], None, cancelled).map(|_| ())
 }
 
 fn resolve_managed_direct_boot_target(
@@ -2757,7 +2894,10 @@ fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project::{ProjectStageMusic, SmsProjectFile};
+    use crate::project::{
+        ProjectMusicRoleOverride, ProjectMusicTrack, ProjectStageMusicProfile,
+        ProjectStageMusicTransition, SmsProjectFile,
+    };
     use std::hash::{DefaultHasher, Hash, Hasher};
 
     struct Fixture {
@@ -2855,6 +2995,75 @@ mod tests {
         )
         .unwrap();
         JDramaDocument { root }.to_bytes().unwrap()
+    }
+
+    #[test]
+    fn sound_change_volume_detection_requires_the_decomp_named_table_and_cube() {
+        let table_names = BTreeSet::from(["sound change table"]);
+        let cube = JDramaRecord {
+            type_name: "CubeGeneralInfo".to_string(),
+            name: "volume".to_string(),
+            payload: JDramaRecordPayload::Fields { fields: Vec::new() },
+        };
+        let matching = JDramaRecord {
+            type_name: "CubeGeneralInfoTable".to_string(),
+            name: "sound change table".to_string(),
+            payload: JDramaRecordPayload::Group {
+                fields: Vec::new(),
+                children: vec![cube.clone()],
+            },
+        };
+        assert!(contains_sound_change_volume(&matching, &table_names));
+
+        let empty = JDramaRecord {
+            payload: JDramaRecordPayload::Group {
+                fields: Vec::new(),
+                children: Vec::new(),
+            },
+            ..matching.clone()
+        };
+        assert!(!contains_sound_change_volume(&empty, &table_names));
+        let wrong_name = JDramaRecord {
+            name: "camera table".to_string(),
+            payload: JDramaRecordPayload::Group {
+                fields: Vec::new(),
+                children: vec![cube],
+            },
+            ..matching
+        };
+        assert!(!contains_sound_change_volume(&wrong_name, &table_names));
+    }
+
+    #[test]
+    fn authored_transition_is_build_blocking_without_decomp_volume_metadata() {
+        let mut fixture = fixture();
+        fixture.project.descriptor.stage_music.insert(
+            "bianco0".to_string(),
+            ProjectStageMusicProfile {
+                inside: Some(ProjectMusicRoleOverride::Track {
+                    bgm_id: 0x8001_0023,
+                    wave_scene_id: Some(0x204),
+                }),
+                transition: ProjectStageMusicTransition::InsideCrossfade,
+                ..ProjectStageMusicProfile::default()
+            },
+        );
+        let run = ManagedRunMirrorOutcome {
+            build_root: fixture.data_root.clone(),
+            run_root: fixture.data_root.clone(),
+            run_main_dol: fixture.data_root.join("sys/main.dol"),
+            source_relative_path: PathBuf::from("files/data/scene/bianco0.szs"),
+            stage_output_path: fixture.data_root.join("bianco0.szs"),
+            stage_size_bytes: 0,
+            stage_replaced: false,
+            copied_files: 0,
+            reused_files: 0,
+            removed_entries: 0,
+        };
+        let error =
+            validate_authored_stage_music_transitions(&fixture.project, &run, None).unwrap_err();
+        assert!(error.contains("decomp-derived schema is unavailable"));
+        assert!(error.contains("SoundChange volume data"));
     }
 
     fn file_hash(path: &Path) -> u64 {
@@ -3173,6 +3382,7 @@ mod tests {
         let error = install_managed_runtime_patches(
             &fixture.project,
             &run,
+            None,
             &[override_],
             &[],
             None,
@@ -3239,6 +3449,7 @@ mod tests {
         install_managed_runtime_patches(
             &fixture.project,
             &run,
+            None,
             &[],
             &[],
             None,
@@ -3820,6 +4031,7 @@ mod tests {
         install_managed_runtime_patches(
             &fixture.project,
             &outcome,
+            None,
             &[],
             &[],
             None,
@@ -3897,6 +4109,7 @@ mod tests {
         install_managed_runtime_patches(
             &fixture.project,
             &second,
+            None,
             &[],
             &[],
             None,
@@ -4146,11 +4359,14 @@ mod tests {
         );
         descriptor.stage_music.insert(
             "dolpic0".to_string(),
-            ProjectStageMusic {
-                bgm_id: 0x8001_0002,
-                wave_scene_id: 0x202,
-                secondary_bgm_id: Some(0x8001_0002),
-                secondary_wave_scene_id: Some(0x202),
+            ProjectStageMusicProfile {
+                main: Some(ProjectMusicRoleOverride::track_override(
+                    ProjectMusicTrack::resolved(0x8001_0002, 0x202),
+                )),
+                inside: Some(ProjectMusicRoleOverride::track_override(
+                    ProjectMusicTrack::resolved(0x8001_0002, 0x202),
+                )),
+                ..ProjectStageMusicProfile::default()
             },
         );
         descriptor.sound_assignments.insert(
@@ -4183,6 +4399,34 @@ mod tests {
         assert!(packaged.len() > original_dol.len());
         const MUSIC_MARKER: &[u8] = b"SMS_EDITOR_STAGE_MUSIC_V1\0";
         assert!(packaged
+            .windows(MUSIC_MARKER.len())
+            .any(|window| window == MUSIC_MARKER));
+
+        let legacy_path = root.path().join("legacy.sms");
+        let legacy_data = root.path().join("legacy-data");
+        let legacy_text = format!(
+            r#"format_version = 1
+kind = "sms-editor-project"
+name = "Legacy music package"
+project_id = "legacy-music-package"
+created_with = "0.1.0"
+base_game_root = "{}"
+project_data_root = "{}"
+
+[stage_music.dolpic0]
+bgm_id = 2147549186
+wave_scene_id = 514
+"#,
+            base_root.display().to_string().replace('\\', "/"),
+            legacy_data.display().to_string().replace('\\', "/"),
+        );
+        fs::write(&legacy_path, legacy_text).unwrap();
+        let legacy_project = OpenProject::load(&legacy_path).unwrap();
+        assert_eq!(legacy_project.descriptor.format_version, 2);
+        fs::write(&run_dol, &original_dol).unwrap();
+        install_managed_stage_music(&legacy_project, &run, &AtomicBool::new(false)).unwrap();
+        let legacy_packaged = fs::read(&run_dol).unwrap();
+        assert!(legacy_packaged
             .windows(MUSIC_MARKER.len())
             .any(|window| window == MUSIC_MARKER));
         assert_eq!(fs::read(source_dol).unwrap(), original_dol);
