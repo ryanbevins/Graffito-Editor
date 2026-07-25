@@ -10,6 +10,17 @@ const PICK_DEPTH_EPSILON: f32 = 0.01;
 const GIZMO_AXIS_LENGTH_PIXELS: f32 = 78.0;
 const GIZMO_RING_RADIUS_PIXELS: f32 = 64.0;
 const GIZMO_HIT_RADIUS_PIXELS: f32 = 10.0;
+pub(super) const VIEWPORT_ANIMATION_REPAINT_INTERVAL: std::time::Duration =
+    std::time::Duration::from_nanos(
+        2_000_000_000 / sms_formats::SMS_ANIMATION_FRAMES_PER_SECOND as u64,
+    );
+
+pub(super) fn request_viewport_animation_repaint(ctx: &egui::Context) {
+    // Sunshine presents at 30 Hz while its authored J3D clock advances at
+    // 60 frames per second. Match that cadence instead of turning an otherwise
+    // idle viewport into an uncapped main-thread render loop.
+    ctx.request_repaint_after(VIEWPORT_ANIMATION_REPAINT_INTERVAL);
+}
 
 fn visit_world_grid_segments(mut visitor: impl FnMut([f32; 3], [f32; 3], egui::Color32, f32)) {
     let minor = egui::Color32::from_rgba_unmultiplied(178, 186, 178, 32);
@@ -395,12 +406,14 @@ impl SmsEditorApp {
                 if let Some(instance_id) = model_instance_id {
                     self.selected_model_instance_id = Some(instance_id);
                     self.selected_object_id = None;
+                    self.selected_world_member = None;
                     self.selected_model_asset = None;
                     self.selected_model_document = None;
                     self.saved_model_document = None;
                 } else {
                     self.selected_model_instance_id = None;
                     self.selected_object_id = object_id;
+                    self.selected_world_member = None;
                     if self.selected_object_id.is_some() {
                         self.selected_model_asset = None;
                         self.selected_model_document = None;
@@ -1079,7 +1092,7 @@ impl SmsEditorApp {
                     || !preview.rotating_models.is_empty()
                     || !preview.actor_particles.is_empty()
             }) {
-                ctx.request_repaint();
+                request_viewport_animation_repaint(ctx);
             }
             if let (Some(gpu_viewport), Some(frame)) =
                 (self.gpu_viewport.as_ref(), self.gpu_viewport_frame(rect))
@@ -1227,7 +1240,7 @@ impl SmsEditorApp {
                 particle_frame = particle_end_frames;
                 self.level_transform_playing = false;
             } else {
-                ctx.request_repaint();
+                request_viewport_animation_repaint(ctx);
             }
         }
 
@@ -2076,7 +2089,7 @@ impl SmsEditorApp {
         rect: egui::Rect,
     ) {
         if self.show_fps {
-            ui.ctx().request_repaint();
+            request_viewport_animation_repaint(ui.ctx());
             let stable_dt = ui.input(|input| input.stable_dt).max(0.000_001);
             let fps = 1.0 / stable_dt;
             let text = format!("{fps:.0} FPS");

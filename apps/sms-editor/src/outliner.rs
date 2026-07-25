@@ -9,10 +9,22 @@ use crate::game_text::{bilingual_object_name, bilingual_record_name};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum OutlinerNodeKind {
     Stage,
+    StageMember,
     Resource,
     Group,
     Object,
     Editor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WorldHierarchyMember {
+    StageMusic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum OutlinerSelection {
+    Object(String),
+    WorldMember(WorldHierarchyMember),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +35,7 @@ pub(super) struct OutlinerNode {
     search_text: String,
     kind: OutlinerNodeKind,
     object_id: Option<String>,
+    world_member: Option<WorldHierarchyMember>,
     children: Vec<OutlinerNode>,
 }
 
@@ -56,10 +69,27 @@ pub(super) struct OutlinerTree {
     pub(super) visible_objects: usize,
 }
 
-pub(super) fn build_outliner_tree(document: &StageDocument, filter: &str) -> OutlinerTree {
+pub(super) fn build_outliner_tree(
+    document: &StageDocument,
+    filter: &str,
+    stage_music_detail: &str,
+) -> OutlinerTree {
     let total_objects = document.objects.len();
     let mut builder = OutlinerBuilder::new(document);
-    let mut stage_children = builder.semantic_resource_nodes();
+    let mut stage_children = vec![OutlinerNode {
+        key: "stage-member:music".to_string(),
+        label: "Stage Music".to_string(),
+        detail: stage_music_detail.to_string(),
+        search_text: format!(
+            "stage music audio bgm msstageinfo {}",
+            stage_music_detail.to_ascii_lowercase()
+        ),
+        kind: OutlinerNodeKind::StageMember,
+        object_id: None,
+        world_member: Some(WorldHierarchyMember::StageMusic),
+        children: Vec::new(),
+    }];
+    stage_children.extend(builder.semantic_resource_nodes());
     stage_children.extend(builder.remaining_object_nodes());
 
     let stage = OutlinerNode {
@@ -69,6 +99,7 @@ pub(super) fn build_outliner_tree(document: &StageDocument, filter: &str) -> Out
         search_text: format!("{} stage level", document.stage_id.to_ascii_lowercase()),
         kind: OutlinerNodeKind::Stage,
         object_id: None,
+        world_member: None,
         children: stage_children,
     };
 
@@ -166,6 +197,7 @@ impl<'a> OutlinerBuilder<'a> {
                 search_text: format!("{path} placement resource"),
                 kind: OutlinerNodeKind::Resource,
                 object_id: None,
+                world_member: None,
                 children,
             });
         }
@@ -222,6 +254,7 @@ impl<'a> OutlinerBuilder<'a> {
                     ),
                     kind: OutlinerNodeKind::Group,
                     object_id: None,
+                    world_member: None,
                     children: nodes,
                 }]
             }
@@ -265,6 +298,7 @@ impl<'a> OutlinerBuilder<'a> {
             ),
             kind: OutlinerNodeKind::Object,
             object_id: Some(object.id.clone()),
+            world_member: None,
             children: related,
         }
     }
@@ -314,6 +348,7 @@ impl<'a> OutlinerBuilder<'a> {
                     search_text: format!("{} objects", path.to_ascii_lowercase()),
                     kind,
                     object_id: None,
+                    world_member: None,
                     children,
                 }
             })
@@ -369,11 +404,20 @@ pub(super) fn show_outliner_tree(
     ui: &mut egui::Ui,
     tree: &OutlinerTree,
     selected_id: Option<&str>,
+    selected_world_member: Option<WorldHierarchyMember>,
     force_open: bool,
-) -> Option<String> {
+) -> Option<OutlinerSelection> {
     let mut clicked = None;
     for root in &tree.roots {
-        show_outliner_node(ui, root, selected_id, force_open, 0, &mut clicked);
+        show_outliner_node(
+            ui,
+            root,
+            selected_id,
+            selected_world_member,
+            force_open,
+            0,
+            &mut clicked,
+        );
     }
     clicked
 }
@@ -382,17 +426,23 @@ fn show_outliner_node(
     ui: &mut egui::Ui,
     node: &OutlinerNode,
     selected_id: Option<&str>,
+    selected_world_member: Option<WorldHierarchyMember>,
     force_open: bool,
     depth: usize,
-    clicked: &mut Option<String>,
+    clicked: &mut Option<OutlinerSelection>,
 ) {
     if node.kind == OutlinerNodeKind::Object {
         show_object_node(ui, node, selected_id, force_open, depth, clicked);
         return;
     }
+    if node.kind == OutlinerNodeKind::StageMember {
+        show_stage_member_node(ui, node, selected_world_member, clicked);
+        return;
+    }
 
     let (icon, color) = match node.kind {
         OutlinerNodeKind::Stage => ("◆", egui::Color32::from_rgb(111, 205, 191)),
+        OutlinerNodeKind::StageMember => unreachable!(),
         OutlinerNodeKind::Resource => ("▰", egui::Color32::from_rgb(114, 166, 206)),
         OutlinerNodeKind::Group => ("◇", egui::Color32::from_rgb(178, 184, 187)),
         OutlinerNodeKind::Editor => ("✦", egui::Color32::from_rgb(220, 169, 93)),
@@ -408,10 +458,38 @@ fn show_outliner_node(
         .show_background(true)
         .show(ui, |ui| {
             for child in &node.children {
-                show_outliner_node(ui, child, selected_id, force_open, depth + 1, clicked);
+                show_outliner_node(
+                    ui,
+                    child,
+                    selected_id,
+                    selected_world_member,
+                    force_open,
+                    depth + 1,
+                    clicked,
+                );
             }
         });
     response.header_response.on_hover_text(&node.detail);
+}
+
+fn show_stage_member_node(
+    ui: &mut egui::Ui,
+    node: &OutlinerNode,
+    selected_world_member: Option<WorldHierarchyMember>,
+    clicked: &mut Option<OutlinerSelection>,
+) {
+    let selected = node.world_member == selected_world_member;
+    let response = ui
+        .add_sized(
+            [ui.available_width(), 38.0],
+            egui::Button::selectable(selected, format!("♫  {}\n    {}", node.label, node.detail)),
+        )
+        .on_hover_text(
+            "Sunshine stage-wide music state (MSMainProc::MSStageInfo). Select to edit.",
+        );
+    if response.clicked() {
+        *clicked = node.world_member.map(OutlinerSelection::WorldMember);
+    }
 }
 
 fn show_object_node(
@@ -420,7 +498,7 @@ fn show_object_node(
     selected_id: Option<&str>,
     force_open: bool,
     depth: usize,
-    clicked: &mut Option<String>,
+    clicked: &mut Option<OutlinerSelection>,
 ) {
     let selected = node.object_id.as_deref() == selected_id;
     let label = format!("●  {}\n    {}", node.label, node.detail);
@@ -432,7 +510,7 @@ fn show_object_node(
             )
             .on_hover_text(format!("{}\n{}", node.detail, node.key));
         if response.clicked() {
-            *clicked = node.object_id.clone();
+            *clicked = node.object_id.clone().map(OutlinerSelection::Object);
         }
         return;
     }
@@ -460,11 +538,11 @@ fn show_object_node(
         })
         .body(|ui| {
             for child in &node.children {
-                show_outliner_node(ui, child, selected_id, force_open, depth + 1, clicked);
+                show_outliner_node(ui, child, selected_id, None, force_open, depth + 1, clicked);
             }
         });
     if header.inner.clicked() {
-        *clicked = node.object_id.clone();
+        *clicked = node.object_id.clone().map(OutlinerSelection::Object);
     }
     header.response.on_hover_text(format!(
         "{}\nOwns {} related object(s)",
@@ -534,7 +612,7 @@ mod tests {
             },
         );
 
-        let tree = build_outliner_tree(&document, "");
+        let tree = build_outliner_tree(&document, "", "Game default");
         let near = find_object(&tree.roots, "manager-near").unwrap();
         let far = find_object(&tree.roots, "manager-far").unwrap();
         assert!(find_object(&near.children, "actor").is_some());
@@ -599,7 +677,7 @@ mod tests {
             SceneObject::new("shine", "Shine"),
         ]);
 
-        let tree = build_outliner_tree(&document, "shine");
+        let tree = build_outliner_tree(&document, "shine", "Game default");
         assert_eq!(tree.total_objects, 2);
         assert_eq!(tree.visible_objects, 1);
         assert!(find_object(&tree.roots, "shine").is_some());
@@ -628,7 +706,7 @@ mod tests {
             },
             dependencies: Vec::new(),
         }));
-        let tree = build_outliner_tree(&document(vec![authored]), "");
+        let tree = build_outliner_tree(&document(vec![authored]), "", "Game default");
         let stage = &tree.roots[0];
         let resource = stage
             .children
@@ -637,5 +715,36 @@ mod tests {
             .expect("authored placement resource group");
         assert_eq!(resource.kind, OutlinerNodeKind::Resource);
         assert!(find_object(&resource.children, "authored").is_some());
+    }
+
+    #[test]
+    fn stage_music_is_a_real_stage_member_without_becoming_a_scene_object() {
+        let document = document(vec![SceneObject::new("coin", "Coin")]);
+        let tree = build_outliner_tree(&document, "", "Bianco Hills");
+        let stage = &tree.roots[0];
+        let music = stage
+            .children
+            .iter()
+            .find(|node| node.world_member == Some(WorldHierarchyMember::StageMusic))
+            .expect("stage music world member");
+
+        assert_eq!(music.kind, OutlinerNodeKind::StageMember);
+        assert_eq!(music.label, "Stage Music");
+        assert_eq!(music.detail, "Bianco Hills");
+        assert!(music.object_id.is_none());
+        assert_eq!(tree.total_objects, 1);
+        assert_eq!(tree.visible_objects, 1);
+    }
+
+    #[test]
+    fn stage_music_filter_keeps_the_world_member_and_stage_root() {
+        let tree = build_outliner_tree(&document(Vec::new()), "msstageinfo", "Game default");
+        assert_eq!(tree.roots.len(), 1);
+        assert_eq!(tree.roots[0].children.len(), 1);
+        assert_eq!(
+            tree.roots[0].children[0].world_member,
+            Some(WorldHierarchyMember::StageMusic)
+        );
+        assert_eq!(tree.visible_objects, 0);
     }
 }

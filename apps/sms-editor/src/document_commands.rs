@@ -2606,6 +2606,7 @@ impl SmsEditorApp {
             },
         );
         self.selected_object_id = Some(id);
+        self.selected_world_member = None;
         if let Some(message) = catalog_log {
             self.log.push(message);
         }
@@ -2793,6 +2794,7 @@ impl SmsEditorApp {
             },
         );
         self.selected_object_id = Some(id);
+        self.selected_world_member = None;
         self.rebuild_model_preview_from_document();
     }
 

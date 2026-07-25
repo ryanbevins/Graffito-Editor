@@ -9,11 +9,7 @@ const GENERATED_ROUTE_NODE_RADIUS: f32 = 3.75;
 
 impl SmsEditorApp {
     pub(super) fn routes_hierarchy_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("Routes");
-            ui.checkbox(&mut self.show_all_routes, "Show all")
-                .on_hover_text("Render inactive graphs and their linked actors as context");
-        });
+        ui.heading("Routes");
         ui.small("One graph is active for editing; all other graphs remain subdued context.");
         ui.separator();
 

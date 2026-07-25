@@ -191,6 +191,13 @@ impl EditorTool {
     }
 }
 
+const CORE_VIEWPORT_TOOLS: [EditorTool; 4] = [
+    EditorTool::Select,
+    EditorTool::Move,
+    EditorTool::Rotate,
+    EditorTool::Scale,
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     Lit,
@@ -863,6 +870,7 @@ struct SmsEditorApp {
     log: Vec<String>,
     renderer: ViewportRenderer,
     selected_object_id: Option<String>,
+    selected_world_member: Option<WorldHierarchyMember>,
     active_placement: Option<ActivePlacement>,
     object_filter: String,
     scene_filter: String,
@@ -1109,6 +1117,7 @@ impl Default for SmsEditorApp {
             log: vec!["Ready.".to_string()],
             renderer: ViewportRenderer::new(RendererConfig::default()),
             selected_object_id: None,
+            selected_world_member: None,
             active_placement: None,
             object_filter: String::new(),
             scene_filter: String::new(),
@@ -1181,7 +1190,7 @@ impl Default for SmsEditorApp {
             show_environment_meshes: true,
             show_goop_meshes: true,
             show_effects: true,
-            show_audio_helpers: true,
+            show_audio_helpers: false,
             selected_audio_helper_id: None,
             audio_cube_edit_before: None,
             audio_cube_helpers_cache: Vec::new(),
@@ -2276,6 +2285,7 @@ impl SmsEditorApp {
         self.rebuild_gpu_viewport_scene();
         self.clear_viewport_preview_cache();
         self.selected_object_id = None;
+        self.selected_world_member = None;
         self.selected_model_instance_id = None;
         self.active_placement = None;
         self.undo_stack.clear();

@@ -658,6 +658,7 @@ impl SmsEditorApp {
         self.model_framebuffer_key = None;
         self.issues.clear();
         self.selected_object_id = None;
+        self.selected_world_member = None;
         self.model_catalog_root = None;
         self.model_catalog_entries.clear();
         self.model_catalog_issues.clear();

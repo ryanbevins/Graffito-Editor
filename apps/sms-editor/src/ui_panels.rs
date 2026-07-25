@@ -2,6 +2,8 @@ use sms_scene::{EditableSceneParameter, ObjectParameterKind};
 
 use super::*;
 
+pub(super) const STAGE_MUSIC_PICKER_HEIGHT: f32 = 360.0;
+
 impl SmsEditorApp {
     pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -84,6 +86,72 @@ impl SmsEditorApp {
                     self.show_project_settings = true;
                 }
                 ui.separator();
+                if ui
+                    .selectable_label(self.tool == EditorTool::Goop, "Goop Tool    G")
+                    .on_hover_text("Paint and edit goop surfaces")
+                    .clicked()
+                {
+                    ui.close();
+                    self.tool = EditorTool::Goop;
+                }
+                ui.menu_button("Routes", |ui| {
+                    let mut route_mode = self.route_mode;
+                    if ui.checkbox(&mut route_mode, "Edit Routes").changed() {
+                        self.set_route_mode(route_mode);
+                    }
+                    ui.checkbox(&mut self.show_all_routes, "Show All Routes")
+                        .on_hover_text(
+                            "Render inactive graphs and their linked actors as context",
+                        );
+                });
+            });
+            ui.menu_button("Audio", |ui| {
+                ui.checkbox(&mut self.show_audio_helpers, "Show Audio Helpers")
+                    .on_hover_text(
+                        "Show data-driven positional sound ranges, rail emitters, and sound cube volumes",
+                    );
+
+                let helpers = self.audio_helpers();
+                ui.menu_button(
+                    format!("Audio Helpers ({})", helpers.len()),
+                    |ui| {
+                        if helpers.is_empty() {
+                            ui.add_enabled(false, egui::Label::new("No helpers in this stage"));
+                            return;
+                        }
+                        let mut selected = None;
+                        egui::ScrollArea::vertical()
+                            .max_height(420.0)
+                            .show(ui, |ui| {
+                                for helper in &helpers {
+                                    let is_selected = self.selected_audio_helper_id.as_deref()
+                                        == Some(&helper.id);
+                                    if ui.selectable_label(is_selected, &helper.label).clicked() {
+                                        selected = Some(helper.clone());
+                                    }
+                                }
+                            });
+                        if let Some(helper) = selected {
+                            ui.close();
+                            self.select_audio_helper(&helper);
+                        }
+                    },
+                );
+
+            });
+            ui.menu_button("View", |ui| {
+                ui.menu_button("Viewport Mode", |ui| {
+                    for mode in [ViewMode::Lit, ViewMode::Collision, ViewMode::Objects] {
+                        if ui
+                            .selectable_label(self.view_mode == mode, mode.label())
+                            .clicked()
+                        {
+                            self.set_view_mode(mode);
+                            ui.close();
+                        }
+                    }
+                });
+                ui.separator();
                 ui.checkbox(&mut self.show_stats, "Show Stats");
                 ui.checkbox(&mut self.show_fps, "Show FPS");
                 if ui
@@ -155,35 +223,13 @@ impl SmsEditorApp {
     pub(super) fn viewport_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(5.0, 4.0);
-            for tool in [
-                EditorTool::Select,
-                EditorTool::Move,
-                EditorTool::Rotate,
-                EditorTool::Scale,
-                EditorTool::Goop,
-            ] {
+            for tool in CORE_VIEWPORT_TOOLS {
                 if ui
                     .selectable_label(self.tool == tool, tool.label())
                     .on_hover_text(format!("{} tool ({})", tool.label(), tool_shortcut(tool)))
                     .clicked()
                 {
                     self.tool = tool;
-                }
-            }
-            if ui
-                .selectable_label(self.route_mode, "Routes")
-                .on_hover_text("Edit scene.ral graphs, links, Bezier handles, and actor assignments")
-                .clicked()
-            {
-                self.route_mode = !self.route_mode;
-                if self.route_mode {
-                    self.tool = EditorTool::Move;
-                }
-                if self.route_mode && self.active_route_graph.is_none() {
-                    self.active_route_graph = self.document.as_ref()
-                        .and_then(|document| document.route_authoring.as_ref())
-                        .and_then(|routes| routes.graphs.first())
-                        .map(|graph| graph.id.clone());
                 }
             }
 
@@ -226,28 +272,6 @@ impl SmsEditorApp {
                 )
                 .on_hover_text("Scale snap interval");
             });
-
-            ui.separator();
-            for mode in [ViewMode::Lit, ViewMode::Collision, ViewMode::Objects] {
-                if ui
-                    .selectable_label(self.view_mode == mode, mode.label())
-                    .clicked()
-                {
-                    self.view_mode = mode;
-                    if mode == ViewMode::Collision {
-                        self.renderer.config_mut().show_collision = true;
-                    }
-                    self.clear_viewport_preview_cache();
-                }
-            }
-
-            if ui
-                .selectable_label(self.show_audio_helpers, "Audio Helpers")
-                .on_hover_text("Show data-driven positional sound ranges, rail emitters, and sound cube volumes")
-                .clicked()
-            {
-                self.show_audio_helpers = !self.show_audio_helpers;
-            }
 
             ui.separator();
             let launch_enabled = self.document.is_some()
@@ -321,6 +345,30 @@ impl SmsEditorApp {
                 }
             }
         });
+    }
+
+    pub(super) fn set_route_mode(&mut self, enabled: bool) {
+        self.route_mode = enabled;
+        if !enabled {
+            return;
+        }
+        self.tool = EditorTool::Move;
+        if self.active_route_graph.is_none() {
+            self.active_route_graph = self
+                .document
+                .as_ref()
+                .and_then(|document| document.route_authoring.as_ref())
+                .and_then(|routes| routes.graphs.first())
+                .map(|graph| graph.id.clone());
+        }
+    }
+
+    fn set_view_mode(&mut self, mode: ViewMode) {
+        self.view_mode = mode;
+        if mode == ViewMode::Collision {
+            self.renderer.config_mut().show_collision = true;
+        }
+        self.clear_viewport_preview_cache();
     }
 
     pub(super) fn right_dock(&mut self, ui: &mut egui::Ui) {
@@ -1130,10 +1178,22 @@ impl SmsEditorApp {
         );
 
         let selected_id = self.selected_object_id.clone();
-        let tree = self
-            .document
-            .as_ref()
-            .map(|document| build_outliner_tree(document, &self.outliner_filter));
+        let selected_world_member = self.selected_world_member;
+        let stage_music_detail = self
+            .current_stage_music()
+            .and_then(|music| {
+                self.retail_music
+                    .iter()
+                    .find(|entry| {
+                        entry.bgm_id == music.bgm_id && entry.wave_scene_id == music.wave_scene_id
+                    })
+                    .map(|entry| entry.label.clone())
+                    .or_else(|| Some(format!("BGM 0x{:08X}", music.bgm_id)))
+            })
+            .unwrap_or_else(|| "Game default".to_string());
+        let tree = self.document.as_ref().map(|document| {
+            build_outliner_tree(document, &self.outliner_filter, &stage_music_detail)
+        });
         if let Some(tree) = tree.as_ref() {
             if !self.outliner_filter.trim().is_empty() {
                 ui.label(
@@ -1148,7 +1208,7 @@ impl SmsEditorApp {
         }
         ui.separator();
 
-        let mut clicked_id = None;
+        let mut clicked_selection = None;
         let mut clicked_model_instance = None;
         let model_instances = self
             .model_instances
@@ -1157,8 +1217,6 @@ impl SmsEditorApp {
             .cloned()
             .collect::<Vec<_>>();
         egui::ScrollArea::vertical().show(ui, |ui| {
-            self.audio_helpers_hierarchy(ui);
-            ui.separator();
             if !model_instances.is_empty() {
                 egui::CollapsingHeader::new("Authored Model Instances")
                     .default_open(true)
@@ -1190,10 +1248,11 @@ impl SmsEditorApp {
                 });
                 return;
             };
-            clicked_id = show_outliner_tree(
+            clicked_selection = show_outliner_tree(
                 ui,
                 tree,
                 selected_id.as_deref(),
+                selected_world_member,
                 !self.outliner_filter.trim().is_empty(),
             );
             if tree.visible_objects == 0 {
@@ -1204,15 +1263,24 @@ impl SmsEditorApp {
                 });
             }
         });
-        if clicked_id.is_some() || clicked_model_instance.is_some() {
+        if clicked_selection.is_some() || clicked_model_instance.is_some() {
             self.content_browser.inspector_active = false;
         }
-        if let Some(id) = clicked_id {
+        if let Some(selection) = clicked_selection {
             if self.asset_dirty && !self.save_selected_model_asset() {
                 return;
             }
             self.clear_audio_helper_selection();
-            self.selected_object_id = Some(id);
+            match selection {
+                OutlinerSelection::Object(id) => {
+                    self.selected_object_id = Some(id);
+                    self.selected_world_member = None;
+                }
+                OutlinerSelection::WorldMember(member) => {
+                    self.selected_object_id = None;
+                    self.selected_world_member = Some(member);
+                }
+            }
             self.selected_model_instance_id = None;
             self.selected_model_asset = None;
             self.selected_model_document = None;
@@ -1225,6 +1293,7 @@ impl SmsEditorApp {
             self.clear_audio_helper_selection();
             self.selected_model_instance_id = Some(id);
             self.selected_object_id = None;
+            self.selected_world_member = None;
             self.selected_model_asset = None;
             self.selected_model_document = None;
             self.saved_model_document = None;
@@ -1239,8 +1308,17 @@ impl SmsEditorApp {
         if self.content_browser_inspector_panel(ui) {
             return;
         }
+        if self.selected_world_member == Some(WorldHierarchyMember::StageMusic) {
+            ui.heading("Stage Music");
+            ui.label(
+                egui::RichText::new("MSMainProc::MSStageInfo")
+                    .small()
+                    .color(egui::Color32::GRAY),
+            );
+            self.stage_music_controls(ui);
+            return;
+        }
         if self.audio_helper_inspector(ui) {
-            self.stage_music_panel(ui);
             self.stage_lighting_panel(ui);
             return;
         }
@@ -1249,13 +1327,11 @@ impl SmsEditorApp {
         }
         if self.selected_model_instance_id.is_some() {
             self.model_instance_inspector_panel(ui);
-            self.stage_music_panel(ui);
             self.stage_lighting_panel(ui);
             return;
         }
         if self.selected_model_document.is_some() {
             self.model_asset_inspector_panel(ui);
-            self.stage_music_panel(ui);
             self.stage_lighting_panel(ui);
             return;
         }
@@ -1526,17 +1602,22 @@ impl SmsEditorApp {
                 ui.label("No stage open.");
             }
         }
-        self.stage_music_panel(ui);
         self.stage_lighting_panel(ui);
     }
 
-    fn stage_music_panel(&mut self, ui: &mut egui::Ui) {
+    fn stage_music_controls(&mut self, ui: &mut egui::Ui) {
         let Some(document) = self.document.as_ref() else {
+            ui.add_enabled(false, egui::Label::new("No stage open"));
             return;
         };
         let stage_id = document.stage_id.clone();
         let current = self.current_stage_music();
         let mut selected = current.map(|music| (music.bgm_id, music.wave_scene_id));
+        let current_is_mapped = current.is_some_and(|music| {
+            self.retail_music.iter().any(|entry| {
+                entry.bgm_id == music.bgm_id && entry.wave_scene_id == music.wave_scene_id
+            })
+        });
         let selected_text = current
             .and_then(|music| {
                 self.retail_music
@@ -1544,44 +1625,51 @@ impl SmsEditorApp {
                     .find(|entry| {
                         entry.bgm_id == music.bgm_id && entry.wave_scene_id == music.wave_scene_id
                     })
-                    .map(|entry| entry.label.as_str())
+                    .map(|entry| entry.label.clone())
+                    .or_else(|| Some(format!("BGM 0x{:08X}", music.bgm_id)))
             })
-            .map(str::to_string)
-            .or_else(|| current.map(|music| format!("BGM 0x{:08X}", music.bgm_id)))
             .unwrap_or_else(|| "Game default".to_string());
 
-        ui.separator();
-        egui::CollapsingHeader::new("Stage Music")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.small(
-                    "This project-level option works for retail and custom stages. Build Game writes every saved choice into the runnable game's main.dol, so it also applies when that package is booted normally in Dolphin.",
-                );
-                ui.label("Music");
-                egui::ComboBox::from_id_salt(("stage-music", stage_id.as_str()))
-                    .selected_text(selected_text)
-                    .width(ui.available_width().clamp(180.0, 320.0))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut selected, None, "Game default");
-                        for entry in &self.retail_music {
-                            ui.selectable_value(
-                                &mut selected,
-                                Some((entry.bgm_id, entry.wave_scene_id)),
-                                &entry.label,
-                            )
-                            .on_hover_text(format!(
-                                "BGM 0x{:08X}; wave scene 0x{:X}",
-                                entry.bgm_id, entry.wave_scene_id
-                            ));
-                        }
-                    });
-                if self.retail_music.is_empty() {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(255, 180, 90),
-                        "No choices are available. Check the configured decomp source root, then reopen the stage.",
-                    );
+        ui.small(
+            "Sunshine resolves this stage-wide member through MSStageInfo. Build Game writes the selection into the managed game's main.dol.",
+        );
+        ui.add_space(4.0);
+        ui.label("Music");
+        egui::ComboBox::from_id_salt(("stage-music", stage_id.as_str()))
+            .selected_text(selected_text)
+            .width(ui.available_width())
+            .height(STAGE_MUSIC_PICKER_HEIGHT)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut selected, None, "Game default");
+                if let Some(music) = current.filter(|_| !current_is_mapped) {
+                    ui.selectable_value(
+                        &mut selected,
+                        Some((music.bgm_id, music.wave_scene_id)),
+                        format!("BGM 0x{:08X}", music.bgm_id),
+                    )
+                    .on_hover_text(format!(
+                        "BGM 0x{:08X}; wave scene 0x{:X}",
+                        music.bgm_id, music.wave_scene_id
+                    ));
+                }
+                for entry in &self.retail_music {
+                    ui.selectable_value(
+                        &mut selected,
+                        Some((entry.bgm_id, entry.wave_scene_id)),
+                        &entry.label,
+                    )
+                    .on_hover_text(format!(
+                        "BGM 0x{:08X}; wave scene 0x{:X}",
+                        entry.bgm_id, entry.wave_scene_id
+                    ));
                 }
             });
+        if self.retail_music.is_empty() {
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 180, 90),
+                "No choices are available. Check the configured decomp source root, then reopen the stage.",
+            );
+        }
         let updated = selected.map(|(bgm_id, wave_scene_id)| ProjectStageMusic {
             bgm_id,
             wave_scene_id,
@@ -1590,6 +1678,10 @@ impl SmsEditorApp {
         });
         if updated != current {
             self.set_current_stage_music(updated);
+        }
+        if let Some((bgm_id, _)) = selected {
+            ui.separator();
+            self.bgm_preview_transport(ui, bgm_id);
         }
     }
 

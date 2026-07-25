@@ -254,29 +254,14 @@ impl SmsEditorApp {
         }
     }
 
-    pub(super) fn audio_helpers_hierarchy(&mut self, ui: &mut egui::Ui) {
-        let helpers = self.audio_helpers();
-        if helpers.is_empty() {
-            return;
-        }
-        egui::CollapsingHeader::new(format!("Audio Helpers ({})", helpers.len()))
-            .default_open(true)
-            .show(ui, |ui| {
-                for helper in helpers {
-                    let selected = self.selected_audio_helper_id.as_deref() == Some(&helper.id);
-                    if ui.selectable_label(selected, &helper.label).clicked() {
-                        self.select_audio_helper(&helper);
-                    }
-                }
-            });
-    }
-
-    fn select_audio_helper(&mut self, helper: &AudioHelper) {
+    pub(super) fn select_audio_helper(&mut self, helper: &AudioHelper) {
         if self.selected_audio_helper_id.as_deref() != Some(helper.id.as_str()) {
             self.finish_audio_cube_edit();
         }
+        self.show_audio_helpers = true;
         self.content_browser.inspector_active = false;
         self.selected_audio_helper_id = Some(helper.id.clone());
+        self.selected_world_member = None;
         self.selected_model_instance_id = None;
         self.selected_model_asset = None;
         self.selected_model_document = None;
@@ -1219,6 +1204,31 @@ mod tests {
         app.clear_audio_helper_selection();
         assert!(app.selected_audio_helper_id.is_none());
         assert!(!app.route_mode);
+    }
+
+    #[test]
+    fn selecting_a_menu_audio_helper_reveals_it_and_exposes_its_real_sound() {
+        let helper = AudioHelper {
+            id: "audio:point:fixture".to_string(),
+            label: "Fixture sound".to_string(),
+            kind: AudioHelperKind::Point {
+                object_id: "fixture".to_string(),
+                actor_name: "FixtureActor".to_string(),
+                original_sound_id: 0x1234,
+                sound_id: 0x5678,
+                category: None,
+                position: [0.0; 3],
+            },
+        };
+        let mut app = SmsEditorApp::default();
+
+        app.select_audio_helper(&helper);
+
+        assert!(app.show_audio_helpers);
+        assert_eq!(
+            app.selected_audio_helper_id.as_deref(),
+            Some("audio:point:fixture")
+        );
     }
 
     #[test]

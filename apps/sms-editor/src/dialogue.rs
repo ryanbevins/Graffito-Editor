@@ -61,13 +61,24 @@ impl SmsEditorApp {
     pub(super) fn schedule_dialogue_index_rebuild(&mut self) {
         self.dialogue_shared_confirmation = None;
         self.cancel_dialogue_consumer_index_rebuild();
-        let Some(document) = self.document.clone() else {
+        let Some(document) = self.document.as_ref() else {
             self.dialogue_route_index = None;
             self.dialogue_consumer_index = None;
             self.dialogue_index_receiver = None;
             self.dialogue_index_error = None;
             self.dialogue_consumer_error = None;
             return;
+        };
+        let document = match document.dialogue_index_snapshot() {
+            Ok(document) => document,
+            Err(error) => {
+                self.dialogue_route_index = None;
+                self.dialogue_consumer_index = None;
+                self.dialogue_index_receiver = None;
+                self.dialogue_index_error = Some(error.to_string());
+                self.dialogue_consumer_error = None;
+                return;
+            }
         };
         // Never leave a derived index usable while a newer document snapshot
         // is being analyzed. Builds and inspector edits must wait for the
@@ -167,10 +178,20 @@ impl SmsEditorApp {
     pub(super) fn schedule_dialogue_consumer_index_rebuild(&mut self) {
         self.dialogue_shared_confirmation = None;
         self.cancel_dialogue_consumer_index_rebuild();
-        let Some(document) = self.document.clone() else {
+        let Some(document) = self.document.as_ref() else {
             self.dialogue_consumer_index = None;
             self.dialogue_consumer_error = None;
             return;
+        };
+        let document = match document.dialogue_index_snapshot() {
+            Ok(document) => document,
+            Err(error) => {
+                self.dialogue_consumer_index = None;
+                self.dialogue_consumer_receiver = None;
+                self.dialogue_consumer_cancel = None;
+                self.dialogue_consumer_error = Some(error.to_string());
+                return;
+            }
         };
         // The Edit-all impact list is authoritative only for the exact
         // document snapshot that produced it.

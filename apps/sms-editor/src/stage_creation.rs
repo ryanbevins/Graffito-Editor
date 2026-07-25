@@ -93,7 +93,7 @@ impl SmsEditorApp {
 
                 ui.add_space(8.0);
                 ui.small(
-                    "The editor allocates the next safe reserved area/scenario entry in the project's stageArc.bin and creates a minimal runtime shell. After creation, drag in the world model and any cataloged typed object class; required manager and resource dependencies are added automatically. Assign a model as Stage skybox, then edit Stage Music and Stage Lighting in the inspector.",
+                    "The editor allocates the next safe reserved area/scenario entry in the project's stageArc.bin and creates a minimal runtime shell. After creation, drag in the world model and any cataloged typed object class; required manager and resource dependencies are added automatically. Assign a model as Stage skybox, select Stage Music in the Hierarchy, then edit Stage Lighting in the inspector.",
                 );
                 ui.small("The extracted game remains read-only. The project mapping is installed only in managed builds and releases.");
 

@@ -696,6 +696,7 @@ impl SmsEditorApp {
                 self.selected_model_texture = 0;
                 self.selected_model_instance_id = None;
                 self.selected_object_id = None;
+                self.selected_world_member = None;
                 self.asset_dirty = false;
                 self.asset_undo_stack.clear();
                 self.asset_redo_stack.clear();
@@ -1143,6 +1144,7 @@ impl SmsEditorApp {
         self.selected_model_document = None;
         self.saved_model_document = None;
         self.selected_object_id = None;
+        self.selected_world_member = None;
         self.model_instances.push(instance);
         self.push_model_instance_undo("Placed model instance", before);
         self.model_instances_dirty = true;

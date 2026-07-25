@@ -1,6 +1,33 @@
 use super::*;
 
 #[test]
+fn animated_viewport_repaint_is_bounded_to_the_sunshine_frame_clock() {
+    let ctx = egui::Context::default();
+    let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+    let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::viewport_ui::request_viewport_animation_repaint(ui.ctx());
+    });
+    let repaint_delay = output
+        .viewport_output
+        .get(&egui::ViewportId::ROOT)
+        .expect("root viewport output")
+        .repaint_delay;
+
+    assert!(
+        crate::viewport_ui::VIEWPORT_ANIMATION_REPAINT_INTERVAL
+            >= std::time::Duration::from_millis(33)
+    );
+    assert!(
+        repaint_delay >= std::time::Duration::from_millis(15),
+        "egui reduced the animation wakeup to an immediate repaint: {repaint_delay:?}"
+    );
+    assert!(
+        repaint_delay <= crate::viewport_ui::VIEWPORT_ANIMATION_REPAINT_INTERVAL,
+        "egui scheduled later than the requested animation cadence: {repaint_delay:?}"
+    );
+}
+
+#[test]
 fn monte_palette_entries_use_friendly_pianta_names() {
     let object = ObjectDefinition {
         factory_name: "NPCMonteMH".to_string(),
@@ -52,8 +79,39 @@ fn editor_layout_defaults_to_the_unreal_style_workspace() {
     assert!(!app.show_issues);
     assert!(!app.show_console);
     assert!(!app.show_stats);
+    assert!(!app.show_audio_helpers);
     assert!(app.show_effects);
     assert_eq!(app.level_transform_progress, FULL_DELFINO_PROGRESSION);
+}
+
+#[test]
+fn viewport_toolbar_keeps_only_core_transform_tools_top_level() {
+    assert_eq!(
+        CORE_VIEWPORT_TOOLS,
+        [
+            EditorTool::Select,
+            EditorTool::Move,
+            EditorTool::Rotate,
+            EditorTool::Scale,
+        ]
+    );
+    assert!(!CORE_VIEWPORT_TOOLS.contains(&EditorTool::Goop));
+}
+
+#[test]
+fn routes_menu_preserves_the_existing_mode_transition() {
+    let mut app = SmsEditorApp {
+        tool: EditorTool::Select,
+        ..SmsEditorApp::default()
+    };
+
+    app.set_route_mode(true);
+    assert!(app.route_mode);
+    assert_eq!(app.tool, EditorTool::Move);
+
+    app.set_route_mode(false);
+    assert!(!app.route_mode);
+    assert_eq!(app.tool, EditorTool::Move);
 }
 
 #[test]

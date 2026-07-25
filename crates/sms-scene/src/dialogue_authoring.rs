@@ -21,7 +21,7 @@ use sms_formats::{
 
 use crate::{
     Result, SceneError, SceneObject, StageArchiveEdits, StageDocument, StageResourceDocument,
-    ValidationIssue,
+    StageResourceEdit, StageResourceEditMode, ValidationIssue,
 };
 
 pub const DIALOGUE_AUTHORING_FORMAT_VERSION: u32 = 1;
@@ -918,6 +918,80 @@ impl StageDocument {
         self.build_dialogue_route_index_with_common(&common)
     }
 
+    /// Clones only the state consumed by the asynchronous dialogue indexes.
+    ///
+    /// Authored source-free stages can carry hundreds of typed model,
+    /// animation, collision, and particle resources. None of those participate
+    /// in SPC/BMG routing, so cloning the complete stage to move work off the
+    /// UI thread needlessly duplicates most of the document.
+    pub fn dialogue_index_snapshot(&self) -> Result<Self> {
+        let mut dialogue_paths = BTreeSet::new();
+        if let Some(archive) = &self.stage_archive {
+            dialogue_paths.extend(
+                archive
+                    .resources()
+                    .iter()
+                    .map(|resource| resource.raw_path.clone())
+                    .filter(|path| is_dialogue_resource_path(path)),
+            );
+        }
+        dialogue_paths.extend(
+            self.archive_edits
+                .resources
+                .iter()
+                .map(|edit| edit.raw_resource_path.clone())
+                .filter(|path| is_dialogue_resource_path(path)),
+        );
+
+        let mut resources = Vec::with_capacity(dialogue_paths.len());
+        for raw_resource_path in dialogue_paths {
+            let Some(document) = self.effective_resource_clone(&raw_resource_path)? else {
+                continue;
+            };
+            resources.push(StageResourceEdit {
+                raw_resource_path,
+                document,
+                mode: StageResourceEditMode::Upsert,
+            });
+        }
+
+        let assets = if self.stage_archive.is_none() {
+            self.assets
+                .iter()
+                .filter(|asset| {
+                    raw_path_from_mounted_asset(&asset.path)
+                        .is_some_and(|path| is_dialogue_resource_path(&path))
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        Ok(Self {
+            stage_id: self.stage_id.clone(),
+            base_root: self.base_root.clone(),
+            assets,
+            objects: self.objects.clone(),
+            changed_files: BTreeMap::new(),
+            stage_archive: None,
+            stage_archive_source_path: None,
+            archive_edits: StageArchiveEdits {
+                resources,
+                ..StageArchiveEdits::default()
+            },
+            registry: self.registry.clone(),
+            route_authoring: None,
+            goop_authoring: None,
+            dialogue_authoring: self.dialogue_authoring.clone(),
+            dialogue_library: self.dialogue_library.clone(),
+            load_issues: Vec::new(),
+            lighting: Default::default(),
+            actor_previews: BTreeMap::new(),
+            loaded_project: self.loaded_project.clone(),
+        })
+    }
+
     fn build_dialogue_route_index_with_common(
         &self,
         common: &DialogueResourceSet,
@@ -1000,6 +1074,7 @@ impl StageDocument {
             if let Some(registry) = registry.clone() {
                 document.registry = Some(registry);
             }
+            let document = document.dialogue_index_snapshot()?;
             let routes = document.build_dialogue_route_index_with_common(&common)?;
             ensure_dialogue_consumer_index_not_cancelled(cancelled)?;
             let blocking = routes
@@ -5996,6 +6071,36 @@ mod tests {
             },
             message_storage_offset: Some(storage_offset),
         }
+    }
+
+    #[test]
+    fn dialogue_index_snapshot_excludes_unrelated_stage_resources_without_changing_routes() {
+        let mut document = balloon_document("test01", "board-a", "Board A");
+        document.archive_edits.upsert_resource(
+            b"mapobj/delete.me".to_vec(),
+            StageResourceDocument::Marker(
+                sms_formats::MarkerTextFile::parse(b"unrelated model bundle marker").unwrap(),
+            ),
+        );
+        document.goop_authoring = Some(crate::GoopAuthoringDocument::default());
+        document.lighting.lights.push(sms_formats::JDramaLight {
+            name: Some("unused by dialogue".to_string()),
+            position: [1.0, 2.0, 3.0],
+            color: [4, 5, 6, 7],
+        });
+
+        let expected = document.build_dialogue_route_index().unwrap();
+        let snapshot = document.dialogue_index_snapshot().unwrap();
+
+        assert_eq!(snapshot.archive_edits.resources.len(), 2);
+        assert!(snapshot
+            .archive_edits
+            .resources
+            .iter()
+            .all(|edit| is_dialogue_resource_path(&edit.raw_resource_path)));
+        assert!(snapshot.goop_authoring.is_none());
+        assert!(snapshot.lighting.lights.is_empty());
+        assert_eq!(snapshot.build_dialogue_route_index().unwrap(), expected);
     }
 
     #[test]
