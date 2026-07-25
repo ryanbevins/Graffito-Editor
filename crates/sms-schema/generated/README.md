@@ -1,8 +1,9 @@
-# Generated object registry
+# Generated schema metadata
 
 `object-registry.json` is a source-free snapshot of metadata extracted from the
 Super Mario Sunshine decompilation source. It contains no retail game assets or
-decompilation source text.
+decompilation source text. The snapshot includes object/NPC/enemy metadata,
+music-to-wave mappings, per-stage audio behavior, and dialogue voice order.
 
 Maintainers refresh it from a clean decompilation revision:
 

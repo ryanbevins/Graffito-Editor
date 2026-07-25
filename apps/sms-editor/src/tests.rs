@@ -3601,6 +3601,20 @@ fn missing_decomp_source_uses_the_shipped_schema_bundle() {
     assert!(!selection.registry.objects.is_empty());
     assert!(!selection.registry.npc_actors.is_empty());
     assert!(!selection.registry.enemy_actors.is_empty());
+    assert!(!selection.registry.bgm_wave_scenes.is_empty());
+    assert!(!selection.registry.stage_audio_areas.is_empty());
+    assert_eq!(
+        selection.registry.dialogue_voices.len(),
+        sms_formats::SMS_TALK_SOUND_LIMIT
+    );
+    let music = index_retail_music(&selection.registry, root.path(), &BTreeMap::new()).unwrap();
+    assert!(
+        music.len() >= 40,
+        "bundled schema exposed only {} music choices",
+        music.len()
+    );
+    let voices = index_retail_dialogue_voices(&selection.registry, &[]).unwrap();
+    assert_eq!(voices.len(), sms_formats::SMS_TALK_SOUND_LIMIT);
     assert!(selection.status.contains("bundled object entries"));
     assert!(selection.status.contains("source was unavailable"));
 }

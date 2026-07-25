@@ -160,7 +160,7 @@ LTO and incremental compilation for practical iteration.
 
 Graffito first uses a configured decomp checkout when one is available, so
 schema developers can test current extractor changes. Installed and
-source-without-decomp builds automatically fall back to the versioned registry
+source-without-decomp builds automatically fall back to the versioned metadata
 in `crates/sms-schema/generated/object-registry.json`. Maintainers refresh and
 verify that artifact from a clean decomp revision with:
 

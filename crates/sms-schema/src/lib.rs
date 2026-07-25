@@ -1,5 +1,6 @@
 //! Decomp-derived object and parameter registry generation.
 
+mod audio_metadata;
 mod factory_extractor;
 mod map_obj_ball_extractor;
 mod map_obj_resource_extractor;
@@ -17,6 +18,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use audio_metadata::{extract_bgm_wave_scenes, extract_dialogue_voices, extract_stage_audio_areas};
 use factory_extractor::{extract_factory_candidates, FactoryEvidence};
 use map_obj_ball_extractor::extract_map_obj_ball_transforms;
 use map_obj_resource_extractor::{extract_map_obj_resources, has_null_animation_model_fallback};
@@ -100,6 +102,8 @@ pub enum SchemaExtractor {
     StageNames,
     CollisionSurfaces,
     CollisionLimits,
+    MusicMetadata,
+    DialogueVoices,
 }
 
 impl std::fmt::Display for SchemaExtractor {
@@ -129,6 +133,8 @@ impl std::fmt::Display for SchemaExtractor {
             Self::StageNames => "stage name",
             Self::CollisionSurfaces => "collision surface",
             Self::CollisionLimits => "collision runtime limit",
+            Self::MusicMetadata => "music metadata",
+            Self::DialogueVoices => "dialogue voice",
         };
         formatter.write_str(name)
     }
@@ -164,6 +170,15 @@ pub struct ObjectRegistry {
     /// Cube manager/table bindings constructed by the runtime name factory.
     #[serde(default)]
     pub cube_managers: Vec<CubeManagerDefinition>,
+    /// BGM identifiers and wave-bank scenes selected by `MSBgm::getSceneNo`.
+    #[serde(default)]
+    pub bgm_wave_scenes: Vec<BgmWaveSceneDefinition>,
+    /// Per-area defaults and scenario overrides from `setMSoundEnterStage`.
+    #[serde(default)]
+    pub stage_audio_areas: Vec<StageAudioAreaDefinition>,
+    /// Exact ordered `scTalkSoundList` used by `TTalk2D2`.
+    #[serde(default)]
+    pub dialogue_voices: Vec<DialogueVoiceDefinition>,
     /// Models selected by the exact resource identity stored in `TMapObjData::unk0`.
     #[serde(default)]
     pub map_obj_resources: Vec<MapObjResourceDefinition>,
@@ -282,6 +297,38 @@ impl ObjectRegistry {
         self.enemy_actors
             .iter()
             .find(|definition| definition.factory_name == factory_name)
+    }
+
+    pub fn find_bgm_wave_scene(&self, bgm_id: u32) -> Option<&BgmWaveSceneDefinition> {
+        self.bgm_wave_scenes
+            .iter()
+            .find(|definition| definition.bgm_id == bgm_id)
+    }
+
+    pub fn stage_audio_state(
+        &self,
+        area_index: u32,
+        scenario_index: u32,
+    ) -> StageAudioStateDefinition {
+        let Some(area) = self
+            .stage_audio_areas
+            .iter()
+            .find(|definition| definition.area_index == area_index)
+            .or_else(|| {
+                self.stage_audio_areas
+                    .iter()
+                    .find(|definition| definition.area_index == u32::MAX)
+            })
+        else {
+            return StageAudioStateDefinition::default();
+        };
+        area.scenario_overrides
+            .iter()
+            .find(|definition| definition.scenario_index == scenario_index)
+            .map_or_else(
+                || area.default.clone(),
+                |definition| definition.state.clone(),
+            )
     }
 
     pub fn object_resources_for<'a>(
@@ -563,6 +610,54 @@ pub struct CubeManagerDefinition {
     pub runtime_global: String,
     pub table_name: String,
     pub kind: CubeManagerKind,
+    pub source_file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BgmWaveSceneDefinition {
+    pub bgm_id: u32,
+    pub wave_scene_id: u32,
+    pub source_file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct StageAudioStateDefinition {
+    #[serde(default)]
+    pub primary_bgm_id: Option<u32>,
+    #[serde(default)]
+    pub entrance_bgm_id: Option<u32>,
+    #[serde(default)]
+    pub secondary_bgm_id: Option<u32>,
+    #[serde(default)]
+    pub secondary_start_status: u8,
+    #[serde(default)]
+    pub flags: u8,
+    #[serde(default)]
+    pub fade_event: u8,
+    #[serde(default)]
+    pub switch_bgm_id: Option<u32>,
+    #[serde(default)]
+    pub switch_bgm2_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageAudioScenarioDefinition {
+    pub scenario_index: u32,
+    pub state: StageAudioStateDefinition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageAudioAreaDefinition {
+    pub area_index: u32,
+    pub default: StageAudioStateDefinition,
+    pub scenario_overrides: Vec<StageAudioScenarioDefinition>,
+    pub source_file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DialogueVoiceDefinition {
+    pub index: u8,
+    pub sound_id: u32,
     pub source_file: String,
 }
 
@@ -1023,7 +1118,28 @@ impl BundledObjectRegistry {
                 current,
             });
         }
-        validate_registry(&self.registry)
+        validate_registry(&self.registry)?;
+        for (count, expected) in [
+            (
+                self.registry.bgm_wave_scenes.len(),
+                "BGM-to-wave-scene mappings",
+            ),
+            (
+                self.registry.stage_audio_areas.len(),
+                "stage audio area profiles",
+            ),
+            (
+                self.registry.dialogue_voices.len(),
+                "dialogue voice identifiers",
+            ),
+        ] {
+            if count == 0 {
+                return Err(SchemaError::RegistryInvariant {
+                    detail: format!("bundled registry has no {expected}"),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1910,6 +2026,38 @@ impl SchemaGenerator {
         let factory_path = "src/System/MarNameRefGen.cpp";
         registry.cube_managers =
             extract_cube_managers(sources.required(factory_path)?.text(), factory_path);
+
+        let bgm_path = "src/MSound/MSoundBGM.cpp";
+        registry.bgm_wave_scenes =
+            extract_bgm_wave_scenes(sources.required(bgm_path)?.text(), bgm_path)?;
+        ensure_extracted(
+            SchemaExtractor::MusicMetadata,
+            self.repo_root.join(bgm_path),
+            registry.bgm_wave_scenes.len(),
+            "BGM-to-wave-scene mappings",
+        )?;
+
+        let stage_audio_path = "src/System/MSoundMainSide.cpp";
+        registry.stage_audio_areas = extract_stage_audio_areas(
+            sources.required(stage_audio_path)?.text(),
+            stage_audio_path,
+        )?;
+        ensure_extracted(
+            SchemaExtractor::MusicMetadata,
+            self.repo_root.join(stage_audio_path),
+            registry.stage_audio_areas.len(),
+            "stage audio area profiles",
+        )?;
+
+        let dialogue_path = "src/GC2D/Talk2D2.cpp";
+        registry.dialogue_voices =
+            extract_dialogue_voices(sources.required(dialogue_path)?.text(), dialogue_path)?;
+        ensure_extracted(
+            SchemaExtractor::DialogueVoices,
+            self.repo_root.join(dialogue_path),
+            registry.dialogue_voices.len(),
+            "ordered dialogue voice identifiers",
+        )?;
         Ok(())
     }
 
@@ -2110,6 +2258,7 @@ impl SchemaGenerator {
 fn schema_generator_fingerprint() -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     [
+        include_bytes!("audio_metadata.rs").as_slice(),
         include_bytes!("lib.rs").as_slice(),
         include_bytes!("source_inventory.rs").as_slice(),
         include_bytes!("factory_extractor.rs").as_slice(),
@@ -4584,6 +4733,50 @@ fn dedup_registry(registry: &mut ObjectRegistry) -> Result<()> {
             .then_with(|| a.factory_name.cmp(&b.factory_name))
     });
     registry.cube_managers.dedup();
+    registry
+        .bgm_wave_scenes
+        .sort_by_key(|definition| definition.bgm_id);
+    for duplicate in registry.bgm_wave_scenes.windows(2) {
+        if duplicate[0].bgm_id == duplicate[1].bgm_id {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!("duplicate BGM mapping {:#010x}", duplicate[0].bgm_id),
+            });
+        }
+    }
+    registry
+        .stage_audio_areas
+        .sort_by_key(|definition| definition.area_index);
+    for area in &mut registry.stage_audio_areas {
+        area.scenario_overrides
+            .sort_by_key(|definition| definition.scenario_index);
+        for duplicate in area.scenario_overrides.windows(2) {
+            if duplicate[0].scenario_index == duplicate[1].scenario_index {
+                return Err(SchemaError::RegistryInvariant {
+                    detail: format!(
+                        "duplicate stage audio scenario {} for area {}",
+                        duplicate[0].scenario_index, area.area_index
+                    ),
+                });
+            }
+        }
+    }
+    for duplicate in registry.stage_audio_areas.windows(2) {
+        if duplicate[0].area_index == duplicate[1].area_index {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!("duplicate stage audio area {}", duplicate[0].area_index),
+            });
+        }
+    }
+    registry
+        .dialogue_voices
+        .sort_by_key(|definition| definition.index);
+    for (expected_index, voice) in registry.dialogue_voices.iter().enumerate() {
+        if usize::from(voice.index) != expected_index {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!("dialogue voice table is not contiguous at index {expected_index}"),
+            });
+        }
+    }
 
     registry.map_obj_flags.sort_by(|a, b| {
         a.factory_name
@@ -6711,6 +6904,10 @@ mod tests {
         assert!(!bundle.registry.object_resources.is_empty());
         assert!(!bundle.registry.npc_actors.is_empty());
         assert!(!bundle.registry.enemy_actors.is_empty());
+        assert!(bundle.registry.bgm_wave_scenes.len() >= 40);
+        assert!(!bundle.registry.stage_audio_areas.is_empty());
+        assert_eq!(bundle.registry.dialogue_voices.len(), 135);
+        assert!(bundle.registry.find_bgm_wave_scene(0x8001_0001).is_some());
         let serialized = bundle.to_pretty_vec().unwrap();
         assert_eq!(
             BundledObjectRegistry::from_slice(&serialized).unwrap(),
@@ -7097,6 +7294,42 @@ mod tests {
                 if (strcmp(name, "NozzleBox") == 0) return new TNozzleBox("box");
                 if (strcmp(name, "FixturePaint") == 0) return new TFixturePaint("paint");
                 if (strcmp(name, "JellyGate") == 0) return new TModelGate("gate");
+            "#,
+        );
+        fixture.write(
+            "src/MSound/MSoundBGM.cpp",
+            r#"
+                int MSBgm::getSceneNo(unsigned long id) {
+                    switch (id) {
+                    case 0x80010001: return 0x201;
+                    case 0x80010002: return 0x202;
+                    }
+                    return -1;
+                }
+            "#,
+        );
+        fixture.write(
+            "src/System/MSoundMainSide.cpp",
+            r#"
+                void MSMainProc::setMSoundEnterStage(unsigned char map, unsigned char area) {
+                    unsigned long base = 0x80010000;
+                    switch (map) {
+                    case 1:
+                        MSStageInfo::stageBgm = base + 0x01;
+                        if (area == 2) {
+                            MSStageInfo::stageBgm = base + 0x02;
+                        }
+                        break;
+                    }
+                }
+            "#,
+        );
+        fixture.write(
+            "src/GC2D/Talk2D2.cpp",
+            r#"
+                static const u32 scTalkSoundList[] = {
+                    0x00008850, 0xFFFFFFFF, 0x80010025,
+                };
             "#,
         );
         fixture.write(

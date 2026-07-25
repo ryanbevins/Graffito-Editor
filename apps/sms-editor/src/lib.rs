@@ -1636,24 +1636,28 @@ impl SmsEditorApp {
                     Err(error) => (BTreeMap::new(), Some(error)),
                 };
                 let (retail_skyboxes, skybox_warnings) = index_retail_skyboxes(&archives);
-                let (retail_music, music_warning) = match index_retail_music(
-                    Path::new(&repo_root),
-                    Path::new(&task_base_root),
-                    &labels,
-                ) {
+                let music_result = registry.as_ref().map_or_else(
+                    || Err("the object schema is not loaded".to_string()),
+                    |registry| index_retail_music(registry, Path::new(&task_base_root), &labels),
+                );
+                let (retail_music, music_warning) = match music_result {
                     Ok(entries) => (entries, None),
                     Err(error) => (Vec::new(), Some(error)),
                 };
                 let retail_sounds =
                     index_retail_sounds(Path::new(&task_base_root)).unwrap_or_default();
-                let retail_dialogue_voices =
-                    index_retail_dialogue_voices(Path::new(&repo_root), &retail_sounds)
-                        .unwrap_or_default();
-                let retail_stage_audio = index_retail_stage_audio_profiles(
-                    Path::new(&repo_root),
-                    Path::new(&task_base_root),
-                )
-                .unwrap_or_default();
+                let retail_dialogue_voices = registry
+                    .as_ref()
+                    .and_then(|registry| {
+                        index_retail_dialogue_voices(registry, &retail_sounds).ok()
+                    })
+                    .unwrap_or_default();
+                let retail_stage_audio = registry
+                    .as_ref()
+                    .and_then(|registry| {
+                        index_retail_stage_audio_profiles(registry, Path::new(&task_base_root)).ok()
+                    })
+                    .unwrap_or_default();
                 let object_authoring_catalog_cache = resolve_object_authoring_catalog(
                     Path::new(&task_base_root),
                     &archives,

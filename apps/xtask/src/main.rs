@@ -137,13 +137,17 @@ fn run_schema_bundle(repo_root: &Path, options: SchemaBundleOptions) -> Result<(
         )
     })?;
     println!(
-        "Wrote {} from decomp revision {} ({:#018x}); {} objects, {} NPC families, {} enemy actors.",
+        "Wrote {} from decomp revision {} ({:#018x}); {} objects, {} NPC families, {} enemy \
+         actors, {} music tracks, {} stage-audio areas, {} dialogue voices.",
         output_path.display(),
         bundle.source_revision,
         bundle.source_fingerprint,
         bundle.registry.objects.len(),
         bundle.registry.npc_actors.len(),
-        bundle.registry.enemy_actors.len()
+        bundle.registry.enemy_actors.len(),
+        bundle.registry.bgm_wave_scenes.len(),
+        bundle.registry.stage_audio_areas.len(),
+        bundle.registry.dialogue_voices.len()
     );
     Ok(())
 }

@@ -2,7 +2,7 @@
   "format_version": 1,
   "source_revision": "01ffd369c94b23be158abde1254c277879c04a9f",
   "source_fingerprint": 15545920352673147969,
-  "generator_fingerprint": 10906901132693341528,
+  "generator_fingerprint": 1399359145563798908,
   "registry": {
     "objects": [
       {
@@ -20746,6 +20746,1903 @@
         "table_name": "高速Ｃキューブテーブル",
         "kind": "other",
         "source_file": "src/System/MarNameRefGen.cpp"
+      }
+    ],
+    "bgm_wave_scenes": [
+      {
+        "bgm_id": 2147549185,
+        "wave_scene_id": 513,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549186,
+        "wave_scene_id": 514,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549187,
+        "wave_scene_id": 515,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549188,
+        "wave_scene_id": 516,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549189,
+        "wave_scene_id": 516,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549190,
+        "wave_scene_id": 517,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549191,
+        "wave_scene_id": 518,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549192,
+        "wave_scene_id": 519,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549193,
+        "wave_scene_id": 520,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549194,
+        "wave_scene_id": 528,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549195,
+        "wave_scene_id": 528,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549196,
+        "wave_scene_id": 528,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549197,
+        "wave_scene_id": 528,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549198,
+        "wave_scene_id": 522,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549199,
+        "wave_scene_id": 521,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549200,
+        "wave_scene_id": 522,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549201,
+        "wave_scene_id": 4294967295,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549202,
+        "wave_scene_id": 524,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549203,
+        "wave_scene_id": 525,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549204,
+        "wave_scene_id": 526,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549205,
+        "wave_scene_id": 527,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549206,
+        "wave_scene_id": 528,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549207,
+        "wave_scene_id": 528,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549208,
+        "wave_scene_id": 518,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549209,
+        "wave_scene_id": 529,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549210,
+        "wave_scene_id": 530,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549211,
+        "wave_scene_id": 528,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549212,
+        "wave_scene_id": 522,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549213,
+        "wave_scene_id": 518,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549214,
+        "wave_scene_id": 525,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549215,
+        "wave_scene_id": 528,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549216,
+        "wave_scene_id": 528,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549217,
+        "wave_scene_id": 532,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549218,
+        "wave_scene_id": 518,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549219,
+        "wave_scene_id": 516,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549220,
+        "wave_scene_id": 528,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549221,
+        "wave_scene_id": 525,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549222,
+        "wave_scene_id": 528,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549223,
+        "wave_scene_id": 528,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549224,
+        "wave_scene_id": 528,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549225,
+        "wave_scene_id": 528,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549226,
+        "wave_scene_id": 528,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549227,
+        "wave_scene_id": 528,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549228,
+        "wave_scene_id": 518,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549230,
+        "wave_scene_id": 533,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      },
+      {
+        "bgm_id": 2147549231,
+        "wave_scene_id": 528,
+        "source_file": "src/MSound/MSoundBGM.cpp"
+      }
+    ],
+    "stage_audio_areas": [
+      {
+        "area_index": 0,
+        "default": {
+          "primary_bgm_id": 2147549210,
+          "entrance_bgm_id": 2147549207,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 10,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 1,
+        "default": {
+          "primary_bgm_id": 2147549185,
+          "entrance_bgm_id": 2147549207,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 10,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [
+          {
+            "scenario_index": 0,
+            "state": {
+              "primary_bgm_id": 2147549185,
+              "entrance_bgm_id": 2147549207,
+              "secondary_bgm_id": null,
+              "secondary_start_status": 2,
+              "flags": 10,
+              "fade_event": 2,
+              "switch_bgm_id": null,
+              "switch_bgm2_id": null
+            }
+          },
+          {
+            "scenario_index": 1,
+            "state": {
+              "primary_bgm_id": 2147549185,
+              "entrance_bgm_id": 2147549206,
+              "secondary_bgm_id": null,
+              "secondary_start_status": 2,
+              "flags": 0,
+              "fade_event": 0,
+              "switch_bgm_id": null,
+              "switch_bgm2_id": null
+            }
+          },
+          {
+            "scenario_index": 5,
+            "state": {
+              "primary_bgm_id": 2147549185,
+              "entrance_bgm_id": 2147549207,
+              "secondary_bgm_id": null,
+              "secondary_start_status": 2,
+              "flags": 10,
+              "fade_event": 2,
+              "switch_bgm_id": null,
+              "switch_bgm2_id": null
+            }
+          },
+          {
+            "scenario_index": 9,
+            "state": {
+              "primary_bgm_id": 2147549185,
+              "entrance_bgm_id": 2147549206,
+              "secondary_bgm_id": null,
+              "secondary_start_status": 2,
+              "flags": 0,
+              "fade_event": 0,
+              "switch_bgm_id": null,
+              "switch_bgm2_id": null
+            }
+          }
+        ],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 2,
+        "default": {
+          "primary_bgm_id": 2147549186,
+          "entrance_bgm_id": 2147549207,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 10,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [
+          {
+            "scenario_index": 0,
+            "state": {
+              "primary_bgm_id": 2147549186,
+              "entrance_bgm_id": 2147549223,
+              "secondary_bgm_id": null,
+              "secondary_start_status": 2,
+              "flags": 10,
+              "fade_event": 2,
+              "switch_bgm_id": null,
+              "switch_bgm2_id": null
+            }
+          },
+          {
+            "scenario_index": 6,
+            "state": {
+              "primary_bgm_id": 2147549186,
+              "entrance_bgm_id": 2147549206,
+              "secondary_bgm_id": null,
+              "secondary_start_status": 2,
+              "flags": 3,
+              "fade_event": 1,
+              "switch_bgm_id": null,
+              "switch_bgm2_id": null
+            }
+          }
+        ],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 3,
+        "default": {
+          "primary_bgm_id": 2147549193,
+          "entrance_bgm_id": 2147549207,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 10,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [
+          {
+            "scenario_index": 4,
+            "state": {
+              "primary_bgm_id": 2147549193,
+              "entrance_bgm_id": 2147549207,
+              "secondary_bgm_id": null,
+              "secondary_start_status": 2,
+              "flags": 10,
+              "fade_event": 3,
+              "switch_bgm_id": 2147549197,
+              "switch_bgm2_id": 2147549226
+            }
+          },
+          {
+            "scenario_index": 6,
+            "state": {
+              "primary_bgm_id": 2147549193,
+              "entrance_bgm_id": 2147549206,
+              "secondary_bgm_id": null,
+              "secondary_start_status": 2,
+              "flags": 3,
+              "fade_event": 1,
+              "switch_bgm_id": null,
+              "switch_bgm2_id": null
+            }
+          }
+        ],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 4,
+        "default": {
+          "primary_bgm_id": 2147549187,
+          "entrance_bgm_id": 2147549207,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 10,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [
+          {
+            "scenario_index": 2,
+            "state": {
+              "primary_bgm_id": 2147549197,
+              "entrance_bgm_id": 2147549197,
+              "secondary_bgm_id": null,
+              "secondary_start_status": 2,
+              "flags": 0,
+              "fade_event": 0,
+              "switch_bgm_id": null,
+              "switch_bgm2_id": null
+            }
+          },
+          {
+            "scenario_index": 6,
+            "state": {
+              "primary_bgm_id": 2147549187,
+              "entrance_bgm_id": 2147549206,
+              "secondary_bgm_id": null,
+              "secondary_start_status": 2,
+              "flags": 3,
+              "fade_event": 1,
+              "switch_bgm_id": null,
+              "switch_bgm2_id": null
+            }
+          }
+        ],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 5,
+        "default": {
+          "primary_bgm_id": 2147549188,
+          "entrance_bgm_id": 2147549207,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 10,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [
+          {
+            "scenario_index": 0,
+            "state": {
+              "primary_bgm_id": 2147549188,
+              "entrance_bgm_id": 2147549223,
+              "secondary_bgm_id": null,
+              "secondary_start_status": 2,
+              "flags": 10,
+              "fade_event": 0,
+              "switch_bgm_id": null,
+              "switch_bgm2_id": null
+            }
+          }
+        ],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 6,
+        "default": {
+          "primary_bgm_id": 2147549192,
+          "entrance_bgm_id": 2147549207,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 10,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 7,
+        "default": {
+          "primary_bgm_id": 2147549203,
+          "entrance_bgm_id": 2147549207,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 10,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [
+          {
+            "scenario_index": 3,
+            "state": {
+              "primary_bgm_id": 2147549206,
+              "entrance_bgm_id": 2147549207,
+              "secondary_bgm_id": 2147549203,
+              "secondary_start_status": 2,
+              "flags": 10,
+              "fade_event": 1,
+              "switch_bgm_id": null,
+              "switch_bgm2_id": null
+            }
+          }
+        ],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 8,
+        "default": {
+          "primary_bgm_id": 2147549191,
+          "entrance_bgm_id": 2147549207,
+          "secondary_bgm_id": 2147549208,
+          "secondary_start_status": 0,
+          "flags": 10,
+          "fade_event": 2,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [
+          {
+            "scenario_index": 5,
+            "state": {
+              "primary_bgm_id": 2147549218,
+              "entrance_bgm_id": 2147549207,
+              "secondary_bgm_id": 2147549208,
+              "secondary_start_status": 0,
+              "flags": 10,
+              "fade_event": 2,
+              "switch_bgm_id": null,
+              "switch_bgm2_id": null
+            }
+          },
+          {
+            "scenario_index": 6,
+            "state": {
+              "primary_bgm_id": 2147549191,
+              "entrance_bgm_id": 2147549206,
+              "secondary_bgm_id": null,
+              "secondary_start_status": 2,
+              "flags": 6,
+              "fade_event": 1,
+              "switch_bgm_id": null,
+              "switch_bgm2_id": null
+            }
+          },
+          {
+            "scenario_index": 7,
+            "state": {
+              "primary_bgm_id": 2147549191,
+              "entrance_bgm_id": 2147549207,
+              "secondary_bgm_id": 2147549228,
+              "secondary_start_status": 2,
+              "flags": 10,
+              "fade_event": 2,
+              "switch_bgm_id": null,
+              "switch_bgm2_id": null
+            }
+          }
+        ],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 9,
+        "default": {
+          "primary_bgm_id": 2147549204,
+          "entrance_bgm_id": 2147549207,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 10,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [
+          {
+            "scenario_index": 1,
+            "state": {
+              "primary_bgm_id": 2147549204,
+              "entrance_bgm_id": 2147549207,
+              "secondary_bgm_id": null,
+              "secondary_start_status": 2,
+              "flags": 10,
+              "fade_event": 3,
+              "switch_bgm_id": 2147549195,
+              "switch_bgm2_id": 2147549195
+            }
+          },
+          {
+            "scenario_index": 6,
+            "state": {
+              "primary_bgm_id": 2147549204,
+              "entrance_bgm_id": 2147549206,
+              "secondary_bgm_id": null,
+              "secondary_start_status": 2,
+              "flags": 3,
+              "fade_event": 1,
+              "switch_bgm_id": null,
+              "switch_bgm2_id": null
+            }
+          }
+        ],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 13,
+        "default": {
+          "primary_bgm_id": 2147549189,
+          "entrance_bgm_id": 2147549207,
+          "secondary_bgm_id": 2147549219,
+          "secondary_start_status": 2,
+          "flags": 10,
+          "fade_event": 2,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [
+          {
+            "scenario_index": 0,
+            "state": {
+              "primary_bgm_id": 2147549206,
+              "entrance_bgm_id": 2147549207,
+              "secondary_bgm_id": 2147549189,
+              "secondary_start_status": 2,
+              "flags": 10,
+              "fade_event": 1,
+              "switch_bgm_id": null,
+              "switch_bgm2_id": null
+            }
+          },
+          {
+            "scenario_index": 4,
+            "state": {
+              "primary_bgm_id": 2147549206,
+              "entrance_bgm_id": 2147549207,
+              "secondary_bgm_id": 2147549189,
+              "secondary_start_status": 2,
+              "flags": 10,
+              "fade_event": 1,
+              "switch_bgm_id": null,
+              "switch_bgm2_id": null
+            }
+          },
+          {
+            "scenario_index": 7,
+            "state": {
+              "primary_bgm_id": null,
+              "entrance_bgm_id": 2147549207,
+              "secondary_bgm_id": 2147549219,
+              "secondary_start_status": 2,
+              "flags": 10,
+              "fade_event": 2,
+              "switch_bgm_id": null,
+              "switch_bgm2_id": null
+            }
+          }
+        ],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 14,
+        "default": {
+          "primary_bgm_id": 2147549214,
+          "entrance_bgm_id": 2147549207,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 10,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 15,
+        "default": {
+          "primary_bgm_id": 2147549200,
+          "entrance_bgm_id": 2147549207,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 10,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 16,
+        "default": {
+          "primary_bgm_id": 2147549190,
+          "entrance_bgm_id": 2147549207,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 10,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 20,
+        "default": {
+          "primary_bgm_id": 2147549185,
+          "entrance_bgm_id": 2147549185,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 21,
+        "default": {
+          "primary_bgm_id": 2147549217,
+          "entrance_bgm_id": 2147549217,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 22,
+        "default": {
+          "primary_bgm_id": 2147549217,
+          "entrance_bgm_id": 2147549217,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 23,
+        "default": {
+          "primary_bgm_id": 2147549217,
+          "entrance_bgm_id": 2147549217,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 24,
+        "default": {
+          "primary_bgm_id": 2147549217,
+          "entrance_bgm_id": 2147549217,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 28,
+        "default": {
+          "primary_bgm_id": 2147549202,
+          "entrance_bgm_id": 2147549202,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 29,
+        "default": {
+          "primary_bgm_id": 2147549217,
+          "entrance_bgm_id": 2147549217,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 30,
+        "default": {
+          "primary_bgm_id": 2147549202,
+          "entrance_bgm_id": 2147549207,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 10,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 31,
+        "default": {
+          "primary_bgm_id": 2147549202,
+          "entrance_bgm_id": 2147549202,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 32,
+        "default": {
+          "primary_bgm_id": 2147549202,
+          "entrance_bgm_id": 2147549202,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 33,
+        "default": {
+          "primary_bgm_id": 2147549217,
+          "entrance_bgm_id": 2147549217,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 34,
+        "default": {
+          "primary_bgm_id": 2147549202,
+          "entrance_bgm_id": 2147549202,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 35,
+        "default": {
+          "primary_bgm_id": 2147549202,
+          "entrance_bgm_id": 2147549202,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 40,
+        "default": {
+          "primary_bgm_id": 2147549202,
+          "entrance_bgm_id": 2147549202,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 41,
+        "default": {
+          "primary_bgm_id": 2147549202,
+          "entrance_bgm_id": 2147549202,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 42,
+        "default": {
+          "primary_bgm_id": 2147549202,
+          "entrance_bgm_id": 2147549202,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 43,
+        "default": {
+          "primary_bgm_id": 2147549202,
+          "entrance_bgm_id": 2147549202,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 44,
+        "default": {
+          "primary_bgm_id": 2147549217,
+          "entrance_bgm_id": 2147549217,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 45,
+        "default": {
+          "primary_bgm_id": 2147549202,
+          "entrance_bgm_id": 2147549202,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 46,
+        "default": {
+          "primary_bgm_id": 2147549202,
+          "entrance_bgm_id": 2147549202,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 47,
+        "default": {
+          "primary_bgm_id": 2147549202,
+          "entrance_bgm_id": 2147549202,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 48,
+        "default": {
+          "primary_bgm_id": 2147549202,
+          "entrance_bgm_id": 2147549202,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 49,
+        "default": {
+          "primary_bgm_id": 2147549202,
+          "entrance_bgm_id": 2147549202,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 50,
+        "default": {
+          "primary_bgm_id": 2147549202,
+          "entrance_bgm_id": 2147549202,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 51,
+        "default": {
+          "primary_bgm_id": 2147549202,
+          "entrance_bgm_id": 2147549202,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 52,
+        "default": {
+          "primary_bgm_id": 2147549205,
+          "entrance_bgm_id": 2147549205,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 55,
+        "default": {
+          "primary_bgm_id": 2147549197,
+          "entrance_bgm_id": 2147549207,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 10,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 57,
+        "default": {
+          "primary_bgm_id": 2147549197,
+          "entrance_bgm_id": 2147549207,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 10,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 58,
+        "default": {
+          "primary_bgm_id": null,
+          "entrance_bgm_id": 2147549207,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 10,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [
+          {
+            "scenario_index": 0,
+            "state": {
+              "primary_bgm_id": 2147549215,
+              "entrance_bgm_id": 2147549207,
+              "secondary_bgm_id": null,
+              "secondary_start_status": 2,
+              "flags": 10,
+              "fade_event": 0,
+              "switch_bgm_id": null,
+              "switch_bgm2_id": null
+            }
+          },
+          {
+            "scenario_index": 1,
+            "state": {
+              "primary_bgm_id": 2147549209,
+              "entrance_bgm_id": 2147549207,
+              "secondary_bgm_id": null,
+              "secondary_start_status": 2,
+              "flags": 10,
+              "fade_event": 0,
+              "switch_bgm_id": null,
+              "switch_bgm2_id": null
+            }
+          }
+        ],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 59,
+        "default": {
+          "primary_bgm_id": 2147549193,
+          "entrance_bgm_id": 2147549207,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 3,
+          "fade_event": 2,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 60,
+        "default": {
+          "primary_bgm_id": 2147549230,
+          "entrance_bgm_id": 2147549230,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 0,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      },
+      {
+        "area_index": 4294967295,
+        "default": {
+          "primary_bgm_id": null,
+          "entrance_bgm_id": 2147549207,
+          "secondary_bgm_id": null,
+          "secondary_start_status": 2,
+          "flags": 10,
+          "fade_event": 0,
+          "switch_bgm_id": null,
+          "switch_bgm2_id": null
+        },
+        "scenario_overrides": [],
+        "source_file": "src/System/MSoundMainSide.cpp"
+      }
+    ],
+    "dialogue_voices": [
+      {
+        "index": 0,
+        "sound_id": 34896,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 1,
+        "sound_id": 34897,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 2,
+        "sound_id": 34898,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 3,
+        "sound_id": 34899,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 4,
+        "sound_id": 34900,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 5,
+        "sound_id": 34901,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 6,
+        "sound_id": 34902,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 7,
+        "sound_id": 34903,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 8,
+        "sound_id": 34904,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 9,
+        "sound_id": 34905,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 10,
+        "sound_id": 34906,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 11,
+        "sound_id": 34907,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 12,
+        "sound_id": 34908,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 13,
+        "sound_id": 34909,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 14,
+        "sound_id": 34910,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 15,
+        "sound_id": 34911,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 16,
+        "sound_id": 34912,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 17,
+        "sound_id": 34913,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 18,
+        "sound_id": 34914,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 19,
+        "sound_id": 34915,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 20,
+        "sound_id": 34918,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 21,
+        "sound_id": 34919,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 22,
+        "sound_id": 34920,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 23,
+        "sound_id": 34921,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 24,
+        "sound_id": 34922,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 25,
+        "sound_id": 34923,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 26,
+        "sound_id": 34924,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 27,
+        "sound_id": 34925,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 28,
+        "sound_id": 34926,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 29,
+        "sound_id": 34927,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 30,
+        "sound_id": 34928,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 31,
+        "sound_id": 34929,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 32,
+        "sound_id": 34930,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 33,
+        "sound_id": 34931,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 34,
+        "sound_id": 34932,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 35,
+        "sound_id": 34933,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 36,
+        "sound_id": 34934,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 37,
+        "sound_id": 34935,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 38,
+        "sound_id": 34936,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 39,
+        "sound_id": 34937,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 40,
+        "sound_id": 34938,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 41,
+        "sound_id": 34939,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 42,
+        "sound_id": 34940,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 43,
+        "sound_id": 34941,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 44,
+        "sound_id": 34942,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 45,
+        "sound_id": 34943,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 46,
+        "sound_id": 34944,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 47,
+        "sound_id": 34945,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 48,
+        "sound_id": 34946,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 49,
+        "sound_id": 34947,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 50,
+        "sound_id": 34948,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 51,
+        "sound_id": 34949,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 52,
+        "sound_id": 34950,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 53,
+        "sound_id": 34951,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 54,
+        "sound_id": 34952,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 55,
+        "sound_id": 34953,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 56,
+        "sound_id": 34954,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 57,
+        "sound_id": 34955,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 58,
+        "sound_id": 34956,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 59,
+        "sound_id": 34957,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 60,
+        "sound_id": 34958,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 61,
+        "sound_id": 34959,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 62,
+        "sound_id": 34960,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 63,
+        "sound_id": 34961,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 64,
+        "sound_id": 34962,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 65,
+        "sound_id": 34963,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 66,
+        "sound_id": 34964,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 67,
+        "sound_id": 34965,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 68,
+        "sound_id": 34966,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 69,
+        "sound_id": 4294967295,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 70,
+        "sound_id": 34969,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 71,
+        "sound_id": 34970,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 72,
+        "sound_id": 34971,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 73,
+        "sound_id": 34972,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 74,
+        "sound_id": 34973,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 75,
+        "sound_id": 34974,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 76,
+        "sound_id": 34975,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 77,
+        "sound_id": 34976,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 78,
+        "sound_id": 34977,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 79,
+        "sound_id": 34978,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 80,
+        "sound_id": 34979,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 81,
+        "sound_id": 35008,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 82,
+        "sound_id": 35009,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 83,
+        "sound_id": 35010,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 84,
+        "sound_id": 35011,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 85,
+        "sound_id": 35012,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 86,
+        "sound_id": 35013,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 87,
+        "sound_id": 35014,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 88,
+        "sound_id": 35015,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 89,
+        "sound_id": 35016,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 90,
+        "sound_id": 35017,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 91,
+        "sound_id": 35018,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 92,
+        "sound_id": 35019,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 93,
+        "sound_id": 35020,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 94,
+        "sound_id": 35021,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 95,
+        "sound_id": 35022,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 96,
+        "sound_id": 35023,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 97,
+        "sound_id": 35045,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 98,
+        "sound_id": 35046,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 99,
+        "sound_id": 35047,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 100,
+        "sound_id": 35048,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 101,
+        "sound_id": 35049,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 102,
+        "sound_id": 35050,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 103,
+        "sound_id": 35051,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 104,
+        "sound_id": 35024,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 105,
+        "sound_id": 35052,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 106,
+        "sound_id": 35053,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 107,
+        "sound_id": 35025,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 108,
+        "sound_id": 35054,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 109,
+        "sound_id": 35026,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 110,
+        "sound_id": 35055,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 111,
+        "sound_id": 35027,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 112,
+        "sound_id": 35028,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 113,
+        "sound_id": 35029,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 114,
+        "sound_id": 35030,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 115,
+        "sound_id": 35031,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 116,
+        "sound_id": 35032,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 117,
+        "sound_id": 35033,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 118,
+        "sound_id": 35034,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 119,
+        "sound_id": 35035,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 120,
+        "sound_id": 35036,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 121,
+        "sound_id": 35037,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 122,
+        "sound_id": 35038,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 123,
+        "sound_id": 35039,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 124,
+        "sound_id": 35040,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 125,
+        "sound_id": 35041,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 126,
+        "sound_id": 35042,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 127,
+        "sound_id": 35043,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 128,
+        "sound_id": 35044,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 129,
+        "sound_id": 18505,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 130,
+        "sound_id": 2147549221,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 131,
+        "sound_id": 18493,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 132,
+        "sound_id": 34982,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 133,
+        "sound_id": 34916,
+        "source_file": "src/GC2D/Talk2D2.cpp"
+      },
+      {
+        "index": 134,
+        "sound_id": 34917,
+        "source_file": "src/GC2D/Talk2D2.cpp"
       }
     ],
     "map_obj_resources": [

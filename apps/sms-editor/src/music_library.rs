@@ -4,6 +4,7 @@ use std::path::Path;
 
 use regex::Regex;
 use sms_formats::{parse_jdrama_scenario_archive_entries, SMS_TALK_SOUND_LIMIT};
+use sms_schema::ObjectRegistry;
 
 use crate::project::ProjectStageMusicProfile;
 use crate::{SceneArchiveLabel, SmsEditorApp};
@@ -66,23 +67,36 @@ impl RetailStageAudioProfile {
 }
 
 pub(super) fn index_retail_music(
-    repo_root: &Path,
+    registry: &ObjectRegistry,
     base_root: &Path,
     labels: &BTreeMap<String, SceneArchiveLabel>,
 ) -> Result<Vec<RetailMusicEntry>, String> {
-    let bgm_source_path = repo_root.join("src/MSound/MSoundBGM.cpp");
-    let stage_source_path = repo_root.join("src/System/MSoundMainSide.cpp");
-    let bgm_source = fs::read_to_string(&bgm_source_path)
-        .map_err(|error| format!("read {}: {error}", bgm_source_path.display()))?;
-    let stage_source = fs::read_to_string(&stage_source_path)
-        .map_err(|error| format!("read {}: {error}", stage_source_path.display()))?;
-    let scene_by_bgm = extract_bgm_wave_scenes(&bgm_source)?;
-    let areas_by_bgm = extract_primary_stage_music(&stage_source)?;
+    if registry.bgm_wave_scenes.is_empty() {
+        return Err("the loaded schema has no BGM-to-wave-scene mappings".to_string());
+    }
+    let mut areas_by_bgm = BTreeMap::<u32, BTreeSet<u32>>::new();
+    for area in &registry.stage_audio_areas {
+        std::iter::once(&area.default)
+            .chain(
+                area.scenario_overrides
+                    .iter()
+                    .map(|override_| &override_.state),
+            )
+            .filter_map(|state| state.primary_bgm_id)
+            .for_each(|bgm_id| {
+                areas_by_bgm
+                    .entry(bgm_id)
+                    .or_default()
+                    .insert(area.area_index);
+            });
+    }
     let archive_by_area = load_archive_stems_by_area(base_root).unwrap_or_default();
     let names_by_bgm = load_retail_bgm_names(base_root).unwrap_or_default();
 
     let mut entries = Vec::new();
-    for (bgm_id, wave_scene_id) in scene_by_bgm {
+    for definition in &registry.bgm_wave_scenes {
+        let bgm_id = definition.bgm_id;
+        let wave_scene_id = definition.wave_scene_id;
         if bgm_id & 0xffff_0000 != BGM_BASE || wave_scene_id == u32::MAX {
             continue;
         }
@@ -117,77 +131,6 @@ pub(super) fn index_retail_music(
         return Err("the decomp did not expose any valid BGM-to-wave-scene mappings".to_string());
     }
     Ok(entries)
-}
-
-fn extract_bgm_wave_scenes(source: &str) -> Result<BTreeMap<u32, u32>, String> {
-    let mapping = Regex::new(r"(?s)case\s+(0x[0-9A-Fa-f]+)\s*:\s*return\s+(0x[0-9A-Fa-f]+)\s*;")
-        .expect("static BGM mapping regex is valid");
-    let mut result = BTreeMap::new();
-    for captures in mapping.captures_iter(source) {
-        let bgm_id = parse_hex(&captures[1])?;
-        let wave_scene_id = parse_hex(&captures[2])?;
-        if result.insert(bgm_id, wave_scene_id).is_some() {
-            return Err(format!(
-                "decomp contains duplicate BGM mapping 0x{bgm_id:08X}"
-            ));
-        }
-    }
-    Ok(result)
-}
-
-fn extract_primary_stage_music(source: &str) -> Result<BTreeMap<u32, BTreeSet<u32>>, String> {
-    let map_case =
-        Regex::new(r"^\s*case\s+(\d+)\s*:").expect("static stage-map case regex is valid");
-    let assignment = Regex::new(r"MSStageInfo::stageBgm\s*=\s*base\s*\+\s*(0x[0-9A-Fa-f]+)")
-        .expect("static stage BGM assignment regex is valid");
-    let switch_start = source
-        .find("switch (map)")
-        .ok_or_else(|| "decomp MSound stage setup has no switch (map)".to_string())?;
-    let body = &source[switch_start..];
-    let mut depth = 0_i32;
-    let mut entered = false;
-    let mut current_areas = Vec::new();
-    let mut current_has_music = false;
-    let mut result = BTreeMap::<u32, BTreeSet<u32>>::new();
-    for line in body.lines() {
-        if entered && depth == 1 {
-            if let Some(captures) = map_case.captures(line) {
-                if current_has_music {
-                    current_areas.clear();
-                    current_has_music = false;
-                }
-                current_areas.push(
-                    captures[1]
-                        .parse::<u32>()
-                        .map_err(|error| format!("parse map case {}: {error}", &captures[1]))?,
-                );
-            }
-        }
-        if entered && !current_has_music {
-            if let Some(captures) = assignment.captures(line) {
-                let bgm_id = BGM_BASE
-                    .checked_add(parse_hex(&captures[1])?)
-                    .ok_or_else(|| "decomp BGM identifier overflows u32".to_string())?;
-                result
-                    .entry(bgm_id)
-                    .or_default()
-                    .extend(current_areas.iter().copied());
-                current_has_music = true;
-            }
-        }
-        let opens = line.bytes().filter(|byte| *byte == b'{').count() as i32;
-        let closes = line.bytes().filter(|byte| *byte == b'}').count() as i32;
-        if !entered && opens > 0 {
-            entered = true;
-        }
-        if entered {
-            depth += opens - closes;
-            if depth <= 0 {
-                break;
-            }
-        }
-    }
-    Ok(result)
 }
 
 fn load_archive_stems_by_area(base_root: &Path) -> Result<BTreeMap<u32, String>, String> {
@@ -229,34 +172,24 @@ pub(super) fn index_retail_sounds(base_root: &Path) -> Result<Vec<RetailSoundEnt
     extract_retail_sound_entries(&bytes)
 }
 
-/// Derives Sunshine's dialogue voice choices from the decomp's
-/// `scTalkSoundList` instead of maintaining a parallel editor table.
 pub(super) fn index_retail_dialogue_voices(
-    repo_root: &Path,
+    registry: &ObjectRegistry,
     sounds: &[RetailSoundEntry],
 ) -> Result<Vec<RetailDialogueVoiceEntry>, String> {
-    let source_path = repo_root.join("src/GC2D/Talk2D2.cpp");
-    let source = fs::read_to_string(&source_path)
-        .map_err(|error| format!("read {}: {error}", source_path.display()))?;
-    let sound_ids = extract_talk_voice_sound_ids(&source)?;
-    if sound_ids.len() != SMS_TALK_SOUND_LIMIT {
+    if registry.dialogue_voices.len() != SMS_TALK_SOUND_LIMIT {
         return Err(format!(
-            "{} contains {} dialogue voices; Sunshine's TTalk2D2 table requires exactly {}",
-            source_path.display(),
-            sound_ids.len(),
+            "the loaded schema contains {} dialogue voices; Sunshine's TTalk2D2 table requires \
+             exactly {}",
+            registry.dialogue_voices.len(),
             SMS_TALK_SOUND_LIMIT
         ));
     }
-    sound_ids
-        .into_iter()
-        .enumerate()
-        .map(|(index, sound_id)| {
-            let index = u8::try_from(index).map_err(|_| {
-                format!(
-                    "{} contains more dialogue voices than Sunshine's u8 voice index supports",
-                    source_path.display()
-                )
-            })?;
+    registry
+        .dialogue_voices
+        .iter()
+        .map(|voice| {
+            let index = voice.index;
+            let sound_id = voice.sound_id;
             let label = sounds
                 .iter()
                 .find(|entry| entry.sound_id == sound_id)
@@ -277,45 +210,10 @@ pub(super) fn index_retail_dialogue_voices(
         .collect()
 }
 
-fn extract_talk_voice_sound_ids(source: &str) -> Result<Vec<u32>, String> {
-    let declaration = source
-        .find("scTalkSoundList")
-        .ok_or_else(|| "Talk2D2.cpp does not declare scTalkSoundList".to_string())?;
-    let body_start = source[declaration..]
-        .find('{')
-        .map(|offset| declaration + offset + 1)
-        .ok_or_else(|| "scTalkSoundList has no initializer".to_string())?;
-    let body_end = source[body_start..]
-        .find('}')
-        .map(|offset| body_start + offset)
-        .ok_or_else(|| "scTalkSoundList initializer is not terminated".to_string())?;
-    let literal = Regex::new(r"0[xX]([0-9A-Fa-f]+)")
-        .map_err(|error| format!("compile talk voice parser: {error}"))?;
-    let values = literal
-        .captures_iter(&source[body_start..body_end])
-        .map(|capture| {
-            u32::from_str_radix(&capture[1], 16)
-                .map_err(|error| format!("invalid scTalkSoundList value: {error}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if values.is_empty() {
-        return Err("scTalkSoundList contains no voice entries".to_string());
-    }
-    Ok(values)
-}
-
 pub(super) fn index_retail_stage_audio_profiles(
-    repo_root: &Path,
+    registry: &ObjectRegistry,
     base_root: &Path,
 ) -> Result<Vec<RetailStageAudioProfile>, String> {
-    let bgm_source_path = repo_root.join("src/MSound/MSoundBGM.cpp");
-    let stage_source_path = repo_root.join("src/System/MSoundMainSide.cpp");
-    let scene_by_bgm = extract_bgm_wave_scenes(
-        &fs::read_to_string(&bgm_source_path)
-            .map_err(|error| format!("read {}: {error}", bgm_source_path.display()))?,
-    )?;
-    let stage_source = fs::read_to_string(&stage_source_path)
-        .map_err(|error| format!("read {}: {error}", stage_source_path.display()))?;
     let entries = load_stage_archive_entries(base_root)?;
     let mut profiles = Vec::new();
     for entry in entries {
@@ -325,11 +223,7 @@ pub(super) fn index_retail_stage_audio_profiles(
         else {
             continue;
         };
-        let Some(state) =
-            evaluate_stage_audio_source(&stage_source, entry.area_index, entry.scenario_index)
-        else {
-            continue;
-        };
+        let state = registry.stage_audio_state(entry.area_index, entry.scenario_index);
         profiles.push(RetailStageAudioProfile {
             stage_id: stage_id.to_ascii_lowercase(),
             area_index: entry.area_index,
@@ -337,7 +231,8 @@ pub(super) fn index_retail_stage_audio_profiles(
             primary_bgm_id: state.primary_bgm_id,
             wave_scene_id: state
                 .primary_bgm_id
-                .and_then(|bgm_id| scene_by_bgm.get(&bgm_id).copied()),
+                .and_then(|bgm_id| registry.find_bgm_wave_scene(bgm_id))
+                .map(|definition| definition.wave_scene_id),
             entrance_bgm_id: state.entrance_bgm_id,
             secondary_bgm_id: state.secondary_bgm_id,
             secondary_start_status: state.secondary_start_status,
@@ -370,6 +265,9 @@ fn load_stage_archive_entries(
     .map_err(|error| format!("parse {}: {error}", path.display()))
 }
 
+/// Independent editor-side oracle retained only for regression comparison with
+/// the generated stage-audio metadata.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct EvaluatedStageAudio {
     primary_bgm_id: Option<u32>,
@@ -382,6 +280,7 @@ struct EvaluatedStageAudio {
     switch_bgm2_id: Option<u32>,
 }
 
+#[cfg(test)]
 fn evaluate_stage_audio_source(source: &str, map: u32, area: u32) -> Option<EvaluatedStageAudio> {
     let function = source.find("void MSMainProc::setMSoundEnterStage")?;
     let open = source[function..].find('{')? + function;
@@ -391,6 +290,7 @@ fn evaluate_stage_audio_source(source: &str, map: u32, area: u32) -> Option<Eval
     Some(state)
 }
 
+#[cfg(test)]
 fn evaluate_audio_block(block: &str, map: u32, area: u32, state: &mut EvaluatedStageAudio) -> bool {
     let mut cursor = 0;
     while cursor < block.len() {
@@ -506,6 +406,7 @@ fn evaluate_audio_block(block: &str, map: u32, area: u32, state: &mut EvaluatedS
     false
 }
 
+#[cfg(test)]
 fn apply_audio_statement(statement: &str, state: &mut EvaluatedStageAudio) {
     let bgm_assignment =
         Regex::new(r"base\s*\+\s*(0x[0-9A-Fa-f]+)").expect("static BGM assignment regex is valid");
@@ -566,6 +467,7 @@ fn apply_audio_statement(statement: &str, state: &mut EvaluatedStageAudio) {
     }
 }
 
+#[cfg(test)]
 fn evaluate_area_condition(condition: &str, area: u32) -> Option<bool> {
     let comparison = Regex::new(r"^\s*area\s*(==|!=)\s*(\d+)\s*$")
         .expect("static area condition regex is valid");
@@ -578,6 +480,7 @@ fn evaluate_area_condition(condition: &str, area: u32) -> Option<bool> {
     })
 }
 
+#[cfg(test)]
 fn cpp_statement(source: &str, start: usize) -> Option<(&str, usize)> {
     if source.as_bytes().get(start) == Some(&b'{') {
         let end = matching_delimiter(source, start, b'{', b'}')?;
@@ -588,6 +491,7 @@ fn cpp_statement(source: &str, start: usize) -> Option<(&str, usize)> {
     }
 }
 
+#[cfg(test)]
 fn switch_case_start(block: &str, value: u32) -> Option<usize> {
     let case = Regex::new(r"(?m)^\s*case\s+(\d+)\s*:").expect("static switch case regex is valid");
     let mut depth = 0_i32;
@@ -608,6 +512,7 @@ fn switch_case_start(block: &str, value: u32) -> Option<usize> {
     None
 }
 
+#[cfg(test)]
 fn keyword_at(source: &str, offset: usize, keyword: &str) -> bool {
     source.get(offset..offset + keyword.len()) == Some(keyword)
         && source
@@ -616,6 +521,7 @@ fn keyword_at(source: &str, offset: usize, keyword: &str) -> bool {
             .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
 }
 
+#[cfg(test)]
 fn skip_cpp_space_and_comments(source: &str, mut offset: usize) -> usize {
     loop {
         while source
@@ -647,6 +553,7 @@ fn skip_cpp_space_and_comments(source: &str, mut offset: usize) -> usize {
     }
 }
 
+#[cfg(test)]
 fn matching_delimiter(source: &str, open: usize, open_byte: u8, close_byte: u8) -> Option<usize> {
     let mut depth = 0_u32;
     for (relative, byte) in source.as_bytes()[open..].iter().copied().enumerate() {
@@ -798,6 +705,7 @@ fn title_case_identifier(value: &str) -> String {
         .join(" ")
 }
 
+#[cfg(test)]
 fn parse_hex(value: &str) -> Result<u32, String> {
     u32::from_str_radix(value.trim_start_matches("0x"), 16)
         .map_err(|error| format!("parse hexadecimal value {value}: {error}"))
@@ -861,35 +769,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_decomp_bgm_wave_scene_pairs() {
-        let source = "case 0x80010001:\n return 0x201;\ncase 0x80010002: return 0x202;";
-        let result = extract_bgm_wave_scenes(source).unwrap();
-        assert_eq!(result[&0x8001_0001], 0x201);
-        assert_eq!(result[&0x8001_0002], 0x202);
-    }
+    fn music_catalog_uses_generated_mappings_without_decomp_source() {
+        let base = tempfile::tempdir().unwrap();
+        let registry = ObjectRegistry {
+            bgm_wave_scenes: vec![
+                sms_schema::BgmWaveSceneDefinition {
+                    bgm_id: 0x8001_0001,
+                    wave_scene_id: 0x201,
+                    source_file: "src/MSound/MSoundBGM.cpp".to_string(),
+                },
+                sms_schema::BgmWaveSceneDefinition {
+                    bgm_id: 0x8001_0002,
+                    wave_scene_id: 0x202,
+                    source_file: "src/MSound/MSoundBGM.cpp".to_string(),
+                },
+            ],
+            ..ObjectRegistry::default()
+        };
 
-    #[test]
-    fn extracts_only_primary_music_from_nested_area_cases() {
-        let source = r#"
-            switch (map) {
-            case 1:
-                MSStageInfo::stageBgm = base + 0x01;
-                switch (area) {
-                case 3:
-                    MSStageInfo::stageBgm = base + 0x16;
-                    break;
-                }
-                break;
-            case 2:
-            case 3:
-                MSStageInfo::stageBgm = base + 0x02;
-                break;
-            }
-        "#;
-        let result = extract_primary_stage_music(source).unwrap();
-        assert_eq!(result[&0x8001_0001], BTreeSet::from([1]));
-        assert_eq!(result[&0x8001_0002], BTreeSet::from([2, 3]));
-        assert!(!result.contains_key(&0x8001_0016));
+        let entries = index_retail_music(&registry, base.path(), &BTreeMap::new()).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .any(|entry| entry.bgm_id == 0x8001_0001 && entry.wave_scene_id == 0x201));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.bgm_id == 0x8001_0002 && entry.wave_scene_id == 0x202));
     }
 
     #[test]
@@ -956,31 +862,23 @@ mod tests {
     }
 
     #[test]
-    fn extracts_dialogue_voice_order_from_decomp_initializer() {
-        let source = r#"
-            static const u32 scTalkSoundList[] = {
-                0x00008850, 0xFFFFFFFF,
-                0X80010025,
-            };
-            static const u32 unrelated[] = { 0xDEADBEEF };
-        "#;
-        assert_eq!(
-            extract_talk_voice_sound_ids(source).unwrap(),
-            vec![0x8850, u32::MAX, 0x8001_0025]
-        );
+    fn shipped_schema_exposes_the_complete_dialogue_voice_order() {
+        let registry = sms_schema::bundled_object_registry().unwrap().registry;
+        assert_eq!(registry.dialogue_voices.len(), SMS_TALK_SOUND_LIMIT);
+        assert_eq!(registry.dialogue_voices[0].index, 0);
+        assert!(registry
+            .dialogue_voices
+            .windows(2)
+            .all(|voices| voices[1].index == voices[0].index + 1));
     }
 
     #[test]
-    #[ignore = "requires SMS_DECOMP_ROOT and SMS_BASE_ROOT"]
-    fn indexes_real_decomp_music_catalog() {
-        let repo_root = std::env::var_os("SMS_DECOMP_ROOT").expect("SMS_DECOMP_ROOT");
+    #[ignore = "requires SMS_BASE_ROOT"]
+    fn indexes_real_music_catalog_without_decomp_source() {
         let base_root = std::env::var_os("SMS_BASE_ROOT").expect("SMS_BASE_ROOT");
-        let entries = index_retail_music(
-            Path::new(&repo_root),
-            Path::new(&base_root),
-            &BTreeMap::new(),
-        )
-        .unwrap();
+        let registry = sms_schema::bundled_object_registry().unwrap().registry;
+        let entries =
+            index_retail_music(&registry, Path::new(&base_root), &BTreeMap::new()).unwrap();
         assert!(entries.len() >= 40, "found only {} tracks", entries.len());
         assert!(entries.iter().any(|entry| entry.bgm_id == 0x8001_0001));
         assert!(entries.iter().all(|entry| entry.wave_scene_id != u32::MAX));
@@ -1013,12 +911,52 @@ mod tests {
 
     #[test]
     #[ignore = "requires SMS_DECOMP_ROOT and SMS_BASE_ROOT"]
-    fn evaluates_real_pinna_crossfade_assignments() {
+    fn bundled_stage_audio_matches_source_for_every_retail_stage() {
         let repo_root = std::env::var_os("SMS_DECOMP_ROOT").expect("SMS_DECOMP_ROOT");
         let base_root = std::env::var_os("SMS_BASE_ROOT").expect("SMS_BASE_ROOT");
-        let profiles =
-            index_retail_stage_audio_profiles(Path::new(&repo_root), Path::new(&base_root))
-                .unwrap();
+        let source_path = Path::new(&repo_root).join("src/System/MSoundMainSide.cpp");
+        let source = fs::read_to_string(&source_path).unwrap();
+        let registry = sms_schema::bundled_object_registry().unwrap().registry;
+
+        for entry in load_stage_archive_entries(Path::new(&base_root)).unwrap() {
+            let expected =
+                evaluate_stage_audio_source(&source, entry.area_index, entry.scenario_index)
+                    .unwrap();
+            let actual = registry.stage_audio_state(entry.area_index, entry.scenario_index);
+            assert_eq!(
+                (
+                    actual.primary_bgm_id,
+                    actual.entrance_bgm_id,
+                    actual.secondary_bgm_id,
+                    actual.secondary_start_status,
+                    actual.flags,
+                    actual.fade_event,
+                    actual.switch_bgm_id,
+                    actual.switch_bgm2_id,
+                ),
+                (
+                    expected.primary_bgm_id,
+                    expected.entrance_bgm_id,
+                    expected.secondary_bgm_id,
+                    expected.secondary_start_status,
+                    expected.flags,
+                    expected.fade_event,
+                    expected.switch_bgm_id,
+                    expected.switch_bgm2_id,
+                ),
+                "generated audio metadata drifted for area {} scenario {}",
+                entry.area_index,
+                entry.scenario_index
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires SMS_BASE_ROOT"]
+    fn evaluates_real_pinna_crossfade_assignments_without_decomp_source() {
+        let base_root = std::env::var_os("SMS_BASE_ROOT").expect("SMS_BASE_ROOT");
+        let registry = sms_schema::bundled_object_registry().unwrap().registry;
+        let profiles = index_retail_stage_audio_profiles(&registry, Path::new(&base_root)).unwrap();
         let pinna = profiles
             .iter()
             .find(|profile| {
@@ -1031,13 +969,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires SMS_DECOMP_ROOT and SMS_BASE_ROOT"]
-    fn evaluates_dolpic_ex4_persistent_demo_alias() {
-        let repo_root = std::env::var_os("SMS_DECOMP_ROOT").expect("SMS_DECOMP_ROOT");
+    #[ignore = "requires SMS_BASE_ROOT"]
+    fn evaluates_dolpic_ex4_persistent_demo_alias_without_decomp_source() {
         let base_root = std::env::var_os("SMS_BASE_ROOT").expect("SMS_BASE_ROOT");
-        let profiles =
-            index_retail_stage_audio_profiles(Path::new(&repo_root), Path::new(&base_root))
-                .unwrap();
+        let registry = sms_schema::bundled_object_registry().unwrap().registry;
+        let profiles = index_retail_stage_audio_profiles(&registry, Path::new(&base_root)).unwrap();
         let profile = profiles
             .iter()
             .find(|profile| profile.stage_id == "dolpic_ex4")
