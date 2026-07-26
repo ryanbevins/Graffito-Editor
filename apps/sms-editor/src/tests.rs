@@ -354,6 +354,34 @@ fn fly_camera_scroll_adjusts_and_clamps_speed() {
 }
 
 #[test]
+fn captured_viewport_navigation_uses_unbounded_raw_mouse_motion() {
+    let position_delta = egui::vec2(0.0, 0.0);
+    let raw_motion = egui::vec2(18.0, -7.0);
+
+    assert_eq!(
+        viewport_ui::captured_viewport_pointer_delta(true, Some(raw_motion), position_delta),
+        raw_motion
+    );
+    assert_eq!(
+        viewport_ui::captured_viewport_pointer_delta(false, Some(raw_motion), position_delta),
+        position_delta
+    );
+}
+
+#[test]
+fn viewport_mouse_capture_releases_with_button_or_window_focus() {
+    assert!(!viewport_ui::viewport_mouse_capture_should_release(
+        true, true, true
+    ));
+    assert!(viewport_ui::viewport_mouse_capture_should_release(
+        true, false, true
+    ));
+    assert!(viewport_ui::viewport_mouse_capture_should_release(
+        true, true, false
+    ));
+}
+
+#[test]
 fn viewport_markers_show_only_selection_outside_objects_mode() {
     let app_objects = vec![
         SceneObject::new("obj-a", "Coin"),

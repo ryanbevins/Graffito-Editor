@@ -22,6 +22,26 @@ pub(super) fn request_viewport_animation_repaint(ctx: &egui::Context) {
     ctx.request_repaint_after(VIEWPORT_ANIMATION_REPAINT_INTERVAL);
 }
 
+pub(super) fn captured_viewport_pointer_delta(
+    captured: bool,
+    raw_motion: Option<egui::Vec2>,
+    pointer_delta: egui::Vec2,
+) -> egui::Vec2 {
+    if captured {
+        raw_motion.unwrap_or(pointer_delta)
+    } else {
+        pointer_delta
+    }
+}
+
+pub(super) fn viewport_mouse_capture_should_release(
+    captured: bool,
+    secondary_down: bool,
+    window_focused: bool,
+) -> bool {
+    captured && (!secondary_down || !window_focused)
+}
+
 fn visit_world_grid_segments(mut visitor: impl FnMut([f32; 3], [f32; 3], egui::Color32, f32)) {
     let minor = egui::Color32::from_rgba_unmultiplied(178, 186, 178, 32);
     let major = egui::Color32::from_rgba_unmultiplied(213, 200, 160, 58);
@@ -324,11 +344,25 @@ impl SmsEditorApp {
             }
             return;
         }
-        let secondary_down = ui.input(|input| input.pointer.secondary_down());
-        let fly_navigation_active = secondary_down
-            && (response.hovered() || response.dragged_by(egui::PointerButton::Secondary));
+        let (secondary_down, secondary_pressed) = ui.input(|input| {
+            (
+                input.pointer.secondary_down(),
+                input.pointer.button_pressed(egui::PointerButton::Secondary),
+            )
+        });
+        if !self.viewport_mouse_captured && secondary_pressed && response.hovered() {
+            self.viewport_mouse_captured = true;
+            response.request_focus();
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+                    egui::viewport::CursorGrab::Locked,
+                ));
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+        }
+        let fly_navigation_active = self.viewport_mouse_captured && secondary_down;
 
-        if response.hovered() {
+        if response.hovered() || fly_navigation_active {
             let scroll = ui.input(|input| input.smooth_scroll_delta().y);
             if scroll.abs() > f32::EPSILON {
                 if fly_navigation_active {
@@ -342,7 +376,13 @@ impl SmsEditorApp {
             }
         }
 
-        let pointer_delta = ui.input(|input| input.pointer.delta());
+        let pointer_delta = ui.input(|input| {
+            captured_viewport_pointer_delta(
+                self.viewport_mouse_captured,
+                input.pointer.motion(),
+                input.pointer.delta(),
+            )
+        });
         let modifiers = ui.input(|input| input.modifiers);
         let route_handle_using_pointer = self.handle_route_handle_drag(ui, rect, response);
         let gizmo_using_pointer =
@@ -364,14 +404,14 @@ impl SmsEditorApp {
             if pointer_delta != egui::Vec2::ZERO {
                 self.mark_viewport_interaction(ui);
             }
-        } else if modifiers.alt && response.dragged_by(egui::PointerButton::Secondary) {
+        } else if modifiers.alt && fly_navigation_active {
             let amount =
                 self.renderer.camera().distance * (pointer_delta.x - pointer_delta.y) * 0.006;
             self.dolly_camera(amount);
             if pointer_delta != egui::Vec2::ZERO {
                 self.mark_viewport_interaction(ui);
             }
-        } else if response.dragged_by(egui::PointerButton::Secondary) {
+        } else if fly_navigation_active {
             self.rotate_camera_in_place(pointer_delta);
             if pointer_delta != egui::Vec2::ZERO {
                 self.mark_viewport_interaction(ui);
@@ -822,6 +862,24 @@ impl SmsEditorApp {
 
     pub(super) fn stop_camera_fly(&mut self) {
         self.camera_fly_velocity = [0.0; 3];
+    }
+
+    pub(super) fn release_viewport_mouse_capture_if_needed(&mut self, ctx: &egui::Context) {
+        let (secondary_down, window_focused) =
+            ctx.input(|input| (input.pointer.secondary_down(), input.focused));
+        if !viewport_mouse_capture_should_release(
+            self.viewport_mouse_captured,
+            secondary_down,
+            window_focused,
+        ) {
+            return;
+        }
+
+        self.viewport_mouse_captured = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+            egui::viewport::CursorGrab::None,
+        ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
     }
 
     pub(super) fn rotate_camera_in_place(&mut self, delta: egui::Vec2) {

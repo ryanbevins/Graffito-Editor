@@ -1013,6 +1013,7 @@ struct SmsEditorApp {
     viewport_zoom: f32,
     camera_speed: f32,
     camera_fly_velocity: [f32; 3],
+    viewport_mouse_captured: bool,
     camera_state_save_pending: bool,
     camera_state_changed_at: Instant,
     hovered_gizmo_axis: Option<GizmoAxis>,
@@ -1260,6 +1261,7 @@ impl Default for SmsEditorApp {
             viewport_zoom: 1.0,
             camera_speed: 1.0,
             camera_fly_velocity: [0.0; 3],
+            viewport_mouse_captured: false,
             camera_state_save_pending: false,
             camera_state_changed_at: Instant::now(),
             hovered_gizmo_axis: None,
@@ -1318,6 +1320,7 @@ impl eframe::App for SmsEditorApp {
         self.poll_embedded_dolphin(ctx);
         self.poll_model_import(ctx);
         self.persist_camera_state_if_due();
+        self.release_viewport_mouse_capture_if_needed(ctx);
         self.sync_window_title(ctx);
         let close_requested = ctx.input(|input| input.viewport().close_requested());
         if close_requested {
