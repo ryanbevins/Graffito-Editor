@@ -667,6 +667,70 @@ fn viewport_picking_ignores_translucent_stage_geometry() {
 }
 
 #[test]
+fn viewport_placement_hits_the_nearest_scene_or_object_geometry() {
+    let mut preview = preview_for_texture_alpha(false, false);
+    preview
+        .object_model_indices
+        .insert("placed-object".to_string(), 2);
+    for (model_index, depth, extent) in [(1, 1_000.0, 200.0), (2, 500.0, 100.0)] {
+        let mut triangle = textured_blended_triangle();
+        triangle.vertices = [
+            [-extent, -extent, depth],
+            [extent, -extent, depth],
+            [0.0, extent, depth],
+        ];
+        triangle.model_index = model_index;
+        triangle.texture_index = None;
+        triangle.tex_coords = None;
+        preview.triangles.push(triangle);
+    }
+    let app = SmsEditorApp {
+        model_preview: Some(preview),
+        ..camera_app()
+    };
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
+
+    assert_vec3_close(
+        app.viewport_placement_position(rect, rect.center())
+            .expect("center ray should hit the nearer object geometry"),
+        [0.0, 0.0, 500.0],
+    );
+}
+
+#[test]
+fn viewport_placement_rejects_void_when_scene_geometry_exists() {
+    let mut preview = preview_for_texture_alpha(false, false);
+    let mut triangle = textured_blended_triangle();
+    triangle.vertices = [
+        [400.0, -100.0, 500.0],
+        [600.0, -100.0, 500.0],
+        [500.0, 100.0, 500.0],
+    ];
+    triangle.texture_index = None;
+    triangle.tex_coords = None;
+    preview.triangles.push(triangle);
+    let app = SmsEditorApp {
+        model_preview: Some(preview),
+        ..camera_app()
+    };
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
+
+    assert_eq!(app.viewport_placement_position(rect, rect.center()), None);
+}
+
+#[test]
+fn viewport_placement_keeps_the_empty_stage_bootstrap_path() {
+    let app = camera_app();
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
+
+    assert_vec3_close(
+        app.viewport_placement_position(rect, rect.center())
+            .expect("an empty stage still needs its first model placement"),
+        [0.0, 0.0, 1_000.0],
+    );
+}
+
+#[test]
 fn selected_object_outline_keeps_the_silhouette_and_removes_internal_edges() {
     let mut preview = preview_for_texture_alpha(false, false);
     preview

@@ -113,6 +113,16 @@ fn preview_triangle_writes_opaque_depth(
     ) && !preview_triangle_is_translucent(preview, triangle)
 }
 
+fn preview_triangle_is_placement_surface(triangle: &PreviewTriangle) -> bool {
+    matches!(
+        triangle.render_layer,
+        PreviewRenderLayer::Main
+            | PreviewRenderLayer::Water
+            | PreviewRenderLayer::MirrorSurface
+            | PreviewRenderLayer::Goop
+    )
+}
+
 #[cfg(test)]
 pub(super) fn outline_segments_from_coverage(
     coverage: &[bool],
@@ -286,19 +296,31 @@ impl SmsEditorApp {
     ) {
         if let Some(payload) = response.dnd_release_payload::<ObjectPaletteDragPayload>() {
             if let Some(pointer) = ui.input(|input| input.pointer.latest_pos()) {
-                let world = self.screen_to_world_floor(rect, pointer);
-                self.clear_audio_helper_selection();
-                self.spawn_object_at(payload.factory_name.clone(), world);
-                self.content_browser.inspector_active = false;
+                if let Some(world) = self.viewport_placement_position(rect, pointer) {
+                    self.clear_audio_helper_selection();
+                    self.spawn_object_at(payload.factory_name.clone(), world);
+                    self.content_browser.inspector_active = false;
+                } else {
+                    self.log.push(format!(
+                        "Could not place '{}': the cursor is not over scene or object geometry.",
+                        payload.factory_name
+                    ));
+                }
             }
             return;
         }
         if let Some(payload) = response.dnd_release_payload::<ModelAssetDragPayload>() {
             if let Some(pointer) = ui.input(|input| input.pointer.latest_pos()) {
-                let world = self.screen_to_world_floor(rect, pointer);
-                self.clear_audio_helper_selection();
-                self.spawn_model_instance_at(payload.asset_id, world);
-                self.content_browser.inspector_active = false;
+                if let Some(world) = self.viewport_placement_position(rect, pointer) {
+                    self.clear_audio_helper_selection();
+                    self.spawn_model_instance_at(payload.asset_id, world);
+                    self.content_browser.inspector_active = false;
+                } else {
+                    self.log.push(
+                        "Could not place the model: the cursor is not over scene or object geometry."
+                            .to_string(),
+                    );
+                }
             }
             return;
         }
@@ -385,15 +407,21 @@ impl SmsEditorApp {
                 }
                 if self.tool == EditorTool::Place {
                     if let Some(placement) = self.active_placement.clone() {
-                        let world = self.screen_to_world_floor(rect, pos);
-                        self.clear_audio_helper_selection();
-                        match placement {
-                            ActivePlacement::Model { asset_id } => {
-                                self.spawn_model_instance_at(asset_id, world);
+                        if let Some(world) = self.viewport_placement_position(rect, pos) {
+                            self.clear_audio_helper_selection();
+                            match placement {
+                                ActivePlacement::Model { asset_id } => {
+                                    self.spawn_model_instance_at(asset_id, world);
+                                }
+                                ActivePlacement::Object { factory_name } => {
+                                    self.spawn_object_at(factory_name, world);
+                                }
                             }
-                            ActivePlacement::Object { factory_name } => {
-                                self.spawn_object_at(factory_name, world);
-                            }
+                        } else {
+                            self.log.push(
+                                "Could not place here: the cursor is not over scene or object geometry."
+                                    .to_string(),
+                            );
                         }
                         return;
                     }
@@ -654,6 +682,66 @@ impl SmsEditorApp {
                 )
             })
             .min_by(f32::total_cmp)
+    }
+
+    pub(super) fn viewport_placement_position(
+        &self,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+    ) -> Option<[f32; 3]> {
+        if !rect.contains(pos) {
+            return None;
+        }
+
+        let Some(preview) = self.model_preview.as_ref() else {
+            return Some(self.screen_to_world_floor(rect, pos));
+        };
+        let has_placement_geometry = preview
+            .triangles
+            .iter()
+            .any(preview_triangle_is_placement_surface);
+        if !has_placement_geometry {
+            // An empty authored stage needs one bootstrap placement before
+            // there is any world geometry to raycast.
+            return Some(self.screen_to_world_floor(rect, pos));
+        }
+
+        let size = framebuffer_size_for_rect(rect);
+        let framebuffer_pos = [
+            (pos.x - rect.left()) * size[0] as f32 / rect.width().max(1.0),
+            (pos.y - rect.top()) * size[1] as f32 / rect.height().max(1.0),
+        ];
+        let depth = preview
+            .triangles
+            .iter()
+            .filter(|triangle| preview_triangle_is_placement_surface(triangle))
+            .filter_map(|triangle| {
+                let projected = self.project_preview_triangle(rect, size, triangle)?;
+                projected_triangle_depth_at_point(
+                    projected.screen,
+                    framebuffer_pos[0],
+                    framebuffer_pos[1],
+                )
+            })
+            .min_by(f32::total_cmp)?;
+
+        let frame = self.camera_frame();
+        let focal = perspective_focal_length(rect, self.viewport_zoom);
+        let local = pos - rect.center() - self.viewport_pan;
+        let ray = vec3_normalize(vec3_add(
+            frame.forward,
+            vec3_add(
+                vec3_scale(frame.right, local.x / focal),
+                vec3_scale(frame.up, -local.y / focal),
+            ),
+        ));
+        let forward_component = vec3_dot(ray, frame.forward);
+        if !forward_component.is_finite() || forward_component <= f32::EPSILON {
+            return None;
+        }
+        let distance = depth / forward_component;
+        (distance.is_finite() && distance > 0.0)
+            .then(|| vec3_add(frame.position, vec3_scale(ray, distance)))
     }
 
     pub(super) fn handle_viewport_keyboard_fly(

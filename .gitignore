@@ -15,6 +15,7 @@ sms-project.toml
 
 # Local agent guidance is intentionally not published.
 /AGENTS.md
+/ROADMAP.md
 
 # IDE and OS files.
 /.idea/
