@@ -1498,6 +1498,7 @@ impl SmsEditorApp {
                 ..
             } = preview;
             for source in animated_models {
+                let animation_seconds = elapsed_seconds * source.playback_rate;
                 let pose_result = source.prepared_triangles.as_ref().map_or_else(
                     || {
                         source
@@ -1505,7 +1506,7 @@ impl SmsEditorApp {
                             .animated_triangles_and_joint_matrices_with_joint_animation(
                                 source.loader_flags,
                                 &source.animation,
-                                elapsed_seconds,
+                                animation_seconds,
                             )
                     },
                     |prepared| {
@@ -1513,7 +1514,7 @@ impl SmsEditorApp {
                             prepared,
                             source.loader_flags,
                             &source.animation,
-                            elapsed_seconds,
+                            animation_seconds,
                         )
                     },
                 );
@@ -1533,6 +1534,12 @@ impl SmsEditorApp {
                         triangles[instance.triangle_range.clone()].iter_mut().zip(
                             posed_triangles
                                 .iter()
+                                .filter(|triangle| {
+                                    !object_preview_shape_is_hidden(
+                                        triangle.shape_index,
+                                        &source.hidden_shape_indices,
+                                    )
+                                })
                                 .filter(|triangle| triangle_vertices_are_finite(triangle.vertices)),
                         )
                     {
@@ -1571,7 +1578,7 @@ impl SmsEditorApp {
                                             accessory.file.animated_triangles_with_joint_animation(
                                                 accessory.loader_flags,
                                                 animation.as_ref(),
-                                                elapsed_seconds,
+                                                animation_seconds,
                                             )
                                         },
                                         |prepared| {
@@ -1581,7 +1588,7 @@ impl SmsEditorApp {
                                                     prepared,
                                                     accessory.loader_flags,
                                                     animation.as_ref(),
-                                                    elapsed_seconds,
+                                                    animation_seconds,
                                                 )
                                                 .map(|(triangles, _)| triangles)
                                         },
@@ -1678,9 +1685,9 @@ impl SmsEditorApp {
                 triangles,
             );
             for pattern in texture_pattern_animations {
-                let frame = pattern
-                    .animation
-                    .playback_frame(elapsed_seconds + pattern.phase_seconds);
+                let frame = pattern.animation.playback_frame(
+                    elapsed_seconds * pattern.playback_rate + pattern.phase_seconds,
+                );
                 for binding in &mut pattern.bindings {
                     let next = pattern.animation.bindings[binding.animation_binding_index]
                         .texture_index(frame)

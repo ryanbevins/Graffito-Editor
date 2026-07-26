@@ -2533,24 +2533,14 @@ impl SmsEditorApp {
                 .push(format!("Could not place class '{factory_name}': {error}."));
             return;
         }
-        if let Some(schema) = self
-            .registry
-            .as_ref()
-            .and_then(|registry| registry.find_object(&factory_name))
-        {
-            object.class_name = Some(schema.class_name.clone());
-            if !object
-                .asset_hints
-                .iter()
-                .any(|hint| hint.role == AssetRole::PreviewModel)
-            {
-                if let Some(model) = &schema.preview_model {
-                    object.asset_hints.push(AssetRef {
-                        path: model.clone(),
-                        role: AssetRole::PreviewModel,
-                    });
-                }
-            }
+        if let Some(registry) = self.registry.as_ref() {
+            self.document
+                .as_ref()
+                .expect("document was checked above")
+                .refresh_registry_derived_object_fields(
+                    std::slice::from_mut(&mut object),
+                    registry,
+                );
         }
 
         self.next_object_serial = next_object_serial;

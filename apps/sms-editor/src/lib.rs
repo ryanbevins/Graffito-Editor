@@ -27,9 +27,9 @@ use sms_render::{
 use sms_scene::{
     AssetRef, AssetRole, DialogueAuthoringDocument, DialogueGameConsumerIndex, DialogueRouteIndex,
     ObjectAuthoringCatalog, ObjectAuthoringCatalogWarning, ProjectDialogueLibrary,
-    RouteAuthoringDocument, SceneError, SceneObject, StageArchiveEdits, StageDocument,
-    StageLighting, StageResourceDocument, StageResourceEdit, Transform, ValidationIssue,
-    ValidationSeverity,
+    ResolvedObjectPreview, RouteAuthoringDocument, SceneError, SceneObject, StageArchiveEdits,
+    StageDocument, StageLighting, StageResourceDocument, StageResourceEdit, Transform,
+    ValidationIssue, ValidationSeverity,
 };
 use sms_schema::{
     bundled_object_registry, ObjectDefinition, ObjectRegistry, ParticleBindingTarget,
@@ -1841,11 +1841,11 @@ impl SmsEditorApp {
                             } = loaded_schema;
                             self.log.push(status);
                             if let Some(document) = &mut self.document {
+                                document.set_registry(registry.clone());
                                 document.refresh_registry_derived_object_fields(
                                     &mut self.saved_objects,
                                     &registry,
                                 );
-                                document.set_registry(registry.clone());
                                 self.document_dirty = stage_document_differs_from_saved(
                                     document,
                                     &self.saved_objects,
@@ -2384,6 +2384,7 @@ impl SmsEditorApp {
             .assets
             .iter()
             .filter(|asset| asset.kind == StageAssetKind::Model)
+            .filter(|asset| !document.is_object_preview_model_asset(&asset.path))
             .filter(|asset| {
                 !instanced_model_paths.contains(&normalized_preview_asset_path(
                     &asset.path.to_string_lossy(),
@@ -2903,7 +2904,16 @@ impl SmsEditorApp {
                         continue;
                     }
                 };
-                let joint_animation = starting_joint_animation(document, object, &model_path);
+                let (joint_animation, joint_animation_playback_rate) =
+                    starting_joint_animation(document, object, &model_path)
+                        .map_or((None, 1.0), |(animation, playback_rate)| {
+                            (Some(animation), playback_rate)
+                        });
+                let resolved_object_preview =
+                    document.resolved_object_preview(object).filter(|preview| {
+                        normalized_preview_asset_path(&preview.model_path)
+                            == normalized_preview_asset_path(&model_path)
+                    });
                 let prepared_triangles = joint_animation
                     .as_ref()
                     .and_then(|_| file.prepare_animated_triangles().ok())
@@ -2928,6 +2938,7 @@ impl SmsEditorApp {
                 };
                 apply_model_material_table(document, &model_path, loader_flags, &mut preview);
                 apply_actor_runtime_textures(document, object, &mut preview);
+                apply_object_preview_appearance(resolved_object_preview.as_ref(), &mut preview);
                 apply_npc_eye_decal_culling(object, &mut preview);
                 let texture_base = push_preview_textures(&mut textures, &preview);
                 let material_base = push_preview_materials(&mut materials, &preview, texture_base);
@@ -2937,6 +2948,10 @@ impl SmsEditorApp {
                     CachedObjectModelPreview {
                         file,
                         joint_animation,
+                        joint_animation_playback_rate,
+                        hidden_shape_indices: resolved_object_preview
+                            .map(|preview| preview.hidden_shape_indices)
+                            .unwrap_or_default(),
                         prepared_triangles,
                         loader_flags,
                         preview,
@@ -2966,7 +2981,7 @@ impl SmsEditorApp {
                 &mut texture_srt_animations,
                 &mut material_animation_bindings,
             );
-            attach_npc_texture_pattern_animation(
+            attach_object_texture_pattern_animation(
                 document,
                 object,
                 &model_path,
@@ -3318,6 +3333,8 @@ impl SmsEditorApp {
                     .map(|animation| AnimatedModelPreview {
                         file: cached.file,
                         animation,
+                        playback_rate: cached.joint_animation_playback_rate,
+                        hidden_shape_indices: cached.hidden_shape_indices,
                         prepared_triangles: cached.prepared_triangles,
                         loader_flags: cached.loader_flags,
                         instances: cached.instances,

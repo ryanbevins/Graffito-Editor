@@ -2,7 +2,7 @@
   "format_version": 1,
   "source_revision": "01ffd369c94b23be158abde1254c277879c04a9f",
   "source_fingerprint": 15545920352673147969,
-  "generator_fingerprint": 1399359145563798908,
+  "generator_fingerprint": 10965404809579206623,
   "registry": {
     "objects": [
       {
@@ -19938,6 +19938,36 @@
       {
         "path": "/subtitle/timg/wipe_m_mark.bti",
         "source_file": "src/GC2D/ScrnFader.cpp"
+      }
+    ],
+    "object_previews": [
+      {
+        "factory_name": "Mario",
+        "runtime_archive_path": "/data/mario.arc",
+        "model_path": "/mario/bmd/ma_mdl1.bmd",
+        "load_flags": 269484032,
+        "idle_bck_path": "/mario/bck/ma_wait.bck",
+        "idle_btp_path": "/mario/btp/ma_wink_tx.btp",
+        "idle_playback_rate_numerator": 1,
+        "idle_playback_rate_denominator": 1,
+        "hidden_shape_indices": [
+          10
+        ],
+        "tev_k_color_alpha_overrides": [
+          {
+            "register": 0,
+            "alpha": 0
+          }
+        ],
+        "source_files": [
+          "src/System/MarNameRefGen.cpp",
+          "src/Player/MarioDraw.cpp",
+          "include/Player/MarioMain.hpp",
+          "src/Player/MarioMain.cpp",
+          "src/Player/MarioInit.cpp",
+          "src/System/Application.cpp",
+          "src/System/MarDirectorDirect.cpp"
+        ]
       }
     ],
     "object_resources": [

@@ -65,6 +65,7 @@ pub(super) struct PreviewMaterialAnimationBinding {
 #[derive(Clone)]
 pub(super) struct PreviewTexturePatternAnimation {
     pub(super) animation: J3dTexturePatternAnimation,
+    pub(super) playback_rate: f32,
     pub(super) phase_seconds: f32,
     pub(super) bindings: Vec<PreviewTexturePatternBinding>,
 }
@@ -288,6 +289,8 @@ pub(super) struct PreviewTexture {
 pub(super) struct CachedObjectModelPreview {
     pub(super) file: J3dFile,
     pub(super) joint_animation: Option<J3dJointAnimation>,
+    pub(super) joint_animation_playback_rate: f32,
+    pub(super) hidden_shape_indices: Vec<u16>,
     pub(super) prepared_triangles: Option<Arc<J3dPreparedAnimatedTriangles>>,
     pub(super) loader_flags: u32,
     pub(super) preview: J3dGeometryPreview,
@@ -313,6 +316,8 @@ pub(super) struct CachedAccessoryModelPreview {
 pub(super) struct AnimatedModelPreview {
     pub(super) file: J3dFile,
     pub(super) animation: J3dJointAnimation,
+    pub(super) playback_rate: f32,
+    pub(super) hidden_shape_indices: Vec<u16>,
     pub(super) prepared_triangles: Option<Arc<J3dPreparedAnimatedTriangles>>,
     pub(super) loader_flags: u32,
     pub(super) instances: Vec<AnimatedModelInstance>,

@@ -1291,7 +1291,11 @@ fn normalized_dummy_names_resolve_differently_separated_model_names() {
 fn npc_starting_animation_uses_family_wait_resource() {
     let monte = SceneObject::new("monte", "NPCMonteMA");
     assert_eq!(
-        starting_joint_animation_candidates(&monte, "C:/game/dolpic0.szs!/montema/moma_model.bmd"),
+        starting_joint_animation_candidates(
+            &monte,
+            "C:/game/dolpic0.szs!/montema/moma_model.bmd",
+            None,
+        ),
         [
             "C:/game/dolpic0.szs!/montema/montema_wait.bck",
             "C:/game/dolpic0.szs!/montemcommon/mom_wait.bck",
@@ -1301,12 +1305,132 @@ fn npc_starting_animation_uses_family_wait_resource() {
 
     let mare = SceneObject::new("mare", "NPCMareMB");
     assert_eq!(
-        starting_joint_animation_candidates(&mare, "C:/game/mare0.szs!/marem/marem.bmd"),
+        starting_joint_animation_candidates(&mare, "C:/game/mare0.szs!/marem/marem.bmd", None,),
         [
             "C:/game/mare0.szs!/maremb/maremb_wait.bck",
             "C:/game/mare0.szs!/marem/marem_wait.bck",
         ]
     );
+}
+
+#[test]
+fn explicit_animation_candidates_precede_heuristic_fallbacks() {
+    let monte = SceneObject::new("monte", "NPCMonteMA");
+    assert_eq!(
+        starting_joint_animation_candidates(
+            &monte,
+            "C:/game/dolpic0.szs!/montema/moma_model.bmd",
+            Some("C:/game/dolpic0.szs!/bck/explicit_wait.bck"),
+        ),
+        [
+            "C:/game/dolpic0.szs!/bck/explicit_wait.bck",
+            "C:/game/dolpic0.szs!/montema/montema_wait.bck",
+            "C:/game/dolpic0.szs!/montemcommon/mom_wait.bck",
+            "C:/game/dolpic0.szs!/montem/mom_wait.bck",
+        ]
+    );
+    assert_eq!(
+        starting_texture_pattern_candidates(
+            &monte,
+            "C:/game/dolpic0.szs!/montema/moma_model.bmd",
+            Some("C:/game/dolpic0.szs!/btp/explicit_wink.btp"),
+        ),
+        [
+            "C:/game/dolpic0.szs!/btp/explicit_wink.btp",
+            "C:/game/dolpic0.szs!/montemcommon/moma_wink.btp",
+        ]
+    );
+
+    let mario = SceneObject::new("player", "Mario");
+    assert_eq!(
+        starting_joint_animation_candidates(
+            &mario,
+            "C:/game/files/data/mario.szs!/bmd/ma_mdl1.bmd",
+            Some("C:/game/files/data/mario.szs!/bck/ma_wait.bck"),
+        ),
+        ["C:/game/files/data/mario.szs!/bck/ma_wait.bck"]
+    );
+    assert_eq!(
+        starting_texture_pattern_candidates(
+            &mario,
+            "C:/game/files/data/mario.szs!/bmd/ma_mdl1.bmd",
+            Some("C:/game/files/data/mario.szs!/btp/ma_wink_tx.btp"),
+        ),
+        ["C:/game/files/data/mario.szs!/btp/ma_wink_tx.btp"]
+    );
+}
+
+#[test]
+fn explicit_texture_pattern_animation_starts_at_phase_zero() {
+    assert_eq!(
+        starting_texture_pattern_phase_seconds("mario", 120, true),
+        0.0
+    );
+    assert_eq!(
+        starting_texture_pattern_phase_seconds("heuristic-npc", 0, false),
+        0.0
+    );
+
+    let heuristic_phase = starting_texture_pattern_phase_seconds("heuristic-npc", 120, false);
+    assert!(heuristic_phase > 0.0);
+    assert_eq!(
+        heuristic_phase,
+        (stable_string_hash("heuristic-npc") % 120) as f32 / 60.0
+    );
+}
+
+#[test]
+fn object_preview_k_color_alpha_overrides_preserve_every_other_channel() {
+    let mut colors = [
+        [79, 108, 97, 128],
+        [1, 2, 3, 4],
+        [5, 6, 7, 8],
+        [9, 10, 11, 12],
+    ];
+    apply_object_preview_k_color_alpha_overrides(
+        &mut colors,
+        &[
+            sms_schema::ObjectPreviewTevKColorAlphaOverride {
+                register: 0,
+                alpha: 0,
+            },
+            sms_schema::ObjectPreviewTevKColorAlphaOverride {
+                register: 3,
+                alpha: 17,
+            },
+            sms_schema::ObjectPreviewTevKColorAlphaOverride {
+                register: 9,
+                alpha: 255,
+            },
+        ],
+    );
+
+    assert_eq!(colors[0], [79, 108, 97, 0]);
+    assert_eq!(colors[1], [1, 2, 3, 4]);
+    assert_eq!(colors[2], [5, 6, 7, 8]);
+    assert_eq!(colors[3], [9, 10, 11, 17]);
+}
+
+#[test]
+fn hidden_object_preview_shapes_keep_animated_triangle_alignment() {
+    let hidden_shapes = [10];
+    assert!(
+        !object_preview_shape_is_hidden(4, &hidden_shapes),
+        "the embedded cap remains visible until the separate cap model is previewed"
+    );
+    let initial_shapes = [9, 10, 11];
+    let initial_visible = initial_shapes
+        .into_iter()
+        .filter(|shape| !object_preview_shape_is_hidden(*shape, &hidden_shapes))
+        .collect::<Vec<_>>();
+    assert_eq!(initial_visible, [9, 11]);
+
+    let posed_triangles = [(9, "body"), (10, "shirt"), (11, "later shape")];
+    let animated_visible = posed_triangles
+        .into_iter()
+        .filter(|(shape, _)| !object_preview_shape_is_hidden(*shape, &hidden_shapes))
+        .collect::<Vec<_>>();
+    assert_eq!(animated_visible, [(9, "body"), (11, "later shape")]);
 }
 
 #[test]
@@ -1361,7 +1485,7 @@ fn gatekeeper_uses_retail_sleep_and_texture_animations() {
     let model = "C:/game/dolpic0.szs!/gatekeeper/gene_pakkun_model1.bmd";
 
     assert_eq!(
-        starting_joint_animation_candidates(&gatekeeper, model),
+        starting_joint_animation_candidates(&gatekeeper, model, None),
         ["C:/game/dolpic0.szs!/gatekeeper/gene_pakkun_wait1.bck"]
     );
     assert_eq!(
@@ -1506,7 +1630,11 @@ fn stay_pakkun_preview_replaces_every_dummy_with_the_stage_goop_texture() {
 fn monte_starting_eye_pattern_uses_retail_variant_resource() {
     let monte = SceneObject::new("monte", "NPCMonteMA");
     assert_eq!(
-        starting_texture_pattern_candidates(&monte, "C:/game/dolpic10.szs!/montema/moma_model.bmd"),
+        starting_texture_pattern_candidates(
+            &monte,
+            "C:/game/dolpic10.szs!/montema/moma_model.bmd",
+            None,
+        ),
         ["C:/game/dolpic10.szs!/montemcommon/moma_wink.btp"]
     );
 }
@@ -2358,12 +2486,14 @@ fn case_distinct_factories_do_not_inherit_coin_or_npc_behavior() {
     let wrong_case_npc = SceneObject::new("wrong-case", "npcMonteMA");
     assert!(starting_joint_animation_candidates(
         &wrong_case_npc,
-        "C:/game/dolpic0.szs!/montema/moma_model.bmd"
+        "C:/game/dolpic0.szs!/montema/moma_model.bmd",
+        None,
     )
     .is_empty());
     assert!(starting_texture_pattern_candidates(
         &wrong_case_npc,
-        "C:/game/dolpic0.szs!/montema/moma_model.bmd"
+        "C:/game/dolpic0.szs!/montema/moma_model.bmd",
+        None,
     )
     .is_empty());
     assert!(actor_runtime_texture_replacements(&wrong_case_npc.factory_name, None).is_empty());
@@ -3755,9 +3885,35 @@ fn object_authoring_catalog_cache_identity_tracks_retail_inventory_and_registry(
         moving_collision_vertex_limit: Some(1),
         ..ObjectRegistry::default()
     };
-    let changed_registry_key =
-        object_authoring_catalog_cache_key(root.path(), &[retail_archive], &changed_registry);
+    let changed_registry_key = object_authoring_catalog_cache_key(
+        root.path(),
+        std::slice::from_ref(&retail_archive),
+        &changed_registry,
+    );
     assert_ne!(original_key, changed_registry_key);
+
+    let preview_registry = ObjectRegistry {
+        object_previews: vec![sms_schema::ObjectPreviewDefinition {
+            factory_name: "Mario".to_string(),
+            runtime_archive_path: "/data/mario.arc".to_string(),
+            model_path: "/mario/bmd/ma_mdl1.bmd".to_string(),
+            load_flags: 0x1010_0000,
+            idle_bck_path: "/mario/bck/ma_wait.bck".to_string(),
+            idle_btp_path: Some("/mario/btp/ma_wink_tx.btp".to_string()),
+            idle_playback_rate_numerator: 1,
+            idle_playback_rate_denominator: 2,
+            hidden_shape_indices: vec![10],
+            tev_k_color_alpha_overrides: vec![sms_schema::ObjectPreviewTevKColorAlphaOverride {
+                register: 0,
+                alpha: 0,
+            }],
+            source_files: vec!["src/Player/MarioDraw.cpp".to_string()],
+        }],
+        ..ObjectRegistry::default()
+    };
+    let preview_registry_key =
+        object_authoring_catalog_cache_key(root.path(), &[retail_archive], &preview_registry);
+    assert_ne!(original_key, preview_registry_key);
 }
 
 #[test]
@@ -3815,26 +3971,44 @@ fn object_authoring_catalog_cache_reuses_the_immutable_payload() {
 
 #[test]
 fn schema_refresh_updates_derived_preview_metadata_without_marking_the_document_dirty() {
-    let object = SceneObject::new("obj-1", "Fixture");
+    let root = tempfile::tempdir().unwrap();
+    let archive_path = root.path().join("files/data/mario.szs");
+    std::fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
+    let mut builder = sms_formats::RarcBuilder::new(b"mario".to_vec()).unwrap();
+    for (path, bytes) in [
+        (b"bmd/ma_mdl1.bmd".as_slice(), b"body".as_slice()),
+        (b"bck/ma_wait.bck".as_slice(), b"wait".as_slice()),
+        (b"btp/ma_wink_tx.btp".as_slice(), b"wink".as_slice()),
+    ] {
+        builder.insert_file(path, bytes.to_vec()).unwrap();
+    }
+    std::fs::write(&archive_path, builder.build().unwrap().to_bytes().unwrap()).unwrap();
+
+    let object = SceneObject::new("mario", "Mario");
     let mut document = test_document(vec![object.clone()]);
-    document.assets.push(StageAsset {
-        path: PathBuf::from("stage.szs!/map/fixture.bmd"),
-        kind: StageAssetKind::Model,
-    });
+    document.base_root = root.path().to_path_buf();
     let mut app = SmsEditorApp {
+        base_root: root.path().display().to_string(),
         document: Some(document),
         saved_objects: vec![object],
         ..SmsEditorApp::default()
     };
     let registry = ObjectRegistry {
-        object_resources: vec![sms_schema::ObjectResourceBinding {
-            factory_name: "Fixture".to_string(),
-            model_index: 0,
-            role: sms_schema::ObjectResourceRole::Primary,
-            model_name: "fixture.bmd".to_string(),
-            resource_base: None,
-            load_flags: 0,
-            source_file: "src/fixture.cpp".to_string(),
+        object_previews: vec![sms_schema::ObjectPreviewDefinition {
+            factory_name: "Mario".to_string(),
+            runtime_archive_path: "/data/mario.arc".to_string(),
+            model_path: "/mario/bmd/ma_mdl1.bmd".to_string(),
+            load_flags: 0x1010_0000,
+            idle_bck_path: "/mario/bck/ma_wait.bck".to_string(),
+            idle_btp_path: Some("/mario/btp/ma_wink_tx.btp".to_string()),
+            idle_playback_rate_numerator: 1,
+            idle_playback_rate_denominator: 2,
+            hidden_shape_indices: vec![10],
+            tev_k_color_alpha_overrides: vec![sms_schema::ObjectPreviewTevKColorAlphaOverride {
+                register: 0,
+                alpha: 0,
+            }],
+            source_files: vec!["src/Player/MarioDraw.cpp".to_string()],
         }],
         ..ObjectRegistry::default()
     };
@@ -3852,7 +4026,15 @@ fn schema_refresh_updates_derived_preview_metadata_without_marking_the_document_
 
     assert!(!app.is_dirty());
     assert_eq!(app.document.as_ref().unwrap().objects, app.saved_objects);
-    assert_eq!(app.saved_objects[0].asset_hints.len(), 1);
+    let hint = app.saved_objects[0]
+        .asset_hints
+        .iter()
+        .find(|hint| hint.role == AssetRole::InferredPreviewModel)
+        .expect("saved Mario exact preview hint");
+    assert!(hint
+        .path
+        .replace('\\', "/")
+        .ends_with("mario.szs!/bmd/ma_mdl1.bmd"));
 }
 
 #[test]

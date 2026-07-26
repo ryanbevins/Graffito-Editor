@@ -519,24 +519,55 @@ pub(super) fn starting_joint_animation(
     document: &StageDocument,
     object: &SceneObject,
     model_path: &str,
-) -> Option<J3dJointAnimation> {
-    if let Some(animation) = root_accessory_body_pose(document, object, model_path) {
-        return Some(animation);
+) -> Option<(J3dJointAnimation, f32)> {
+    let resolved = document.resolved_object_preview(object);
+    let explicit_path = resolved
+        .as_ref()
+        .map(|preview| preview.idle_bck_path.as_str());
+    let candidates = starting_joint_animation_candidates(object, model_path, explicit_path);
+    let explicit_candidate_count = usize::from(explicit_path.is_some());
+
+    if let Some(animation) =
+        load_joint_animation_candidates(document, &candidates[..explicit_candidate_count])
+    {
+        let playback_rate = resolved
+            .as_ref()
+            .and_then(|preview| preview.idle_playback_rate())
+            .unwrap_or(1.0);
+        return Some((animation, playback_rate));
     }
-    let candidates = starting_joint_animation_candidates(object, model_path);
-    let asset = document.assets.iter().find(|asset| {
-        asset.kind == StageAssetKind::Animation
-            && candidates.iter().any(|candidate| {
-                asset
+    if let Some(animation) = root_accessory_body_pose(document, object, model_path) {
+        return Some((animation, 1.0));
+    }
+    load_joint_animation_candidates(document, &candidates[explicit_candidate_count..])
+        .map(|animation| (animation, 1.0))
+}
+
+fn load_joint_animation_candidates(
+    document: &StageDocument,
+    candidates: &[String],
+) -> Option<J3dJointAnimation> {
+    for candidate in candidates {
+        let Some(asset) = document.assets.iter().find(|asset| {
+            asset.kind == StageAssetKind::Animation
+                && asset
                     .path
                     .to_string_lossy()
                     .replace('\\', "/")
                     .eq_ignore_ascii_case(candidate)
-            })
-    })?;
-    let bytes = document.read_asset_bytes(&asset.path).ok()?;
-    J3dJointAnimation::parse(bytes).ok()
+        }) else {
+            continue;
+        };
+        let Ok(bytes) = document.read_asset_bytes(&asset.path) else {
+            continue;
+        };
+        if let Ok(animation) = J3dJointAnimation::parse(bytes) {
+            return Some(animation);
+        }
+    }
+    None
 }
+
 fn root_accessory_body_pose(
     document: &StageDocument,
     object: &SceneObject,
@@ -596,9 +627,14 @@ fn root_accessory_body_pose(
 pub(super) fn starting_joint_animation_candidates(
     object: &SceneObject,
     model_path: &str,
+    explicit_path: Option<&str>,
 ) -> Vec<String> {
     let normalized = model_path.replace('\\', "/");
     let archive = normalized.split_once("!/").map(|(archive, _)| archive);
+    let mut candidates = explicit_path
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
     let factory = object.factory_name.as_str();
     let mut relative_candidates = Vec::new();
     // Actor-specific animation volumes conventionally use the factory name
@@ -634,19 +670,23 @@ pub(super) fn starting_joint_animation_candidates(
     relative_candidates.extend(family_candidates.iter().map(|path| (*path).to_string()));
     relative_candidates.dedup();
 
-    relative_candidates
-        .into_iter()
-        .map(|relative| {
-            archive.map_or_else(
-                || relative.clone(),
-                |archive| format!("{archive}!/{relative}"),
-            )
-        })
-        .collect()
+    for relative in relative_candidates {
+        let candidate = archive.map_or_else(
+            || relative.clone(),
+            |archive| format!("{archive}!/{relative}"),
+        );
+        if !candidates
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&candidate))
+        {
+            candidates.push(candidate);
+        }
+    }
+    candidates
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn attach_npc_texture_pattern_animation(
+pub(super) fn attach_object_texture_pattern_animation(
     document: &StageDocument,
     object: &SceneObject,
     model_path: &str,
@@ -656,31 +696,34 @@ pub(super) fn attach_npc_texture_pattern_animation(
     materials: &mut [J3dMaterial],
     animations: &mut Vec<PreviewTexturePatternAnimation>,
 ) {
-    let candidates = starting_texture_pattern_candidates(object, model_path);
-    let Some(asset) = document.assets.iter().find(|asset| {
-        asset.kind == StageAssetKind::Animation
-            && candidates.iter().any(|candidate| {
-                asset
-                    .path
-                    .to_string_lossy()
-                    .replace('\\', "/")
-                    .eq_ignore_ascii_case(candidate)
-            })
-    }) else {
-        return;
-    };
-    let Ok(bytes) = document.read_asset_bytes(&asset.path) else {
-        return;
-    };
-    let Ok(animation) = J3dTexturePatternAnimation::parse(bytes) else {
-        return;
-    };
-    let phase_frames = if animation.max_frame == 0 {
-        0
+    let resolved = document.resolved_object_preview(object);
+    let explicit_path = resolved
+        .as_ref()
+        .and_then(|preview| preview.idle_btp_path.as_deref());
+    let candidates = starting_texture_pattern_candidates(object, model_path, explicit_path);
+    let explicit_candidate_count = usize::from(explicit_path.is_some());
+    let (animation, playback_rate, uses_explicit_animation) = if let Some(animation) =
+        load_texture_pattern_animation_candidates(document, &candidates[..explicit_candidate_count])
+    {
+        let playback_rate = resolved
+            .as_ref()
+            .and_then(|preview| preview.idle_playback_rate())
+            .unwrap_or(1.0);
+        (animation, playback_rate, true)
     } else {
-        stable_string_hash(&object.id) % animation.max_frame as u64
+        let Some(animation) = load_texture_pattern_animation_candidates(
+            document,
+            &candidates[explicit_candidate_count..],
+        ) else {
+            return;
+        };
+        (animation, 1.0, false)
     };
-    let phase_seconds = phase_frames as f32 / 60.0;
+    let phase_seconds = starting_texture_pattern_phase_seconds(
+        &object.id,
+        animation.max_frame,
+        uses_explicit_animation,
+    );
     let frame = animation.playback_frame(phase_seconds);
     let mut bindings = Vec::new();
     for (animation_binding_index, binding) in animation.bindings.iter().enumerate() {
@@ -713,19 +756,63 @@ pub(super) fn attach_npc_texture_pattern_animation(
     if !bindings.is_empty() {
         animations.push(PreviewTexturePatternAnimation {
             animation,
+            playback_rate,
             phase_seconds,
             bindings,
         });
     }
 }
 
+pub(super) fn starting_texture_pattern_phase_seconds(
+    object_id: &str,
+    max_frame: u16,
+    uses_explicit_animation: bool,
+) -> f32 {
+    if uses_explicit_animation || max_frame == 0 {
+        0.0
+    } else {
+        let phase_frames = stable_string_hash(object_id) % u64::from(max_frame);
+        phase_frames as f32 / 60.0
+    }
+}
+
+fn load_texture_pattern_animation_candidates(
+    document: &StageDocument,
+    candidates: &[String],
+) -> Option<J3dTexturePatternAnimation> {
+    for candidate in candidates {
+        let Some(asset) = document.assets.iter().find(|asset| {
+            asset.kind == StageAssetKind::Animation
+                && asset
+                    .path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .eq_ignore_ascii_case(candidate)
+        }) else {
+            continue;
+        };
+        let Ok(bytes) = document.read_asset_bytes(&asset.path) else {
+            continue;
+        };
+        if let Ok(animation) = J3dTexturePatternAnimation::parse(bytes) {
+            return Some(animation);
+        }
+    }
+    None
+}
+
 pub(super) fn starting_texture_pattern_candidates(
     object: &SceneObject,
     model_path: &str,
+    explicit_path: Option<&str>,
 ) -> Vec<String> {
     let normalized = model_path.replace('\\', "/");
     let archive = normalized.split_once("!/").map(|(archive, _)| archive);
-    let Some(relative) = (match object.factory_name.as_str() {
+    let mut candidates = explicit_path
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let relative = match object.factory_name.as_str() {
         "NPCMonteMA" | "NPCMonteMH" => Some("montemcommon/moma_wink.btp"),
         "NPCMonteMB" => Some("montemcommon/momb_wink.btp"),
         "NPCMonteMC" | "NPCMonteMG" => Some("montemcommon/momc_wink.btp"),
@@ -735,13 +822,20 @@ pub(super) fn starting_texture_pattern_candidates(
         "NPCMonteWB" => Some("montewcommon/mowb_wink.btp"),
         "NPCMonteW" | "NPCMonteWC" => Some("montewcommon/mow_wink.btp"),
         _ => None,
-    }) else {
-        return Vec::new();
     };
-    vec![archive.map_or_else(
-        || relative.to_string(),
-        |archive| format!("{archive}!/{relative}"),
-    )]
+    if let Some(relative) = relative {
+        let candidate = archive.map_or_else(
+            || relative.to_string(),
+            |archive| format!("{archive}!/{relative}"),
+        );
+        if !candidates
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&candidate))
+        {
+            candidates.push(candidate);
+        }
+    }
+    candidates
 }
 
 pub(super) fn stable_string_hash(value: &str) -> u64 {
@@ -887,6 +981,45 @@ pub(super) fn apply_actor_runtime_textures(
             preview.textures[texture_index] = texture.clone();
         }
     }
+}
+
+pub(super) fn apply_object_preview_appearance(
+    resolved: Option<&ResolvedObjectPreview>,
+    preview: &mut J3dGeometryPreview,
+) {
+    let Some(resolved) = resolved else {
+        return;
+    };
+    for material in &mut preview.materials {
+        apply_object_preview_k_color_alpha_overrides(
+            &mut material.tev_k_colors,
+            &resolved.tev_k_color_alpha_overrides,
+        );
+    }
+    preview.triangles.retain(|triangle| {
+        !object_preview_shape_is_hidden(triangle.shape_index, &resolved.hidden_shape_indices)
+    });
+}
+
+pub(super) fn apply_object_preview_k_color_alpha_overrides(
+    colors: &mut [[u8; 4]; 4],
+    overrides: &[sms_schema::ObjectPreviewTevKColorAlphaOverride],
+) {
+    for override_value in overrides {
+        let Some(color) = colors.get_mut(usize::from(override_value.register)) else {
+            continue;
+        };
+        color[3] = override_value.alpha;
+    }
+}
+
+pub(super) fn object_preview_shape_is_hidden(
+    shape_index: usize,
+    hidden_shape_indices: &[u16],
+) -> bool {
+    hidden_shape_indices
+        .iter()
+        .any(|hidden| usize::from(*hidden) == shape_index)
 }
 
 pub(super) fn actor_runtime_texture_replacements(

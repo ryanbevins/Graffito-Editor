@@ -15,7 +15,8 @@ use sms_formats::{
     SourceLocation, StageAsset, StageAssetKind,
 };
 use sms_schema::{
-    EnemyActorDefinition, EnemyManagerDefinition, EnemyModelDefinition, ObjectRegistry,
+    EnemyActorDefinition, EnemyManagerDefinition, EnemyModelDefinition, ObjectPreviewDefinition,
+    ObjectPreviewTevKColorAlphaOverride, ObjectRegistry,
 };
 use thiserror::Error;
 
@@ -24,11 +25,18 @@ mod dialogue_authoring;
 mod goop_authoring;
 mod object_authoring;
 mod object_parameters;
+mod object_preview;
 mod project_store;
 mod route_authoring;
 mod stage_archive;
 mod stage_export;
 mod validation;
+use object_preview::{
+    discover_object_preview_assets, install_registry_actor_previews,
+    is_registry_object_preview_model_asset, object_preview_asset_matches_definition,
+    object_preview_asset_matches_resource, remove_registry_object_preview_assets,
+    resolve_object_preview_definition, resolve_object_preview_resource_path,
+};
 
 pub use blank_stage::{
     blank_stage_mario_record, blank_stage_sky_record, runtime_sky_material_table,
@@ -265,6 +273,31 @@ pub struct ActorPreview {
     pub load_flags: u32,
     pub manager_factory: String,
     pub runtime_uniform_scale: Option<f32>,
+}
+
+/// Exact runtime resources used to render a registry-backed object preview.
+///
+/// These paths point at the narrowly installed members of the actor's global
+/// runtime archive rather than at every model or animation in that archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedObjectPreview {
+    pub factory_name: String,
+    pub model_path: String,
+    pub load_flags: u32,
+    pub idle_bck_path: String,
+    pub idle_btp_path: Option<String>,
+    pub idle_playback_rate_numerator: u32,
+    pub idle_playback_rate_denominator: u32,
+    pub hidden_shape_indices: Vec<u16>,
+    pub tev_k_color_alpha_overrides: Vec<ObjectPreviewTevKColorAlphaOverride>,
+}
+
+impl ResolvedObjectPreview {
+    pub fn idle_playback_rate(&self) -> Option<f32> {
+        (self.idle_playback_rate_denominator != 0).then(|| {
+            self.idle_playback_rate_numerator as f32 / self.idle_playback_rate_denominator as f32
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1080,13 +1113,27 @@ impl StageDocument {
     }
 
     pub fn set_registry(&mut self, registry: ObjectRegistry) {
-        let (actor_previews, preview_issues) =
+        if let Some(previous_registry) = self.registry.as_ref() {
+            remove_registry_object_preview_assets(&mut self.assets, previous_registry);
+        }
+        let (object_preview_assets, mut object_preview_issues) =
+            discover_object_preview_assets(&self.base_root, &registry);
+        self.assets.extend(object_preview_assets);
+        self.assets
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        self.assets.dedup_by(|left, right| left.path == right.path);
+
+        let (mut actor_previews, preview_issues) =
             build_actor_preview_catalog(&self.base_root, &self.assets, &registry, |path| {
                 self.read_asset_bytes(path)
                     .map_err(|error| error.to_string())
             });
-        let object_preview_issues =
-            apply_registry_preview_hints(&mut self.objects, &self.assets, &registry);
+        install_registry_actor_previews(&mut actor_previews, &self.assets, &registry);
+        object_preview_issues.extend(apply_registry_preview_hints(
+            &mut self.objects,
+            &self.assets,
+            &registry,
+        ));
         refresh_object_manager_capacity_dependencies(&mut self.objects, &registry);
         self.actor_previews = actor_previews;
         self.load_issues.retain(|issue| {
@@ -1122,12 +1169,59 @@ impl StageDocument {
             })
     }
 
+    /// Returns the decomp-derived preview definition for this object's factory.
+    pub fn object_preview_definition(
+        &self,
+        object: &SceneObject,
+    ) -> Option<&ObjectPreviewDefinition> {
+        self.registry
+            .as_ref()?
+            .find_object_preview(&object.factory_name)
+    }
+
+    /// Resolves one runtime resource to the exact installed archive member.
+    pub fn object_preview_resource_path(
+        &self,
+        definition: &ObjectPreviewDefinition,
+        runtime_resource_path: &str,
+    ) -> Option<String> {
+        resolve_object_preview_resource_path(definition, runtime_resource_path, &self.assets)
+    }
+
+    /// Returns all exact model and idle-animation resources for an object.
+    pub fn resolved_object_preview(&self, object: &SceneObject) -> Option<ResolvedObjectPreview> {
+        let definition = self.object_preview_definition(object)?;
+        resolve_object_preview_definition(definition, &self.assets)
+    }
+
+    /// Returns whether a path belongs exclusively to a registry-backed object preview.
+    pub fn is_object_preview_resource_path(&self, path: &Path) -> bool {
+        self.registry.as_ref().is_some_and(|registry| {
+            registry
+                .object_previews
+                .iter()
+                .any(|definition| object_preview_asset_matches_definition(path, definition))
+        })
+    }
+
+    /// Returns whether a model asset is a registry-backed object preview model.
+    pub fn is_object_preview_model_asset(&self, path: &Path) -> bool {
+        self.registry.as_ref().is_some_and(|registry| {
+            registry.object_previews.iter().any(|definition| {
+                object_preview_asset_matches_resource(path, definition, &definition.model_path)
+            })
+        })
+    }
+
     /// Returns the exact decomp-authored model-loader flags for a typed object placement.
     ///
     /// These flags are instance data for `TMapObjBase` and actor-table data for
     /// `TMapStaticObj`; a model-path heuristic cannot distinguish those cases.
     pub fn object_preview_load_flags(&self, object: &SceneObject) -> Option<u32> {
         let registry = self.registry.as_ref()?;
+        if let Some(preview) = registry.find_object_preview(&object.factory_name) {
+            return Some(preview.load_flags);
+        }
         if let Some(named_model) = object
             .raw_param("name")
             .and_then(|name| registry.find_named_object_model(&object.factory_name, name))
@@ -2233,7 +2327,10 @@ fn apply_registry_preview_hints(
     assets: &[StageAsset],
     registry: &ObjectRegistry,
 ) -> Vec<ValidationIssue> {
-    let model_index = stage_model_index(assets);
+    let model_index = stage_model_index(assets)
+        .into_iter()
+        .filter(|(path, _)| !is_registry_object_preview_model_asset(Path::new(path), registry))
+        .collect::<Vec<_>>();
     let mut issues = Vec::new();
 
     for object in objects {
@@ -2256,6 +2353,36 @@ fn apply_registry_preview_hints(
             // so a newer decomp extractor can repair old "Unknown" labels
             // without rewriting the placement record.
             object.class_name = Some(definition.class_name.clone());
+        }
+        if let Some(definition) = registry.find_object_preview(&object.factory_name) {
+            // A generated runtime preview is an exact actor binding. It outranks
+            // stage-local basename inference and every generic object resource.
+            object
+                .asset_hints
+                .retain(|hint| hint.role != AssetRole::InferredPreviewModel);
+            if let Some(path) =
+                resolve_object_preview_resource_path(definition, &definition.model_path, assets)
+            {
+                object.asset_hints.push(AssetRef {
+                    path,
+                    role: AssetRole::InferredPreviewModel,
+                });
+            } else {
+                issues.push(ValidationIssue::warning(
+                    "object-preview-model-unresolved",
+                    format!(
+                        "Could not resolve exact runtime model '{}' for {} from {}",
+                        definition.model_path,
+                        object.factory_name,
+                        if definition.source_files.is_empty() {
+                            "generated object-preview metadata".to_string()
+                        } else {
+                            definition.source_files.join(", ")
+                        }
+                    ),
+                ));
+            }
+            continue;
         }
         let is_map_static =
             object_definition.is_some_and(|definition| definition.class_name == "TMapStaticObj");
@@ -3144,6 +3271,25 @@ mod tests {
             preview_model: preview_model.map(str::to_string),
             hidden: false,
             unsafe_to_edit: false,
+        }
+    }
+
+    fn schema_object_preview() -> sms_schema::ObjectPreviewDefinition {
+        sms_schema::ObjectPreviewDefinition {
+            factory_name: "Mario".to_string(),
+            runtime_archive_path: "/data/mario.arc".to_string(),
+            model_path: "/mario/bmd/ma_mdl1.bmd".to_string(),
+            load_flags: 0x1010_0000,
+            idle_bck_path: "/mario/bck/ma_wait.bck".to_string(),
+            idle_btp_path: Some("/mario/btp/ma_wink_tx.btp".to_string()),
+            idle_playback_rate_numerator: 1,
+            idle_playback_rate_denominator: 2,
+            hidden_shape_indices: vec![10],
+            tev_k_color_alpha_overrides: vec![sms_schema::ObjectPreviewTevKColorAlphaOverride {
+                register: 0,
+                alpha: 0,
+            }],
+            source_files: vec!["src/Player/MarioDraw.cpp".to_string()],
         }
     }
 
@@ -5570,6 +5716,143 @@ mod tests {
             resolve_manager_actor_preview(&actor, &base_manager, "/scene/hamukuri", &models)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn registry_object_preview_installs_only_declared_members_for_future_objects() {
+        let root = unique_test_project_root("object-preview-runtime-archive");
+        let archive_path = root.join("files/data/mario.szs");
+        fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
+        let mut builder = sms_formats::RarcBuilder::new(b"mario".to_vec()).unwrap();
+        for (path, bytes) in [
+            (b"bmd/ma_mdl1.bmd".as_slice(), b"body".as_slice()),
+            (b"bck/ma_wait.bck".as_slice(), b"wait".as_slice()),
+            (b"btp/ma_wink_tx.btp".as_slice(), b"wink".as_slice()),
+            (b"bmd/unrelated.bmd".as_slice(), b"other model".as_slice()),
+            (
+                b"bck/unrelated.bck".as_slice(),
+                b"other animation".as_slice(),
+            ),
+        ] {
+            builder.insert_file(path, bytes.to_vec()).unwrap();
+        }
+        fs::write(&archive_path, builder.build().unwrap().to_bytes().unwrap()).unwrap();
+
+        let mut document = empty_document("custom0");
+        document.base_root = root.clone();
+        let mut registry = ObjectRegistry::default();
+        registry.object_previews.push(schema_object_preview());
+        document.set_registry(registry.clone());
+
+        assert!(
+            document.load_issues.is_empty(),
+            "{:?}",
+            document.load_issues
+        );
+        assert_eq!(document.assets.len(), 3);
+        let installed_paths = document
+            .assets
+            .iter()
+            .map(|asset| asset.path.to_string_lossy().replace('\\', "/"))
+            .collect::<Vec<_>>();
+        assert!(installed_paths
+            .iter()
+            .any(|path| path.ends_with("mario.szs!/bmd/ma_mdl1.bmd")));
+        assert!(installed_paths
+            .iter()
+            .any(|path| path.ends_with("mario.szs!/bck/ma_wait.bck")));
+        assert!(installed_paths
+            .iter()
+            .any(|path| path.ends_with("mario.szs!/btp/ma_wink_tx.btp")));
+        assert!(!installed_paths
+            .iter()
+            .any(|path| path.contains("unrelated")));
+        assert!(document
+            .assets
+            .iter()
+            .all(|asset| document.is_object_preview_resource_path(&asset.path)));
+
+        let mut unrelated = SceneObject::new("position", "MarioPositionObj");
+        unrelated.set_raw_param("actor_tail_string", "ma_mdl1");
+        document.refresh_registry_derived_object_fields(
+            std::slice::from_mut(&mut unrelated),
+            &registry,
+        );
+        assert!(unrelated
+            .asset_hints
+            .iter()
+            .all(|hint| hint.role != AssetRole::InferredPreviewModel));
+
+        let mut mario = SceneObject::new("mario", "Mario");
+        document
+            .refresh_registry_derived_object_fields(std::slice::from_mut(&mut mario), &registry);
+        assert_eq!(mario.asset_hints.len(), 1);
+        assert!(mario.asset_hints[0]
+            .path
+            .replace('\\', "/")
+            .ends_with("mario.szs!/bmd/ma_mdl1.bmd"));
+        assert_eq!(
+            document.object_preview_load_flags(&mario),
+            Some(0x1010_0000)
+        );
+        assert!(document.is_object_preview_model_asset(Path::new(&mario.asset_hints[0].path)));
+        let actor_preview = document.actor_preview(&mario).unwrap();
+        assert_eq!(actor_preview.load_flags, 0x1010_0000);
+
+        document.add_object(mario);
+        let resolved = document
+            .resolved_object_preview(&document.objects[0])
+            .expect("resolved Mario preview");
+        assert!(resolved.model_path.ends_with("mario.szs!/bmd/ma_mdl1.bmd"));
+        assert!(resolved
+            .idle_bck_path
+            .ends_with("mario.szs!/bck/ma_wait.bck"));
+        assert!(resolved
+            .idle_btp_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("mario.szs!/btp/ma_wink_tx.btp")));
+        assert_eq!(resolved.idle_playback_rate(), Some(0.5));
+        assert_eq!(resolved.hidden_shape_indices, [10]);
+        assert_eq!(
+            resolved.tev_k_color_alpha_overrides,
+            [sms_schema::ObjectPreviewTevKColorAlphaOverride {
+                register: 0,
+                alpha: 0,
+            }]
+        );
+        assert_eq!(
+            document.read_asset_bytes(&resolved.model_path).unwrap(),
+            b"body"
+        );
+
+        document.set_registry(ObjectRegistry::default());
+        assert!(document.assets.is_empty());
+        assert!(document.actor_preview(&document.objects[0]).is_none());
+        assert!(document.objects[0]
+            .asset_hints
+            .iter()
+            .all(|hint| hint.role != AssetRole::InferredPreviewModel));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_object_preview_archive_is_a_non_fatal_refresh_warning() {
+        let root = unique_test_project_root("missing-object-preview-runtime-archive");
+        fs::create_dir_all(&root).unwrap();
+        let mut document = empty_document("custom0");
+        document.base_root = root.clone();
+        let mut registry = ObjectRegistry::default();
+        registry.object_previews.push(schema_object_preview());
+
+        document.set_registry(registry);
+
+        assert!(document.assets.is_empty());
+        assert!(document.registry.is_some());
+        assert!(document.load_issues.iter().any(|issue| {
+            issue.code == "object-preview-runtime-archive-unavailable"
+                && issue.message.contains("/data/mario.arc")
+        }));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

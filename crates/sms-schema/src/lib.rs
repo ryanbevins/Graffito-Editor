@@ -7,6 +7,7 @@ mod map_obj_resource_extractor;
 mod map_obj_shared_model_extractor;
 mod map_obj_stream_tev_extractor;
 mod map_obj_string_tev_extractor;
+mod object_preview_extractor;
 mod source_inventory;
 mod stage_name_extractor;
 
@@ -28,6 +29,7 @@ use map_obj_shared_model_extractor::{
 };
 use map_obj_stream_tev_extractor::extract_map_obj_stream_tev_colors;
 use map_obj_string_tev_extractor::extract_nozzle_box_tev_program;
+use object_preview_extractor::{extract_mario_object_preview, MarioObjectPreviewSources};
 use source_inventory::SourceInventory;
 pub use stage_name_extractor::{extract_stage_name_tables, StageNameTables};
 
@@ -79,6 +81,7 @@ pub type Result<T> = std::result::Result<T, SchemaError>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaExtractor {
     FactoryRegistration,
+    ObjectPreviews,
     ModelLoaderFlags,
     EnemyModelData,
     Params,
@@ -110,6 +113,7 @@ impl std::fmt::Display for SchemaExtractor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
             Self::FactoryRegistration => "factory registration",
+            Self::ObjectPreviews => "object preview",
             Self::ModelLoaderFlags => "model loader flags",
             Self::EnemyModelData => "enemy model data",
             Self::Params => "parameter metadata",
@@ -145,6 +149,9 @@ pub struct ObjectRegistry {
     pub objects: Vec<ObjectDefinition>,
     pub params: Vec<ParamDefinition>,
     pub asset_hints: Vec<AssetHint>,
+    /// Decomp-derived model and idle-animation presentation for placed actors.
+    #[serde(default)]
+    pub object_previews: Vec<ObjectPreviewDefinition>,
     /// Decomp-derived primary model resources for actor factory names.
     #[serde(default)]
     pub object_resources: Vec<ObjectResourceBinding>,
@@ -331,6 +338,12 @@ impl ObjectRegistry {
             )
     }
 
+    pub fn find_object_preview(&self, factory_name: &str) -> Option<&ObjectPreviewDefinition> {
+        self.object_previews
+            .iter()
+            .find(|definition| definition.factory_name == factory_name)
+    }
+
     pub fn object_resources_for<'a>(
         &'a self,
         factory_name: &str,
@@ -510,6 +523,45 @@ pub struct ParamDefinition {
 pub struct AssetHint {
     pub path: String,
     pub source_file: String,
+}
+
+/// Runtime-authored model and idle-animation resources for a placed actor.
+///
+/// Paths retain the exact virtual archive identities consumed by retail. The
+/// playback ratio is stored as integers so generated registries remain Eq-safe
+/// and consumers can apply it without embedding an approximate schema float.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ObjectPreviewDefinition {
+    pub factory_name: String,
+    pub runtime_archive_path: String,
+    pub model_path: String,
+    pub load_flags: u32,
+    pub idle_bck_path: String,
+    #[serde(default)]
+    pub idle_btp_path: Option<String>,
+    pub idle_playback_rate_numerator: u32,
+    pub idle_playback_rate_denominator: u32,
+    /// SHP1 shape indices disabled by the actor's default retail state.
+    #[serde(default)]
+    pub hidden_shape_indices: Vec<u16>,
+    /// Per-instance TEV konst-alpha values installed by the actor before draw.
+    #[serde(default)]
+    pub tev_k_color_alpha_overrides: Vec<ObjectPreviewTevKColorAlphaOverride>,
+    pub source_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ObjectPreviewTevKColorAlphaOverride {
+    pub register: u8,
+    pub alpha: u8,
+}
+
+impl ObjectPreviewDefinition {
+    pub fn idle_playback_rate(&self) -> Option<f32> {
+        (self.idle_playback_rate_denominator != 0).then(|| {
+            self.idle_playback_rate_numerator as f32 / self.idle_playback_rate_denominator as f32
+        })
+    }
 }
 
 /// A model resource selected by a factory/manager pair in the decompilation.
@@ -1232,6 +1284,7 @@ impl SchemaGenerator {
     fn generate_from_inventory(&self, sources: &SourceInventory) -> Result<ObjectRegistry> {
         let mut registry = ObjectRegistry::default();
         self.scan_mar_name_ref_gen(sources, &mut registry)?;
+        self.scan_object_previews(sources, &mut registry)?;
         self.scan_named_object_models(sources, &mut registry)?;
         self.scan_enemy_model_data(sources, &mut registry)?;
         self.scan_map_obj_manager(sources, &mut registry)?;
@@ -1298,6 +1351,62 @@ impl SchemaGenerator {
             }
         }
         Ok(())
+    }
+
+    fn scan_object_previews(
+        &self,
+        sources: &SourceInventory,
+        registry: &mut ObjectRegistry,
+    ) -> Result<()> {
+        const FACTORY_PATH: &str = "src/System/MarNameRefGen.cpp";
+        const MARIO_DRAW_PATH: &str = "src/Player/MarioDraw.cpp";
+        const MARIO_MAIN_HEADER_PATH: &str = "include/Player/MarioMain.hpp";
+        const MARIO_MAIN_SOURCE_PATH: &str = "src/Player/MarioMain.cpp";
+        const MARIO_INIT_PATH: &str = "src/Player/MarioInit.cpp";
+        const APPLICATION_PATH: &str = "src/System/Application.cpp";
+        const MAR_DIRECTOR_DIRECT_PATH: &str = "src/System/MarDirectorDirect.cpp";
+
+        let (factory_name, class_name) = registry
+            .objects
+            .iter()
+            .find(|object| object.factory_name == "Mario")
+            .map(|object| (object.factory_name.clone(), object.class_name.clone()))
+            .ok_or_else(|| SchemaError::ExtractionDrift {
+                extractor: SchemaExtractor::ObjectPreviews,
+                source_path: self.repo_root.join(FACTORY_PATH),
+                expected: "registered Mario -> TMario factory",
+            })?;
+        let definition = extract_mario_object_preview(
+            &factory_name,
+            &class_name,
+            MarioObjectPreviewSources {
+                mario_draw: sources.required(MARIO_DRAW_PATH)?.text(),
+                mario_main_header: sources.required(MARIO_MAIN_HEADER_PATH)?.text(),
+                mario_main_source: sources.required(MARIO_MAIN_SOURCE_PATH)?.text(),
+                mario_init: sources.required(MARIO_INIT_PATH)?.text(),
+                application: sources.required(APPLICATION_PATH)?.text(),
+                mar_director_direct: sources.required(MAR_DIRECTOR_DIRECT_PATH)?.text(),
+                provenance: [
+                    FACTORY_PATH,
+                    MARIO_DRAW_PATH,
+                    MARIO_MAIN_HEADER_PATH,
+                    MARIO_MAIN_SOURCE_PATH,
+                    MARIO_INIT_PATH,
+                    APPLICATION_PATH,
+                    MAR_DIRECTOR_DIRECT_PATH,
+                ],
+            },
+        )
+        .map_err(|detail| SchemaError::RegistryInvariant {
+            detail: format!("failed to extract Mario object preview: {detail}"),
+        })?;
+        registry.object_previews.push(definition);
+        ensure_extracted(
+            SchemaExtractor::ObjectPreviews,
+            self.repo_root.join(MARIO_DRAW_PATH),
+            registry.object_previews.len(),
+            "linked Mario model and idle-animation resources",
+        )
     }
 
     fn scan_enemy_model_data(
@@ -2262,6 +2371,7 @@ fn schema_generator_fingerprint() -> u64 {
         include_bytes!("lib.rs").as_slice(),
         include_bytes!("source_inventory.rs").as_slice(),
         include_bytes!("factory_extractor.rs").as_slice(),
+        include_bytes!("object_preview_extractor.rs").as_slice(),
         include_bytes!("map_obj_ball_extractor.rs").as_slice(),
         include_bytes!("map_obj_resource_extractor.rs").as_slice(),
         include_bytes!("map_obj_shared_model_extractor.rs").as_slice(),
@@ -4598,6 +4708,35 @@ fn dedup_registry(registry: &mut ObjectRegistry) -> Result<()> {
     });
     registry.asset_hints.dedup();
 
+    for preview in &mut registry.object_previews {
+        preview.hidden_shape_indices.sort_unstable();
+        preview.hidden_shape_indices.dedup();
+        preview.tev_k_color_alpha_overrides.sort_unstable();
+        preview.tev_k_color_alpha_overrides.dedup();
+        for duplicate in preview.tev_k_color_alpha_overrides.windows(2) {
+            if duplicate[0].register == duplicate[1].register {
+                return Err(SchemaError::RegistryInvariant {
+                    detail: format!(
+                        "factory {} has conflicting alpha overrides for TEV konst register {}",
+                        preview.factory_name, duplicate[0].register
+                    ),
+                });
+            }
+        }
+    }
+    registry.object_previews.sort();
+    registry.object_previews.dedup();
+    for duplicate in registry.object_previews.windows(2) {
+        if duplicate[0].factory_name == duplicate[1].factory_name {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "duplicate object preview definition for factory {}",
+                    duplicate[0].factory_name
+                ),
+            });
+        }
+    }
+
     registry.object_resources.sort_by(|a, b| {
         a.factory_name
             .cmp(&b.factory_name)
@@ -4961,6 +5100,99 @@ fn validate_registry(registry: &ObjectRegistry) -> Result<()> {
         .iter()
         .map(|object| (object.factory_name.as_str(), object))
         .collect::<BTreeMap<_, _>>();
+    let valid_runtime_path = |path: &str, suffix: &str| {
+        path.starts_with('/') && path.ends_with(suffix) && !path.contains('\\')
+    };
+    let mut preview_factories = BTreeSet::new();
+    for preview in &registry.object_previews {
+        if !objects.contains_key(preview.factory_name.as_str()) {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "object preview model {} has no registered factory {}",
+                    preview.model_path, preview.factory_name
+                ),
+            });
+        }
+        if !preview_factories.insert(preview.factory_name.as_str()) {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "duplicate object preview definition for factory {}",
+                    preview.factory_name
+                ),
+            });
+        }
+        if preview.idle_playback_rate_numerator == 0 || preview.idle_playback_rate_denominator == 0
+        {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "factory {} has a zero idle playback numerator or denominator",
+                    preview.factory_name
+                ),
+            });
+        }
+        let mut hidden_shapes = BTreeSet::new();
+        if preview
+            .hidden_shape_indices
+            .iter()
+            .any(|shape| !hidden_shapes.insert(*shape))
+        {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "factory {} has duplicate hidden preview shape indices",
+                    preview.factory_name
+                ),
+            });
+        }
+        let mut alpha_override_registers = BTreeSet::new();
+        for alpha_override in &preview.tev_k_color_alpha_overrides {
+            if alpha_override.register > 3 {
+                return Err(SchemaError::RegistryInvariant {
+                    detail: format!(
+                        "factory {} overrides invalid TEV konst register {}",
+                        preview.factory_name, alpha_override.register
+                    ),
+                });
+            }
+            if !alpha_override_registers.insert(alpha_override.register) {
+                return Err(SchemaError::RegistryInvariant {
+                    detail: format!(
+                        "factory {} has duplicate alpha overrides for TEV konst register {}",
+                        preview.factory_name, alpha_override.register
+                    ),
+                });
+            }
+        }
+        if !valid_runtime_path(&preview.runtime_archive_path, ".arc")
+            || !valid_runtime_path(&preview.model_path, ".bmd")
+            || !valid_runtime_path(&preview.idle_bck_path, ".bck")
+            || preview
+                .idle_btp_path
+                .as_deref()
+                .is_some_and(|path| !valid_runtime_path(path, ".btp"))
+        {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "factory {} has an invalid runtime archive, model, or idle-animation path",
+                    preview.factory_name
+                ),
+            });
+        }
+        let provenance = preview.source_files.iter().collect::<BTreeSet<_>>();
+        if preview.source_files.is_empty()
+            || provenance.len() != preview.source_files.len()
+            || preview.source_files.iter().any(|source| {
+                source.is_empty() || !(source.starts_with("src/") || source.starts_with("include/"))
+            })
+        {
+            return Err(SchemaError::RegistryInvariant {
+                detail: format!(
+                    "factory {} has missing, duplicate, or invalid object-preview provenance",
+                    preview.factory_name
+                ),
+            });
+        }
+    }
+
     for folder in &registry.npc_resource_folders {
         if folder.folder.is_empty() || folder.source_file.is_empty() {
             return Err(SchemaError::RegistryInvariant {
@@ -6602,6 +6834,29 @@ mod tests {
             .objects
             .iter()
             .any(|object| object.factory_name == "H_ma_rak_dummy"));
+        let mario = first
+            .find_object_preview("Mario")
+            .expect("decomp-linked Mario object preview");
+        assert_eq!(mario.runtime_archive_path, "/data/mario.arc");
+        assert_eq!(mario.model_path, "/mario/bmd/ma_mdl1.bmd");
+        assert_eq!(mario.load_flags, 0x1010_0000);
+        assert_eq!(mario.idle_bck_path, "/mario/bck/ma_wait.bck");
+        assert_eq!(
+            mario.idle_btp_path.as_deref(),
+            Some("/mario/btp/ma_wink_tx.btp")
+        );
+        assert_eq!(mario.idle_playback_rate_numerator, 1);
+        assert_eq!(mario.idle_playback_rate_denominator, 1);
+        assert_eq!(mario.idle_playback_rate(), Some(1.0));
+        assert_eq!(mario.hidden_shape_indices, [10]);
+        assert_eq!(
+            mario.tev_k_color_alpha_overrides,
+            [ObjectPreviewTevKColorAlphaOverride {
+                register: 0,
+                alpha: 0,
+            }]
+        );
+        assert!(first.find_object_preview("mario").is_none());
         let primary = first.primary_object_resource("NPCExample").unwrap();
         assert_eq!(primary.model_index, 0);
         assert_eq!(primary.role, ObjectResourceRole::Primary);
@@ -6728,6 +6983,165 @@ mod tests {
         let error = validate_registry(&registry).unwrap_err();
         assert!(
             matches!(error, SchemaError::RegistryInvariant { detail } if detail.contains("2 primary"))
+        );
+    }
+
+    #[test]
+    fn object_preview_validation_lookup_and_legacy_default_are_safe() {
+        let object = ObjectDefinition {
+            factory_name: "Mario".to_string(),
+            class_name: "TMario".to_string(),
+            category: "System".to_string(),
+            source: SchemaSource::MarNameRefGen,
+            display_name: None,
+            preview_model: None,
+            hidden: false,
+            unsafe_to_edit: false,
+        };
+        let preview = ObjectPreviewDefinition {
+            factory_name: "Mario".to_string(),
+            runtime_archive_path: "/data/mario.arc".to_string(),
+            model_path: "/mario/bmd/ma_mdl1.bmd".to_string(),
+            load_flags: 0,
+            idle_bck_path: "/mario/bck/ma_wait.bck".to_string(),
+            idle_btp_path: Some("/mario/btp/ma_wink_tx.btp".to_string()),
+            idle_playback_rate_numerator: 1,
+            idle_playback_rate_denominator: 2,
+            hidden_shape_indices: vec![10],
+            tev_k_color_alpha_overrides: vec![ObjectPreviewTevKColorAlphaOverride {
+                register: 0,
+                alpha: 0,
+            }],
+            source_files: vec![
+                "src/System/MarNameRefGen.cpp".to_string(),
+                "src/Player/MarioDraw.cpp".to_string(),
+                "include/Player/MarioMain.hpp".to_string(),
+                "src/Player/MarioMain.cpp".to_string(),
+                "src/Player/MarioInit.cpp".to_string(),
+                "src/System/Application.cpp".to_string(),
+            ],
+        };
+        let mut registry = ObjectRegistry {
+            objects: vec![object],
+            object_previews: vec![preview],
+            ..ObjectRegistry::default()
+        };
+
+        validate_registry(&registry).expect("zero loader flags are a valid exact bitset");
+        assert_eq!(
+            registry
+                .find_object_preview("Mario")
+                .and_then(ObjectPreviewDefinition::idle_playback_rate),
+            Some(0.5)
+        );
+        assert!(registry.find_object_preview("mario").is_none());
+
+        let mut duplicate_shape = registry.clone();
+        duplicate_shape.object_previews[0]
+            .hidden_shape_indices
+            .push(10);
+        let error = validate_registry(&duplicate_shape).unwrap_err();
+        assert!(
+            matches!(error, SchemaError::RegistryInvariant { detail } if detail.contains("duplicate hidden preview shape"))
+        );
+
+        let mut invalid_register = registry.clone();
+        invalid_register.object_previews[0].tev_k_color_alpha_overrides[0].register = 4;
+        let error = validate_registry(&invalid_register).unwrap_err();
+        assert!(
+            matches!(error, SchemaError::RegistryInvariant { detail } if detail.contains("invalid TEV konst register 4"))
+        );
+
+        registry.object_previews[0].idle_playback_rate_denominator = 0;
+        let error = validate_registry(&registry).unwrap_err();
+        assert!(
+            matches!(error, SchemaError::RegistryInvariant { detail } if detail.contains("zero idle playback"))
+        );
+
+        let mut serialized = serde_json::to_value(ObjectRegistry::default()).unwrap();
+        serialized
+            .as_object_mut()
+            .expect("registry serializes as an object")
+            .remove("object_previews");
+        let legacy: ObjectRegistry = serde_json::from_value(serialized).unwrap();
+        assert!(legacy.object_previews.is_empty());
+
+        let mut serialized_preview = serde_json::to_value(&registry.object_previews[0]).unwrap();
+        let serialized_preview = serialized_preview
+            .as_object_mut()
+            .expect("object preview serializes as an object");
+        serialized_preview.remove("hidden_shape_indices");
+        serialized_preview.remove("tev_k_color_alpha_overrides");
+        let legacy_preview: ObjectPreviewDefinition =
+            serde_json::from_value(serialized_preview.clone().into()).unwrap();
+        assert!(legacy_preview.hidden_shape_indices.is_empty());
+        assert!(legacy_preview.tev_k_color_alpha_overrides.is_empty());
+    }
+
+    #[test]
+    fn object_preview_dedup_collapses_exact_rows_and_rejects_conflicts() {
+        let preview = ObjectPreviewDefinition {
+            factory_name: "Mario".to_string(),
+            runtime_archive_path: "/data/mario.arc".to_string(),
+            model_path: "/mario/bmd/ma_mdl1.bmd".to_string(),
+            load_flags: 0x1010_0000,
+            idle_bck_path: "/mario/bck/ma_wait.bck".to_string(),
+            idle_btp_path: Some("/mario/btp/ma_wink_tx.btp".to_string()),
+            idle_playback_rate_numerator: 1,
+            idle_playback_rate_denominator: 2,
+            hidden_shape_indices: vec![10, 10],
+            tev_k_color_alpha_overrides: vec![
+                ObjectPreviewTevKColorAlphaOverride {
+                    register: 0,
+                    alpha: 0,
+                },
+                ObjectPreviewTevKColorAlphaOverride {
+                    register: 0,
+                    alpha: 0,
+                },
+            ],
+            source_files: vec!["src/Player/MarioDraw.cpp".to_string()],
+        };
+        let mut registry = ObjectRegistry {
+            object_previews: vec![preview.clone(), preview.clone()],
+            ..ObjectRegistry::default()
+        };
+        dedup_registry(&mut registry).unwrap();
+        let normalized = registry.object_previews[0].clone();
+        assert_eq!(
+            registry.object_previews.as_slice(),
+            &[ObjectPreviewDefinition {
+                hidden_shape_indices: vec![10],
+                tev_k_color_alpha_overrides: vec![ObjectPreviewTevKColorAlphaOverride {
+                    register: 0,
+                    alpha: 0,
+                }],
+                ..preview.clone()
+            }]
+        );
+
+        let mut conflict = registry.object_previews[0].clone();
+        conflict.idle_bck_path = "/mario/bck/ma_jump.bck".to_string();
+        registry.object_previews.push(conflict);
+        let error = dedup_registry(&mut registry).unwrap_err();
+        assert!(
+            matches!(error, SchemaError::RegistryInvariant { detail } if detail.contains("duplicate object preview"))
+        );
+
+        let mut conflicting_alpha = normalized;
+        conflicting_alpha
+            .tev_k_color_alpha_overrides
+            .push(ObjectPreviewTevKColorAlphaOverride {
+                register: 0,
+                alpha: 1,
+            });
+        let mut registry = ObjectRegistry {
+            object_previews: vec![conflicting_alpha],
+            ..ObjectRegistry::default()
+        };
+        let error = dedup_registry(&mut registry).unwrap_err();
+        assert!(
+            matches!(error, SchemaError::RegistryInvariant { detail } if detail.contains("conflicting alpha overrides"))
         );
     }
 
@@ -7551,8 +7965,123 @@ mod tests {
             "#,
         );
         fixture.write(
+            "include/Player/MarioMain.hpp",
+            r#"
+                class TMario {
+                public:
+                    enum { ANIM_WAIT = 1 };
+                };
+            "#,
+        );
+        fixture.write(
+            "src/Player/MarioDraw.cpp",
+            r#"
+                static unkTMarioAnimeFilesStruct marioAnimeFiles[2] = {
+                    { 0, "jump" },
+                    { 0, "wait" },
+                };
+                TMarioAnimeData gMarioAnimeData[2] = {
+                    { 0, 0, 1, 0, 0, 0 },
+                    { 1, 0, 0, 0, 0, 0 },
+                };
+                static char* marioAnimeTexPatternFilenames[1] = {
+                    "/mario/btp/ma_wink_tx.btp",
+                };
+                f32 TMario::setAnimation(int param_1, f32 param_2) {
+                    mModel->changeMtxCalcSIAnmBQAnmTransform(
+                        0, 0, gMarioAnimeData[param_1].unk0);
+                    s8 pattern = gMarioAnimeData[param_1].unk4;
+                    if (pattern < 1) {
+                        mModel->changeAnmTexPattern(0, pattern);
+                    }
+                    getMotionFrameCtrl().setRate(param_2 * 0.5f);
+                    mModel->getFrameCtrl(2).setRate(param_2 * 0.5f);
+                    return 0.0f;
+                }
+                void TMario::initModel() {
+                    mBodyModelData = J3DModelLoaderDataBase::load(
+                        JKRFileLoader::getGlbResource("/mario/bmd/ma_mdl1.bmd"),
+                        0x10100000);
+                    for (int i = 0; i < 2; ++i) {
+                        snprintf(buffer, 0xff, "/mario/bck/ma_%s.bck",
+                                 marioAnimeFiles[i].unk4);
+                    }
+                    mModel = modelMario;
+                    setAnimation(1, 1.0f);
+                }
+                void TMario::addDirty() {
+                    for (u16 i = 0; i < mBodyModelData->getMaterialNum(); ++i) {
+                        J3DGXColor* konstColor =
+                            mBodyModelData->getMaterialNodePointer(i)
+                                ->getTevBlock()
+                                ->getTevKColor(0);
+                        konstColor->color.a = unk134;
+                    }
+                }
+            "#,
+        );
+        fixture.write(
+            "src/Player/MarioMain.cpp",
+            r#"
+                void TMario::perform(u32 flags, JDrama::TGraphics* gfx) {
+                    u32 doMovement = flags & 1;
+                    if (checkFlag(MARIO_FLAG_HAS_SHIRT)) {
+                        J3DShape* shape =
+                            mModel->unk8->mModelData->mShapeNodePointer[10];
+                        shape->offFlag(1);
+                    } else {
+                        J3DShape* shape =
+                            mModel->unk8->mModelData->mShapeNodePointer[10];
+                        shape->onFlag(1);
+                    }
+                    if (doMovement && unk14E <= 0) {
+                        calcAnim(2, gfx);
+                    }
+                }
+            "#,
+        );
+        fixture.write(
+            "src/Player/MarioInit.cpp",
+            r#"
+                void TMario::initValues() {
+                    unk134 = 0.0f;
+                }
+                void TMario::load(JSUMemoryInputStream& stream) {
+                    mState = 0;
+                    if (flags & 1) {
+                        mState &= ~MARIO_FLAG_HAS_FLUDD;
+                    } else {
+                        mState |= MARIO_FLAG_HAS_FLUDD;
+                    }
+                    initValues();
+                }
+            "#,
+        );
+        fixture.write(
             "src/System/Application.cpp",
-            r#"bufStageArcBin = JKRDvdRipper::loadToMainRAM("/data/stageArc.bin", nullptr, EXPAND_SWITCH_DEFAULT, 0, mHeap);"#,
+            r#"
+                f32 SMSGetAnmFrameRate() {
+                    return 60.0f / SMSGetVSyncTimesPerSec();
+                }
+                arcBufMario = SMSLoadArchive(
+                    "/data/mario.arc", nullptr, 0, JKRGetRootHeap());
+                bufStageArcBin = JKRDvdRipper::loadToMainRAM(
+                    "/data/stageArc.bin", nullptr, EXPAND_SWITCH_DEFAULT, 0, mHeap);
+            "#,
+        );
+        fixture.write(
+            "src/System/MarDirectorDirect.cpp",
+            r#"
+                int TMarDirector::direct() {
+                    int vsyncRate = 600 / (int)SMSGetVSyncTimesPerSec();
+                    unk54 += vsyncRate;
+                    for (;;) {
+                        unk54 -= 5;
+                        if (unk54 < 5)
+                            unk4C |= 0x4000;
+                    }
+                }
+            "#,
         );
         fixture.write(
             "src/System/MarNameRefGen_NPC.cpp",
