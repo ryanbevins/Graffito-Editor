@@ -5901,8 +5901,8 @@ mod tests {
                 character_name: String::new(),
                 light_map: sms_formats::JDramaLightMap::default(),
                 fields: vec![JDramaField {
-                    name: "graph_name".to_string(),
-                    value: JDramaFieldValue::String("route_a".to_string()),
+                    name: "resource_name".to_string(),
+                    value: JDramaFieldValue::String("resource_a".to_string()),
                 }],
             },
         };
@@ -5922,13 +5922,14 @@ mod tests {
             ..SmsEditorApp::default()
         };
 
-        app.update_selected_parameter("graph_name", "route_b");
+        app.update_selected_parameter("resource_name", "resource_b");
 
         let object = &app.document.as_ref().unwrap().objects[0];
-        assert_eq!(object.raw_param("graph_name"), Some("route_a"));
+        assert_eq!(object.raw_param("resource_name"), Some("resource_a"));
         assert!(app.undo_stack.is_empty());
         assert!(app.log.iter().any(|message| {
-            message.contains("Could not edit parameter 'graph_name'") && message.contains("respawn")
+            message.contains("Could not edit parameter 'resource_name'")
+                && message.contains("respawn")
         }));
     }
 

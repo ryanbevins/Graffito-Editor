@@ -2516,13 +2516,13 @@ mod tests {
 
     use sms_formats::{
         BmgMessage, ColGroup, ColTriangle, ColVertex, JDramaAmbient, JDramaDocument, JDramaField,
-        JDramaFieldValue, JDramaLight, JDramaLightMap, PrmEntry, PrmFile, PrmValue, RarcDocument,
-        RarcEntryRecord, RarcLayout, RarcNodeRecord,
+        JDramaFieldValue, JDramaLight, JDramaLightMap, PrmEntry, PrmFile, PrmValue, RalDocument,
+        RarcDocument, RarcEntryRecord, RarcLayout, RarcNodeRecord,
     };
 
     use crate::{
         AuthoredPlacement, AuthoredPlacementDependency, AuthoredPlacementDependencyTarget,
-        PlacementBinding, SceneRuntimeReferenceBinding, Transform,
+        PlacementBinding, RouteAuthoringDocument, SceneRuntimeReferenceBinding, Transform,
     };
 
     #[test]
@@ -2596,6 +2596,64 @@ mod tests {
             .collect::<Vec<_>>();
         shine_names.sort();
         assert_eq!(shine_names, ["first authored shine", "runtime reward name"]);
+    }
+
+    #[test]
+    fn existing_object_route_assignment_rebuilds_and_round_trips_graph_name() {
+        let fixture = StageFixture::new("existing-route-assignment");
+        let mut document = fixture.document();
+        let source_record = rail_fence_record("first", "route_a");
+        let archive = document.stage_archive.as_mut().unwrap();
+        let StageResourceDocument::Placement(placements) =
+            archive.resource_mut(b"scene.bin").unwrap()
+        else {
+            unreachable!()
+        };
+        let JDramaRecordPayload::Group { children, .. } = &mut placements.root.payload else {
+            unreachable!()
+        };
+        children[0] = source_record.clone();
+
+        document.objects[0].factory_name = "RailFence".to_string();
+        crate::seed_scene_object_parameters(&mut document.objects[0], &source_record).unwrap();
+
+        let mut routes = RouteAuthoringDocument::lift(
+            crate::ROUTE_RESOURCE_PATH.to_vec(),
+            &RalDocument::empty_canonical(),
+        );
+        routes.add_graph("route_a", [0, 0, 0], [0, 0, 100]).unwrap();
+        routes
+            .add_graph("route_b", [100, 0, 0], [100, 0, 100])
+            .unwrap();
+        archive
+            .insert_resource(
+                crate::ROUTE_RESOURCE_PATH.to_vec(),
+                StageResourceDocument::Rail(routes.compile().unwrap()),
+            )
+            .unwrap();
+
+        // Persisted overlays deserialize parameters as clean source values, so
+        // export must validate against the effective RAL even when the route
+        // editor has not been opened in this session.
+        document.objects[0].insert_source_raw_param("graph_name", "route_b");
+        assert!(document.route_authoring.is_none());
+
+        let rebuilt = document.build_stage_archive().unwrap();
+        let reopened = SourceFreeStageArchive::parse(&rebuilt).unwrap();
+        let record = placement_record(&reopened, &address(&[0])).unwrap();
+        let JDramaRecordPayload::Actor { fields, .. } = &record.payload else {
+            unreachable!()
+        };
+        assert!(fields.iter().any(|field| {
+            field.name == "graph_name"
+                && field.value == JDramaFieldValue::String("route_b".to_string())
+        }));
+        assert_eq!(reopened.encode().unwrap(), rebuilt);
+
+        document.objects[0].insert_source_raw_param("graph_name", "missing_route");
+        let error = document.build_stage_archive().unwrap_err().to_string();
+        assert!(error.contains("missing-route-reference"), "{error}");
+        assert!(error.contains("missing_route"), "{error}");
     }
 
     #[test]
@@ -4572,6 +4630,33 @@ mod tests {
                 character_name: name.to_string(),
                 light_map: JDramaLightMap::default(),
                 fields: Vec::new(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn rail_fence_record(name: &str, graph_name: &str) -> JDramaRecord {
+        JDramaRecord::new(
+            "RailFence",
+            name,
+            JDramaRecordPayload::Actor {
+                transform: JDramaTransform {
+                    translation: [1.0, 2.0, 3.0],
+                    rotation: [0.0, 90.0, 0.0],
+                    scale: [1.0; 3],
+                },
+                character_name: name.to_string(),
+                light_map: JDramaLightMap::default(),
+                fields: vec![
+                    JDramaField {
+                        name: "resource_name".to_string(),
+                        value: JDramaFieldValue::String("rail_fence".to_string()),
+                    },
+                    JDramaField {
+                        name: "graph_name".to_string(),
+                        value: JDramaFieldValue::String(graph_name.to_string()),
+                    },
+                ],
             },
         )
         .unwrap()

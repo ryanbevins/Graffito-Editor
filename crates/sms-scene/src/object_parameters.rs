@@ -222,7 +222,9 @@ impl StageDocument {
 /// callers can construct clean `SceneParameter` values without going through
 /// the inspector. Ordinary typed values remain editable, while linked values
 /// must still equal the typed prototype unless the binding proves that the
-/// corresponding dependency was updated with them.
+/// corresponding dependency was updated with them. Route graph names are
+/// ordinary typed references: route authoring validates the destination graph
+/// and owns the RAL resource independently of any one actor placement.
 #[cfg(test)]
 pub(crate) fn validate_object_parameter_links(
     record: &JDramaRecord,
@@ -1097,7 +1099,7 @@ fn parameter_read_only_reason(
         "authoring_character_name" => {
             "Owns a character registration; respawn the object to change."
         }
-        "graph_name" => "Owns an imported route graph; respawn the object to change.",
+        "graph_name" => return None,
         "manager_name" => match placement {
             Some(PlacementBinding::Existing(_) | PlacementBinding::CloneOf(_)) => {
                 "Retail and cloned manager links have no owned dependency."
@@ -1971,7 +1973,7 @@ mod editability_tests {
             },
         };
         let descriptors = editable_object_parameters(&record).unwrap();
-        for key in ["name", "resource_name", "graph_name", "target_actor_name"] {
+        for key in ["name", "resource_name", "target_actor_name"] {
             let descriptor = descriptors
                 .iter()
                 .find(|descriptor| descriptor.key == key)
@@ -1984,7 +1986,7 @@ mod editability_tests {
                 "{key} should be linked read-only"
             );
         }
-        for key in ["item_selector", "ordinary"] {
+        for key in ["graph_name", "item_selector", "ordinary"] {
             assert!(descriptors
                 .iter()
                 .find(|descriptor| descriptor.key == key)
@@ -2087,7 +2089,7 @@ mod editability_tests {
             }],
         });
 
-        for key in ["name", "resource_name", "character_name", "graph_name"] {
+        for key in ["name", "resource_name", "character_name"] {
             let original = object.raw_param(key).unwrap().to_string();
             object.insert_source_raw_param(key, format!("{original}_changed"));
             let error = validate_object_parameter_links(&prototype, &object, &binding)
@@ -2096,6 +2098,11 @@ mod editability_tests {
             object.insert_source_raw_param(key, original);
         }
 
+        object.insert_source_raw_param("graph_name", "route_b");
+        validate_object_parameter_links(&prototype, &object, &binding)
+            .expect("a graph_name edit changes only the actor's typed route reference");
+
+        object.insert_source_raw_param("graph_name", "route_a");
         object.insert_source_raw_param("manager_name", "manager_b");
         let error = validate_object_parameter_links(&prototype, &object, &binding)
             .expect_err("an unowned manager rename must be rejected");
