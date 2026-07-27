@@ -1151,8 +1151,8 @@ impl SmsEditorApp {
         if let Err(error) = self.save_model_instances() {
             self.log.push(error);
         }
-        self.rebuild_gpu_viewport_scene();
-        self.clear_viewport_preview_cache();
+        self.model_preview_revision = self.model_preview_revision.wrapping_add(1);
+        self.rebuild_model_preview_from_document_async();
         self.log.push(format!(
             "Placed model '{}' at {:.1}, {:.1}, {:.1}.",
             document.name, position[0], position[1], position[2]
@@ -1160,6 +1160,74 @@ impl SmsEditorApp {
         if first_authored_stage_model {
             self.frame_selected_model_instance();
         }
+    }
+
+    pub(super) fn build_model_drag_preview_geometry(
+        &self,
+        id: AssetId,
+    ) -> Result<ViewportDragPreviewGeometry, String> {
+        if self.document.is_none() || self.stage_id.trim().is_empty() {
+            return Err("open a stage before placing a model asset".to_string());
+        }
+        let document = if self.selected_model_asset == Some(id) {
+            self.selected_model_document.clone()
+        } else {
+            self.model_catalog()
+                .ok()
+                .and_then(|catalog| catalog.load_asset(id).ok())
+        }
+        .ok_or_else(|| "could not load the model asset for placement".to_string())?;
+        let origin = [0.0; 3];
+        let mut placement = ModelInstancePlacement::new(id, document.name.clone());
+        let authored_blank_stage = self
+            .document
+            .as_ref()
+            .and_then(|document| document.stage_archive.as_ref())
+            .is_some_and(|archive| {
+                matches!(archive.origin(), sms_scene::StageOrigin::Blank { .. })
+            });
+        if should_default_to_map_terrain(
+            authored_blank_stage,
+            document.collision.is_some(),
+            &self.stage_id,
+            &self.model_instances,
+        ) {
+            placement.export_mode = ModelInstanceExportMode::MapTerrain;
+        }
+        let loader_flags = model_instance_loader_flags(&placement, self.registry.as_ref())
+            .unwrap_or(SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS);
+        placement.transform = transform_to_matrix(Transform {
+            translation: origin,
+            ..Transform::default()
+        });
+        let instance = EditorModelInstance {
+            stage_id: self.stage_id.clone(),
+            placement,
+            local_bounds: model_document_bounds(&document).unwrap_or([[-50.0; 3], [50.0; 3]]),
+        };
+        let geometry = Arc::new(build_authored_model_preview(&document, loader_flags)?);
+        let key = AuthoredModelPreviewKey {
+            asset_id: id,
+            loader_flags,
+        };
+        let cache = BTreeMap::from([(key, geometry)]);
+        let mut preview = empty_authored_model_preview();
+        if append_authored_model_instances(
+            &mut preview,
+            &cache,
+            std::slice::from_ref(&instance),
+            &self.stage_id,
+            self.registry.as_ref(),
+        ) == 0
+        {
+            return Err("the model asset has no renderable preview geometry".to_string());
+        }
+        let model_index = preview
+            .triangles
+            .first()
+            .map(|triangle| triangle.model_index)
+            .ok_or_else(|| "the model asset has no renderable preview geometry".to_string())?;
+        viewport_drag_preview_geometry(&preview, model_index, origin)
     }
 
     pub(super) fn selected_model_instance(&self) -> Option<&EditorModelInstance> {
@@ -1553,46 +1621,13 @@ impl SmsEditorApp {
 
     pub(super) fn sync_authored_model_instance_preview(&mut self) {
         self.remove_authored_model_instance_preview();
-        if !self.model_instances.iter().any(|instance| {
-            instance.stage_id.eq_ignore_ascii_case(&self.stage_id)
-                && model_instance_preview_key(instance, self.registry.as_ref())
-                    .is_ok_and(|key| self.model_asset_preview_cache.contains_key(&key))
-        }) {
-            return;
-        }
-
-        let had_stage_preview = self.model_preview.is_some();
-        let preview = self
-            .model_preview
-            .get_or_insert_with(empty_authored_model_preview);
-        self.authored_model_preview_base = Some(AuthoredModelPreviewBase {
-            had_stage_preview,
-            triangle_count: preview.triangles.len(),
-            texture_count: preview.textures.len(),
-            material_count: preview.materials.len(),
-            material_binding_count: preview.material_animation_bindings.len(),
-            bounds_min: preview.bounds_min,
-            bounds_max: preview.bounds_max,
-            camera_bounds_min: preview.camera_bounds_min,
-            camera_bounds_max: preview.camera_bounds_max,
-            goop_surface_model_indices: preview.goop_surface_model_indices.clone(),
-        });
-        let appended = append_authored_model_instances(
-            preview,
+        self.authored_model_preview_base = append_authored_model_instances_to_stage_preview(
+            &mut self.model_preview,
             &self.model_asset_preview_cache,
             &self.model_instances,
             &self.stage_id,
             self.registry.as_ref(),
         );
-        if appended == 0 {
-            self.remove_authored_model_instance_preview();
-            return;
-        }
-        recompute_model_preview_bounds(preview);
-        if !had_stage_preview {
-            preview.camera_bounds_min = preview.bounds_min;
-            preview.camera_bounds_max = preview.bounds_max;
-        }
     }
 
     fn remove_authored_model_instance_preview(&mut self) {
@@ -4040,7 +4075,58 @@ pub(super) fn append_authored_model_instances(
     preview.triangles.len() - triangle_start
 }
 
-fn empty_authored_model_preview() -> ModelPreview {
+pub(super) fn append_authored_model_instances_to_stage_preview(
+    preview: &mut Option<ModelPreview>,
+    cache: &BTreeMap<AuthoredModelPreviewKey, Arc<AuthoredModelPreviewGeometry>>,
+    instances: &[EditorModelInstance],
+    stage_id: &str,
+    registry: Option<&ObjectRegistry>,
+) -> Option<AuthoredModelPreviewBase> {
+    if !instances.iter().any(|instance| {
+        instance.stage_id.eq_ignore_ascii_case(stage_id)
+            && model_instance_preview_key(instance, registry)
+                .is_ok_and(|key| cache.contains_key(&key))
+    }) {
+        return None;
+    }
+
+    let had_stage_preview = preview.is_some();
+    let (base, appended) = {
+        let stage_preview = preview.get_or_insert_with(empty_authored_model_preview);
+        let base = AuthoredModelPreviewBase {
+            had_stage_preview,
+            triangle_count: stage_preview.triangles.len(),
+            texture_count: stage_preview.textures.len(),
+            material_count: stage_preview.materials.len(),
+            material_binding_count: stage_preview.material_animation_bindings.len(),
+            bounds_min: stage_preview.bounds_min,
+            bounds_max: stage_preview.bounds_max,
+            camera_bounds_min: stage_preview.camera_bounds_min,
+            camera_bounds_max: stage_preview.camera_bounds_max,
+            goop_surface_model_indices: stage_preview.goop_surface_model_indices.clone(),
+        };
+        let appended =
+            append_authored_model_instances(stage_preview, cache, instances, stage_id, registry);
+        (base, appended)
+    };
+    if appended == 0 {
+        if !had_stage_preview {
+            *preview = None;
+        }
+        return None;
+    }
+    let stage_preview = preview
+        .as_mut()
+        .expect("authored model geometry was appended to a preview");
+    recompute_model_preview_bounds(stage_preview);
+    if !had_stage_preview {
+        stage_preview.camera_bounds_min = stage_preview.bounds_min;
+        stage_preview.camera_bounds_max = stage_preview.bounds_max;
+    }
+    Some(base)
+}
+
+pub(super) fn empty_authored_model_preview() -> ModelPreview {
     ModelPreview {
         points: Vec::new(),
         triangles: Vec::new(),
@@ -4323,6 +4409,12 @@ mod tests {
         app.renderer.camera_mut().distance = 2_500.0;
 
         app.spawn_model_instance_at(entry.id, [0.0, 0.0, 0.0]);
+        let context = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.model_preview_rebuild_receiver.is_some() && std::time::Instant::now() < deadline {
+            app.poll_model_preview_rebuild(&context);
+            std::thread::yield_now();
+        }
 
         assert_eq!(app.model_instances.len(), 1);
         assert_eq!(

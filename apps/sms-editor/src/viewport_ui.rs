@@ -318,14 +318,29 @@ impl SmsEditorApp {
             if let Some(pointer) = ui.input(|input| input.pointer.latest_pos()) {
                 if let Some(world) = self.viewport_placement_position(rect, pointer) {
                     self.clear_audio_helper_selection();
+                    let object_count = self
+                        .document
+                        .as_ref()
+                        .map_or(0, |document| document.objects.len());
                     self.spawn_object_at(payload.factory_name.clone(), world);
+                    if self
+                        .document
+                        .as_ref()
+                        .map_or(0, |document| document.objects.len())
+                        == object_count
+                    {
+                        self.clear_viewport_drag_preview();
+                    }
                     self.content_browser.inspector_active = false;
                 } else {
+                    self.clear_viewport_drag_preview();
                     self.log.push(format!(
                         "Could not place '{}': the cursor is not over scene or object geometry.",
                         payload.factory_name
                     ));
                 }
+            } else {
+                self.clear_viewport_drag_preview();
             }
             return;
         }
@@ -333,16 +348,45 @@ impl SmsEditorApp {
             if let Some(pointer) = ui.input(|input| input.pointer.latest_pos()) {
                 if let Some(world) = self.viewport_placement_position(rect, pointer) {
                     self.clear_audio_helper_selection();
+                    let instance_count = self.model_instances.len();
                     self.spawn_model_instance_at(payload.asset_id, world);
+                    if self.model_instances.len() == instance_count {
+                        self.clear_viewport_drag_preview();
+                    }
                     self.content_browser.inspector_active = false;
                 } else {
+                    self.clear_viewport_drag_preview();
                     self.log.push(
                         "Could not place the model: the cursor is not over scene or object geometry."
                             .to_string(),
                     );
                 }
+            } else {
+                self.clear_viewport_drag_preview();
             }
             return;
+        }
+        let drag_preview = response
+            .dnd_hover_payload::<ObjectPaletteDragPayload>()
+            .map(|payload| ViewportDragPreviewKey::Object(payload.factory_name.clone()))
+            .or_else(|| {
+                response
+                    .dnd_hover_payload::<ModelAssetDragPayload>()
+                    .map(|payload| ViewportDragPreviewKey::Model(payload.asset_id))
+            });
+        let drag_preview_position = drag_preview.as_ref().and_then(|_| {
+            ui.input(|input| input.pointer.latest_pos())
+                .and_then(|pointer| self.viewport_placement_position(rect, pointer))
+        });
+        match (drag_preview, drag_preview_position) {
+            (Some(key), Some(position)) => {
+                self.update_viewport_drag_preview(key, position);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Copy);
+            }
+            _ if self.model_preview_rebuild_receiver.is_none() => {
+                self.clear_viewport_drag_preview();
+            }
+            _ => {}
         }
         let (secondary_down, secondary_pressed) = ui.input(|input| {
             (
@@ -736,10 +780,13 @@ impl SmsEditorApp {
         let Some(preview) = self.model_preview.as_ref() else {
             return Some(self.screen_to_world_floor(rect, pos));
         };
-        let has_placement_geometry = preview
-            .triangles
-            .iter()
-            .any(preview_triangle_is_placement_surface);
+        let has_placement_geometry = preview.triangles.iter().any(|triangle| {
+            preview_triangle_is_placement_surface(triangle)
+                && self
+                    .viewport_drag_preview
+                    .as_ref()
+                    .is_none_or(|drag| triangle.model_index != drag.model_index)
+        });
         if !has_placement_geometry {
             // An empty authored stage needs one bootstrap placement before
             // there is any world geometry to raycast.
@@ -754,7 +801,13 @@ impl SmsEditorApp {
         let depth = preview
             .triangles
             .iter()
-            .filter(|triangle| preview_triangle_is_placement_surface(triangle))
+            .filter(|triangle| {
+                preview_triangle_is_placement_surface(triangle)
+                    && self
+                        .viewport_drag_preview
+                        .as_ref()
+                        .is_none_or(|drag| triangle.model_index != drag.model_index)
+            })
             .filter_map(|triangle| {
                 let projected = self.project_preview_triangle(rect, size, triangle)?;
                 projected_triangle_depth_at_point(
@@ -782,6 +835,187 @@ impl SmsEditorApp {
         let distance = depth / forward_component;
         (distance.is_finite() && distance > 0.0)
             .then(|| vec3_add(frame.position, vec3_scale(ray, distance)))
+    }
+
+    fn update_viewport_drag_preview(&mut self, key: ViewportDragPreviewKey, position: [f32; 3]) {
+        if self
+            .viewport_drag_preview
+            .as_ref()
+            .is_some_and(|preview| preview.key == key)
+        {
+            self.move_viewport_drag_preview(position);
+            return;
+        }
+        if self.viewport_drag_preview_failed_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.clear_viewport_drag_preview();
+        let geometry = match &key {
+            ViewportDragPreviewKey::Object(factory_name) => {
+                self.build_object_drag_preview_geometry(factory_name)
+            }
+            ViewportDragPreviewKey::Model(asset_id) => {
+                self.build_model_drag_preview_geometry(*asset_id)
+            }
+        };
+        match geometry {
+            Ok(geometry) => self.append_viewport_drag_preview(key, geometry, position),
+            Err(error) => {
+                self.log
+                    .push(format!("Could not show the placement preview: {error}."));
+                self.viewport_drag_preview_failed_key = Some(key);
+            }
+        }
+    }
+
+    fn append_viewport_drag_preview(
+        &mut self,
+        key: ViewportDragPreviewKey,
+        geometry: ViewportDragPreviewGeometry,
+        position: [f32; 3],
+    ) {
+        self.sync_authored_model_instance_preview();
+        let had_stage_preview = self.model_preview.is_some();
+        let preview = self
+            .model_preview
+            .get_or_insert_with(empty_authored_model_preview);
+        let texture_start = preview.textures.len();
+        preview.textures.extend(geometry.textures.iter().cloned());
+        let material_start = preview.materials.len();
+        preview
+            .materials
+            .extend(
+                geometry
+                    .materials
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(index, mut material)| {
+                        material.material_index = material_start + index;
+                        for index in material.texture_indices.iter_mut().flatten() {
+                            *index += texture_start;
+                        }
+                        material
+                    }),
+            );
+        let material_binding_start = preview.material_animation_bindings.len();
+        preview
+            .material_animation_bindings
+            .resize_with(preview.materials.len(), Vec::new);
+        let model_index = preview
+            .triangles
+            .iter()
+            .map(|triangle| triangle.model_index)
+            .chain(preview.points.iter().map(|point| point.model_index))
+            .max()
+            .map_or(0, |index| index + 1);
+        let packet_base = preview
+            .triangles
+            .iter()
+            .map(|triangle| triangle.packet_index)
+            .max()
+            .map_or(0, |index| index + 1);
+        let triangle_start = preview.triangles.len();
+        preview
+            .triangles
+            .extend(geometry.triangles.iter().map(|triangle| {
+                positioned_viewport_drag_triangle(
+                    *triangle,
+                    geometry.origin,
+                    position,
+                    material_start,
+                    texture_start,
+                    packet_base,
+                    model_index,
+                )
+            }));
+        let triangle_range = triangle_start..preview.triangles.len();
+        // The GPU renderer compacts static batches into indexed buffers. Mark
+        // this transient model as an object so its vertices stay updateable
+        // while the pointer moves.
+        preview
+            .object_model_indices
+            .insert(VIEWPORT_DRAG_PREVIEW_OBJECT_ID.to_string(), model_index);
+        self.viewport_drag_preview = Some(ViewportDragPreview {
+            key,
+            geometry,
+            position,
+            had_stage_preview,
+            triangle_range,
+            texture_start,
+            material_start,
+            material_binding_start,
+            model_index,
+        });
+        self.viewport_drag_preview_failed_key = None;
+        if let (Some(target_format), Some(preview)) =
+            (self.gpu_target_format, self.model_preview.as_ref())
+        {
+            self.gpu_viewport = Some(gpu_viewport::GpuViewportScene::from_preview(
+                preview,
+                target_format,
+            ));
+        }
+        self.clear_viewport_preview_cache();
+    }
+
+    fn move_viewport_drag_preview(&mut self, position: [f32; 3]) {
+        let (Some(state), Some(preview)) = (
+            self.viewport_drag_preview.as_mut(),
+            self.model_preview.as_mut(),
+        ) else {
+            return;
+        };
+        if state.position == position {
+            return;
+        }
+        let packet_base = preview.triangles[..state.triangle_range.start]
+            .iter()
+            .map(|triangle| triangle.packet_index)
+            .max()
+            .map_or(0, |index| index + 1);
+        for (triangle, source) in preview.triangles[state.triangle_range.clone()]
+            .iter_mut()
+            .zip(state.geometry.triangles.iter())
+        {
+            *triangle = positioned_viewport_drag_triangle(
+                *source,
+                state.geometry.origin,
+                position,
+                state.material_start,
+                state.texture_start,
+                packet_base,
+                state.model_index,
+            );
+        }
+        state.position = position;
+        if let Some(gpu_viewport) = self.gpu_viewport.as_ref() {
+            gpu_viewport.update_geometry(preview, std::slice::from_ref(&state.triangle_range));
+        }
+        self.clear_viewport_preview_cache();
+    }
+
+    fn clear_viewport_drag_preview(&mut self) {
+        self.viewport_drag_preview_failed_key = None;
+        let Some(state) = self.viewport_drag_preview.take() else {
+            return;
+        };
+        if let Some(preview) = self.model_preview.as_mut() {
+            preview
+                .object_model_indices
+                .remove(VIEWPORT_DRAG_PREVIEW_OBJECT_ID);
+            preview.triangles.truncate(state.triangle_range.start);
+            preview.textures.truncate(state.texture_start);
+            preview.materials.truncate(state.material_start);
+            preview
+                .material_animation_bindings
+                .truncate(state.material_binding_start);
+        }
+        if !state.had_stage_preview {
+            self.model_preview = None;
+        }
+        self.rebuild_gpu_viewport_scene();
+        self.clear_viewport_preview_cache();
     }
 
     pub(super) fn handle_viewport_keyboard_fly(
@@ -2461,6 +2695,36 @@ fn point_segment_distance(point: egui::Pos2, start: egui::Pos2, end: egui::Pos2)
     let projection =
         ((offset.x * segment.x + offset.y * segment.y) / length_squared).clamp(0.0, 1.0);
     point.distance(start + segment * projection)
+}
+
+pub(super) fn positioned_viewport_drag_triangle(
+    mut triangle: PreviewTriangle,
+    origin: [f32; 3],
+    position: [f32; 3],
+    material_base: usize,
+    texture_base: usize,
+    packet_base: usize,
+    model_index: usize,
+) -> PreviewTriangle {
+    let translation = vec3_sub(position, origin);
+    let transform = Transform {
+        translation,
+        ..Transform::default()
+    };
+    triangle.vertices = triangle
+        .vertices
+        .map(|vertex| vec3_add(vertex, translation));
+    triangle.material_index = triangle.material_index.map(|index| material_base + index);
+    triangle.texture_index = triangle.texture_index.map(|index| texture_base + index);
+    triangle.mask_texture_index = triangle
+        .mask_texture_index
+        .map(|index| texture_base + index);
+    triangle.packet_index += packet_base;
+    triangle.model_index = model_index;
+    triangle.billboard = triangle
+        .billboard
+        .and_then(|billboard| transform_j3d_billboard(billboard, transform, triangle.normals));
+    triangle
 }
 
 pub(super) fn transform_from_gizmo_drag(

@@ -2586,7 +2586,7 @@ impl SmsEditorApp {
                 })
             }
         };
-        self.apply_object_edit(
+        self.apply_object_edit_before_preview_rebuild(
             "Added object",
             ObjectUndoRecord {
                 deltas: vec![ObjectDelta::Insert { index, object }],
@@ -2600,7 +2600,98 @@ impl SmsEditorApp {
         if let Some(message) = catalog_log {
             self.log.push(message);
         }
-        self.rebuild_model_preview_from_document();
+        self.rebuild_model_preview_from_document_async();
+    }
+
+    pub(super) fn build_object_drag_preview_geometry(
+        &self,
+        factory_name: &str,
+    ) -> Result<ViewportDragPreviewGeometry, String> {
+        if self
+            .registry
+            .as_ref()
+            .and_then(|registry| registry.find_object(factory_name))
+            .is_some_and(|definition| definition.unsafe_to_edit)
+        {
+            return Err("the schema marks this class unsafe to edit".to_string());
+        }
+        let document = self
+            .document
+            .as_ref()
+            .ok_or_else(|| "open a stage before placing an object class".to_string())?;
+        let origin = [0.0; 3];
+        let preview_id = "__graffito_drag_preview".to_string();
+        let same_stage_template = document
+            .objects
+            .iter()
+            .find(|object| object.factory_name == factory_name && object.placement.is_some())
+            .cloned();
+        if let Some((template, preview, model_index)) =
+            same_stage_template.as_ref().and_then(|template| {
+                let preview = self.model_preview.as_ref()?;
+                let model_index = preview.object_model_indices.get(&template.id).copied()?;
+                Some((template, preview, model_index))
+            })
+        {
+            return viewport_drag_preview_geometry(
+                preview,
+                model_index,
+                template.transform.translation,
+            );
+        }
+        let catalog_template = same_stage_template
+            .is_none()
+            .then(|| self.object_authoring_catalog.find(factory_name).cloned())
+            .flatten();
+        let mut preview_document = document.clone();
+
+        let mut object = if matches!(factory_name, "Mario" | "Sky") {
+            SceneObject::new(preview_id.clone(), factory_name.to_string())
+        } else if let Some(template) = same_stage_template {
+            duplicate_object_for_spawn(template, preview_id.clone(), origin, self.registry.as_ref())
+        } else if let Some(template) = catalog_template {
+            let preflight = preflight_catalog_resources(document, &template)?;
+            let mut object = object_from_catalog_template(
+                preview_id.clone(),
+                factory_name.to_string(),
+                origin,
+                &template,
+                &preflight.graph_name_rewrites,
+            )?;
+            let resource_deltas = catalog_resource_edit_deltas(document, preflight.writes);
+            ObjectUndoRecord {
+                deltas: Vec::new(),
+                resource_deltas,
+                route_delta: None,
+                dialogue_delta: None,
+            }
+            .apply_forward(&mut preview_document);
+            add_catalog_preview_hint(&mut object, &preview_document, &template);
+            object
+        } else {
+            return Err(
+                "this stage has no typed instance to duplicate and the retail authoring catalog has no template"
+                    .to_string(),
+            );
+        };
+        object.transform.translation = origin;
+        if let Some(registry) = self.registry.as_ref() {
+            preview_document.refresh_registry_derived_object_fields(
+                std::slice::from_mut(&mut object),
+                registry,
+            );
+        }
+        preview_document.objects.clear();
+        preview_document.objects.push(object);
+
+        let preview = Self::build_model_preview(&preview_document, self.preview_visibility())
+            .ok_or_else(|| "the class has no renderable preview model".to_string())?;
+        let model_index = preview
+            .object_model_indices
+            .get(&preview_id)
+            .copied()
+            .ok_or_else(|| "the class has no renderable preview model".to_string())?;
+        viewport_drag_preview_geometry(&preview, model_index, origin)
     }
 
     pub(super) fn can_spawn_factory(&self, factory_name: &str) -> bool {
@@ -3166,6 +3257,24 @@ impl SmsEditorApp {
     }
 
     fn apply_object_edit(&mut self, label: &str, record: ObjectUndoRecord) {
+        self.apply_object_edit_inner(label, record, true);
+    }
+
+    fn apply_object_edit_before_preview_rebuild(&mut self, label: &str, record: ObjectUndoRecord) {
+        // Rebuilding the preview below already refreshes validation. More
+        // importantly, save_project_folder serializes the authoritative
+        // overlay immediately before writing it. Avoid pretty-serializing a
+        // potentially hundreds-of-megabytes archive overlay on the UI thread
+        // merely because the mouse button was released.
+        self.apply_object_edit_inner(label, record, false);
+    }
+
+    fn apply_object_edit_inner(
+        &mut self,
+        label: &str,
+        record: ObjectUndoRecord,
+        flush_overlay: bool,
+    ) {
         if record.is_empty() {
             return;
         }
@@ -3193,9 +3302,12 @@ impl SmsEditorApp {
                 &self.saved_dialogue_library,
             )
         };
+        self.model_preview_revision = self.model_preview_revision.wrapping_add(1);
         if !in_transaction {
             self.push_undo_record(record);
-            self.flush_document_change();
+            if flush_overlay {
+                self.flush_document_change();
+            }
             if rebuild_dialogue_index {
                 self.schedule_dialogue_index_rebuild();
                 self.schedule_dialogue_consumer_index_rebuild();
@@ -3205,12 +3317,15 @@ impl SmsEditorApp {
     }
 
     pub(super) fn flush_document_change(&mut self) {
-        let Some(document) = &mut self.document else {
+        self.model_preview_revision = self.model_preview_revision.wrapping_add(1);
+        let Some(document) = &self.document else {
             return;
         };
-        if let Err(err) = document.queue_editor_overlay_change() {
-            self.log.push(format!("Scene overlay update failed: {err}"));
-        }
+        // The document is authoritative while editing. Serializing its full
+        // project overlay here can copy and pretty-print hundreds of megabytes
+        // after a one-field change. save_project_folder queues a fresh overlay
+        // immediately before every explicit save (and the required pre-build
+        // save), so keep the interactive path to validation only.
         self.issues = validation_issues_for_preview(document, self.model_preview.as_ref());
     }
 
@@ -3506,6 +3621,11 @@ impl SmsEditorApp {
     }
 
     pub(super) fn rebuild_model_preview_from_document(&mut self) {
+        self.model_preview_rebuild_receiver = None;
+        // A full rebuild supersedes any retained drop proxy. Do not truncate
+        // the newly built preview later using ranges from the old scene.
+        self.viewport_drag_preview = None;
+        self.viewport_drag_preview_failed_key = None;
         self.refresh_goop_stale_from_final_terrain();
         self.rebuild_audio_cube_helpers_cache();
         let visibility = self.preview_visibility();
@@ -3525,6 +3645,100 @@ impl SmsEditorApp {
         self.last_level_transform_progress_bits = u32::MAX;
         self.rebuild_gpu_viewport_scene();
         self.clear_viewport_preview_cache();
+    }
+
+    pub(super) fn rebuild_model_preview_from_document_async(&mut self) {
+        self.refresh_goop_stale_from_final_terrain();
+        self.rebuild_audio_cube_helpers_cache();
+        let Some(document) = self.document.clone() else {
+            self.rebuild_model_preview_from_document();
+            return;
+        };
+        let revision = self.model_preview_revision;
+        let stage_id = document.stage_id.clone();
+        let visibility = self.preview_visibility();
+        let target_format = self.gpu_target_format;
+        let model_asset_preview_cache = self.model_asset_preview_cache.clone();
+        let model_instances = self.model_instances.clone();
+        let registry = self.registry.clone();
+        let repaint_context = self.repaint_context.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.model_preview_rebuild_receiver = Some(receiver);
+        thread::spawn(move || {
+            let render_scene = RenderScene::from_document(&document);
+            let mut model_preview = SmsEditorApp::build_model_preview(&document, visibility);
+            let authored_model_preview_base = append_authored_model_instances_to_stage_preview(
+                &mut model_preview,
+                &model_asset_preview_cache,
+                &model_instances,
+                &stage_id,
+                registry.as_ref(),
+            );
+            let issues = validation_issues_for_preview(&document, model_preview.as_ref());
+            let gpu_viewport =
+                target_format
+                    .zip(model_preview.as_ref())
+                    .map(|(target_format, preview)| {
+                        gpu_viewport::GpuViewportScene::from_preview(preview, target_format)
+                    });
+            let _ = sender.send(ModelPreviewRebuildResult {
+                revision,
+                stage_id,
+                render_scene,
+                model_preview,
+                authored_model_preview_base,
+                gpu_viewport,
+                issues,
+            });
+            if let Some(context) = repaint_context {
+                context.request_repaint();
+            }
+        });
+        self.clear_viewport_preview_cache();
+    }
+
+    pub(super) fn poll_model_preview_rebuild(&mut self, ctx: &egui::Context) {
+        let result = self
+            .model_preview_rebuild_receiver
+            .as_ref()
+            .map(Receiver::try_recv);
+        match result {
+            Some(Ok(result)) => {
+                self.model_preview_rebuild_receiver = None;
+                let stage_is_current = self
+                    .document
+                    .as_ref()
+                    .is_some_and(|document| document.stage_id == result.stage_id);
+                if result.revision != self.model_preview_revision || !stage_is_current {
+                    if stage_is_current {
+                        self.rebuild_model_preview_from_document_async();
+                    }
+                    return;
+                }
+                self.viewport_drag_preview = None;
+                self.viewport_drag_preview_failed_key = None;
+                self.render_scene = Some(result.render_scene);
+                self.authored_model_preview_base = result.authored_model_preview_base;
+                self.model_preview = result.model_preview;
+                self.gpu_viewport = result.gpu_viewport;
+                self.issues = result.issues;
+                self.last_level_transform_progress_bits = u32::MAX;
+                self.clear_viewport_preview_cache();
+                ctx.request_repaint();
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.model_preview_rebuild_receiver = None;
+                self.log.push(
+                    "The background viewport rebuild stopped unexpectedly; rebuilding now."
+                        .to_string(),
+                );
+                self.rebuild_model_preview_from_document();
+            }
+            Some(Err(TryRecvError::Empty)) => {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+            None => {}
+        }
     }
 
     pub(super) fn update_object_preview_transform(
@@ -3830,6 +4044,62 @@ mod tests {
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         }
+    }
+
+    #[test]
+    fn completed_background_preview_atomically_replaces_the_drag_proxy() {
+        let document = command_test_document(Vec::new());
+        let render_scene = RenderScene::from_document(&document);
+        let mut rebuilt_preview = empty_authored_model_preview();
+        rebuilt_preview.loaded_models = 7;
+        let drag_geometry = ViewportDragPreviewGeometry {
+            origin: [0.0; 3],
+            triangles: Vec::new(),
+            textures: Vec::new(),
+            materials: Vec::new(),
+        };
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(ModelPreviewRebuildResult {
+                revision: 11,
+                stage_id: document.stage_id.clone(),
+                render_scene,
+                model_preview: Some(rebuilt_preview),
+                authored_model_preview_base: None,
+                gpu_viewport: None,
+                issues: Vec::new(),
+            })
+            .unwrap();
+        let mut app = SmsEditorApp {
+            stage_id: document.stage_id.clone(),
+            document: Some(document),
+            viewport_drag_preview: Some(ViewportDragPreview {
+                key: ViewportDragPreviewKey::Object("Fixture".to_string()),
+                geometry: drag_geometry,
+                position: [10.0, 20.0, 30.0],
+                had_stage_preview: true,
+                triangle_range: 0..0,
+                texture_start: 0,
+                material_start: 0,
+                material_binding_start: 0,
+                model_index: 0,
+            }),
+            model_preview_revision: 11,
+            model_preview_rebuild_receiver: Some(receiver),
+            ..SmsEditorApp::default()
+        };
+
+        app.poll_model_preview_rebuild(&egui::Context::default());
+
+        assert!(app.viewport_drag_preview.is_none());
+        assert!(app.model_preview_rebuild_receiver.is_none());
+        assert_eq!(
+            app.model_preview
+                .as_ref()
+                .expect("completed preview")
+                .loaded_models,
+            7
+        );
     }
 
     #[test]
@@ -4190,6 +4460,35 @@ mod tests {
                 .len(),
             document.objects.len()
         );
+    }
+
+    #[test]
+    fn spawn_defers_full_overlay_serialization_until_save_preparation() {
+        let mut template = SceneObject::new("fixture0-obj-0001", "FixtureEnemy");
+        template.placement = Some(sms_scene::PlacementBinding::Existing(
+            sms_scene::PlacementAddress {
+                raw_resource_path: b"map/scene.bin".to_vec(),
+                record_path: vec![4, 0],
+            },
+        ));
+        let mut app = SmsEditorApp {
+            stage_id: "fixture0".to_string(),
+            document: Some(command_test_document(vec![template])),
+            ..SmsEditorApp::default()
+        };
+
+        app.spawn_object_at("FixtureEnemy".to_string(), [10.0, 20.0, 30.0]);
+
+        let document = app.document.as_mut().unwrap();
+        assert!(
+            document.changed_files.is_empty(),
+            "mouse release must not serialize the full editor overlay"
+        );
+        document.queue_editor_overlay_change().unwrap();
+        let overlay_path = document.editor_overlay_path().unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&document.changed_files[&overlay_path]).unwrap();
+        assert_eq!(json["objects"].as_array().unwrap().len(), 2);
     }
 
     #[test]

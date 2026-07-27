@@ -271,6 +271,36 @@ fn geometry_updates_touch_only_requested_triangle_batches() {
 }
 
 #[test]
+fn transient_drag_preview_geometry_remains_updateable_after_gpu_batch_packing() {
+    let mut preview = shared_static_quad_preview();
+    preview.object_model_indices.insert(
+        crate::VIEWPORT_DRAG_PREVIEW_OBJECT_ID.to_string(),
+        preview.triangles[0].model_index,
+    );
+    let mut scene = GpuSceneData::from_preview(&preview);
+    let locations = scene
+        .triangle_vertices
+        .iter()
+        .map(|location| location.expect("drag preview triangles must remain addressable"))
+        .collect::<Vec<_>>();
+    assert!(scene.batches[locations[0].batch_index].indices.is_none());
+
+    preview.triangles[0].vertices[0] = [50.0, 60.0, 70.0];
+    let mut dirty_vertex_ranges = vec![None; scene.batches.len()];
+    let drag_preview_range = 0..1;
+    assert!(scene.update_geometry(
+        &preview,
+        std::slice::from_ref(&drag_preview_range),
+        &mut dirty_vertex_ranges
+    ));
+    assert_eq!(
+        scene.batches[locations[0].batch_index].vertices[locations[0].vertex_offset].position,
+        [50.0, 60.0, 70.0]
+    );
+    assert!(dirty_vertex_ranges[locations[0].batch_index].is_some());
+}
+
+#[test]
 fn geometry_updates_keep_dynamic_particle_shape_metadata() {
     let mut preview = geometry_update_preview();
     preview.triangles[1].particle_type = Some(3);

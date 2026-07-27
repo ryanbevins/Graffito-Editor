@@ -759,6 +759,82 @@ fn viewport_placement_keeps_the_empty_stage_bootstrap_path() {
 }
 
 #[test]
+fn viewport_drag_preview_follows_the_geometry_placement_without_hitting_itself() {
+    let mut preview = preview_for_texture_alpha(false, false);
+    for (model_index, depth, extent) in [(1, 1_000.0, 200.0), (2, 500.0, 100.0)] {
+        let mut triangle = textured_blended_triangle();
+        triangle.vertices = [
+            [-extent, -extent, depth],
+            [extent, -extent, depth],
+            [0.0, extent, depth],
+        ];
+        triangle.model_index = model_index;
+        triangle.texture_index = None;
+        triangle.tex_coords = None;
+        preview.triangles.push(triangle);
+    }
+    let geometry =
+        viewport_drag_preview_geometry(&preview, 2, [0.0; 3]).expect("drag preview geometry");
+    let app = SmsEditorApp {
+        viewport_drag_preview: Some(ViewportDragPreview {
+            key: ViewportDragPreviewKey::Object("Coin".to_string()),
+            geometry,
+            position: [0.0, 0.0, 500.0],
+            had_stage_preview: true,
+            triangle_range: 1..2,
+            texture_start: preview.textures.len(),
+            material_start: preview.materials.len(),
+            material_binding_start: preview.material_animation_bindings.len(),
+            model_index: 2,
+        }),
+        model_preview: Some(preview),
+        ..camera_app()
+    };
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
+
+    assert_vec3_close(
+        app.viewport_placement_position(rect, rect.center())
+            .expect("the stage surface behind the preview should remain hittable"),
+        [0.0, 0.0, 1_000.0],
+    );
+}
+
+#[test]
+fn viewport_drag_preview_triangle_moves_and_remaps_shared_render_resources() {
+    let mut triangle = textured_blended_triangle();
+    triangle.vertices = [[10.0, 20.0, 30.0], [20.0, 20.0, 30.0], [10.0, 30.0, 30.0]];
+    triangle.material_index = Some(2);
+    triangle.texture_index = Some(3);
+    triangle.mask_texture_index = Some(4);
+    triangle.packet_index = 5;
+    triangle.model_index = 6;
+
+    let positioned = viewport_ui::positioned_viewport_drag_triangle(
+        triangle,
+        [10.0, 20.0, 30.0],
+        [110.0, 220.0, 330.0],
+        7,
+        11,
+        13,
+        17,
+    );
+
+    assert_eq!(
+        positioned.vertices,
+        [
+            [110.0, 220.0, 330.0],
+            [120.0, 220.0, 330.0],
+            [110.0, 230.0, 330.0],
+        ]
+    );
+    assert_eq!(positioned.material_index, Some(9));
+    assert_eq!(positioned.texture_index, Some(14));
+    assert_eq!(positioned.mask_texture_index, Some(15));
+    assert_eq!(positioned.packet_index, 18);
+    assert_eq!(positioned.model_index, 17);
+}
+
+#[test]
 fn selected_object_outline_keeps_the_silhouette_and_removes_internal_edges() {
     let mut preview = preview_for_texture_alpha(false, false);
     preview
@@ -4066,7 +4142,10 @@ fn transform_transaction_creates_one_undo_entry() {
             if before.transform.translation[0] == 0.0
                 && after.transform.translation[0] == 20.0
     ));
-    assert_eq!(app.document.as_ref().unwrap().changed_files.len(), 1);
+    assert!(
+        app.document.as_ref().unwrap().changed_files.is_empty(),
+        "committing an edit must defer the full overlay until save"
+    );
     app.undo();
     assert_eq!(app.selected_object().unwrap().transform.translation[0], 0.0);
     app.redo();
@@ -4074,6 +4153,9 @@ fn transform_transaction_creates_one_undo_entry() {
         app.selected_object().unwrap().transform.translation[0],
         20.0
     );
+    let document = app.document.as_mut().unwrap();
+    document.queue_editor_overlay_change().unwrap();
+    assert_eq!(document.changed_files.len(), 1);
 }
 
 fn test_document(objects: Vec<SceneObject>) -> StageDocument {

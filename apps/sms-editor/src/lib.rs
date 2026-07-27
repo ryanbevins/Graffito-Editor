@@ -257,6 +257,16 @@ struct LoadedStage {
     music_warning: Option<String>,
 }
 
+struct ModelPreviewRebuildResult {
+    revision: u64,
+    stage_id: String,
+    render_scene: RenderScene,
+    model_preview: Option<ModelPreview>,
+    authored_model_preview_base: Option<AuthoredModelPreviewBase>,
+    gpu_viewport: Option<gpu_viewport::GpuViewportScene>,
+    issues: Vec<ValidationIssue>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ObjectAuthoringCatalogCacheKey {
     base_root: String,
@@ -897,6 +907,8 @@ struct SmsEditorApp {
     game_content_index: GameContentIndexState,
     content_thumbnails: ContentThumbnailService,
     model_preview: Option<ModelPreview>,
+    viewport_drag_preview: Option<ViewportDragPreview>,
+    viewport_drag_preview_failed_key: Option<ViewportDragPreviewKey>,
     gpu_viewport: Option<gpu_viewport::GpuViewportScene>,
     gpu_target_format: Option<eframe::wgpu::TextureFormat>,
     model_framebuffer: Option<egui::TextureHandle>,
@@ -1036,6 +1048,9 @@ struct SmsEditorApp {
     background_receiver: Option<Receiver<BackgroundResult>>,
     background_label: Option<String>,
     active_build_cancel: Option<Arc<AtomicBool>>,
+    model_preview_revision: u64,
+    model_preview_rebuild_receiver: Option<Receiver<ModelPreviewRebuildResult>>,
+    repaint_context: Option<egui::Context>,
     embedded_dolphin: Option<play_in_editor::EmbeddedDolphinSession>,
     animation_started_at: Instant,
     last_skeletal_animation_tick: u64,
@@ -1145,6 +1160,8 @@ impl Default for SmsEditorApp {
             game_content_index: GameContentIndexState::default(),
             content_thumbnails: ContentThumbnailService::default(),
             model_preview: None,
+            viewport_drag_preview: None,
+            viewport_drag_preview_failed_key: None,
             gpu_viewport: None,
             gpu_target_format: None,
             model_framebuffer: None,
@@ -1284,6 +1301,9 @@ impl Default for SmsEditorApp {
             background_receiver: None,
             background_label: None,
             active_build_cancel: None,
+            model_preview_revision: 0,
+            model_preview_rebuild_receiver: None,
+            repaint_context: None,
             embedded_dolphin: None,
             animation_started_at: Instant::now(),
             last_skeletal_animation_tick: u64::MAX,
@@ -1303,6 +1323,7 @@ impl SmsEditorApp {
                 .wgpu_render_state
                 .as_ref()
                 .map(|render_state| render_state.target_format),
+            repaint_context: Some(cc.egui_ctx.clone()),
             ..Self::default()
         }
     }
@@ -1310,8 +1331,10 @@ impl SmsEditorApp {
 
 impl eframe::App for SmsEditorApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.repaint_context = Some(ctx.clone());
         self.finish_dialogue_transaction_if_selection_changed();
         self.poll_background_task(ctx, Some(frame));
+        self.poll_model_preview_rebuild(ctx);
         self.poll_dialogue_index(ctx);
         self.sync_game_content_index();
         self.poll_game_content_index(ctx);

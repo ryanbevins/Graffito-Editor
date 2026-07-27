@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) const VIEWPORT_DRAG_PREVIEW_OBJECT_ID: &str = "__graffito_viewport_drag_preview";
+
 #[derive(Clone)]
 pub(super) struct ModelPreview {
     pub(super) points: Vec<PreviewPoint>,
@@ -42,6 +44,105 @@ pub(super) struct ModelPreview {
     pub(super) actor_particles: Vec<LevelTransformParticlePreview>,
     pub(super) level_transform_duration_frames: f32,
     pub(super) level_transform_particle_end_frames: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ViewportDragPreviewKey {
+    Object(String),
+    Model(sms_authoring::AssetId),
+}
+
+#[derive(Clone)]
+pub(super) struct ViewportDragPreviewGeometry {
+    pub(super) origin: [f32; 3],
+    pub(super) triangles: Vec<PreviewTriangle>,
+    pub(super) textures: Vec<PreviewTexture>,
+    pub(super) materials: Vec<J3dMaterial>,
+}
+
+pub(super) struct ViewportDragPreview {
+    pub(super) key: ViewportDragPreviewKey,
+    pub(super) geometry: ViewportDragPreviewGeometry,
+    pub(super) position: [f32; 3],
+    pub(super) had_stage_preview: bool,
+    pub(super) triangle_range: std::ops::Range<usize>,
+    pub(super) texture_start: usize,
+    pub(super) material_start: usize,
+    pub(super) material_binding_start: usize,
+    pub(super) model_index: usize,
+}
+
+pub(super) fn viewport_drag_preview_geometry(
+    preview: &ModelPreview,
+    model_index: usize,
+    origin: [f32; 3],
+) -> Result<ViewportDragPreviewGeometry, String> {
+    let mut triangles = preview
+        .triangles
+        .iter()
+        .filter(|triangle| triangle.model_index == model_index)
+        .copied()
+        .collect::<Vec<_>>();
+    if triangles.is_empty() {
+        return Err("the class has no renderable preview model".to_string());
+    }
+    let material_indices = triangles
+        .iter()
+        .filter_map(|triangle| triangle.material_index)
+        .collect::<BTreeSet<_>>();
+    let mut texture_indices = triangles
+        .iter()
+        .flat_map(|triangle| [triangle.texture_index, triangle.mask_texture_index])
+        .flatten()
+        .collect::<BTreeSet<_>>();
+    for material_index in &material_indices {
+        if let Some(material) = preview.materials.get(*material_index) {
+            texture_indices.extend(material.texture_indices.iter().flatten().copied());
+        }
+    }
+    let texture_remap = texture_indices
+        .iter()
+        .enumerate()
+        .map(|(new, old)| (*old, new))
+        .collect::<BTreeMap<_, _>>();
+    let material_remap = material_indices
+        .iter()
+        .enumerate()
+        .map(|(new, old)| (*old, new))
+        .collect::<BTreeMap<_, _>>();
+    let textures = texture_indices
+        .iter()
+        .filter_map(|index| preview.textures.get(*index).cloned())
+        .collect();
+    let materials = material_indices
+        .iter()
+        .filter_map(|index| preview.materials.get(*index).cloned())
+        .enumerate()
+        .map(|(index, mut material)| {
+            material.material_index = index;
+            for texture_index in material.texture_indices.iter_mut().flatten() {
+                *texture_index = texture_remap[texture_index];
+            }
+            material
+        })
+        .collect();
+    for triangle in &mut triangles {
+        triangle.material_index = triangle
+            .material_index
+            .and_then(|index| material_remap.get(&index).copied());
+        triangle.texture_index = triangle
+            .texture_index
+            .and_then(|index| texture_remap.get(&index).copied());
+        triangle.mask_texture_index = triangle
+            .mask_texture_index
+            .and_then(|index| texture_remap.get(&index).copied());
+    }
+    Ok(ViewportDragPreviewGeometry {
+        origin,
+        triangles,
+        textures,
+        materials,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
