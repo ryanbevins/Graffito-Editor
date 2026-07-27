@@ -75,10 +75,11 @@ pub use object_authoring::{
 pub(crate) use object_parameters::validate_object_parameter_links_with_owned_name;
 pub use object_parameters::{
     apply_all_object_parameters, apply_dirty_object_parameter_edits, apply_object_parameter_edits,
-    editable_object_parameters, editable_parameters_for_object, seed_scene_object_parameters,
-    sync_scene_object_parameter_aliases, EditableSceneParameter, ObjectParameterBitFlag,
-    ObjectParameterChoice, ObjectParameterIndexedChoice, ObjectParameterInfo, ObjectParameterKind,
-    ParameterApplyMode, OBJECT_PARAMETER_CHARACTER_NAME, OBJECT_PARAMETER_NAME,
+    editable_object_parameters, editable_parameters_for_object, generated_clone_runtime_name,
+    seed_scene_object_parameters, sync_scene_object_parameter_aliases, EditableSceneParameter,
+    ObjectParameterBitFlag, ObjectParameterChoice, ObjectParameterIndexedChoice,
+    ObjectParameterInfo, ObjectParameterKind, ParameterApplyMode, OBJECT_PARAMETER_CHARACTER_NAME,
+    OBJECT_PARAMETER_NAME,
 };
 pub use route_authoring::{
     BezierHandles, RouteAssignmentSuggestion, RouteAuthoringDocument, RouteAuthoringError,
@@ -3336,6 +3337,7 @@ mod tests {
                 raw_resource_path: b"map/catalog.prm".to_vec(),
                 document: parameter_document(),
                 mode: StageResourceEditMode::Insert,
+                catalog_managed: false,
             }),
             None,
             None,
@@ -3346,6 +3348,7 @@ mod tests {
                 raw_resource_path: b"map/base.prm".to_vec(),
                 document: parameter_document(),
                 mode: StageResourceEditMode::Upsert,
+                catalog_managed: false,
             }),
             None,
             None,

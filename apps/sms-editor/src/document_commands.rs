@@ -556,6 +556,7 @@ fn catalog_resource_edit_deltas(
                 } else {
                     sms_scene::StageResourceEditMode::Insert
                 },
+                catalog_managed: true,
             }),
             edit_index: delta.after.edit_index.or_else(|| {
                 let index = next_new_index;
@@ -577,6 +578,175 @@ struct CatalogResourceRepair {
     runtime_links_added: usize,
     repaired_factories: Vec<String>,
     errors: Vec<String>,
+}
+
+#[derive(Default)]
+struct CatalogResourceMaintenance {
+    resource_deltas: Vec<ResourceEditDelta>,
+    migrated_resources: usize,
+    pruned_resources: usize,
+    errors: Vec<String>,
+}
+
+fn authored_catalog_factories(
+    document: &StageDocument,
+    excluded_object_id: Option<&str>,
+) -> BTreeSet<String> {
+    document
+        .objects
+        .iter()
+        .filter(|object| excluded_object_id != Some(object.id.as_str()))
+        .filter(|object| {
+            matches!(
+                object.placement,
+                Some(sms_scene::PlacementBinding::Authored(_))
+            )
+        })
+        .map(|object| object.factory_name.clone())
+        .collect()
+}
+
+fn catalog_resource_maintenance(
+    document: &StageDocument,
+    catalog: &ObjectAuthoringCatalog,
+    active_factories: &BTreeSet<String>,
+) -> CatalogResourceMaintenance {
+    let templates = catalog
+        .iter()
+        .map(|(_, template)| template)
+        .collect::<Vec<_>>();
+    catalog_resource_maintenance_from_templates(document, &templates, active_factories)
+}
+
+fn catalog_resource_maintenance_from_templates(
+    document: &StageDocument,
+    templates: &[&sms_scene::ObjectAuthoringTemplate],
+    active_factories: &BTreeSet<String>,
+) -> CatalogResourceMaintenance {
+    let mut maintenance = CatalogResourceMaintenance::default();
+    let missing_templates = active_factories
+        .iter()
+        .filter(|factory_name| {
+            !templates
+                .iter()
+                .any(|template| template.factory_name.as_str() == factory_name.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_templates.is_empty() {
+        maintenance.errors.push(format!(
+            "cannot garbage-collect catalog resources because authored class template(s) are unavailable: {}",
+            missing_templates.join(", ")
+        ));
+        return maintenance;
+    }
+
+    let required_paths = active_factories
+        .iter()
+        .filter_map(|factory_name| {
+            templates
+                .iter()
+                .copied()
+                .find(|template| template.factory_name.as_str() == factory_name.as_str())
+        })
+        .flat_map(|template| {
+            template
+                .resources
+                .iter()
+                .map(|resource| resource.raw_resource_path.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    let migrate_legacy_inserts = document.objects.iter().any(|object| {
+        matches!(
+            object.placement,
+            Some(sms_scene::PlacementBinding::Authored(_))
+        )
+    }) && !document
+        .archive_edits
+        .resources
+        .iter()
+        .any(|edit| edit.catalog_managed);
+    let catalog_resources_by_path = migrate_legacy_inserts.then(|| {
+        let mut by_path = BTreeMap::<Vec<u8>, Vec<&sms_scene::ObjectAuthoringResource>>::new();
+        for template in templates {
+            for resource in &template.resources {
+                by_path
+                    .entry(resource.raw_resource_path.clone())
+                    .or_default()
+                    .push(resource);
+            }
+        }
+        for resources in by_path.values_mut() {
+            resources.sort_by(|left, right| {
+                left.source_asset_path
+                    .cmp(&right.source_asset_path)
+                    .then_with(|| left.raw_resource_path.cmp(&right.raw_resource_path))
+            });
+            resources.dedup_by(|left, right| {
+                left.source_asset_path == right.source_asset_path
+                    && left.raw_resource_path == right.raw_resource_path
+            });
+        }
+        by_path
+    });
+
+    for edit in &document.archive_edits.resources {
+        let mut catalog_managed = edit.catalog_managed;
+        if !catalog_managed
+            && migrate_legacy_inserts
+            && edit.mode == sms_scene::StageResourceEditMode::Insert
+        {
+            if let Some(candidates) = catalog_resources_by_path
+                .as_ref()
+                .and_then(|by_path| by_path.get(&edit.raw_resource_path))
+            {
+                for candidate in candidates {
+                    match parse_catalog_resource(candidate) {
+                        Ok(source) if source == edit.document => {
+                            catalog_managed = true;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(error) => maintenance.errors.push(error),
+                    }
+                }
+            }
+        }
+        if !catalog_managed {
+            continue;
+        }
+
+        let before = resource_edit_state(&document.archive_edits, &edit.raw_resource_path);
+        if required_paths.contains(&edit.raw_resource_path) {
+            if !edit.catalog_managed {
+                let mut managed_edit = edit.clone();
+                managed_edit.catalog_managed = true;
+                maintenance.resource_deltas.push(ResourceEditDelta {
+                    raw_resource_path: edit.raw_resource_path.clone(),
+                    after: ResourceEditState {
+                        edit: Some(managed_edit),
+                        ..before.clone()
+                    },
+                    before,
+                });
+                maintenance.migrated_resources += 1;
+            }
+        } else {
+            maintenance.resource_deltas.push(ResourceEditDelta {
+                raw_resource_path: edit.raw_resource_path.clone(),
+                after: ResourceEditState {
+                    edit: None,
+                    edit_index: None,
+                    removal_index: before.removal_index,
+                },
+                before,
+            });
+            maintenance.pruned_resources += 1;
+        }
+    }
+    maintenance.errors.sort();
+    maintenance.errors.dedup();
+    maintenance
 }
 
 fn repair_authored_catalog_resources(
@@ -1491,23 +1661,28 @@ fn duplicate_object_for_spawn(
         .placement
         .as_ref()
         .map(sms_scene::PlacementBinding::duplicate_for_new_object);
-    let shine_name = if let Some(sms_scene::PlacementBinding::Authored(authored)) =
-        &mut source.placement
-    {
-        if semantic_record_type(&authored.prototype.type_name) == "Shine" {
+    let generated_clone_name = sms_scene::generated_clone_runtime_name(&source.id);
+    let owned_name = match &mut source.placement {
+        Some(sms_scene::PlacementBinding::Authored(authored))
+            if semantic_record_type(&authored.prototype.type_name) == "Shine" =>
+        {
             let unique_name = format!("Graffito-Editor Shine {}", source.id);
             set_authored_shine_string_field(&mut authored.prototype, "name", unique_name.clone())
                 .ok()
                 .map(|_| unique_name)
-        } else {
-            None
         }
-    } else {
-        None
+        Some(sms_scene::PlacementBinding::Authored(authored)) => {
+            authored.prototype.name.clone_from(&generated_clone_name);
+            Some(generated_clone_name)
+        }
+        Some(sms_scene::PlacementBinding::CloneOf(_)) => Some(generated_clone_name),
+        Some(sms_scene::PlacementBinding::Existing(_)) | None => None,
     };
-    if let Some(unique_name) = shine_name {
+    if let Some(unique_name) = owned_name {
         source.insert_source_raw_param("name", unique_name);
-        source.authoring_defaults_version = sms_scene::OBJECT_AUTHORING_DEFAULTS_VERSION;
+        if source.factory_name == "Shine" {
+            source.authoring_defaults_version = sms_scene::OBJECT_AUTHORING_DEFAULTS_VERSION;
+        }
     }
     source.transform.translation = translation;
     source
@@ -2232,6 +2407,28 @@ impl SmsEditorApp {
             .iter()
             .filter_map(|factory_name| self.object_authoring_catalog.find(factory_name).cloned())
             .collect::<Vec<_>>();
+        let maintenance = self
+            .document
+            .as_ref()
+            .map(|document| {
+                catalog_resource_maintenance(
+                    document,
+                    self.object_authoring_catalog.as_ref(),
+                    &authored_factories,
+                )
+            })
+            .unwrap_or_default();
+        if !maintenance.resource_deltas.is_empty() {
+            if let Some(document) = &mut self.document {
+                ObjectUndoRecord {
+                    deltas: Vec::new(),
+                    resource_deltas: maintenance.resource_deltas.clone(),
+                    route_delta: None,
+                    dialogue_delta: None,
+                }
+                .apply_forward(document);
+            }
+        }
         let repair = self
             .document
             .as_mut()
@@ -2285,8 +2482,15 @@ impl SmsEditorApp {
                 "Could not repair authored object runtime resources: {error}"
             ));
         }
+        for error in &maintenance.errors {
+            self.log.push(format!(
+                "Could not reconcile authored object catalog resources: {error}"
+            ));
+        }
         if repair.resource_writes == 0
             && repair.runtime_links_added == 0
+            && maintenance.migrated_resources == 0
+            && maintenance.pruned_resources == 0
             && runtime_goop_writes == 0
             && migrated_shines.is_empty()
         {
@@ -2319,6 +2523,18 @@ impl SmsEditorApp {
                 "Reconciled {} decomp-derived runtime actor link(s) for existing authored class(es): {}. Select required targets in the inspector and save before launching.",
                 repair.runtime_links_added,
                 repair.repaired_factories.join(", ")
+            ));
+        }
+        if maintenance.migrated_resources > 0 {
+            self.log.push(format!(
+                "Marked {} legacy retail catalog resource(s) for safe dependency tracking.",
+                maintenance.migrated_resources
+            ));
+        }
+        if maintenance.pruned_resources > 0 {
+            self.log.push(format!(
+                "Removed {} unused retail catalog resource(s) left by deleted authored objects. Save the project before launching.",
+                maintenance.pruned_resources
             ));
         }
         if runtime_goop_writes > 0 {
@@ -2978,11 +3194,36 @@ impl SmsEditorApp {
                 after_library,
             })
         });
+        let resource_maintenance = self
+            .document
+            .as_ref()
+            .map(|document| {
+                let remaining_factories =
+                    authored_catalog_factories(document, Some(selected_id.as_str()));
+                catalog_resource_maintenance(
+                    document,
+                    self.object_authoring_catalog.as_ref(),
+                    &remaining_factories,
+                )
+            })
+            .unwrap_or_default();
+        for error in &resource_maintenance.errors {
+            self.log.push(format!(
+                "Could not clean up catalog resources after deleting '{}': {error}",
+                object.factory_name
+            ));
+        }
+        if resource_maintenance.pruned_resources > 0 {
+            self.log.push(format!(
+                "Removed {} unused catalog resource(s) after deleting '{}'",
+                resource_maintenance.pruned_resources, object.factory_name
+            ));
+        }
         self.apply_object_edit(
             "Deleted object",
             ObjectUndoRecord {
                 deltas: vec![ObjectDelta::Remove { index, object }],
-                resource_deltas: Vec::new(),
+                resource_deltas: resource_maintenance.resource_deltas,
                 route_delta: None,
                 dialogue_delta,
             },
@@ -4247,6 +4488,58 @@ mod tests {
         })
     }
 
+    fn parameter_document(name: &str, value: f32) -> StageResourceDocument {
+        StageResourceDocument::Parameters(PrmFile {
+            entries: vec![sms_formats::PrmEntry {
+                name: name.to_string(),
+                value: sms_formats::PrmValue::from_f32(value),
+            }],
+        })
+    }
+
+    fn minimal_catalog_template(
+        factory_name: &str,
+        resources: Vec<sms_scene::ObjectAuthoringResource>,
+    ) -> sms_scene::ObjectAuthoringTemplate {
+        sms_scene::ObjectAuthoringTemplate {
+            factory_name: factory_name.to_string(),
+            group_index: 4,
+            record: JDramaRecord::new(
+                factory_name,
+                factory_name.to_ascii_lowercase(),
+                JDramaRecordPayload::Empty,
+            )
+            .unwrap(),
+            dependencies: Vec::new(),
+            character_records: Vec::new(),
+            table_dependencies: Vec::new(),
+            runtime_actor_references: Vec::new(),
+            required_graph_names: Vec::new(),
+            resources,
+            preview_resource_path: None,
+            source_stage: "fixture0".to_string(),
+        }
+    }
+
+    fn authored_fixture_object(id: &str, factory_name: &str) -> SceneObject {
+        let prototype = JDramaRecord::new(
+            factory_name,
+            factory_name.to_ascii_lowercase(),
+            JDramaRecordPayload::Empty,
+        )
+        .unwrap();
+        let mut object = SceneObject::new(id, factory_name);
+        object.placement = Some(sms_scene::PlacementBinding::Authored(
+            sms_scene::AuthoredPlacement {
+                raw_resource_path: CATALOG_SCENE_PATH.to_vec(),
+                target_group_index: 4,
+                prototype,
+                dependencies: Vec::new(),
+            },
+        ));
+        object
+    }
+
     fn built_in_proxy_document(raw_resource_path: &[u8]) -> StageResourceDocument {
         let requirement = sms_scene::BLANK_STAGE_BOOTSTRAP_REQUIREMENTS
             .iter()
@@ -5325,6 +5618,14 @@ mod tests {
             Some(sms_scene::PlacementBinding::Authored(_))
         ));
         assert_eq!(duplicate.transform.translation, [4.0, 5.0, 6.0]);
+        assert_eq!(
+            duplicate.raw_param("name"),
+            Some("GraffitoClone_fixture-copy")
+        );
+        let Some(sms_scene::PlacementBinding::Authored(authored)) = &duplicate.placement else {
+            unreachable!()
+        };
+        assert_eq!(authored.prototype.name, "GraffitoClone_fixture-copy");
     }
 
     #[test]
@@ -5352,6 +5653,10 @@ mod tests {
             duplicate.placement,
             Some(sms_scene::PlacementBinding::CloneOf(_))
         ));
+        assert_eq!(
+            duplicate.raw_param("name"),
+            Some("GraffitoClone_launcher-copy")
+        );
     }
 
     #[test]
@@ -6013,6 +6318,7 @@ mod tests {
         assert_eq!(document.objects.len(), 1);
         assert!(document.has_effective_resource(&raw_resource_path));
         assert_eq!(document.archive_edits.resources.len(), 1);
+        assert!(document.archive_edits.resources[0].catalog_managed);
         assert!(app.document_dirty);
 
         app.undo();
@@ -6035,6 +6341,204 @@ mod tests {
         assert!(document.has_effective_resource(&raw_resource_path));
         assert_eq!(document.archive_edits.resources.len(), 1);
         assert!(app.document_dirty);
+    }
+
+    #[test]
+    fn catalog_resource_maintenance_prunes_only_unreferenced_managed_resources() {
+        let keep_path = b"mapobj/keep.prm".to_vec();
+        let stale_path = b"mapobj/stale.prm".to_vec();
+        let custom_path = b"mapobj/custom.prm".to_vec();
+        let active_template = minimal_catalog_template(
+            "ActiveFixture",
+            vec![sms_scene::ObjectAuthoringResource {
+                raw_resource_path: keep_path.clone(),
+                source_asset_path: PathBuf::from("unused-keep.prm"),
+            }],
+        );
+        let inactive_template = minimal_catalog_template(
+            "InactiveFixture",
+            vec![sms_scene::ObjectAuthoringResource {
+                raw_resource_path: stale_path.clone(),
+                source_asset_path: PathBuf::from("unused-stale.prm"),
+            }],
+        );
+        let mut document =
+            command_test_document(vec![authored_fixture_object("active", "ActiveFixture")]);
+        document.archive_edits.resources = vec![
+            StageResourceEdit {
+                raw_resource_path: keep_path.clone(),
+                document: empty_parameter_document(),
+                mode: sms_scene::StageResourceEditMode::Insert,
+                catalog_managed: true,
+            },
+            StageResourceEdit {
+                raw_resource_path: stale_path.clone(),
+                document: empty_parameter_document(),
+                mode: sms_scene::StageResourceEditMode::Insert,
+                catalog_managed: true,
+            },
+            StageResourceEdit {
+                raw_resource_path: custom_path.clone(),
+                document: parameter_document("mCustom", 1.0),
+                mode: sms_scene::StageResourceEditMode::Insert,
+                catalog_managed: false,
+            },
+        ];
+
+        let templates = [&active_template, &inactive_template];
+        let active_factories = authored_catalog_factories(&document, None);
+        let maintenance =
+            catalog_resource_maintenance_from_templates(&document, &templates, &active_factories);
+
+        assert!(maintenance.errors.is_empty());
+        assert_eq!(maintenance.migrated_resources, 0);
+        assert_eq!(maintenance.pruned_resources, 1);
+        ObjectUndoRecord {
+            deltas: Vec::new(),
+            resource_deltas: maintenance.resource_deltas,
+            route_delta: None,
+            dialogue_delta: None,
+        }
+        .apply_forward(&mut document);
+        assert!(document
+            .archive_edits
+            .resources
+            .iter()
+            .any(|edit| edit.raw_resource_path == keep_path && edit.catalog_managed));
+        assert!(!document
+            .archive_edits
+            .resources
+            .iter()
+            .any(|edit| edit.raw_resource_path == stale_path));
+        assert!(document
+            .archive_edits
+            .resources
+            .iter()
+            .any(|edit| edit.raw_resource_path == custom_path && !edit.catalog_managed));
+    }
+
+    #[test]
+    fn legacy_catalog_resources_are_classified_by_exact_retail_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let keep_path = b"mapobj/keep.prm".to_vec();
+        let stale_path = b"mapobj/stale.prm".to_vec();
+        let customized_path = b"mapobj/customized.prm".to_vec();
+        let source_document = empty_parameter_document();
+        let source_bytes = source_document.to_bytes().unwrap();
+        let keep_source = temp.path().join("keep.prm");
+        let stale_source = temp.path().join("stale.prm");
+        let customized_source = temp.path().join("customized.prm");
+        std::fs::write(&keep_source, &source_bytes).unwrap();
+        std::fs::write(&stale_source, &source_bytes).unwrap();
+        std::fs::write(&customized_source, &source_bytes).unwrap();
+        let active_template = minimal_catalog_template(
+            "ActiveFixture",
+            vec![sms_scene::ObjectAuthoringResource {
+                raw_resource_path: keep_path.clone(),
+                source_asset_path: keep_source,
+            }],
+        );
+        let inactive_template = minimal_catalog_template(
+            "InactiveFixture",
+            vec![
+                sms_scene::ObjectAuthoringResource {
+                    raw_resource_path: stale_path.clone(),
+                    source_asset_path: stale_source,
+                },
+                sms_scene::ObjectAuthoringResource {
+                    raw_resource_path: customized_path.clone(),
+                    source_asset_path: customized_source,
+                },
+            ],
+        );
+        let mut document =
+            command_test_document(vec![authored_fixture_object("active", "ActiveFixture")]);
+        document.archive_edits.resources = vec![
+            StageResourceEdit {
+                raw_resource_path: keep_path.clone(),
+                document: source_document.clone(),
+                mode: sms_scene::StageResourceEditMode::Insert,
+                catalog_managed: false,
+            },
+            StageResourceEdit {
+                raw_resource_path: stale_path.clone(),
+                document: source_document,
+                mode: sms_scene::StageResourceEditMode::Insert,
+                catalog_managed: false,
+            },
+            StageResourceEdit {
+                raw_resource_path: customized_path.clone(),
+                document: parameter_document("mCustomized", 2.0),
+                mode: sms_scene::StageResourceEditMode::Insert,
+                catalog_managed: false,
+            },
+        ];
+
+        let templates = [&active_template, &inactive_template];
+        let active_factories = authored_catalog_factories(&document, None);
+        let maintenance =
+            catalog_resource_maintenance_from_templates(&document, &templates, &active_factories);
+
+        assert!(maintenance.errors.is_empty());
+        assert_eq!(maintenance.migrated_resources, 1);
+        assert_eq!(maintenance.pruned_resources, 1);
+        ObjectUndoRecord {
+            deltas: Vec::new(),
+            resource_deltas: maintenance.resource_deltas,
+            route_delta: None,
+            dialogue_delta: None,
+        }
+        .apply_forward(&mut document);
+        assert!(document
+            .archive_edits
+            .resources
+            .iter()
+            .any(|edit| edit.raw_resource_path == keep_path && edit.catalog_managed));
+        assert!(!document
+            .archive_edits
+            .resources
+            .iter()
+            .any(|edit| edit.raw_resource_path == stale_path));
+        assert!(document
+            .archive_edits
+            .resources
+            .iter()
+            .any(|edit| edit.raw_resource_path == customized_path && !edit.catalog_managed));
+    }
+
+    #[test]
+    fn deleting_last_authored_object_prunes_managed_resources_and_undo_restores_them() {
+        let object = authored_fixture_object("catalog-object", "FixtureEnemy");
+        let raw_resource_path = b"mapobj/catalog.prm".to_vec();
+        let mut document = command_test_document(vec![object.clone()]);
+        document.archive_edits.resources.push(StageResourceEdit {
+            raw_resource_path: raw_resource_path.clone(),
+            document: empty_parameter_document(),
+            mode: sms_scene::StageResourceEditMode::Insert,
+            catalog_managed: true,
+        });
+        let mut app = SmsEditorApp {
+            selected_object_id: Some(object.id.clone()),
+            document: Some(document),
+            ..SmsEditorApp::default()
+        };
+
+        app.delete_selected();
+
+        let document = app.document.as_ref().unwrap();
+        assert!(document.objects.is_empty());
+        assert!(document.archive_edits.resources.is_empty());
+
+        app.undo();
+
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.objects, [object]);
+        assert_eq!(document.archive_edits.resources.len(), 1);
+        assert_eq!(
+            document.archive_edits.resources[0].raw_resource_path,
+            raw_resource_path
+        );
+        assert!(document.archive_edits.resources[0].catalog_managed);
     }
 
     #[test]

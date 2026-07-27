@@ -52,6 +52,11 @@ pub struct StageResourceEdit {
     pub document: StageResourceDocument,
     #[serde(default)]
     pub mode: StageResourceEditMode,
+    /// True when Graffito copied this exact resource from a retail catalog
+    /// template for an authored placement. Catalog-managed inserts may be
+    /// garbage-collected once no authored object requires their runtime path.
+    #[serde(default)]
+    pub catalog_managed: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,11 +172,13 @@ impl StageArchiveEdits {
         {
             edit.document = document;
             edit.mode = mode;
+            edit.catalog_managed = false;
         } else {
             self.resources.push(StageResourceEdit {
                 raw_resource_path,
                 document,
                 mode,
+                catalog_managed: false,
             });
         }
     }
@@ -1550,6 +1557,10 @@ fn reconcile_scene_objects_with_owned_dialogue_names(
             )));
         };
         let dialogue_owns_name = dialogue_owned_runtime_names.contains(&object.id);
+        let generated_clone_name = crate::generated_clone_runtime_name(&object.id);
+        let clone_owns_name = matches!(binding, PlacementBinding::CloneOf(_))
+            && object.raw_param(crate::OBJECT_PARAMETER_NAME)
+                == Some(generated_clone_name.as_str());
         if dialogue_owns_name && runtime_actor_names.contains_key(&object.id) {
             return Err(stage_export_error(format!(
                 "object '{}' cannot use both an editor-generated dialogue identity and another runtime TNameRef binding",
@@ -1572,7 +1583,7 @@ fn reconcile_scene_objects_with_owned_dialogue_names(
                     &record,
                     object,
                     binding,
-                    dialogue_owns_name,
+                    dialogue_owns_name || clone_owns_name,
                 )?;
                 crate::apply_object_parameter_edits(
                     &mut record,
@@ -3321,6 +3332,35 @@ mod tests {
             .collect::<Vec<_>>();
         stage_ids.sort_unstable();
         assert_eq!(stage_ids, [17, 29]);
+    }
+
+    #[test]
+    fn generated_clone_name_round_trips_without_renaming_the_retail_source() {
+        let prototype = map_change_stage_record("retail fountain 0", "base resource", 1);
+        let mut archive = authoring_strategy_archive(vec![prototype.clone()]);
+        let mut objects = existing_and_clone_objects(&prototype);
+        let clone_name = crate::generated_clone_runtime_name(&objects[1].id);
+        objects[1].insert_source_raw_param("name", clone_name.clone());
+
+        reconcile_scene_objects(&mut archive, &objects, &[], None).unwrap();
+
+        assert_eq!(
+            named_record_paths(
+                &archive,
+                WORLD_SCENE_PATH,
+                "MapObjChangeStage",
+                "retail fountain 0",
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert_eq!(
+            named_record_paths(&archive, WORLD_SCENE_PATH, "MapObjChangeStage", &clone_name,)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

@@ -952,6 +952,7 @@ impl StageDocument {
                 raw_resource_path,
                 document,
                 mode: StageResourceEditMode::Upsert,
+                catalog_managed: false,
             });
         }
 

@@ -14,6 +14,15 @@ use crate::{
 
 pub const OBJECT_PARAMETER_NAME: &str = "name";
 pub const OBJECT_PARAMETER_CHARACTER_NAME: &str = "character_name";
+
+/// Returns the stable TNameRef identity owned by a newly cloned placement.
+///
+/// Retail actor names are commonly stage-unique lookup keys. Reusing the
+/// source record's name makes the clone ambiguous even when every other typed
+/// field is safe to duplicate.
+pub fn generated_clone_runtime_name(object_id: &str) -> String {
+    format!("GraffitoClone_{object_id}")
+}
 const SOURCE_PARAMETER_ALIASES: [(&str, &str); 11] = [
     (OBJECT_PARAMETER_CHARACTER_NAME, "stream_string_0"),
     ("item_selector", "nozzle_box_item"),
