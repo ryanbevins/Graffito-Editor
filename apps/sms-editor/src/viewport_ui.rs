@@ -1023,19 +1023,30 @@ impl SmsEditorApp {
         ui: &egui::Ui,
         navigation_active: bool,
     ) -> bool {
-        let (dt, forward_key, back_key, left_key, right_key, up_key, down_key, shift) =
-            ui.input(|input| {
-                (
-                    input.stable_dt.clamp(1.0 / 240.0, 1.0 / 15.0),
-                    input.key_down(egui::Key::W),
-                    input.key_down(egui::Key::S),
-                    input.key_down(egui::Key::A),
-                    input.key_down(egui::Key::D),
-                    input.key_down(egui::Key::E),
-                    input.key_down(egui::Key::Q),
-                    input.modifiers.shift,
-                )
-            });
+        let (
+            dt,
+            forward_key,
+            back_key,
+            left_key,
+            right_key,
+            up_key,
+            down_key,
+            shift,
+            command_modifier,
+        ) = ui.input(|input| {
+            (
+                input.stable_dt.clamp(1.0 / 240.0, 1.0 / 15.0),
+                input.key_down(egui::Key::W),
+                input.key_down(egui::Key::S),
+                input.key_down(egui::Key::A),
+                input.key_down(egui::Key::D),
+                input.key_down(egui::Key::E),
+                input.key_down(egui::Key::Q),
+                input.modifiers.shift,
+                input.modifiers.command,
+            )
+        });
+        let navigation_active = navigation_active && !command_modifier;
         let frame = self.camera_frame();
         let mut move_axis = [0.0, 0.0, 0.0];
         if navigation_active && forward_key {
@@ -2774,7 +2785,7 @@ pub(super) fn transform_from_gizmo_drag(
             }
             transform.scale[axis] = value.max(0.001);
         }
-        EditorTool::Select | EditorTool::Goop | EditorTool::Place => {}
+        EditorTool::Goop | EditorTool::Place => {}
     }
     transform
 }

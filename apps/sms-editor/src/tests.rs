@@ -74,6 +74,7 @@ fn nozzle_box_palette_entry_uses_a_readable_name() {
 fn editor_layout_defaults_to_the_unreal_style_workspace() {
     let app = SmsEditorApp::default();
 
+    assert_eq!(app.tool, EditorTool::Move);
     assert_eq!(app.bottom_tab, BottomTab::Content);
     assert!(!app.show_project_settings);
     assert!(!app.show_issues);
@@ -88,12 +89,7 @@ fn editor_layout_defaults_to_the_unreal_style_workspace() {
 fn viewport_toolbar_keeps_only_core_transform_tools_top_level() {
     assert_eq!(
         CORE_VIEWPORT_TOOLS,
-        [
-            EditorTool::Select,
-            EditorTool::Move,
-            EditorTool::Rotate,
-            EditorTool::Scale,
-        ]
+        [EditorTool::Move, EditorTool::Rotate, EditorTool::Scale]
     );
     assert!(!CORE_VIEWPORT_TOOLS.contains(&EditorTool::Goop));
 }
@@ -101,7 +97,7 @@ fn viewport_toolbar_keeps_only_core_transform_tools_top_level() {
 #[test]
 fn routes_menu_preserves_the_existing_mode_transition() {
     let mut app = SmsEditorApp {
-        tool: EditorTool::Select,
+        tool: EditorTool::Rotate,
         ..SmsEditorApp::default()
     };
 
@@ -257,13 +253,127 @@ fn transform_shortcuts_do_not_exit_goop_mode() {
     }
 
     assert_eq!(
-        EditorTool::Select.after_keyboard_shortcut(egui::Key::W),
-        EditorTool::Move
+        EditorTool::Move.after_keyboard_shortcut(egui::Key::E),
+        EditorTool::Rotate
     );
     assert_eq!(
         EditorTool::Move.after_keyboard_shortcut(egui::Key::G),
         EditorTool::Goop
     );
+}
+
+fn keyboard_input(key: egui::Key, modifiers: egui::Modifiers) -> egui::RawInput {
+    egui::RawInput {
+        modifiers,
+        events: vec![egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }],
+        ..egui::RawInput::default()
+    }
+}
+
+fn clipboard_input(event: egui::Event) -> egui::RawInput {
+    egui::RawInput {
+        modifiers: egui::Modifiers::CTRL,
+        events: vec![event],
+        ..egui::RawInput::default()
+    }
+}
+
+fn shortcut_test_document(object: SceneObject) -> StageDocument {
+    StageDocument {
+        stage_id: "fixture0".to_string(),
+        base_root: PathBuf::from("."),
+        assets: Vec::new(),
+        objects: vec![object],
+        changed_files: BTreeMap::new(),
+        stage_archive: None,
+        stage_archive_source_path: Some(PathBuf::from("virtual/fixture0.szs")),
+        archive_edits: StageArchiveEdits::default(),
+        registry: None,
+        route_authoring: None,
+        goop_authoring: None,
+        dialogue_authoring: None,
+        dialogue_library: Default::default(),
+        load_issues: Vec::new(),
+        lighting: StageLighting::default(),
+        actor_previews: BTreeMap::new(),
+        loaded_project: None,
+    }
+}
+
+#[test]
+fn viewport_focus_allows_world_edit_shortcuts_while_text_edit_focus_owns_them() {
+    let context = egui::Context::default();
+    let _ = context.run_ui(egui::RawInput::default(), |ui| {
+        let viewport = ui.allocate_response(egui::vec2(100.0, 100.0), egui::Sense::click());
+        viewport.request_focus();
+    });
+    assert!(context.egui_wants_keyboard_input());
+    assert!(!text_editor_owns_shortcuts(&context));
+
+    let mut object = SceneObject::new("source-object", "FixtureEnemy");
+    object.transform.translation = [10.0, 20.0, 30.0];
+    let mut app = SmsEditorApp {
+        selected_object_id: Some(object.id.clone()),
+        document: Some(shortcut_test_document(object.clone())),
+        ..SmsEditorApp::default()
+    };
+    let _ = context.run_ui(
+        keyboard_input(egui::Key::Delete, egui::Modifiers::NONE),
+        |ui| app.handle_editor_shortcuts(ui.ctx()),
+    );
+    assert!(app.document.as_ref().unwrap().objects.is_empty());
+
+    let _ = context.run_ui(keyboard_input(egui::Key::Z, egui::Modifiers::CTRL), |ui| {
+        app.handle_editor_shortcuts(ui.ctx())
+    });
+    assert_eq!(
+        app.document.as_ref().unwrap().objects,
+        std::slice::from_ref(&object)
+    );
+
+    app.selected_object_id = Some(object.id.clone());
+    let copy_output = context.run_ui(clipboard_input(egui::Event::Copy), |ui| {
+        app.handle_editor_shortcuts(ui.ctx());
+    });
+    assert!(copy_output.platform_output.commands.iter().any(|command| {
+        matches!(
+            command,
+            egui::OutputCommand::CopyText(text) if text == "Graffito Editor object"
+        )
+    }));
+    let _ = context.run_ui(
+        clipboard_input(egui::Event::Paste("Graffito Editor object".to_string())),
+        |ui| app.handle_editor_shortcuts(ui.ctx()),
+    );
+    let objects = &app.document.as_ref().unwrap().objects;
+    assert_eq!(objects.len(), 2);
+    assert_eq!(
+        objects[1].transform.translation,
+        object.transform.translation
+    );
+
+    let _ = context.run_ui(keyboard_input(egui::Key::D, egui::Modifiers::CTRL), |ui| {
+        app.handle_editor_shortcuts(ui.ctx())
+    });
+    let objects = &app.document.as_ref().unwrap().objects;
+    assert_eq!(objects.len(), 3);
+    assert_eq!(
+        objects[2].transform.translation,
+        object.transform.translation
+    );
+
+    let text_context = egui::Context::default();
+    let mut text = String::new();
+    let _ = text_context.run_ui(egui::RawInput::default(), |ui| {
+        ui.text_edit_singleline(&mut text).request_focus();
+    });
+    assert!(text_editor_owns_shortcuts(&text_context));
 }
 
 #[test]

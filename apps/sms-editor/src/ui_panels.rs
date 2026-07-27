@@ -1246,28 +1246,6 @@ impl SmsEditorApp {
                 .small()
                 .color(egui::Color32::GRAY),
             );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(
-                        self.selected_object_id.is_some(),
-                        egui::Button::new("Delete").small(),
-                    )
-                    .on_hover_text("Delete the selected object")
-                    .clicked()
-                {
-                    self.delete_selected();
-                }
-                if ui
-                    .add_enabled(
-                        self.selected_object_id.is_some(),
-                        egui::Button::new("Duplicate").small(),
-                    )
-                    .on_hover_text("Duplicate the selected object")
-                    .clicked()
-                {
-                    self.duplicate_selected();
-                }
-            });
         });
         ui.add(
             egui::TextEdit::singleline(&mut self.outliner_filter)
@@ -1465,19 +1443,6 @@ impl SmsEditorApp {
             if edit.stopped {
                 self.commit_undo_transaction("Updated transform");
             }
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button("Frame").clicked() {
-                    self.frame_selected();
-                }
-                if ui.button("Duplicate").clicked() {
-                    self.duplicate_selected();
-                }
-                if ui.button("Delete").clicked() {
-                    self.delete_selected();
-                }
-            });
 
             self.object_audio_helper_panel(ui, &object.id);
 
@@ -2560,7 +2525,6 @@ fn is_palette_service_type(type_name: &str) -> bool {
 
 fn tool_shortcut(tool: EditorTool) -> &'static str {
     match tool {
-        EditorTool::Select => "Q",
         EditorTool::Move => "W",
         EditorTool::Rotate => "E",
         EditorTool::Scale => "R",

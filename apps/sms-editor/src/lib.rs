@@ -109,7 +109,6 @@ pub fn run() -> eframe::Result<()> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditorTool {
-    Select,
     Move,
     Rotate,
     Scale,
@@ -169,7 +168,6 @@ struct GizmoDrag {
 impl EditorTool {
     fn label(self) -> &'static str {
         match self {
-            Self::Select => "Select",
             Self::Move => "Move",
             Self::Rotate => "Rotate",
             Self::Scale => "Scale",
@@ -184,7 +182,6 @@ impl EditorTool {
         }
 
         match key {
-            egui::Key::Q => Self::Select,
             egui::Key::W => Self::Move,
             egui::Key::E => Self::Rotate,
             egui::Key::R => Self::Scale,
@@ -194,12 +191,12 @@ impl EditorTool {
     }
 }
 
-const CORE_VIEWPORT_TOOLS: [EditorTool; 4] = [
-    EditorTool::Select,
-    EditorTool::Move,
-    EditorTool::Rotate,
-    EditorTool::Scale,
-];
+const CORE_VIEWPORT_TOOLS: [EditorTool; 3] =
+    [EditorTool::Move, EditorTool::Rotate, EditorTool::Scale];
+
+fn text_editor_owns_shortcuts(ctx: &egui::Context) -> bool {
+    ctx.text_edit_focused()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
@@ -859,6 +856,14 @@ struct ObjectUndoTransaction {
     before: SceneObject,
     kind: ObjectUndoTransactionKind,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+struct ObjectClipboard {
+    project_root: String,
+    stage_id: String,
+    object: SceneObject,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct RouteUndoTransaction {
     before_objects: Vec<SceneObject>,
@@ -917,6 +922,7 @@ struct SmsEditorApp {
     log: Vec<String>,
     renderer: ViewportRenderer,
     selected_object_id: Option<String>,
+    object_clipboard: Option<ObjectClipboard>,
     selected_world_member: Option<WorldHierarchyMember>,
     active_placement: Option<ActivePlacement>,
     object_filter: String,
@@ -1170,6 +1176,7 @@ impl Default for SmsEditorApp {
             log: vec!["Ready.".to_string()],
             renderer: ViewportRenderer::new(RendererConfig::default()),
             selected_object_id: None,
+            object_clipboard: None,
             selected_world_member: None,
             active_placement: None,
             object_filter: String::new(),
@@ -1211,7 +1218,7 @@ impl Default for SmsEditorApp {
             last_scanned_base_root: String::new(),
             pending_auto_refresh_root: None,
             last_auto_refresh_attempt_root: String::new(),
-            tool: EditorTool::Select,
+            tool: EditorTool::Move,
             selected_goop_layer: 0,
             selected_goop_template: 0,
             show_incompatible_goop_templates: false,
@@ -1327,6 +1334,62 @@ impl SmsEditorApp {
             ..Self::default()
         }
     }
+
+    fn handle_editor_shortcuts(&mut self, ctx: &egui::Context) {
+        if text_editor_owns_shortcuts(ctx) {
+            return;
+        }
+
+        self.content_browser_keyboard(ctx);
+
+        if ctx.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::Z)) {
+            self.undo();
+        }
+        if ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::Z)) {
+            self.redo();
+        }
+        let copy_requested = ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Copy))
+                || (input.modifiers.ctrl && input.key_pressed(egui::Key::C))
+        });
+        if copy_requested && self.copy_selected() {
+            ctx.copy_text("Graffito Editor object".to_string());
+        }
+        let paste_requested = ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Paste(_)))
+                || (input.modifiers.ctrl && input.key_pressed(egui::Key::V))
+        });
+        if paste_requested {
+            self.paste_copied();
+        }
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::D)) {
+            self.duplicate_selected();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
+            self.delete_selected();
+        }
+        if ctx.input(|i| i.pointer.secondary_down()) {
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::W)) {
+            self.tool = self.tool.after_keyboard_shortcut(egui::Key::W);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::E)) {
+            self.tool = self.tool.after_keyboard_shortcut(egui::Key::E);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::R)) {
+            self.tool = self.tool.after_keyboard_shortcut(egui::Key::R);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::G)) {
+            self.tool = self.tool.after_keyboard_shortcut(egui::Key::G);
+        }
+    }
 }
 
 impl eframe::App for SmsEditorApp {
@@ -1362,39 +1425,7 @@ impl eframe::App for SmsEditorApp {
             return;
         }
 
-        if ctx.egui_wants_keyboard_input() {
-            return;
-        }
-
-        self.content_browser_keyboard(ctx);
-
-        if ctx.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::Z)) {
-            self.undo();
-        }
-        if ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::Z)) {
-            self.redo();
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
-            self.delete_selected();
-        }
-        if ctx.input(|i| i.pointer.secondary_down()) {
-            return;
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::W)) {
-            self.tool = self.tool.after_keyboard_shortcut(egui::Key::W);
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::E)) {
-            self.tool = self.tool.after_keyboard_shortcut(egui::Key::E);
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::R)) {
-            self.tool = self.tool.after_keyboard_shortcut(egui::Key::R);
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::Q)) {
-            self.tool = self.tool.after_keyboard_shortcut(egui::Key::Q);
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::G)) {
-            self.tool = self.tool.after_keyboard_shortcut(egui::Key::G);
-        }
+        self.handle_editor_shortcuts(ctx);
     }
 
     fn ui(&mut self, root_ui: &mut egui::Ui, frame: &mut eframe::Frame) {

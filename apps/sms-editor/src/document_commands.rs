@@ -2967,10 +2967,47 @@ impl SmsEditorApp {
         self.clear_viewport_preview_cache();
     }
 
+    pub(super) fn copy_selected(&mut self) -> bool {
+        let Some(document) = self.document.as_ref() else {
+            return false;
+        };
+        let Some(object) = self.selected_object().cloned() else {
+            return false;
+        };
+        self.object_clipboard = Some(ObjectClipboard {
+            project_root: self.project_root.clone(),
+            stage_id: document.stage_id.clone(),
+            object,
+        });
+        self.log.push("Copied selected object.".to_string());
+        true
+    }
+
+    pub(super) fn paste_copied(&mut self) {
+        let Some(clipboard) = self.object_clipboard.clone() else {
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        if clipboard.project_root != self.project_root || clipboard.stage_id != document.stage_id {
+            self.log.push(
+                "Could not paste object: the copied object belongs to another project or stage."
+                    .to_string(),
+            );
+            return;
+        }
+        self.insert_object_copy(clipboard.object, "Pasted object", "paste");
+    }
+
     pub(super) fn duplicate_selected(&mut self) {
         let Some(source) = self.selected_object().cloned() else {
             return;
         };
+        self.insert_object_copy(source, "Duplicated object", "duplicate");
+    }
+
+    fn insert_object_copy(&mut self, source: SceneObject, action: &str, verb: &str) {
         let source_object_id = source.id.clone();
         let source_is_talk_capable = self
             .registry
@@ -2992,21 +3029,19 @@ impl SmsEditorApp {
                 .map(|error| format!("route analysis failed: {error}"))
                 .unwrap_or_else(|| "route analysis is still running".to_string());
             self.log.push(format!(
-                "Could not duplicate '{}': its dialogue routes are unavailable ({detail}). Wait for dialogue analysis so the duplicate can inherit every player-initiated variant.",
-                source.factory_name
+                "Could not {verb} '{}': its dialogue routes are unavailable ({detail}). Wait for dialogue analysis so the duplicate can inherit every player-initiated variant.",
+                source.factory_name,
             ));
             return;
         }
         let Some((id, next_object_serial)) = self.next_available_object_id() else {
-            self.log.push(
-                "Could not duplicate object: no unique editor object id is available.".to_string(),
-            );
+            self.log.push(format!(
+                "Could not {verb} object: no unique editor object id is available."
+            ));
             return;
         };
 
-        let mut translation = source.transform.translation;
-        translation[0] += self.snap_translation.max(25.0);
-        translation[2] += self.snap_translation.max(25.0);
+        let translation = source.transform.translation;
         let mut clone =
             duplicate_object_for_spawn(source, id.clone(), translation, self.registry.as_ref());
         if let Err(error) = assign_unique_shine_id_for_spawn(
@@ -3015,8 +3050,7 @@ impl SmsEditorApp {
                 .as_ref()
                 .expect("selected object belongs to a document"),
         ) {
-            self.log
-                .push(format!("Could not duplicate Shine: {error}."));
+            self.log.push(format!("Could not {verb} Shine: {error}."));
             return;
         }
         self.next_object_serial = next_object_serial;
@@ -3052,16 +3086,16 @@ impl SmsEditorApp {
                         dialogue_document.duplicate_dialogue_authoring(&source_object_id, &id)
                     {
                         self.log.push(format!(
-                            "Could not inherit dialogue for duplicated '{}': {error}",
-                            clone.factory_name
+                            "Could not inherit dialogue for copied '{}': {error}",
+                            clone.factory_name,
                         ));
                         return;
                     }
                 } else {
                     if let Err(error) = dialogue_document.initialize_dialogue_for_new_object(&id) {
                         self.log.push(format!(
-                            "Could not initialize dialogue for duplicated '{}': {error}",
-                            clone.factory_name
+                            "Could not initialize dialogue for copied '{}': {error}",
+                            clone.factory_name,
                         ));
                         return;
                     }
@@ -3079,7 +3113,7 @@ impl SmsEditorApp {
             }
         };
         self.apply_object_edit(
-            "Duplicated object",
+            action,
             ObjectUndoRecord {
                 deltas: vec![ObjectDelta::Insert {
                     index,
@@ -5381,6 +5415,59 @@ mod tests {
                 .len(),
             document.objects.len()
         );
+    }
+
+    #[test]
+    fn copied_object_pastes_from_its_snapshot_through_the_duplicate_path() {
+        let mut source = SceneObject::new("source-object", "FixtureEnemy");
+        source.transform.translation = [10.0, 20.0, 30.0];
+        let mut app = SmsEditorApp {
+            project_root: "fixture-project".to_string(),
+            stage_id: "fixture0".to_string(),
+            selected_object_id: Some(source.id.clone()),
+            document: Some(command_test_document(vec![source])),
+            ..SmsEditorApp::default()
+        };
+
+        app.copy_selected();
+        app.document.as_mut().unwrap().objects[0]
+            .transform
+            .translation = [100.0, 200.0, 300.0];
+        app.paste_copied();
+
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.objects.len(), 2);
+        assert_eq!(
+            document.objects[0].transform.translation,
+            [100.0, 200.0, 300.0]
+        );
+        assert_eq!(
+            document.objects[1].transform.translation,
+            [10.0, 20.0, 30.0]
+        );
+        assert_eq!(app.selected_object_id.as_deref(), Some("fixture0-obj-0001"));
+        assert_eq!(app.undo_stack.len(), 1);
+
+        app.undo();
+        assert_eq!(app.document.as_ref().unwrap().objects.len(), 1);
+    }
+
+    #[test]
+    fn object_clipboard_does_not_cross_project_or_stage_boundaries() {
+        let source = SceneObject::new("source-object", "FixtureEnemy");
+        let mut app = SmsEditorApp {
+            project_root: "fixture-project".to_string(),
+            selected_object_id: Some(source.id.clone()),
+            document: Some(command_test_document(vec![source])),
+            ..SmsEditorApp::default()
+        };
+
+        app.copy_selected();
+        app.document.as_mut().unwrap().stage_id = "other-stage".to_string();
+        app.paste_copied();
+
+        assert_eq!(app.document.as_ref().unwrap().objects.len(), 1);
+        assert!(app.log.last().unwrap().contains("another project or stage"));
     }
 
     #[test]
