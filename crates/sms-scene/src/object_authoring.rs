@@ -1584,32 +1584,26 @@ fn resolve_particle_resources(
     registry: &ObjectRegistry,
     class_names: &BTreeSet<String>,
 ) -> Result<(), String> {
-    let effect_ids = registry
+    let bindings = registry
         .actor_particle_bindings
         .iter()
         .filter(|binding| class_names.contains(&binding.class_name))
-        .map(|binding| binding.effect_id)
-        .collect::<BTreeSet<_>>();
-    for effect_id in effect_ids {
-        let paths = registry
-            .particle_resources
-            .iter()
-            .filter(|resource| resource.effect_id == effect_id)
-            .map(|resource| resource.path.as_str())
-            .collect::<BTreeSet<_>>();
-        if paths.len() != 1 {
-            return Err(format!(
-                "particle effect {effect_id} used by {} has {} exact JPA paths in the schema",
-                candidate.factory_name,
-                paths.len()
-            ));
-        }
+        .collect::<Vec<_>>();
+    for binding in bindings {
+        let resource = registry
+            .particle_resource_for_binding(binding)
+            .ok_or_else(|| {
+                format!(
+                    "particle effect {} used by {} has no unambiguous decomp-authored JPA path",
+                    binding.effect_id, candidate.factory_name
+                )
+            })?;
         add_stage_reference(
             out,
             sources,
             &candidate.source_stage,
-            paths.into_iter().next().expect("one path checked above"),
-            &format!("particle effect {effect_id}"),
+            &resource.path,
+            &format!("particle effect {}", binding.effect_id),
             false,
         )?;
     }

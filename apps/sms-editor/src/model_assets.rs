@@ -4063,6 +4063,7 @@ pub(super) fn append_authored_model_instances(
                 particle_direction: None,
                 particle_color_mode: None,
                 particle_environment_color: None,
+                particle_extra_texture: None,
             });
         }
         if instance.placement.export_mode == ModelInstanceExportMode::MapTerrain

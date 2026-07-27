@@ -1280,9 +1280,7 @@ impl SmsEditorApp {
             .filter(|triangle| {
                 !matches!(
                     triangle.render_layer,
-                    PreviewRenderLayer::Shadow
-                        | PreviewRenderLayer::Particle
-                        | PreviewRenderLayer::ParticleDistortion
+                    PreviewRenderLayer::Shadow | PreviewRenderLayer::Particle
                 )
             })
             .filter_map(|triangle| {

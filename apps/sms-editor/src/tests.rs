@@ -2128,6 +2128,7 @@ fn textured_blended_triangle() -> PreviewTriangle {
         particle_direction: None,
         particle_color_mode: None,
         particle_environment_color: None,
+        particle_extra_texture: None,
     }
 }
 
@@ -2285,9 +2286,6 @@ fn shimmer_models_are_controlled_by_effect_visibility() {
     );
     assert!(preview_render_layer_is_effect(PreviewRenderLayer::Heatwave));
     assert!(preview_render_layer_is_effect(PreviewRenderLayer::Particle));
-    assert!(preview_render_layer_is_effect(
-        PreviewRenderLayer::ParticleDistortion
-    ));
     assert!(!preview_render_layer_is_effect(PreviewRenderLayer::Main));
 }
 
@@ -3211,6 +3209,7 @@ fn updating_object_transform_moves_cached_preview_mesh() {
                 particle_direction: None,
                 particle_color_mode: None,
                 particle_environment_color: None,
+                particle_extra_texture: None,
             }],
             collision_triangles: Vec::new(),
             collision_file_count: 0,
@@ -4178,6 +4177,144 @@ fn test_document(objects: Vec<SceneObject>) -> StageDocument {
         actor_previews: BTreeMap::new(),
         loaded_project: None,
     }
+}
+
+fn synthetic_particle_effect() -> Vec<u8> {
+    let texture = sms_formats::BtiFile {
+        allocation_size: 0x40,
+        format: 0,
+        transparency: 0,
+        width: 8,
+        height: 8,
+        wrap_s: 1,
+        wrap_t: 1,
+        palette_enabled: 0,
+        palette_format: 0,
+        palette_entries: Vec::new(),
+        palette_offset: 0,
+        mipmap_enabled: 0,
+        edge_lod: 0,
+        bias_clamp: 0,
+        max_anisotropy: 0,
+        min_filter: 1,
+        mag_filter: 1,
+        min_lod: 0,
+        max_lod: 0,
+        mipmap_count: 1,
+        reserved_19: 0,
+        lod_bias: 0,
+        image_offset: 0x20,
+        encoded_mip_levels: vec![vec![0xff; 32]],
+    }
+    .encode()
+    .expect("encode synthetic particle texture");
+    let emitter_size = 0x90usize;
+    let shape_size = 0x98usize;
+    let texture_size = 0x20 + texture.len();
+    let declared_size = 0x20 + emitter_size + shape_size + texture_size;
+    let mut bytes = vec![0; declared_size];
+    bytes[..8].copy_from_slice(b"JEFFjpa1");
+    bytes[8..12].copy_from_slice(&(declared_size as u32).to_be_bytes());
+    bytes[12..16].copy_from_slice(&3u32.to_be_bytes());
+
+    let emitter = 0x20;
+    bytes[emitter..emitter + 4].copy_from_slice(b"BEM1");
+    bytes[emitter + 4..emitter + 8].copy_from_slice(&(emitter_size as u32).to_be_bytes());
+    bytes[emitter + 0x18..emitter + 0x1c].copy_from_slice(&5.0f32.to_be_bytes());
+    bytes[emitter + 0x44..emitter + 0x46].copy_from_slice(&30u16.to_be_bytes());
+
+    let shape = emitter + emitter_size;
+    bytes[shape..shape + 4].copy_from_slice(b"BSP1");
+    bytes[shape + 4..shape + 8].copy_from_slice(&(shape_size as u32).to_be_bytes());
+    bytes[shape + 0x18..shape + 0x1c].copy_from_slice(&1.0f32.to_be_bytes());
+    bytes[shape + 0x1c..shape + 0x20].copy_from_slice(&1.0f32.to_be_bytes());
+    bytes[shape + 0x64..shape + 0x68].copy_from_slice(&[255; 4]);
+
+    let texture_block = shape + shape_size;
+    bytes[texture_block..texture_block + 4].copy_from_slice(b"TEX1");
+    bytes[texture_block + 4..texture_block + 8]
+        .copy_from_slice(&(texture_size as u32).to_be_bytes());
+    bytes[texture_block + 0x0c..texture_block + 0x12].copy_from_slice(b"funsui");
+    bytes[texture_block + 0x20..].copy_from_slice(&texture);
+    bytes
+}
+
+#[test]
+fn particle_only_actors_render_without_placeholder_models() {
+    let unique = format!(
+        "graffito-particle-only-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+    let particle_path = root
+        .join("scene")
+        .join("map")
+        .join("map")
+        .join("ms_bia_funsui.jpa");
+    std::fs::create_dir_all(particle_path.parent().expect("particle parent"))
+        .expect("create particle fixture folder");
+    std::fs::write(&particle_path, synthetic_particle_effect()).expect("write particle fixture");
+
+    let mut object = SceneObject::new("bianco-fountain", "EffectBiancoFunsui");
+    object.transform.translation = [100.0, 200.0, 300.0];
+    let mut document = test_document(vec![object.clone()]);
+    document.base_root = root.clone();
+    document.assets.push(StageAsset {
+        path: particle_path,
+        kind: StageAssetKind::Particle,
+    });
+    document.registry = Some(ObjectRegistry {
+        objects: vec![ObjectDefinition {
+            factory_name: "EffectBiancoFunsui".to_string(),
+            class_name: "TEffectBiancoFunsui".to_string(),
+            category: "Enemy".to_string(),
+            source: sms_schema::SchemaSource::MarNameRefGen,
+            display_name: None,
+            preview_model: None,
+            hidden: false,
+            unsafe_to_edit: false,
+        }],
+        particle_resources: vec![sms_schema::ParticleResourceDefinition {
+            effect_id: 0x1A9,
+            path: "/scene/map/map/ms_bia_funsui.jpa".to_string(),
+            source_file: "src/Enemy/effectObj.cpp".to_string(),
+        }],
+        actor_particle_bindings: vec![sms_schema::ActorParticleBinding {
+            class_name: "TEffectBiancoFunsui".to_string(),
+            effect_id: 0x1A9,
+            target: ParticleBindingTarget::ActorOrigin,
+            source_file: "src/Enemy/effectObj.cpp".to_string(),
+        }],
+        ..ObjectRegistry::default()
+    });
+
+    let preview = SmsEditorApp::build_model_preview(
+        &document,
+        PreviewVisibility {
+            environment: false,
+            goop: false,
+            effects: true,
+        },
+    )
+    .expect("build particle-only actor preview");
+    let model_index = preview.object_model_indices[&object.id];
+
+    assert_eq!(preview.loaded_models, 1);
+    assert_eq!(preview.actor_particles.len(), 1);
+    assert_eq!(preview.actor_particles[0].model_index, Some(model_index));
+    assert_eq!(
+        preview.actor_particles[0].bind_transform.translation,
+        object.transform.translation
+    );
+    assert!(preview.triangles.iter().any(|triangle| {
+        triangle.model_index == model_index && triangle.render_layer == PreviewRenderLayer::Particle
+    }));
+
+    std::fs::remove_dir_all(root).expect("remove particle fixture folder");
 }
 
 #[test]

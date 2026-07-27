@@ -260,6 +260,29 @@ impl ObjectRegistry {
             .find(|object| object.factory_name == factory_name)
     }
 
+    /// Resolves the JPA loaded for a persistent actor binding.
+    ///
+    /// Effect IDs are reused by stage-specific particle tables. A load in the
+    /// same decomp translation unit as the actor binding is therefore stronger
+    /// evidence than a globally unique numeric ID. The numeric fallback keeps
+    /// bindings whose resources are loaded by a shared director table working.
+    pub fn particle_resource_for_binding(
+        &self,
+        binding: &ActorParticleBinding,
+    ) -> Option<&ParticleResourceDefinition> {
+        let unique_path = |same_source: bool| {
+            let mut candidates = self.particle_resources.iter().filter(|resource| {
+                resource.effect_id == binding.effect_id
+                    && (!same_source || resource.source_file == binding.source_file)
+            });
+            let first = candidates.next()?;
+            candidates
+                .all(|candidate| candidate.path == first.path)
+                .then_some(first)
+        };
+        unique_path(true).or_else(|| unique_path(false))
+    }
+
     pub fn find_npc_actor(&self, factory_name: &str) -> Option<&NpcActorDefinition> {
         let actor_key = factory_name.strip_prefix("NPC")?;
         self.npc_actors
@@ -2070,7 +2093,7 @@ impl SchemaGenerator {
             }
             let source_file = file.relative_path().to_string();
             extract_particle_resources(file.text(), &source_file, registry);
-            extract_calc_particle_bindings(file.text(), &source_file, registry);
+            extract_persistent_particle_bindings(file.text(), &source_file, registry);
         }
         ensure_extracted(
             SchemaExtractor::ParticleResources,
@@ -2948,7 +2971,7 @@ fn extract_stage_bootstrap_map_static_actors(text: &str) -> Vec<String> {
 
 fn extract_particle_resources(text: &str, source_file: &str, registry: &mut ObjectRegistry) {
     let load_re = Regex::new(
-        r#"(?:gpResourceManager|[A-Za-z_][A-Za-z0-9_]*ResourceManager)\s*->\s*load\s*\(\s*\"([^\"]+\.jpa)\"\s*,\s*(0[xX][0-9A-Fa-f]+|[0-9]+)"#,
+        r#"(?:SMS_LoadParticle\s*\(|(?:gpResourceManager|[A-Za-z_][A-Za-z0-9_]*ResourceManager)\s*->\s*load\s*\()\s*\"([^\"]+\.jpa)\"\s*,\s*(0[xX][0-9A-Fa-f]+|[0-9]+)"#,
     )
     .expect("valid particle resource regex");
     for captures in load_re.captures_iter(text) {
@@ -2965,13 +2988,25 @@ fn extract_particle_resources(text: &str, source_file: &str, registry: &mut Obje
     }
 }
 
-fn extract_calc_particle_bindings(text: &str, source_file: &str, registry: &mut ObjectRegistry) {
-    let calc_re = Regex::new(r"([A-Za-z_][A-Za-z0-9_:]*)::calc\s*\([^)]*\)\s*(?:const\s*)?\{")
-        .expect("valid calc method regex");
+fn extract_persistent_particle_bindings(
+    text: &str,
+    source_file: &str,
+    registry: &mut ObjectRegistry,
+) {
+    let method_re = Regex::new(
+        r"([A-Za-z_][A-Za-z0-9_:]*)::([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)\s*(?:const\s*)?\{",
+    )
+    .expect("valid C++ method regex");
+    let call_re =
+        Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(").expect("valid C++ method call regex");
     let matrix_re = Regex::new(
         r"(?:MtxPtr|Mtx\s*\*)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[^;]*mNodeMatrices\s*\[\s*([0-9]+)\s*\]",
     )
     .expect("valid particle matrix regex");
+    let actor_matrix_re = Regex::new(
+        r"MsMtxSetXYZRPH\s*\(\s*([^,\n]+)\s*,\s*mPosition\.x\s*,\s*mPosition\.y\s*,\s*mPosition\.z\s*,",
+    )
+    .expect("valid actor particle matrix regex");
     let emit_re = Regex::new(
         r"emitAndBind(ToPosPtr|ToMtxPtr|ToSRTMtxPtr|ToMtx)\s*\(\s*(0[xX][0-9A-Fa-f]+|[0-9]+)\s*,\s*([^,\n]+)",
     )
@@ -2979,7 +3014,30 @@ fn extract_calc_particle_bindings(text: &str, source_file: &str, registry: &mut 
     let direct_joint_re =
         Regex::new(r"mNodeMatrices\s*\[\s*([0-9]+)\s*\]").expect("valid direct joint regex");
 
-    for captures in calc_re.captures_iter(text) {
+    // `calc()` is Sunshine's ordinary per-frame actor update. Some small
+    // effect actors instead dispatch their virtual emitter from `perform()`;
+    // derive those persistent method names from the local call graph so
+    // event-only methods such as damage/explosion handlers stay excluded.
+    let mut methods_called_from_perform = BTreeSet::new();
+    for captures in method_re.captures_iter(text) {
+        if &captures[2] != "perform" {
+            continue;
+        }
+        let Some(whole_match) = captures.get(0) else {
+            continue;
+        };
+        let Some(body) = braced_body(text, whole_match.end() - 1) else {
+            continue;
+        };
+        methods_called_from_perform
+            .extend(call_re.captures_iter(body).map(|call| call[1].to_string()));
+    }
+
+    for captures in method_re.captures_iter(text) {
+        let method_name = &captures[2];
+        if method_name != "calc" && !methods_called_from_perform.contains(method_name) {
+            continue;
+        }
         let Some(whole_match) = captures.get(0) else {
             continue;
         };
@@ -2992,6 +3050,10 @@ fn extract_calc_particle_bindings(text: &str, source_file: &str, registry: &mut 
                 Some((captures[1].to_string(), captures[2].parse::<usize>().ok()?))
             })
             .collect::<BTreeMap<_, _>>();
+        let actor_matrices = actor_matrix_re
+            .captures_iter(body)
+            .map(|captures| captures[1].trim().to_string())
+            .collect::<BTreeSet<_>>();
         for emission in emit_re.captures_iter(body) {
             let Some(effect_id) = parse_cpp_u16(&emission[2]) else {
                 continue;
@@ -3009,6 +3071,11 @@ fn extract_calc_particle_bindings(text: &str, source_file: &str, registry: &mut 
                             .captures(argument)
                             .and_then(|captures| captures[1].parse::<usize>().ok())
                             .map(ParticleBindingTarget::ModelJoint)
+                    })
+                    .or_else(|| {
+                        actor_matrices
+                            .contains(argument)
+                            .then_some(ParticleBindingTarget::ActorOrigin)
                     })
             };
             let Some(target) = target else {
@@ -6419,7 +6486,7 @@ mod tests {
         "#;
         let mut registry = ObjectRegistry::default();
         extract_particle_resources(resources, "src/System/Resources.cpp", &mut registry);
-        extract_calc_particle_bindings(actor, "src/MoveBG/Example.cpp", &mut registry);
+        extract_persistent_particle_bindings(actor, "src/MoveBG/Example.cpp", &mut registry);
 
         assert_eq!(registry.particle_resources[0].effect_id, 7);
         assert_eq!(registry.particle_resources[0].path, "ms_glow.jpa");
@@ -6439,9 +6506,116 @@ mod tests {
             }
         "#;
         let mut registry = ObjectRegistry::default();
-        extract_calc_particle_bindings(actor, "src/MoveBG/Example.cpp", &mut registry);
+        extract_persistent_particle_bindings(actor, "src/MoveBG/Example.cpp", &mut registry);
 
         assert!(registry.actor_particle_bindings.is_empty());
+    }
+
+    #[test]
+    fn discovers_perform_dispatched_actor_origin_particles() {
+        let source = r#"
+            void TSimpleEffect::perform(u32 flags, JDrama::TGraphics*)
+            {
+                if (flags & 2)
+                    emitEffect();
+            }
+
+            void TExampleFountain::loadAfter()
+            {
+                SMS_LoadParticle("/scene/map/map/ms_example_fountain.jpa", 0x1A9);
+            }
+
+            void TExampleFountain::emitEffect()
+            {
+                MsMtxSetXYZRPH(getEffectMatrix(), mPosition.x, mPosition.y, mPosition.z,
+                               mRotation.x, mRotation.y, mRotation.z);
+                gpMarioParticleManager->emitAndBindToMtxPtr(
+                    0x1A9, getEffectMatrix(), 1, this);
+            }
+        "#;
+        let mut registry = ObjectRegistry::default();
+        extract_particle_resources(source, "src/Enemy/Effect.cpp", &mut registry);
+        extract_persistent_particle_bindings(source, "src/Enemy/Effect.cpp", &mut registry);
+
+        assert_eq!(
+            registry.particle_resources,
+            [ParticleResourceDefinition {
+                effect_id: 0x1A9,
+                path: "/scene/map/map/ms_example_fountain.jpa".to_string(),
+                source_file: "src/Enemy/Effect.cpp".to_string(),
+            }]
+        );
+        assert_eq!(
+            registry.actor_particle_bindings,
+            [ActorParticleBinding {
+                class_name: "TExampleFountain".to_string(),
+                effect_id: 0x1A9,
+                target: ParticleBindingTarget::ActorOrigin,
+                source_file: "src/Enemy/Effect.cpp".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn particle_bindings_prefer_same_source_resources_when_effect_ids_are_reused() {
+        let binding = ActorParticleBinding {
+            class_name: "TStageActor".to_string(),
+            effect_id: 0x168,
+            target: ParticleBindingTarget::ActorOrigin,
+            source_file: "src/Enemy/StageActor.cpp".to_string(),
+        };
+        let registry = ObjectRegistry {
+            particle_resources: vec![
+                ParticleResourceDefinition {
+                    effect_id: 0x168,
+                    path: "/scene/other/effect.jpa".to_string(),
+                    source_file: "src/Enemy/OtherActor.cpp".to_string(),
+                },
+                ParticleResourceDefinition {
+                    effect_id: 0x168,
+                    path: "/scene/stage/effect.jpa".to_string(),
+                    source_file: binding.source_file.clone(),
+                },
+            ],
+            ..ObjectRegistry::default()
+        };
+
+        assert_eq!(
+            registry
+                .particle_resource_for_binding(&binding)
+                .map(|resource| resource.path.as_str()),
+            Some("/scene/stage/effect.jpa")
+        );
+    }
+
+    #[test]
+    fn bundled_schema_contains_perform_dispatched_fountain_particles() {
+        let registry = bundled_object_registry().unwrap().registry;
+        for (class_name, effect_id, path) in [
+            (
+                "TEffectPinnaFunsui",
+                0x1A8,
+                "/scene/map/map/ms_pinna_funsui.jpa",
+            ),
+            (
+                "TEffectBiancoFunsui",
+                0x1A9,
+                "/scene/map/map/ms_bia_funsui.jpa",
+            ),
+        ] {
+            let binding = registry
+                .actor_particle_bindings
+                .iter()
+                .find(|binding| binding.class_name == class_name && binding.effect_id == effect_id)
+                .unwrap_or_else(|| panic!("missing {class_name} particle binding"));
+            assert_eq!(binding.target, ParticleBindingTarget::ActorOrigin);
+            assert_eq!(
+                registry
+                    .particle_resource_for_binding(binding)
+                    .map(|resource| resource.path.as_str()),
+                Some(path)
+            );
+        }
     }
 
     #[test]

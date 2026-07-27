@@ -49,6 +49,238 @@ fn retail_placement_census(
 
 #[test]
 #[ignore = "requires an extracted retail base root"]
+fn bianco0_renders_the_retail_fountain_particle_actor() {
+    let base_root = retail_base_root();
+    let registry = bundled_object_registry()
+        .expect("load bundled decomp-derived schema")
+        .registry;
+    let document = StageDocument::open(&base_root, "bianco0")
+        .expect("open bianco0")
+        .with_registry(registry);
+    let fountain = document
+        .objects
+        .iter()
+        .find(|object| object.factory_name == "EffectBiancoFunsui")
+        .expect("bianco0 contains EffectBiancoFunsui");
+    let fountain_asset = document
+        .assets
+        .iter()
+        .find(|asset| {
+            asset.kind == StageAssetKind::Particle
+                && normalized_preview_asset_path(&asset.path.to_string_lossy())
+                    .ends_with("map/map/ms_bia_funsui.jpa")
+        })
+        .expect("bianco0 mounts ms_bia_funsui.jpa");
+    let effect = JpaEffect::parse(
+        document
+            .read_asset_bytes(&fountain_asset.path)
+            .expect("read retail fountain JPA"),
+    )
+    .expect("parse retail fountain JPA");
+    assert_eq!(
+        effect.emitter.rotation_degrees,
+        [0, 0, 66],
+        "retail BEM1 launch rotation"
+    );
+    assert!(
+        !effect.textures.is_empty(),
+        "retail fountain JPA has no drawable texture"
+    );
+    let extra_texture = effect
+        .extra_texture
+        .expect("retail fountain JPA has its ETX1 material state");
+    assert_eq!(extra_texture.indirect_mode, 0);
+    assert!(extra_texture.second_texture_enabled);
+    let loaded_effects = load_actor_particle_effects(&document);
+    assert!(
+        loaded_effects.contains_key(&0x1A9),
+        "fountain binding did not load effect 0x1A9; object={fountain:#?}, loaded={:?}",
+        loaded_effects.keys().collect::<Vec<_>>()
+    );
+
+    let mut preview = SmsEditorApp::build_model_preview(
+        &document,
+        PreviewVisibility {
+            environment: false,
+            goop: false,
+            effects: true,
+        },
+    )
+    .expect("build bianco0 effect preview");
+    let model_index = *preview
+        .object_model_indices
+        .get(&fountain.id)
+        .unwrap_or_else(|| {
+            panic!(
+                "fountain has no render identity; object={fountain:#?}, actor particles={}, \
+                 model failures={:#?}",
+                preview.actor_particles.len(),
+                preview.model_failures
+            )
+        });
+    let particles = preview
+        .actor_particles
+        .iter()
+        .filter(|particles| particles.model_index == Some(model_index))
+        .count();
+    assert!(particles > 0, "fountain produced no actor particle preview");
+    let particle_triangle_start = preview
+        .actor_particles
+        .iter()
+        .find(|particles| particles.model_index == Some(model_index))
+        .expect("fountain particle preview")
+        .triangle_range
+        .start;
+
+    apply_actor_particles(&preview.actor_particles, 30.0, &mut preview.triangles);
+    let frame_30_triangle = preview.triangles[particle_triangle_start];
+    let visible_triangles = preview
+        .triangles
+        .iter()
+        .filter(|triangle| triangle.model_index == model_index)
+        .filter(|triangle| {
+            let edge_a = std::array::from_fn::<_, 3, _>(|axis| {
+                triangle.vertices[1][axis] - triangle.vertices[0][axis]
+            });
+            let edge_b = std::array::from_fn::<_, 3, _>(|axis| {
+                triangle.vertices[2][axis] - triangle.vertices[0][axis]
+            });
+            let cross = [
+                edge_a[1] * edge_b[2] - edge_a[2] * edge_b[1],
+                edge_a[2] * edge_b[0] - edge_a[0] * edge_b[2],
+                edge_a[0] * edge_b[1] - edge_a[1] * edge_b[0],
+            ];
+            cross.iter().any(|component| component.abs() > 0.01)
+        })
+        .count();
+    assert!(
+        visible_triangles > 0,
+        "retail fountain emitted no non-degenerate particle triangles at frame 30; \
+         emitter={:?}, base_shape={:?}",
+        effect.emitter,
+        effect.base_shape
+    );
+
+    let mut isolated = preview.clone();
+    isolated
+        .triangles
+        .retain(|triangle| triangle.model_index == model_index);
+    let drawable_triangles = isolated
+        .triangles
+        .iter()
+        .filter(|triangle| {
+            triangle.color_channels[0]
+                .is_some_and(|colors| colors.iter().any(|color| color[3] != 0))
+                && {
+                    let edge_a = std::array::from_fn::<_, 3, _>(|axis| {
+                        triangle.vertices[1][axis] - triangle.vertices[0][axis]
+                    });
+                    let edge_b = std::array::from_fn::<_, 3, _>(|axis| {
+                        triangle.vertices[2][axis] - triangle.vertices[0][axis]
+                    });
+                    let cross = [
+                        edge_a[1] * edge_b[2] - edge_a[2] * edge_b[1],
+                        edge_a[2] * edge_b[0] - edge_a[0] * edge_b[2],
+                        edge_a[0] * edge_b[1] - edge_a[1] * edge_b[0],
+                    ];
+                    cross.iter().any(|component| component.abs() > 0.01)
+                }
+        })
+        .collect::<Vec<_>>();
+    let mut minimum = [f32::INFINITY; 3];
+    let mut maximum = [f32::NEG_INFINITY; 3];
+    for vertex in drawable_triangles
+        .iter()
+        .flat_map(|triangle| triangle.vertices)
+    {
+        for axis in 0..3 {
+            minimum[axis] = minimum[axis].min(vertex[axis]);
+            maximum[axis] = maximum[axis].max(vertex[axis]);
+        }
+    }
+    assert!(
+        maximum[1] > fountain.transform.translation[1] + 250.0,
+        "authored 66-degree emitter launch must rise above the bound actor; \
+         actor_y={}, bounds={minimum:?}..{maximum:?}",
+        fountain.transform.translation[1]
+    );
+    let center = std::array::from_fn(|axis| (minimum[axis] + maximum[axis]) * 0.5);
+    let radius = (0..3)
+        .map(|axis| (maximum[axis] - minimum[axis]) * 0.5)
+        .fold(1.0f32, f32::max);
+    let distance = (radius * 3.0).max(100.0);
+    let image = gpu_viewport::render_preview_offscreen(
+        &isolated,
+        gpu_viewport::GpuViewportFrame {
+            camera_position: [center[0], center[1], center[2] - distance],
+            right: [1.0, 0.0, 0.0],
+            up: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+            focal: 350.0,
+            viewport_size: [512.0, 512.0],
+            viewport_pan: [0.0; 2],
+            near: 1.0,
+            animation_seconds: 1.0,
+            light_position: center,
+            light_color: [1.0; 4],
+            ambient_color: Some([1.0; 4]),
+            show_grid: false,
+        },
+        [512, 512],
+    )
+    .expect("render the retail fountain through WGPU");
+    let colored_pixels = image
+        .pixels
+        .iter()
+        .filter(|pixel| {
+            let [red, green, blue, _] = pixel.to_srgba_unmultiplied();
+            red != 0 || green != 0 || blue != 0
+        })
+        .count();
+    assert!(
+        colored_pixels > 100,
+        "retail fountain reached WGPU but rendered no visible pixels; colored={colored_pixels}, \
+         bounds={minimum:?}..{maximum:?}, base_shape={:?}",
+        effect.base_shape
+    );
+    apply_actor_particles(&preview.actor_particles, 31.0, &mut preview.triangles);
+    let frame_31_triangle = preview.triangles[particle_triangle_start];
+    assert_ne!(
+        frame_30_triangle.tex_coords, frame_31_triangle.tex_coords,
+        "retail BSP1 texture translation must animate the stream"
+    );
+    assert_eq!(
+        frame_30_triangle.tex_coord_sets[2], frame_31_triangle.tex_coord_sets[2],
+        "ETX1 extra textures must keep the untransformed GX TEX0 coordinate"
+    );
+    let edge_direction = |triangle: PreviewTriangle| {
+        let edge = std::array::from_fn::<_, 3, _>(|axis| {
+            triangle.vertices[1][axis] - triangle.vertices[0][axis]
+        });
+        let length = edge.iter().map(|value| value * value).sum::<f32>().sqrt();
+        edge.map(|value| value / length.max(0.000001))
+    };
+    let edge_30 = edge_direction(frame_30_triangle);
+    let edge_31 = edge_direction(frame_31_triangle);
+    assert!(
+        edge_30
+            .iter()
+            .zip(edge_31)
+            .map(|(left, right)| left * right)
+            .sum::<f32>()
+            > 0.8,
+        "transported stripe basis must not flip between adjacent retail frames"
+    );
+    if let Some(output) = env::var_os(OUTPUT_ENV).map(PathBuf::from) {
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent).expect("create fountain screenshot directory");
+        }
+        write_bmp(&output, &image).expect("write fountain screenshot");
+    }
+}
+
+#[test]
+#[ignore = "requires an extracted retail base root"]
 fn mamma0_ocean_water_survives_enemy_preview_catalog() {
     let base_root = retail_base_root();
     let decomp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");

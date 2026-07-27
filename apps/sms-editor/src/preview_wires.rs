@@ -425,6 +425,7 @@ fn wire_triangle(
         particle_direction: None,
         particle_color_mode: None,
         particle_environment_color: None,
+        particle_extra_texture: None,
     }
 }
 
@@ -531,6 +532,7 @@ fn append_fitting_instance(
             particle_direction: None,
             particle_color_mode: None,
             particle_environment_color: None,
+            particle_extra_texture: None,
         });
     }
 }

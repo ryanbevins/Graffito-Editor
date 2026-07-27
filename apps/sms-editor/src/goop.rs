@@ -2946,6 +2946,7 @@ mod tests {
             particle_direction: None,
             particle_color_mode: None,
             particle_environment_color: None,
+            particle_extra_texture: None,
         };
         let prop = triangle(2, 50.0);
         let floor = triangle(1, 0.0);

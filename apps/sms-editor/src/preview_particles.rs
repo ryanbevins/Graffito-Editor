@@ -20,9 +20,17 @@ struct SampledParticle {
     particle_type: u8,
     direction: [f32; 3],
     velocity: [f32; 3],
+    stripe_basis: [f32; 3],
     trail_id: u32,
     quad_vertices: Option<[[f32; 3]; 4]>,
     quad_uvs: Option<[[f32; 2]; 4]>,
+    raw_quad_uvs: Option<[[f32; 2]; 4]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ParticlePreviewOrigin {
+    ActorBound(ParticleBindTransform),
+    AuthoredOrTarget([f32; 3]),
 }
 
 pub(super) fn load_actor_particle_effects(document: &StageDocument) -> BTreeMap<u16, JpaEffect> {
@@ -34,21 +42,19 @@ pub(super) fn load_actor_particle_effects(document: &StageDocument) -> BTreeMap<
         .iter()
         .flat_map(|object| cpp_class_names_for_object(registry, object))
         .collect::<BTreeSet<_>>();
-    let requested_ids = registry
+    let requested_resources = registry
         .actor_particle_bindings
         .iter()
         .filter(|binding| actor_classes.contains(binding.class_name.as_str()))
-        .map(|binding| binding.effect_id)
-        .collect::<BTreeSet<_>>();
-    if requested_ids.is_empty() {
+        .filter_map(|binding| {
+            registry
+                .particle_resource_for_binding(binding)
+                .map(|resource| (binding.effect_id, resource.path.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if requested_resources.is_empty() {
         return BTreeMap::new();
     }
-    let requested_resources = registry
-        .particle_resources
-        .iter()
-        .filter(|resource| requested_ids.contains(&resource.effect_id))
-        .map(|resource| (resource.effect_id, resource.path.clone()))
-        .collect::<BTreeMap<_, _>>();
     let mut effects = BTreeMap::new();
 
     for asset in document
@@ -159,13 +165,14 @@ fn resolve_actor_particle_asset(
             continue;
         }
         let resource = normalized_preview_asset_path(resource_path);
-        let matches = if resource.contains('/') {
-            internal.ends_with(resource.trim_start_matches('/'))
+        let mounted_suffix = mounted_particle_resource_suffix(&resource);
+        let matches = if mounted_suffix.contains('/') {
+            internal.ends_with(mounted_suffix)
         } else {
             internal
                 .rsplit('/')
                 .next()
-                .is_some_and(|name| name.eq_ignore_ascii_case(&resource))
+                .is_some_and(|name| name.eq_ignore_ascii_case(mounted_suffix))
         };
         if !matches {
             continue;
@@ -177,6 +184,11 @@ fn resolve_actor_particle_asset(
             effects.insert(*effect_id, effect);
         }
     }
+}
+
+fn mounted_particle_resource_suffix(resource: &str) -> &str {
+    let resource = resource.trim_start_matches('/');
+    resource.strip_prefix("scene/").unwrap_or(resource)
 }
 
 fn cpp_class_names_for_object<'a>(
@@ -246,20 +258,20 @@ pub(super) fn push_actor_particle_previews(
         let Some(effect) = effects.get(&binding.effect_id) else {
             continue;
         };
-        let origin = match binding.target {
-            ParticleBindingTarget::ActorOrigin => transform.translation,
+        let bind_transform = match binding.target {
+            ParticleBindingTarget::ActorOrigin => particle_actor_bind_transform(transform),
             ParticleBindingTarget::ModelJoint(index) => {
                 let Some(matrix) = joint_matrices.get(index).copied() else {
                     continue;
                 };
-                transform_preview_point([matrix[0][3], matrix[1][3], matrix[2][3]], transform)
+                particle_joint_bind_transform(matrix, transform)
             }
         };
         let preview_start = previews.len();
         append_particle_preview(
             effect.clone(),
             Some(binding.effect_id),
-            origin,
+            ParticlePreviewOrigin::ActorBound(bind_transform),
             textures,
             triangles,
             next_packet_index,
@@ -271,6 +283,50 @@ pub(super) fn push_actor_particle_previews(
                 triangle.model_index = model_index;
             }
         }
+    }
+}
+
+fn particle_actor_bind_transform(transform: Transform) -> ParticleBindTransform {
+    let rotation_only = Transform {
+        translation: [0.0; 3],
+        scale: [1.0; 3],
+        ..transform
+    };
+    ParticleBindTransform {
+        translation: transform.translation,
+        rotation: [
+            transform_preview_vector([1.0, 0.0, 0.0], rotation_only),
+            transform_preview_vector([0.0, 1.0, 0.0], rotation_only),
+            transform_preview_vector([0.0, 0.0, 1.0], rotation_only),
+        ],
+    }
+}
+
+fn particle_joint_bind_transform(
+    matrix: J3dMatrix34,
+    actor_transform: Transform,
+) -> ParticleBindTransform {
+    let actor_rotation = Transform {
+        translation: [0.0; 3],
+        scale: [1.0; 3],
+        ..actor_transform
+    };
+    let transform_axis = |axis| {
+        normalize3(transform_preview_vector(
+            transform_j3d_matrix_vector(matrix, axis),
+            actor_rotation,
+        ))
+    };
+    ParticleBindTransform {
+        translation: transform_preview_point(
+            [matrix[0][3], matrix[1][3], matrix[2][3]],
+            actor_transform,
+        ),
+        rotation: [
+            transform_axis([1.0, 0.0, 0.0]),
+            transform_axis([0.0, 1.0, 0.0]),
+            transform_axis([0.0, 0.0, 1.0]),
+        ],
     }
 }
 
@@ -313,8 +369,8 @@ pub(super) fn push_level_transform_particle_previews(
         .into_values()
         .filter(|effects| {
             effects.len() >= 2
-                && effects.iter().any(|effect| effect.uses_screen_texture)
-                && effects.iter().any(|effect| !effect.uses_screen_texture)
+                && effects.iter().any(|effect| effect.extra_texture.is_some())
+                && effects.iter().any(|effect| effect.extra_texture.is_none())
                 && effects.iter().all(|effect| effect.emitter.max_frame > 0)
         })
         .collect::<Vec<_>>();
@@ -336,7 +392,7 @@ pub(super) fn push_level_transform_particle_previews(
             append_particle_preview(
                 effect.clone(),
                 None,
-                target_center,
+                ParticlePreviewOrigin::AuthoredOrTarget(target_center),
                 textures,
                 triangles,
                 next_packet_index,
@@ -395,35 +451,36 @@ fn level_transform_target_centers(model: &LevelTransformModelPreview) -> Vec<[f3
 fn append_particle_preview(
     effect: JpaEffect,
     shared_simulation_id: Option<u16>,
-    target_center: [f32; 3],
+    origin: ParticlePreviewOrigin,
     textures: &mut Vec<PreviewTexture>,
     triangles: &mut Vec<PreviewTriangle>,
     next_packet_index: &mut usize,
     previews: &mut Vec<LevelTransformParticlePreview>,
 ) {
-    let origin_offset = if effect
-        .emitter
-        .translation
-        .iter()
-        .all(|component| component.abs() <= 0.01)
-    {
-        target_center
-    } else {
-        [0.0; 3]
+    let bind_transform = match origin {
+        ParticlePreviewOrigin::ActorBound(transform) => transform,
+        ParticlePreviewOrigin::AuthoredOrTarget(target)
+            if effect
+                .emitter
+                .translation
+                .iter()
+                .all(|component| component.abs() <= 0.01) =>
+        {
+            ParticleBindTransform {
+                translation: target,
+                ..ParticleBindTransform::IDENTITY
+            }
+        }
+        ParticlePreviewOrigin::AuthoredOrTarget(_) => ParticleBindTransform::IDENTITY,
     };
-    let source_texture_index = if effect.uses_screen_texture {
-        usize::from(effect.indirect_texture_index.unwrap_or(1))
-    } else {
-        usize::from(effect.base_shape.texture_index)
-    };
+    let source_texture_index = usize::from(effect.base_shape.texture_index);
     if effect.child_shape.is_none_or(|child| child.draw_parent) {
         append_particle_shape_preview(
             effect.clone(),
             JpaParticleKind::Parent,
             shared_simulation_id,
-            origin_offset,
+            bind_transform,
             source_texture_index,
-            effect.uses_screen_texture,
             textures,
             triangles,
             next_packet_index,
@@ -435,9 +492,8 @@ fn append_particle_preview(
             effect,
             JpaParticleKind::Child,
             shared_simulation_id,
-            origin_offset,
+            bind_transform,
             usize::from(child.texture_index),
-            false,
             textures,
             triangles,
             next_packet_index,
@@ -526,9 +582,8 @@ fn append_particle_shape_preview(
     effect: JpaEffect,
     kind: JpaParticleKind,
     shared_simulation_id: Option<u16>,
-    origin_offset: [f32; 3],
+    bind_transform: ParticleBindTransform,
     source_texture_index: usize,
-    screen_distortion: bool,
     textures: &mut Vec<PreviewTexture>,
     triangles: &mut Vec<PreviewTriangle>,
     next_packet_index: &mut usize,
@@ -537,6 +592,9 @@ fn append_particle_shape_preview(
     let Some(source_texture) = effect.textures.get(source_texture_index) else {
         return;
     };
+    let particle_extra_texture = effect
+        .extra_texture
+        .and_then(|extra| append_particle_extra_textures(&effect, extra, textures));
     let texture_index = push_j3d_preview_textures(textures, std::slice::from_ref(source_texture));
     let draw_shape = match kind {
         JpaParticleKind::Parent => effect.base_shape,
@@ -565,11 +623,11 @@ fn append_particle_shape_preview(
             texture_index,
             draw_shape,
             extra_shape,
-            screen_distortion,
+            particle_extra_texture,
         );
     }
     previews.push(LevelTransformParticlePreview {
-        origin_offset,
+        bind_transform,
         effect,
         kind,
         shared_simulation_id,
@@ -577,6 +635,42 @@ fn append_particle_shape_preview(
         particle_capacity,
         model_index: None,
     });
+}
+
+fn append_particle_extra_textures(
+    effect: &JpaEffect,
+    extra: sms_formats::JpaExtraTexture,
+    textures: &mut Vec<PreviewTexture>,
+) -> Option<ParticleExtraTexturePreview> {
+    let push_texture = |source_index: u8, textures: &mut Vec<PreviewTexture>| {
+        effect
+            .textures
+            .get(usize::from(source_index))
+            .map(|texture| push_j3d_preview_textures(textures, std::slice::from_ref(texture)))
+    };
+    let indirect_texture_index = push_texture(extra.indirect_texture_index, textures)?;
+    let sub_texture_index = (extra.indirect_mode == 2)
+        .then(|| push_texture(extra.sub_texture_index, textures))
+        .flatten();
+    if extra.indirect_mode == 2 && sub_texture_index.is_none() {
+        return None;
+    }
+    let second_texture_index = extra
+        .second_texture_enabled
+        .then(|| push_texture(extra.second_texture_index, textures))
+        .flatten();
+    if extra.second_texture_enabled && second_texture_index.is_none() {
+        return None;
+    }
+    Some(ParticleExtraTexturePreview {
+        indirect_mode: extra.indirect_mode,
+        matrix_mode: extra.matrix_mode,
+        indirect_matrix: extra.indirect_matrix,
+        exponent: extra.exponent,
+        indirect_texture_index,
+        sub_texture_index,
+        second_texture_index,
+    })
 }
 
 pub(super) fn level_transform_duration_frames(previews: &[LevelTransformParticlePreview]) -> f32 {
@@ -662,8 +756,8 @@ pub(super) fn apply_level_transform_particles(
     triangles: &mut [PreviewTriangle],
 ) {
     for preview in previews {
-        let samples = sample_particle_preview(preview, preview.origin_offset, retail_frame);
-        apply_particle_samples(preview, &samples, [0.0; 3], triangles);
+        let samples = sample_particle_preview(preview, [0.0; 3], retail_frame);
+        apply_particle_samples(preview, &samples, preview.bind_transform, triangles);
     }
 }
 
@@ -678,14 +772,14 @@ pub(super) fn apply_actor_particles(
     let mut shared_samples = BTreeMap::<(u16, JpaParticleKind), Vec<SampledParticle>>::new();
     for preview in previews {
         let Some(effect_id) = preview.shared_simulation_id else {
-            let samples = sample_particle_preview(preview, preview.origin_offset, retail_frame);
-            apply_particle_samples(preview, &samples, [0.0; 3], triangles);
+            let samples = sample_particle_preview(preview, [0.0; 3], retail_frame);
+            apply_particle_samples(preview, &samples, preview.bind_transform, triangles);
             continue;
         };
         let samples = shared_samples
             .entry((effect_id, preview.kind))
             .or_insert_with(|| sample_particle_preview(preview, [0.0; 3], retail_frame));
-        apply_particle_samples(preview, samples, preview.origin_offset, triangles);
+        apply_particle_samples(preview, samples, preview.bind_transform, triangles);
     }
 }
 
@@ -724,20 +818,62 @@ fn sample_particle_preview(
             preview.effect.base_shape.flags & 1 != 0,
             preview.particle_capacity,
         );
+        apply_stripe_texture_matrix(
+            &mut samples,
+            preview.effect.base_shape,
+            retail_frame - f32::from(preview.effect.emitter.start_frame.max(0)),
+        );
     }
     samples
+}
+
+fn apply_stripe_texture_matrix(
+    samples: &mut [SampledParticle],
+    shape: sms_formats::JpaBaseShape,
+    emitter_frame: f32,
+) {
+    let Some(matrix) = shape.texture_matrix else {
+        return;
+    };
+    // JPABaseEmitter increments its frame manager after particle calculation,
+    // before JPADrawExecSetTexMtx consumes it.
+    let tick = emitter_frame.floor().max(0.0) + 1.0;
+    let translation: [f32; 2] =
+        std::array::from_fn(|axis| matrix.translation[axis] + matrix.translation_step[axis] * tick);
+    let scale: [f32; 2] =
+        std::array::from_fn(|axis| matrix.scale[axis] + matrix.scale_step[axis] * tick);
+    let (sin, cos) = (matrix.rotation_step * tick * std::f32::consts::PI).sin_cos();
+    let tiling = shape.tiling.map(|value| value * 0.5);
+    let offset = [
+        tiling[0]
+            + scale[0] * (sin * (tiling[1] + translation[1]) - cos * (tiling[0] + translation[0])),
+        tiling[1]
+            - scale[1] * (sin * (tiling[0] + translation[0]) + cos * (tiling[1] + translation[1])),
+    ];
+    for sample in samples {
+        let Some(uvs) = &mut sample.quad_uvs else {
+            continue;
+        };
+        for uv in uvs {
+            let [u, v] = *uv;
+            *uv = [
+                scale[0] * cos * u - scale[0] * sin * v + offset[0],
+                scale[1] * sin * u + scale[1] * cos * v + offset[1],
+            ];
+        }
+    }
 }
 
 fn apply_particle_samples(
     preview: &LevelTransformParticlePreview,
     samples: &[SampledParticle],
-    translation: [f32; 3],
+    bind_transform: ParticleBindTransform,
     triangles: &mut [PreviewTriangle],
 ) {
     let slots = triangles[preview.triangle_range.clone()].chunks_exact_mut(2);
     for (index, slot) in slots.enumerate() {
         if let Some(sample) = samples.get(index).copied() {
-            update_particle_slot(slot, sample, translation);
+            update_particle_slot(slot, sample, bind_transform);
         } else {
             hide_particle_slot(slot);
         }
@@ -802,6 +938,7 @@ fn sample_child_particles(
             }
 
             let local = volume_position(effect, parent_seed);
+            let parent_start = emitter_particle_position(effect, local);
             let parent_velocity = initial_velocity(effect, local, parent_seed, birth_frame as f32);
             for child_birth_age in
                 (first_child_age..=last_child_age).step_by(usize::from(child.spawn_step) + 1)
@@ -817,14 +954,15 @@ fn sample_child_particles(
                         .wrapping_add(child_index.wrapping_mul(0xc2b2_ae35));
                     let parent_age = child_birth_age as f32;
                     let mut child_velocity = [0.0; 3];
-                    let (parent_position, parent_current_velocity) = simulate_particle_motion(
-                        effect,
-                        std::array::from_fn(|axis| local[axis] * emitter.scale[axis]),
-                        parent_velocity,
-                        parent_seed,
-                        parent_age,
-                        parent_lifetime,
-                    );
+                    let (parent_position, parent_current_velocity, parent_stripe_basis) =
+                        simulate_particle_motion(
+                            effect,
+                            parent_start,
+                            parent_velocity,
+                            parent_seed,
+                            parent_age,
+                            parent_lifetime,
+                        );
                     let random_offset = random_unit3(seed ^ 0x27d4_eb2d)
                         .map(|value| value * child.position_random * random01(seed ^ 0x1656_67b1));
                     let random_velocity = random_unit3(seed ^ 0xd3a2_646c);
@@ -838,7 +976,7 @@ fn sample_child_particles(
                     }
                     let child_start =
                         std::array::from_fn(|axis| parent_position[axis] + random_offset[axis]);
-                    let (child_position, child_current_velocity) =
+                    let (child_position, child_current_velocity, child_stripe_basis) =
                         if child.children_affected_by_fields {
                             simulate_particle_motion(
                                 effect,
@@ -854,6 +992,7 @@ fn sample_child_particles(
                                     child_start[axis] + child_velocity[axis] * child_age
                                 }),
                                 child_velocity,
+                                parent_stripe_basis,
                             )
                         };
                     let position = std::array::from_fn(|axis| {
@@ -923,12 +1062,14 @@ fn sample_child_particles(
                             child.direction_type,
                             child_current_velocity,
                             random_offset,
-                            effect.emitter.direction,
+                            emitter_rotated_vector(effect, effect.emitter.direction),
                         ),
                         velocity: child_current_velocity,
+                        stripe_basis: child_stripe_basis,
                         trail_id: parent_seed,
                         quad_vertices: None,
                         quad_uvs: None,
+                        raw_quad_uvs: None,
                     });
                     if result.len() == capacity {
                         return result;
@@ -989,24 +1130,16 @@ fn sample_particles(
             }
             let life = (age / lifetime.max(1.0)).clamp(0.0, 1.0);
             let local = volume_position(effect, seed);
+            let particle_start = emitter_particle_position(effect, local);
             let velocity = initial_velocity(effect, local, seed, birth_frame as f32);
-            let (local_position, current_velocity) = simulate_particle_motion(
-                effect,
-                std::array::from_fn(|axis| local[axis] * emitter.scale[axis]),
-                velocity,
-                seed,
-                age,
-                lifetime,
-            );
+            let (local_position, current_velocity, stripe_basis) =
+                simulate_particle_motion(effect, particle_start, velocity, seed, age, lifetime);
             let position = std::array::from_fn(|axis| {
                 origin_offset[axis] + emitter.translation[axis] + local_position[axis]
             });
             let scale = particle_scale(effect, life, seed, birth_frame as f32);
             let (mut color, environment_color) =
                 particle_colors(effect, age, life, seed, emitter_frame);
-            if effect.uses_screen_texture {
-                color = [190, 220, 255, 92];
-            }
             color[3] = ((f32::from(color[3]) * particle_alpha(effect, life))
                 .round()
                 .clamp(0.0, 255.0)) as u8;
@@ -1023,13 +1156,15 @@ fn sample_particles(
                 direction: particle_draw_direction(
                     effect.base_shape.direction_type,
                     current_velocity,
-                    local,
-                    emitter.direction,
+                    particle_start,
+                    emitter_rotated_vector(effect, emitter.direction),
                 ),
                 velocity: current_velocity,
+                stripe_basis,
                 trail_id: seed,
                 quad_vertices: None,
                 quad_uvs: None,
+                raw_quad_uvs: None,
             });
             if result.len() == capacity {
                 return result;
@@ -1128,7 +1263,29 @@ fn initial_velocity(effect: &JpaEffect, local: [f32; 3], seed: u32, birth_frame:
     });
     let velocity_random =
         1.0 + emitter.initial_velocity_random_scale * (random01(seed ^ 0x1f83_d9ab) * 2.0 - 1.0);
-    velocity.map(|component| component * velocity_random)
+    let mut velocity = velocity.map(|component| component * velocity_random);
+    if emitter.flags & 4 != 0 {
+        velocity = std::array::from_fn(|axis| velocity[axis] * emitter.scale[axis]);
+    }
+    emitter_rotated_vector(effect, velocity)
+}
+
+fn emitter_particle_position(effect: &JpaEffect, local: [f32; 3]) -> [f32; 3] {
+    emitter_rotated_vector(
+        effect,
+        std::array::from_fn(|axis| local[axis] * effect.emitter.scale[axis]),
+    )
+}
+
+fn emitter_rotated_vector(effect: &JpaEffect, vector: [f32; 3]) -> [f32; 3] {
+    rotate_particle_vector_degrees(vector, effect.emitter.rotation_degrees.map(f32::from))
+}
+
+fn rotate_particle_vector_degrees(vector: [f32; 3], rotation_degrees: [f32; 3]) -> [f32; 3] {
+    let [x, y, z] = rotation_degrees;
+    let vector = rotate_x_degrees(vector, x);
+    let vector = rotate_y_degrees(vector, y);
+    rotate_z_degrees(vector, z)
 }
 
 fn simulate_particle_motion(
@@ -1138,7 +1295,7 @@ fn simulate_particle_motion(
     seed: u32,
     age: f32,
     lifetime: f32,
-) -> ([f32; 3], [f32; 3]) {
+) -> ([f32; 3], [f32; 3], [f32; 3]) {
     let emitter = effect.emitter;
     let air = (emitter.base_air_resistance
         + emitter.air_resistance_variance * (random01(seed ^ 0x428a_2f98) - 0.5))
@@ -1147,9 +1304,10 @@ fn simulate_particle_motion(
         emitter.base_weight * (1.0 - emitter.weight_random_scale * random01(seed ^ 0x7137_4491));
     let mut field_acceleration = [0.0; 3];
     let mut velocity = base_velocity.map(|value| value * weight);
-    for frame in 0..age.floor().max(0.0) as u32 {
+    let mut stripe_basis = emitter_rotated_vector(effect, [0.0, 1.0, 0.0]);
+    for frame in 0..=age.floor().max(0.0) as u32 {
         let progress = frame as f32 / lifetime.max(1.0);
-        let mut field_velocity = field_acceleration;
+        let mut field_velocity = [0.0; 3];
         for (field_index, field) in effect.fields.iter().enumerate() {
             let fade = field_fade_scale(*field, progress);
             if fade <= 0.0 {
@@ -1192,13 +1350,40 @@ fn simulate_particle_motion(
         if air < 1.0 {
             base_velocity = base_velocity.map(|value| value * air);
         }
-        velocity =
-            std::array::from_fn(|axis| (base_velocity[axis] + field_velocity[axis]) * weight);
+        velocity = std::array::from_fn(|axis| {
+            (base_velocity[axis] + field_acceleration[axis] + field_velocity[axis]) * weight
+        });
         for axis in 0..3 {
             position[axis] += velocity[axis];
         }
+        let draw_direction = particle_draw_direction(
+            effect.base_shape.direction_type,
+            velocity,
+            position,
+            emitter_rotated_vector(effect, emitter.direction),
+        );
+        stripe_basis = transport_stripe_basis(stripe_basis, draw_direction);
     }
-    (position, velocity)
+    (position, velocity, stripe_basis)
+}
+
+fn transport_stripe_basis(basis: [f32; 3], direction: [f32; 3]) -> [f32; 3] {
+    let direction = normalize3(direction);
+    if direction == [0.0; 3] {
+        return normalize3(basis);
+    }
+    let mut side = cross3(basis, direction);
+    if side == [0.0; 3] {
+        side = [0.0, 1.0, 0.0];
+    } else {
+        side = normalize3(side);
+    }
+    let transported = normalize3(cross3(direction, side));
+    if transported == [0.0; 3] {
+        normalize3(basis)
+    } else {
+        transported
+    }
 }
 
 fn field_fade_scale(field: sms_formats::JpaField, progress: f32) -> f32 {
@@ -1289,7 +1474,9 @@ fn stripe_particle_segments(
             let (start_left, start_right) = stripe_edges(pair[0], cross_index == 1);
             let (end_left, end_right) = stripe_edges(pair[1], cross_index == 1);
             segment.quad_vertices = Some([start_left, start_right, end_left, end_right]);
-            segment.quad_uvs = Some([[0.0, start_v], [1.0, start_v], [0.0, end_v], [1.0, end_v]]);
+            let uvs = [[0.0, start_v], [1.0, start_v], [0.0, end_v], [1.0, end_v]];
+            segment.quad_uvs = Some(uvs);
+            segment.raw_quad_uvs = Some(uvs);
             // 255 is the internal pre-expanded particle geometry marker. The
             // GPU must preserve these authored strip vertices verbatim.
             segment.particle_type = 255;
@@ -1313,27 +1500,38 @@ fn stripe_edges(particle: &SampledParticle, second_cross: bool) -> ([f32; 3], [f
     } else {
         direction
     };
-    let mut side = cross3([0.0, 1.0, 0.0], direction);
+    let basis = transport_stripe_basis(particle.stripe_basis, direction);
+    let mut side = cross3(basis, direction);
     if side == [0.0; 3] {
         side = [0.0, 1.0, 0.0];
     } else {
         side = normalize3(side);
     }
-    let across = normalize3(cross3(direction, side));
     let angle = particle.rotation * std::f32::consts::PI;
     let (sin, cos) = angle.sin_cos();
-    let (basis_x, basis_y, width) = if second_cross {
-        (across.map(|value| -value), side, particle.half_size[1])
+    let (axis, width, reverse_vertices) = if second_cross {
+        (
+            std::array::from_fn(|component| basis[component] * sin - side[component] * cos),
+            particle.half_size[1],
+            true,
+        )
     } else {
-        (across, side, particle.half_size[0])
+        (
+            std::array::from_fn(|component| basis[component] * sin + side[component] * cos),
+            particle.half_size[0],
+            false,
+        )
     };
-    let axis = normalize3(std::array::from_fn(|component| {
-        basis_x[component] * sin + basis_y[component] * cos
-    }));
-    (
-        std::array::from_fn(|component| particle.position[component] - axis[component] * width),
-        std::array::from_fn(|component| particle.position[component] + axis[component] * width),
-    )
+    let axis = normalize3(axis);
+    let negative =
+        std::array::from_fn(|component| particle.position[component] - axis[component] * width);
+    let positive =
+        std::array::from_fn(|component| particle.position[component] + axis[component] * width);
+    if reverse_vertices {
+        (positive, negative)
+    } else {
+        (negative, positive)
+    }
 }
 
 fn particle_scale(effect: &JpaEffect, life: f32, seed: u32, birth_frame: f32) -> [f32; 2] {
@@ -1468,7 +1666,7 @@ fn push_particle_slot(
     texture_index: usize,
     shape: sms_formats::JpaBaseShape,
     extra_shape: Option<sms_formats::JpaExtraShape>,
-    screen_distortion: bool,
+    particle_extra_texture: Option<ParticleExtraTexturePreview>,
 ) {
     let triangle = |uv: [[f32; 2]; 3], corner_uv: [[f32; 2]; 3]| PreviewTriangle {
         vertices: [[0.0; 3]; 3],
@@ -1477,15 +1675,15 @@ fn push_particle_slot(
             Some([[255, 255, 255, 0]; 3]),
             Some([shape.environment_color; 3]),
         ],
-        tex_coord_sets: std::array::from_fn(|slot| (slot == 1).then_some(corner_uv)),
+        tex_coord_sets: std::array::from_fn(|slot| match slot {
+            1 => Some(corner_uv),
+            2 => Some(uv),
+            _ => None,
+        }),
         material_index: None,
         packet_index,
         model_index: 0,
-        render_layer: if screen_distortion {
-            PreviewRenderLayer::ParticleDistortion
-        } else {
-            PreviewRenderLayer::Particle
-        },
+        render_layer: PreviewRenderLayer::Particle,
         color: None,
         vertex_colors: None,
         combine_mode: J3dPreviewCombineMode::TextureModulateVertex,
@@ -1520,6 +1718,7 @@ fn push_particle_slot(
         particle_direction: Some([0.0; 3]),
         particle_color_mode: Some(shape.color_mode),
         particle_environment_color: Some(shape.environment_color),
+        particle_extra_texture,
     };
     let [tiling_x, tiling_y] = shape.tiling;
     triangles.push(triangle(
@@ -1535,15 +1734,19 @@ fn push_particle_slot(
 fn update_particle_slot(
     slot: &mut [PreviewTriangle],
     sample: SampledParticle,
-    translation: [f32; 3],
+    bind_transform: ParticleBindTransform,
 ) {
-    let sample = translated_particle_sample(sample, translation);
+    let sample = transform_particle_sample(sample, bind_transform);
     if let (Some(vertices), Some(uvs)) = (sample.quad_vertices, sample.quad_uvs) {
         if let [first, second] = slot {
             first.vertices = [vertices[0], vertices[1], vertices[3]];
             second.vertices = [vertices[0], vertices[3], vertices[2]];
             first.tex_coords = Some([uvs[0], uvs[1], uvs[3]]);
             second.tex_coords = Some([uvs[0], uvs[3], uvs[2]]);
+            if let Some(raw_uvs) = sample.raw_quad_uvs {
+                first.tex_coord_sets[2] = Some([raw_uvs[0], raw_uvs[1], raw_uvs[3]]);
+                second.tex_coord_sets[2] = Some([raw_uvs[0], raw_uvs[3], raw_uvs[2]]);
+            }
         }
     }
     for triangle in slot {
@@ -1558,17 +1761,31 @@ fn update_particle_slot(
     }
 }
 
-fn translated_particle_sample(
+fn transform_particle_sample(
     mut sample: SampledParticle,
-    translation: [f32; 3],
+    bind_transform: ParticleBindTransform,
 ) -> SampledParticle {
-    sample.position = std::array::from_fn(|axis| sample.position[axis] + translation[axis]);
+    sample.position = transform_particle_point(sample.position, bind_transform);
+    sample.direction = transform_particle_vector(sample.direction, bind_transform.rotation);
+    sample.velocity = transform_particle_vector(sample.velocity, bind_transform.rotation);
+    sample.stripe_basis = transform_particle_vector(sample.stripe_basis, bind_transform.rotation);
     if let Some(vertices) = &mut sample.quad_vertices {
         for vertex in vertices {
-            *vertex = std::array::from_fn(|axis| vertex[axis] + translation[axis]);
+            *vertex = transform_particle_point(*vertex, bind_transform);
         }
     }
     sample
+}
+
+fn transform_particle_point(point: [f32; 3], bind_transform: ParticleBindTransform) -> [f32; 3] {
+    let rotated = transform_particle_vector(point, bind_transform.rotation);
+    std::array::from_fn(|axis| rotated[axis] + bind_transform.translation[axis])
+}
+
+fn transform_particle_vector(vector: [f32; 3], rotation: [[f32; 3]; 3]) -> [f32; 3] {
+    std::array::from_fn(|row| {
+        rotation[0][row] * vector[0] + rotation[1][row] * vector[1] + rotation[2][row] * vector[2]
+    })
 }
 
 fn hide_particle_slot(slot: &mut [PreviewTriangle]) {
@@ -1654,11 +1871,19 @@ mod tests {
             particle_type: 6,
             direction: [0.0, 1.0, 0.0],
             velocity: [0.0; 3],
+            stripe_basis: [1.0, 0.0, 0.0],
             trail_id: 0,
             quad_vertices: Some([[1.0, 2.0, 3.0]; 4]),
             quad_uvs: Some([[0.0; 2]; 4]),
+            raw_quad_uvs: Some([[0.0; 2]; 4]),
         };
-        let translated = translated_particle_sample(sample, [10.0, 20.0, 30.0]);
+        let translated = transform_particle_sample(
+            sample,
+            ParticleBindTransform {
+                translation: [10.0, 20.0, 30.0],
+                ..ParticleBindTransform::IDENTITY
+            },
+        );
         assert_eq!(translated.position, [11.0, 22.0, 33.0]);
         assert!(translated
             .quad_vertices
@@ -1691,6 +1916,39 @@ mod tests {
     }
 
     #[test]
+    fn authored_emitter_z_rotation_turns_forward_launch_upward() {
+        let rotated = rotate_particle_vector_degrees([1.0, 0.0, 0.0], [0.0, 0.0, 66.0]);
+        assert!(rotated[0] > 0.4);
+        assert!(rotated[1] > 0.9);
+        assert!(rotated[2].abs() < 0.0001);
+    }
+
+    #[test]
+    fn stripe_basis_parallel_transports_without_frame_to_frame_flips() {
+        let mut basis = [0.0, 1.0, 0.0];
+        for direction in [
+            [1.0, 0.2, 0.0],
+            [1.0, 0.1, 0.05],
+            [1.0, 0.0, 0.1],
+            [1.0, -0.1, 0.15],
+            [1.0, -0.2, 0.2],
+        ] {
+            let next = transport_stripe_basis(basis, direction);
+            assert!(next.iter().all(|value| value.is_finite()));
+            assert!(basis.iter().zip(next).map(|(a, b)| a * b).sum::<f32>() > 0.9);
+            assert!(
+                next.iter()
+                    .zip(normalize3(direction))
+                    .map(|(a, b)| a * b)
+                    .sum::<f32>()
+                    .abs()
+                    < 0.0001
+            );
+            basis = next;
+        }
+    }
+
+    #[test]
     fn particle_color_tables_interpolate_retail_keyframes() {
         let keys = [
             sms_formats::JpaColorKey {
@@ -1716,9 +1974,11 @@ mod tests {
             particle_type: 6,
             direction: [1.0, 0.0, 0.0],
             velocity: [0.0, 0.0, 1.0],
+            stripe_basis: [0.0, 1.0, 0.0],
             trail_id: 7,
             quad_vertices: None,
             quad_uvs: None,
+            raw_quad_uvs: None,
         };
         let segments = stripe_particle_segments(
             &[
@@ -1818,6 +2078,19 @@ mod tests {
             cpp_class_names_for_object(&registry, &object),
             vec!["TExampleActor"]
         );
+    }
+
+    #[test]
+    fn absolute_scene_particle_paths_match_mounted_archive_members() {
+        assert_eq!(
+            mounted_particle_resource_suffix("/scene/map/map/ms_bia_funsui.jpa"),
+            "map/map/ms_bia_funsui.jpa"
+        );
+        assert_eq!(
+            mounted_particle_resource_suffix("/scene/mapObj/effect.jpa"),
+            "mapObj/effect.jpa"
+        );
+        assert_eq!(mounted_particle_resource_suffix("shared.jpa"), "shared.jpa");
     }
 
     #[test]

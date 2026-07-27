@@ -12,8 +12,7 @@ pub struct JpaEffect {
     pub keyframes: Vec<JpaKeyframeCurve>,
     pub color_animation: Option<JpaColorAnimation>,
     pub textures: Vec<J3dTexturePreview>,
-    pub uses_screen_texture: bool,
-    pub indirect_texture_index: Option<u8>,
+    pub extra_texture: Option<JpaExtraTexture>,
     /// Blocks that this parser does not understand yet, retained verbatim.
     pub unknown_blocks: Vec<JpaRawBlock>,
     bytes: Vec<u8>,
@@ -30,6 +29,7 @@ pub struct JpaRawBlock {
 pub struct JpaEmitter {
     pub scale: [f32; 3],
     pub translation: [f32; 3],
+    pub rotation_degrees: [i16; 3],
     pub volume_type: u8,
     pub emit_interval: u8,
     pub spawn_rate: f32,
@@ -61,6 +61,7 @@ pub struct JpaBaseShape {
     pub direction_type: u8,
     pub rotation_type: u8,
     pub tiling: [f32; 2],
+    pub texture_matrix: Option<JpaTextureMatrix>,
     pub texture_index: u8,
     pub color_mode: u8,
     pub color: [u8; 4],
@@ -72,6 +73,16 @@ pub struct JpaBaseShape {
     pub z_compare_enable: bool,
     pub z_compare_function: u8,
     pub z_update_enable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JpaTextureMatrix {
+    pub translation: [f32; 2],
+    pub scale: [f32; 2],
+    pub translation_step: [f32; 2],
+    pub scale_step: [f32; 2],
+    /// Signed half-turns per emitter frame, matching JPADrawExecSetTexMtx.
+    pub rotation_step: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -168,6 +179,18 @@ pub struct JpaColorKey {
     pub color: [u8; 4],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JpaExtraTexture {
+    pub indirect_mode: u8,
+    pub matrix_mode: u8,
+    pub indirect_matrix: [[f32; 3]; 2],
+    pub exponent: i8,
+    pub indirect_texture_index: u8,
+    pub sub_texture_index: u8,
+    pub second_texture_enabled: bool,
+    pub second_texture_index: u8,
+}
+
 impl JpaEffect {
     pub fn parse(bytes: impl AsRef<[u8]>) -> Result<Self> {
         let bytes = bytes.as_ref();
@@ -198,8 +221,7 @@ impl JpaEffect {
         let mut raw_curves = Vec::new();
         let mut color_animation = None;
         let mut textures = Vec::new();
-        let mut uses_screen_texture = false;
-        let mut indirect_texture_index = None;
+        let mut extra_texture = None;
         let mut unknown_blocks = Vec::new();
         let mut offset = 0x20usize;
 
@@ -226,11 +248,7 @@ impl JpaEffect {
                 b"SSP1" => child_shape = Some(parse_child_shape(block)?),
                 b"FLD1" => fields.push(parse_field(block)?),
                 b"KFA1" => raw_curves.push(parse_keyframes(block)?),
-                b"ETX1" => {
-                    require(block, 0x20)?;
-                    uses_screen_texture = true;
-                    indirect_texture_index = Some(block[0x1f]);
-                }
+                b"ETX1" => extra_texture = Some(parse_extra_texture(block)?),
                 b"TEX1" => {
                     let mut texture = decode_bti_texture(
                         block.get(0x20..).ok_or_else(|| invalid(offset + 0x20, 1))?,
@@ -284,12 +302,36 @@ impl JpaEffect {
             keyframes: raw_curves,
             color_animation,
             textures,
-            uses_screen_texture,
-            indirect_texture_index,
+            extra_texture,
             unknown_blocks,
             bytes: bytes.to_vec(),
         })
     }
+}
+
+fn parse_extra_texture(block: &[u8]) -> Result<JpaExtraTexture> {
+    require(block, 0x34)?;
+    Ok(JpaExtraTexture {
+        indirect_mode: block[0x10],
+        matrix_mode: block[0x11],
+        indirect_matrix: [
+            [
+                fixed(block, 0x12)?,
+                fixed(block, 0x14)?,
+                fixed(block, 0x16)?,
+            ],
+            [
+                fixed(block, 0x18)?,
+                fixed(block, 0x1a)?,
+                fixed(block, 0x1c)?,
+            ],
+        ],
+        exponent: block[0x1e] as i8,
+        indirect_texture_index: block[0x1f],
+        sub_texture_index: block[0x20],
+        second_texture_enabled: block[0x30] & 1 != 0,
+        second_texture_index: block[0x33],
+    })
 }
 
 impl PreserveBytes for JpaEffect {
@@ -337,6 +379,11 @@ fn parse_emitter(block: &[u8]) -> Result<JpaEmitter> {
     Ok(JpaEmitter {
         scale: vec3(block, 0x0c)?,
         translation: vec3(block, 0x18)?,
+        rotation_degrees: [
+            be_i16(block, 0x24)?,
+            be_i16(block, 0x26)?,
+            be_i16(block, 0x28)?,
+        ],
         volume_type: block[0x2a],
         emit_interval: block[0x2b],
         spawn_rate: be_f32(block, 0x30)?,
@@ -381,6 +428,19 @@ fn parse_base_shape(block: &[u8]) -> Result<JpaBaseShape> {
         direction_type: block[0x25],
         rotation_type: block[0x26],
         tiling: [fixed(block, 0x88)? * 10.0, fixed(block, 0x8a)? * 10.0],
+        texture_matrix: (block[0x96] != 0)
+            .then(|| -> Result<JpaTextureMatrix> {
+                Ok(JpaTextureMatrix {
+                    // These apparently crossed fields reproduce JPABaseShape's
+                    // getters, which are what the retail draw visitor consumes.
+                    translation: [fixed(block, 0x80)? * 10.0, fixed(block, 0x82)? * 10.0],
+                    scale: [fixed(block, 0x84)? * 10.0, fixed(block, 0x86)? * 10.0],
+                    translation_step: [fixed(block, 0x8c)?, fixed(block, 0x8e)?],
+                    scale_step: [fixed(block, 0x90)? * 0.1, fixed(block, 0x92)? * 0.1],
+                    rotation_step: fixed(block, 0x94)?,
+                })
+            })
+            .transpose()?,
         texture_index: block[0x4f],
         color_mode: block[0x30],
         color: block[0x64..0x68].try_into().unwrap(),
@@ -663,6 +723,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_authored_emitter_rotation() {
+        let mut block = vec![0; 0x90];
+        block[..4].copy_from_slice(b"BEM1");
+        block[0x24..0x26].copy_from_slice(&(-12i16).to_be_bytes());
+        block[0x26..0x28].copy_from_slice(&34i16.to_be_bytes());
+        block[0x28..0x2a].copy_from_slice(&66i16.to_be_bytes());
+
+        let emitter = parse_emitter(&block).unwrap();
+        assert_eq!(emitter.rotation_degrees, [-12, 34, 66]);
+    }
+
+    #[test]
     fn sparse_keyframe_mask_uses_the_set_bit_index_and_preserves_unknown_data() {
         let mut bytes = effect_with_keyframe_mask(0b1000);
         bytes.extend_from_slice(b"trailing bytes");
@@ -757,8 +829,18 @@ mod tests {
         block[0x30] = 3;
         block[0x64..0x68].copy_from_slice(&[1, 2, 3, 4]);
         block[0x68..0x6c].copy_from_slice(&[5, 6, 7, 8]);
+        block[0x80..0x82].copy_from_slice(&3277i16.to_be_bytes());
+        block[0x82..0x84].copy_from_slice(&6554i16.to_be_bytes());
+        block[0x84..0x86].copy_from_slice(&9830i16.to_be_bytes());
+        block[0x86..0x88].copy_from_slice(&13107i16.to_be_bytes());
         block[0x88..0x8a].copy_from_slice(&3277i16.to_be_bytes());
         block[0x8a..0x8c].copy_from_slice(&6554i16.to_be_bytes());
+        block[0x8c..0x8e].copy_from_slice(&1638i16.to_be_bytes());
+        block[0x8e..0x90].copy_from_slice(&(-3277i16).to_be_bytes());
+        block[0x90..0x92].copy_from_slice(&6554i16.to_be_bytes());
+        block[0x92..0x94].copy_from_slice(&(-6554i16).to_be_bytes());
+        block[0x94..0x96].copy_from_slice(&8192i16.to_be_bytes());
+        block[0x96] = 1;
 
         let shape = parse_base_shape(&block).unwrap();
         assert_eq!(shape.size, [1.5, 4.0]);
@@ -770,6 +852,16 @@ mod tests {
         assert_eq!(shape.environment_color, [5, 6, 7, 8]);
         assert!((shape.tiling[0] - 1.0).abs() < 0.001);
         assert!((shape.tiling[1] - 2.0).abs() < 0.001);
+        let texture_matrix = shape.texture_matrix.unwrap();
+        assert!((texture_matrix.translation[0] - 1.0).abs() < 0.001);
+        assert!((texture_matrix.translation[1] - 2.0).abs() < 0.001);
+        assert!((texture_matrix.scale[0] - 3.0).abs() < 0.001);
+        assert!((texture_matrix.scale[1] - 4.0).abs() < 0.001);
+        assert!((texture_matrix.translation_step[0] - 0.05).abs() < 0.001);
+        assert!((texture_matrix.translation_step[1] + 0.1).abs() < 0.001);
+        assert!((texture_matrix.scale_step[0] - 0.02).abs() < 0.001);
+        assert!((texture_matrix.scale_step[1] + 0.02).abs() < 0.001);
+        assert!((texture_matrix.rotation_step - 0.25).abs() < 0.001);
     }
 
     #[test]
@@ -781,6 +873,43 @@ mod tests {
 
         let shape = parse_extra_shape(&block).unwrap();
         assert_eq!(shape.scale_pivot, [0, 2]);
+    }
+
+    #[test]
+    fn parses_extra_texture_as_jparticle_indirect_state() {
+        let mut block = vec![0; 0x40];
+        block[..4].copy_from_slice(b"ETX1");
+        block[4..8].copy_from_slice(&0x40u32.to_be_bytes());
+        block[0x10] = 2;
+        block[0x11] = 1;
+        for (offset, value) in [
+            (0x12, 16384i16),
+            (0x14, -8192),
+            (0x16, 4096),
+            (0x18, -16384),
+            (0x1a, 8192),
+            (0x1c, -4096),
+        ] {
+            block[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+        }
+        block[0x1e] = (-2i8) as u8;
+        block[0x1f] = 3;
+        block[0x20] = 4;
+        block[0x30] = 1;
+        block[0x33] = 5;
+
+        let extra = parse_extra_texture(&block).unwrap();
+        assert_eq!(extra.indirect_mode, 2);
+        assert_eq!(extra.matrix_mode, 1);
+        assert_eq!(
+            extra.indirect_matrix,
+            [[0.5, -0.25, 0.125], [-0.5, 0.25, -0.125]]
+        );
+        assert_eq!(extra.exponent, -2);
+        assert_eq!(extra.indirect_texture_index, 3);
+        assert_eq!(extra.sub_texture_index, 4);
+        assert!(extra.second_texture_enabled);
+        assert_eq!(extra.second_texture_index, 5);
     }
 
     #[test]

@@ -13,8 +13,9 @@ use sms_formats::{
 use sms_render::ViewportTargetFeatures;
 
 use super::{
-    preview_solid_triangle_colors, preview_triangle_normal, ModelPreview, PreviewMirrorCube,
-    PreviewRenderLayer, PreviewTexture, PreviewTriangle,
+    preview_solid_triangle_colors, preview_triangle_normal, ModelPreview,
+    ParticleExtraTexturePreview, PreviewMirrorCube, PreviewRenderLayer, PreviewTexture,
+    PreviewTriangle,
 };
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
@@ -382,6 +383,74 @@ struct GpuTriangleLocation {
     surface_attributes_dynamic: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct GpuFallbackMaterialKey {
+    texture: usize,
+    mask: usize,
+    layer: u8,
+    cull: u8,
+    alpha_compare: [u8; 5],
+    blend: [u8; 4],
+    depth: [u8; 3],
+    particle_color_mode: u8,
+    particle_environment_color: u32,
+    particle_extra_texture: Option<GpuParticleExtraTextureKey>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct GpuParticleExtraTextureKey {
+    indirect_mode: u8,
+    matrix_mode: u8,
+    indirect_matrix: [[u32; 3]; 2],
+    exponent: i8,
+    indirect_texture_index: usize,
+    sub_texture_index: usize,
+    second_texture_index: usize,
+}
+
+impl GpuFallbackMaterialKey {
+    fn from_triangle(triangle: &PreviewTriangle) -> Self {
+        let alpha = triangle.alpha_compare.unwrap_or(always_alpha_compare());
+        let blend = triangle.blend_mode.unwrap_or(J3dBlendMode {
+            mode: 0,
+            src_factor: 1,
+            dst_factor: 0,
+            logic_op: 3,
+        });
+        let depth = triangle.z_mode.unwrap_or(default_z_mode());
+        Self {
+            texture: triangle.texture_index.unwrap_or(usize::MAX),
+            mask: triangle.mask_texture_index.unwrap_or(usize::MAX),
+            layer: render_layer_id(triangle.render_layer),
+            cull: triangle.cull_mode.unwrap_or(0),
+            alpha_compare: [alpha.comp0, alpha.ref0, alpha.op, alpha.comp1, alpha.ref1],
+            blend: [
+                blend.mode,
+                blend.src_factor,
+                blend.dst_factor,
+                blend.logic_op,
+            ],
+            depth: [depth.compare_enable, depth.func, depth.update_enable],
+            particle_color_mode: triangle.particle_color_mode.unwrap_or(u8::MAX),
+            particle_environment_color: triangle
+                .particle_environment_color
+                .map(u32::from_be_bytes)
+                .unwrap_or(0),
+            particle_extra_texture: triangle.particle_extra_texture.map(|extra| {
+                GpuParticleExtraTextureKey {
+                    indirect_mode: extra.indirect_mode,
+                    matrix_mode: extra.matrix_mode,
+                    indirect_matrix: extra.indirect_matrix.map(|row| row.map(f32::to_bits)),
+                    exponent: extra.exponent,
+                    indirect_texture_index: extra.indirect_texture_index,
+                    sub_texture_index: extra.sub_texture_index.unwrap_or(usize::MAX),
+                    second_texture_index: extra.second_texture_index.unwrap_or(usize::MAX),
+                }
+            }),
+        }
+    }
+}
+
 impl GpuSceneData {
     fn active_mirror_slot(&self, position: [f32; 3]) -> Option<usize> {
         active_mirror_slot_for_cubes(&self.mirror_cubes, position)
@@ -422,7 +491,7 @@ impl GpuSceneData {
             .iter()
             .map(|material| GpuMaterialData::from_j3d(material, preview))
             .collect::<Vec<_>>();
-        let mut fallback_materials = BTreeMap::<(usize, usize, u8, u8, u32), usize>::new();
+        let mut fallback_materials = BTreeMap::<GpuFallbackMaterialKey, usize>::new();
         let mut batch_map = BTreeMap::<
             (
                 usize,
@@ -444,22 +513,8 @@ impl GpuSceneData {
                 .material_index
                 .filter(|index| *index < materials.len())
                 .unwrap_or_else(|| {
-                    let texture = triangle.texture_index.unwrap_or(usize::MAX);
-                    let mask = triangle.mask_texture_index.unwrap_or(usize::MAX);
-                    let layer = render_layer_id(triangle.render_layer);
-                    let particle_color_mode = triangle.particle_color_mode.unwrap_or(u8::MAX);
-                    let particle_environment_color = triangle
-                        .particle_environment_color
-                        .map(u32::from_be_bytes)
-                        .unwrap_or(0);
                     *fallback_materials
-                        .entry((
-                            texture,
-                            mask,
-                            layer,
-                            particle_color_mode,
-                            particle_environment_color,
-                        ))
+                        .entry(GpuFallbackMaterialKey::from_triangle(triangle))
                         .or_insert_with(|| {
                             let index = materials.len();
                             materials.push(GpuMaterialData::fallback(triangle, preview));
@@ -762,9 +817,7 @@ fn updateable_preview_triangles(preview: &ModelPreview) -> Vec<bool> {
             || triangle.particle_direction.is_some()
             || matches!(
                 triangle.render_layer,
-                PreviewRenderLayer::WaveFoam
-                    | PreviewRenderLayer::Particle
-                    | PreviewRenderLayer::ParticleDistortion
+                PreviewRenderLayer::WaveFoam | PreviewRenderLayer::Particle
             );
     }
     updateable
@@ -1008,7 +1061,6 @@ fn render_layer_id(layer: PreviewRenderLayer) -> u8 {
         PreviewRenderLayer::Shadow => 6,
         PreviewRenderLayer::Heatwave => 7,
         PreviewRenderLayer::Particle => 8,
-        PreviewRenderLayer::ParticleDistortion => 9,
         PreviewRenderLayer::IndirectWater => 10,
         PreviewRenderLayer::WaveFoam => 11,
     }
@@ -1019,7 +1071,6 @@ fn coordinate_space_for_render_layer(layer: PreviewRenderLayer) -> u32 {
         PreviewRenderLayer::Sky => 1,
         PreviewRenderLayer::Heatwave => 2,
         PreviewRenderLayer::Particle => 3,
-        PreviewRenderLayer::ParticleDistortion => 4,
         PreviewRenderLayer::MirrorSurface => 5,
         PreviewRenderLayer::IndirectWater => 6,
         PreviewRenderLayer::WaveFoam => 7,
@@ -1030,9 +1081,7 @@ fn coordinate_space_for_render_layer(layer: PreviewRenderLayer) -> u32 {
 fn render_layer_uses_efb_copy(layer: PreviewRenderLayer) -> bool {
     matches!(
         layer,
-        PreviewRenderLayer::Heatwave
-            | PreviewRenderLayer::IndirectWater
-            | PreviewRenderLayer::ParticleDistortion
+        PreviewRenderLayer::Heatwave | PreviewRenderLayer::IndirectWater
     )
 }
 
@@ -1316,29 +1365,23 @@ impl GpuMaterialData {
             uniform.set_alpha_compare(compare);
         }
         let mut texture_indices = [0; TEXTURE_SLOT_COUNT];
-        texture_indices[0] = triangle
-            .texture_index
-            .filter(|index| *index < preview.textures.len())
-            .map(|index| index + 1)
-            .unwrap_or(0);
-        texture_indices[1] = triangle
-            .mask_texture_index
-            .filter(|index| *index < preview.textures.len())
-            .map(|index| index + 1)
-            .unwrap_or(0);
-        if let Some(texture) = triangle
-            .texture_index
-            .and_then(|index| preview.textures.get(index))
-        {
-            uniform.texture_sizes[0] =
-                texture_size_uniform([texture.image.size[0] as f32, texture.image.size[1] as f32]);
-        }
-        if let Some(texture) = triangle
-            .mask_texture_index
-            .and_then(|index| preview.textures.get(index))
-        {
-            uniform.texture_sizes[1] =
-                texture_size_uniform([texture.image.size[0] as f32, texture.image.size[1] as f32]);
+        set_fallback_texture(
+            &mut uniform,
+            &mut texture_indices,
+            preview,
+            0,
+            triangle.texture_index,
+        );
+        if let Some(extra) = triangle.particle_extra_texture {
+            configure_particle_extra_texture(&mut uniform, &mut texture_indices, preview, extra);
+        } else {
+            set_fallback_texture(
+                &mut uniform,
+                &mut texture_indices,
+                preview,
+                1,
+                triangle.mask_texture_index,
+            );
         }
         Self {
             uniform,
@@ -1382,6 +1425,112 @@ impl GpuMaterialData {
     }
 }
 
+fn set_fallback_texture(
+    uniform: &mut GpuMaterialUniform,
+    texture_indices: &mut [usize; TEXTURE_SLOT_COUNT],
+    preview: &ModelPreview,
+    slot: usize,
+    texture_index: Option<usize>,
+) {
+    let Some(texture_index) = texture_index.filter(|index| *index < preview.textures.len()) else {
+        return;
+    };
+    let texture = &preview.textures[texture_index];
+    texture_indices[slot] = texture_index + 1;
+    uniform.texture_sizes[slot] =
+        texture_size_uniform([texture.image.size[0] as f32, texture.image.size[1] as f32]);
+    uniform.texture_lod_parameters[slot] = texture_lod_uniform(texture);
+}
+
+fn configure_particle_extra_texture(
+    uniform: &mut GpuMaterialUniform,
+    texture_indices: &mut [usize; TEXTURE_SLOT_COUNT],
+    preview: &ModelPreview,
+    extra: ParticleExtraTexturePreview,
+) {
+    set_fallback_texture(
+        uniform,
+        texture_indices,
+        preview,
+        1,
+        Some(extra.indirect_texture_index),
+    );
+    let mut texture_count = 2usize;
+    if extra.indirect_mode == 2 {
+        set_fallback_texture(
+            uniform,
+            texture_indices,
+            preview,
+            2,
+            extra.sub_texture_index,
+        );
+        texture_count = 3;
+    }
+    if let Some(second_texture_index) = extra.second_texture_index {
+        set_fallback_texture(
+            uniform,
+            texture_indices,
+            preview,
+            texture_count,
+            Some(second_texture_index),
+        );
+        texture_count += 1;
+    }
+    for slot in 1..texture_count.min(TEXTURE_SLOT_COUNT) {
+        // JPA extra textures use GX_TG_TEX0 with the identity matrix, not
+        // TEXCOORD0 after its animated base-texture matrix. Particle previews
+        // preserve that raw GX TEX0 input in vertex UV set 2.
+        uniform.tex_gens[slot] = [1, 6, 0, 0];
+    }
+    uniform.counts[1] = texture_count.min(TEXTURE_SLOT_COUNT) as u32;
+
+    if matches!(extra.indirect_mode, 1 | 2) {
+        uniform.counts[3] = 1;
+        uniform.indirect_orders[0] = [2, 2, 0, 0];
+        let scale = 2.0f32.powi(extra.exponent as i32);
+        uniform.indirect_matrix_rows[0] = [
+            extra.indirect_matrix[0][0] * scale,
+            extra.indirect_matrix[0][1] * scale,
+            extra.indirect_matrix[0][2] * scale,
+            0.0,
+        ];
+        uniform.indirect_matrix_rows[1] = [
+            extra.indirect_matrix[1][0] * scale,
+            extra.indirect_matrix[1][1] * scale,
+            extra.indirect_matrix[1][2] * scale,
+            0.0,
+        ];
+        let matrix = match extra.matrix_mode {
+            0 | 1 => 1,
+            2 => 5,
+            3 => 9,
+            _ => 0,
+        };
+        let stage = usize::from(extra.indirect_mode == 2);
+        uniform.indirect_stages0[stage] = [0, 0, 7, matrix];
+    }
+
+    if extra.indirect_mode == 2 {
+        uniform.counts[0] = 2;
+        uniform.tev_orders[1] = [3, 3, 0, 0];
+        uniform.tev_color_args[1] = [15, 8, 0, 9];
+        uniform.tev_alpha_args[1] = [7, 7, 7, 0];
+        uniform.tev_color_ops[1] = [0, 0, 0, 1];
+        uniform.tev_alpha_ops[1] = [0, 0, 0, 1];
+    }
+
+    if extra.second_texture_index.is_some() {
+        let stage = uniform.counts[0] as usize;
+        let texture_slot = texture_count - 1;
+        uniform.counts[0] += 1;
+        uniform.tev_orders[stage] = [texture_slot as u32 + 1, texture_slot as u32 + 1, 0, 0];
+        uniform.tev_color_args[stage] = [15, 8, 0, 15];
+        uniform.tev_alpha_args[stage] = [7, 4, 0, 7];
+        uniform.tev_color_ops[stage] = [0, 0, 0, 1];
+        uniform.tev_alpha_ops[stage] = [0, 0, 0, 1];
+    }
+}
+
 #[derive(Clone, Copy)]
 struct GpuMaterialState {
     cull: GpuCullMode,
@@ -1410,10 +1559,7 @@ impl GpuMaterialState {
             GpuBatchPass::Heatwave
         } else if render_layer == PreviewRenderLayer::WaveFoam {
             GpuBatchPass::WaveFoam
-        } else if matches!(
-            render_layer,
-            PreviewRenderLayer::Particle | PreviewRenderLayer::ParticleDistortion
-        ) {
+        } else if render_layer == PreviewRenderLayer::Particle {
             GpuBatchPass::Particle
         } else if render_layer == PreviewRenderLayer::Sky {
             GpuBatchPass::Sky

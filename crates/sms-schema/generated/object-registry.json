@@ -2,7 +2,7 @@
   "format_version": 1,
   "source_revision": "01ffd369c94b23be158abde1254c277879c04a9f",
   "source_fingerprint": 15545920352673147969,
-  "generator_fingerprint": 10965404809579206623,
+  "generator_fingerprint": 14076704497560109288,
   "registry": {
     "objects": [
       {
@@ -31201,6 +31201,411 @@
     ],
     "particle_resources": [
       {
+        "effect_id": 1,
+        "path": "ms_m_rocket_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 2,
+        "path": "ms_m_rocket_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 3,
+        "path": "ms_m_rocket_b2.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 4,
+        "path": "ms_m_rocket_c.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 5,
+        "path": "ms_m_rocket_d.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 6,
+        "path": "ms_firedmg_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 7,
+        "path": "ms_fumi_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 8,
+        "path": "ms_fumi_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 9,
+        "path": "ms_fumi_c.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 10,
+        "path": "ms_dmg_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 11,
+        "path": "ms_dmg_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 12,
+        "path": "ms_dmg_c.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 13,
+        "path": "ms_ase.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 14,
+        "path": "ms_itemget1_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 15,
+        "path": "ms_itemget1_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 16,
+        "path": "ms_jump_ed_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 17,
+        "path": "ms_jump_ed_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 18,
+        "path": "ms_hipdrop_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 19,
+        "path": "ms_hipdrop_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 20,
+        "path": "ms_hipdrop_c.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 21,
+        "path": "ms_mariwalk1_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 22,
+        "path": "ms_mariwalk1_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 23,
+        "path": "ms_mariwalk1_c.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 24,
+        "path": "ms_wallkick_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 25,
+        "path": "ms_wallkick_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 26,
+        "path": "/scene/map/map/gate/ms_mariowp_body.jpa",
+        "source_file": "src/MoveBG/ModelGate.cpp"
+      },
+      {
+        "effect_id": 27,
+        "path": "/scene/map/map/gate/ms_mariowp_head.jpa",
+        "source_file": "src/MoveBG/ModelGate.cpp"
+      },
+      {
+        "effect_id": 28,
+        "path": "/scene/map/map/gate/ms_mariowp_cap.jpa",
+        "source_file": "src/MoveBG/ModelGate.cpp"
+      },
+      {
+        "effect_id": 29,
+        "path": "/scene/map/map/gate/ms_mariowp_rhand.jpa",
+        "source_file": "src/MoveBG/ModelGate.cpp"
+      },
+      {
+        "effect_id": 30,
+        "path": "/scene/map/map/gate/ms_mariowp_lhand.jpa",
+        "source_file": "src/MoveBG/ModelGate.cpp"
+      },
+      {
+        "effect_id": 31,
+        "path": "/scene/map/map/gate/ms_mariowp_rleg.jpa",
+        "source_file": "src/MoveBG/ModelGate.cpp"
+      },
+      {
+        "effect_id": 32,
+        "path": "/scene/map/map/gate/ms_mariowp_rfoot.jpa",
+        "source_file": "src/MoveBG/ModelGate.cpp"
+      },
+      {
+        "effect_id": 33,
+        "path": "/scene/map/map/gate/ms_mariowp_lleg.jpa",
+        "source_file": "src/MoveBG/ModelGate.cpp"
+      },
+      {
+        "effect_id": 34,
+        "path": "/scene/map/map/gate/ms_mariowp_lfoot.jpa",
+        "source_file": "src/MoveBG/ModelGate.cpp"
+      },
+      {
+        "effect_id": 35,
+        "path": "/scene/map/map/gate/ms_mariowp_watgun.jpa",
+        "source_file": "src/MoveBG/ModelGate.cpp"
+      },
+      {
+        "effect_id": 36,
+        "path": "ms_marioap_body.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 37,
+        "path": "ms_marioap_head.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 38,
+        "path": "ms_marioap_cap.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 39,
+        "path": "ms_marioap_rhand.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 40,
+        "path": "ms_marioap_lhand.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 41,
+        "path": "ms_marioap_rleg.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 42,
+        "path": "ms_marioap_rfoot.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 43,
+        "path": "ms_marioap_lleg.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 44,
+        "path": "ms_marioap_lfoot.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 45,
+        "path": "ms_marioap_watgun.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 46,
+        "path": "ms_watboost_on.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 47,
+        "path": "/scene/bombColumWater/jpa/ms_m_tobikomi_a.jpa",
+        "source_file": "src/Enemy/effectObj.cpp"
+      },
+      {
+        "effect_id": 47,
+        "path": "ms_m_tobikomi_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 48,
+        "path": "/scene/bombColumWater/jpa/ms_m_tobikomi_b.jpa",
+        "source_file": "src/Enemy/effectObj.cpp"
+      },
+      {
+        "effect_id": 48,
+        "path": "ms_m_tobikomi_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 49,
+        "path": "ms_m_tobikomi_s_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 50,
+        "path": "ms_m_tobikomi_s_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 51,
+        "path": "ms_m_awahamon.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 52,
+        "path": "ms_m_watrun_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 53,
+        "path": "ms_m_watrun_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 54,
+        "path": "ms_m_watrun_c.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 55,
+        "path": "ms_coinget_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 56,
+        "path": "ms_coinget_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 57,
+        "path": "ms_m_amiattack.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 58,
+        "path": "ms_m_walksand_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 59,
+        "path": "ms_m_walksand_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 60,
+        "path": "/scene/map/map/gate/ms_mariowp_dust.jpa",
+        "source_file": "src/MoveBG/ModelGate.cpp"
+      },
+      {
+        "effect_id": 61,
+        "path": "ms_yos_nomu_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 62,
+        "path": "ms_yos_nomu_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 63,
+        "path": "ms_yos_warp.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 64,
+        "path": "ms_m_gout_gate.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 65,
+        "path": "ms_m_gout_dokan.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 66,
+        "path": "ms_m_walkcloud.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 67,
+        "path": "ms_m_sphipd_hit_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 68,
+        "path": "ms_m_sphipd_hit_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 69,
+        "path": "ms_m_sphipd_hit_c.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 70,
+        "path": "ms_m_sphipd_hit_d.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 71,
+        "path": "ms_redcoinget_1.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 72,
+        "path": "ms_redcoinget_2.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 73,
+        "path": "ms_redcoinget_3.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 74,
+        "path": "ms_redcoinget_4.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 75,
+        "path": "ms_redcoinget_5.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 76,
+        "path": "ms_redcoinget_6.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 77,
+        "path": "ms_redcoinget_7.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 78,
+        "path": "ms_redcoinget_8.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 81,
+        "path": "/scene/map/map/gate/ms_mariowp_senko.jpa",
+        "source_file": "src/MoveBG/ModelGate.cpp"
+      },
+      {
         "effect_id": 82,
         "path": "ms_osendan.jpa",
         "source_file": "src/System/MarDirectorLoadResource.cpp"
@@ -31221,6 +31626,46 @@
         "source_file": "src/MoveBG/MapObjMamma.cpp"
       },
       {
+        "effect_id": 86,
+        "path": "/scene/mapObj/ShiningStoneF.jpa",
+        "source_file": "src/MoveBG/MapObjMamma.cpp"
+      },
+      {
+        "effect_id": 87,
+        "path": "/scene/mapObj/ms_watcoin_hit.jpa",
+        "source_file": "src/MoveBG/MapObjHide.cpp"
+      },
+      {
+        "effect_id": 87,
+        "path": "/scene/mapObj/ms_watcoin_hit.jpa",
+        "source_file": "src/MoveBG/MapObjTown.cpp"
+      },
+      {
+        "effect_id": 88,
+        "path": "/scene/mapObj/ms_watcoin_kira.jpa",
+        "source_file": "src/MoveBG/Item.cpp"
+      },
+      {
+        "effect_id": 89,
+        "path": "/scene/map/map/ms_objup_slope_a.jpa",
+        "source_file": "src/Map/MapEventSink.cpp"
+      },
+      {
+        "effect_id": 90,
+        "path": "/scene/mapObj/balloonKoopaJr.jpa",
+        "source_file": "src/MoveBG/MapObjPinna.cpp"
+      },
+      {
+        "effect_id": 91,
+        "path": "/scene/mapObj/balloonKoopaJrA.jpa",
+        "source_file": "src/MoveBG/MapObjPinna.cpp"
+      },
+      {
+        "effect_id": 92,
+        "path": "/scene/mapObj/balloonKoopaJrB.jpa",
+        "source_file": "src/MoveBG/MapObjPinna.cpp"
+      },
+      {
         "effect_id": 93,
         "path": "/scene/mapObj/watermelon_bomb.jpa",
         "source_file": "src/MoveBG/MapObjBall.cpp"
@@ -31236,14 +31681,74 @@
         "source_file": "src/MoveBG/MapObjBall.cpp"
       },
       {
+        "effect_id": 96,
+        "path": "/scene/mapObj/BrickBlockA.jpa",
+        "source_file": "src/MoveBG/MapObjBlock.cpp"
+      },
+      {
+        "effect_id": 97,
+        "path": "/scene/mapObj/BrickBlockB.jpa",
+        "source_file": "src/MoveBG/MapObjBlock.cpp"
+      },
+      {
+        "effect_id": 98,
+        "path": "/scene/mapObj/BrickBlockC.jpa",
+        "source_file": "src/MoveBG/MapObjBlock.cpp"
+      },
+      {
+        "effect_id": 99,
+        "path": "/scene/mapObj/ms_ex_hahen.jpa",
+        "source_file": "src/MoveBG/MapObjTown.cpp"
+      },
+      {
         "effect_id": 100,
         "path": "ms_teppanfire_j.jpa",
         "source_file": "src/System/MarDirectorLoadResource.cpp"
       },
       {
+        "effect_id": 101,
+        "path": "/scene/map/pollution/ms_newfire_a.jpa",
+        "source_file": "src/Map/Map.cpp"
+      },
+      {
+        "effect_id": 102,
+        "path": "/scene/map/map/ms_objup_maniya_a.jpa",
+        "source_file": "src/Map/MapEventDolpic.cpp"
+      },
+      {
+        "effect_id": 103,
+        "path": "/scene/map/map/ms_objup_toudai_a.jpa",
+        "source_file": "src/Map/MapEventDolpic.cpp"
+      },
+      {
+        "effect_id": 104,
+        "path": "/scene/map/map/ms_objup_hotel_a.jpa",
+        "source_file": "src/Map/MapEventSirena.cpp"
+      },
+      {
+        "effect_id": 105,
+        "path": "/scene/map/map/ms_mare_objup_a.jpa",
+        "source_file": "src/Map/Map.cpp"
+      },
+      {
+        "effect_id": 106,
+        "path": "/scene/mapObj/SandSteam.jpa",
+        "source_file": "src/Map/Map.cpp"
+      },
+      {
+        "effect_id": 107,
+        "path": "/scene/mapObj/WaterMelonBlockA.jpa",
+        "source_file": "src/MoveBG/MapObjHide.cpp"
+      },
+      {
         "effect_id": 107,
         "path": "/scene/mapObj/watermelon_shrink_a.jpa",
         "source_file": "src/MoveBG/MapObjBall.cpp"
+      },
+      {
+        "effect_id": 108,
+        "path": "/scene/mapObj/WaterMelonBlockB.jpa",
+        "source_file": "src/MoveBG/MapObjHide.cpp"
       },
       {
         "effect_id": 108,
@@ -31254,6 +31759,21 @@
         "effect_id": 109,
         "path": "ms_ex_cube_disa.jpa",
         "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 110,
+        "path": "/scene/map/map/ms_m_fileblock.jpa",
+        "source_file": "src/MoveBG/MapObjOption.cpp"
+      },
+      {
+        "effect_id": 111,
+        "path": "/scene/map/pollution/ms_thunder_s.jpa",
+        "source_file": "src/Map/PollutionLayer.cpp"
+      },
+      {
+        "effect_id": 112,
+        "path": "/scene/tamaNoko/jpa/ms_mnt_kira.jpa",
+        "source_file": "src/Enemy/tamaNoko.cpp"
       },
       {
         "effect_id": 112,
@@ -31284,6 +31804,56 @@
         "effect_id": 117,
         "path": "ms_kino_yogore.jpa",
         "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 118,
+        "path": "ms_boha_sandsmo.jpa",
+        "source_file": "src/Enemy/BossHanachanEffect.cpp"
+      },
+      {
+        "effect_id": 119,
+        "path": "ms_boha_sand.jpa",
+        "source_file": "src/Enemy/BossHanachanEffect.cpp"
+      },
+      {
+        "effect_id": 120,
+        "path": "ms_boha_jouki_r_a.jpa",
+        "source_file": "src/Enemy/BossHanachanEffect.cpp"
+      },
+      {
+        "effect_id": 121,
+        "path": "ms_boha_jouki_r_b.jpa",
+        "source_file": "src/Enemy/BossHanachanEffect.cpp"
+      },
+      {
+        "effect_id": 122,
+        "path": "ms_boha_jouki_l_a.jpa",
+        "source_file": "src/Enemy/BossHanachanEffect.cpp"
+      },
+      {
+        "effect_id": 123,
+        "path": "ms_boha_jouki_l_b.jpa",
+        "source_file": "src/Enemy/BossHanachanEffect.cpp"
+      },
+      {
+        "effect_id": 124,
+        "path": "ms_boha_hamon_a.jpa",
+        "source_file": "src/Enemy/BossHanachanEffect.cpp"
+      },
+      {
+        "effect_id": 125,
+        "path": "ms_boha_hamon_b.jpa",
+        "source_file": "src/Enemy/BossHanachanEffect.cpp"
+      },
+      {
+        "effect_id": 126,
+        "path": "/scene/columSand/jpa/ms_boha_crash_a.jpa",
+        "source_file": "src/Enemy/effectObj.cpp"
+      },
+      {
+        "effect_id": 126,
+        "path": "ms_boha_crash_a.jpa",
+        "source_file": "src/Enemy/BossHanachanEffect.cpp"
       },
       {
         "effect_id": 127,
@@ -31336,9 +31906,124 @@
         "source_file": "src/System/MarDirectorLoadResource.cpp"
       },
       {
+        "effect_id": 137,
+        "path": "/scene/columWater/jpa/ms_enehamon_a.jpa",
+        "source_file": "src/Enemy/effectObj.cpp"
+      },
+      {
+        "effect_id": 138,
+        "path": "/scene/columWater/jpa/ms_enehamon_b.jpa",
+        "source_file": "src/Enemy/effectObj.cpp"
+      },
+      {
         "effect_id": 139,
         "path": "ms_moe_fire_off.jpa",
         "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 140,
+        "path": "/scene/bgeso/jpa/ms_boge_attack_a.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 141,
+        "path": "/scene/bgeso/jpa/ms_boge_attack_b.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 142,
+        "path": "/scene/bgeso/jpa/ms_boge_attack_c.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 143,
+        "path": "/scene/bgeso/jpa/ms_boge_attack_d.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 144,
+        "path": "/scene/bgeso/jpa/ms_boge_blur.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 145,
+        "path": "/scene/bgeso/jpa/ms_boge_blur_f.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 146,
+        "path": "/scene/bgeso/jpa/ms_boge_blur_j.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 147,
+        "path": "/scene/bgeso/jpa/ms_boge_canon_a.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 148,
+        "path": "/scene/bgeso/jpa/ms_boge_canon_b.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 149,
+        "path": "/scene/bgeso/jpa/ms_boge_damage_a.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 150,
+        "path": "/scene/bgeso/jpa/ms_boge_damage_b.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 151,
+        "path": "/scene/bgeso/jpa/ms_boge_hit_a.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 152,
+        "path": "/scene/bgeso/jpa/ms_boge_hit_b.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 153,
+        "path": "/scene/bgeso/jpa/ms_boge_hit_c.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 154,
+        "path": "/scene/bgeso/jpa/ms_boge_hitdown.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 155,
+        "path": "/scene/bgeso/jpa/ms_boge_jump.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 156,
+        "path": "/scene/bgeso/jpa/ms_boge_kizetsu.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 157,
+        "path": "/scene/bgeso/jpa/ms_boge_kizetsu_r.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 158,
+        "path": "/scene/bgeso/jpa/ms_boge_odanhit_a.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 159,
+        "path": "/scene/bgeso/jpa/ms_boge_odanhit_b.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 160,
+        "path": "/scene/bgeso/jpa/ms_boge_osen.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
       },
       {
         "effect_id": 161,
@@ -31369,6 +32054,61 @@
         "effect_id": 166,
         "path": "ms_deadmoekli_w.jpa",
         "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 167,
+        "path": "/scene/gatekeeper/jpa/ms_gkpa_dead.jpa",
+        "source_file": "src/Enemy/gatekeeper.cpp"
+      },
+      {
+        "effect_id": 168,
+        "path": "/scene/gatekeeper/jpa/ms_gkpa_deadsmoke.jpa",
+        "source_file": "src/Enemy/gatekeeper.cpp"
+      },
+      {
+        "effect_id": 169,
+        "path": "/scene/bosspakkun/jpa/ms_bopa_blur1.jpa",
+        "source_file": "src/Enemy/bosspakkun.cpp"
+      },
+      {
+        "effect_id": 170,
+        "path": "/scene/bosspakkun/jpa/ms_bopa_down.jpa",
+        "source_file": "src/Enemy/bosspakkun.cpp"
+      },
+      {
+        "effect_id": 171,
+        "path": "/scene/bosspakkun/jpa/ms_bopa_swing1.jpa",
+        "source_file": "src/Enemy/bosspakkun.cpp"
+      },
+      {
+        "effect_id": 172,
+        "path": "/scene/bosspakkun/jpa/ms_bopa_swing2.jpa",
+        "source_file": "src/Enemy/bosspakkun.cpp"
+      },
+      {
+        "effect_id": 173,
+        "path": "/scene/bwanwan/jpa/ms_bwan_jump_rock.jpa",
+        "source_file": "src/Enemy/bosswanwan.cpp"
+      },
+      {
+        "effect_id": 174,
+        "path": "/scene/bwanwan/jpa/ms_bwan_jump_smoke.jpa",
+        "source_file": "src/Enemy/bosswanwan.cpp"
+      },
+      {
+        "effect_id": 175,
+        "path": "/scene/bwanwan/jpa/ms_bwan_hibana.jpa",
+        "source_file": "src/Enemy/bosswanwan.cpp"
+      },
+      {
+        "effect_id": 176,
+        "path": "/scene/bwanwan/jpa/ms_bwan_downyuge.jpa",
+        "source_file": "src/Enemy/bosswanwan.cpp"
+      },
+      {
+        "effect_id": 177,
+        "path": "/scene/bwanwan/jpa/ms_bwan_deadyuge.jpa",
+        "source_file": "src/Enemy/bosswanwan.cpp"
       },
       {
         "effect_id": 178,
@@ -31461,6 +32201,21 @@
         "source_file": "src/System/MarDirectorLoadResource.cpp"
       },
       {
+        "effect_id": 196,
+        "path": "/scene/explosion/jpa/ms_bomb_smoke.jpa",
+        "source_file": "src/Enemy/effectObj.cpp"
+      },
+      {
+        "effect_id": 197,
+        "path": "/scene/explosion/jpa/ms_bomb_bomb.jpa",
+        "source_file": "src/Enemy/effectObj.cpp"
+      },
+      {
+        "effect_id": 198,
+        "path": "/scene/explosion/jpa/ms_bomb_hahen.jpa",
+        "source_file": "src/Enemy/effectObj.cpp"
+      },
+      {
         "effect_id": 199,
         "path": "ms_cho_moku_a.jpa",
         "source_file": "src/System/MarDirectorLoadResource.cpp"
@@ -31506,6 +32261,76 @@
         "source_file": "src/Enemy/Kazekun.cpp"
       },
       {
+        "effect_id": 208,
+        "path": "ms_gene_dead.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 209,
+        "path": "ms_sl_or_melt1.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 210,
+        "path": "ms_sl_or_melt2.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 215,
+        "path": "/scene/btelesa/jpa/ms_btls_fhit.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "effect_id": 216,
+        "path": "/scene/btelesa/jpa/ms_btls_fhit_pe.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "effect_id": 217,
+        "path": "/scene/btelesa/jpa/ms_btls_fhit_gr.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "effect_id": 218,
+        "path": "/scene/btelesa/jpa/ms_btls_fhit_or.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "effect_id": 219,
+        "path": "/scene/btelesa/jpa/ms_btls_damage.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "effect_id": 220,
+        "path": "/scene/btelesa/jpa/ms_btls_down.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "effect_id": 221,
+        "path": "/scene/btelesa/jpa/ms_btls_down_pe.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "effect_id": 222,
+        "path": "/scene/btelesa/jpa/ms_btls_down_gr.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "effect_id": 223,
+        "path": "/scene/btelesa/jpa/ms_btls_down_or.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "effect_id": 224,
+        "path": "/scene/btelesa/jpa/ms_btls_spicy_hit.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "effect_id": 225,
+        "path": "/scene/btelesa/jpa/ms_btls_fubuki.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
         "effect_id": 226,
         "path": "ms_enm_wallhit.jpa",
         "source_file": "src/System/MarDirectorLoadResource.cpp"
@@ -31536,6 +32361,271 @@
         "source_file": "src/System/MarDirectorLoadResource.cpp"
       },
       {
+        "effect_id": 232,
+        "path": "/scene/cannon/jpa/ms_cannon_a.jpa",
+        "source_file": "src/Enemy/cannon.cpp"
+      },
+      {
+        "effect_id": 232,
+        "path": "/scene/mapObj/demoCannon_a.jpa",
+        "source_file": "src/MoveBG/MapObjDolpic.cpp"
+      },
+      {
+        "effect_id": 233,
+        "path": "/scene/cannon/jpa/ms_cannon_b.jpa",
+        "source_file": "src/Enemy/cannon.cpp"
+      },
+      {
+        "effect_id": 233,
+        "path": "/scene/mapObj/demoCannon_b.jpa",
+        "source_file": "src/MoveBG/MapObjDolpic.cpp"
+      },
+      {
+        "effect_id": 234,
+        "path": "/scene/cannon/jpa/ms_cannon_c.jpa",
+        "source_file": "src/Enemy/cannon.cpp"
+      },
+      {
+        "effect_id": 234,
+        "path": "/scene/mapObj/demoCannon_c.jpa",
+        "source_file": "src/MoveBG/MapObjDolpic.cpp"
+      },
+      {
+        "effect_id": 235,
+        "path": "/scene/cannon/jpa/ms_cannon_d.jpa",
+        "source_file": "src/Enemy/cannon.cpp"
+      },
+      {
+        "effect_id": 235,
+        "path": "/scene/mapObj/demoCannon_d.jpa",
+        "source_file": "src/MoveBG/MapObjDolpic.cpp"
+      },
+      {
+        "effect_id": 236,
+        "path": "/scene/cannon/jpa/ms_cannon_e.jpa",
+        "source_file": "src/Enemy/cannon.cpp"
+      },
+      {
+        "effect_id": 236,
+        "path": "/scene/mapObj/demoCannon_e.jpa",
+        "source_file": "src/MoveBG/MapObjDolpic.cpp"
+      },
+      {
+        "effect_id": 237,
+        "path": "/scene/kagemario/jpa/ms_kgm_change.jpa",
+        "source_file": "src/Enemy/enemyMario.cpp"
+      },
+      {
+        "effect_id": 245,
+        "path": "/scene/koopa/jpa/ms_kp_hipdrop.jpa",
+        "source_file": "src/Enemy/Koopa.cpp"
+      },
+      {
+        "effect_id": 246,
+        "path": "/scene/map/map/ms_kp_break_a.jpa",
+        "source_file": "src/MoveBG/MapObjCorona.cpp"
+      },
+      {
+        "effect_id": 247,
+        "path": "/scene/map/map/ms_kp_break_b.jpa",
+        "source_file": "src/MoveBG/MapObjCorona.cpp"
+      },
+      {
+        "effect_id": 254,
+        "path": "ms_watboost_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 255,
+        "path": "ms_watboost_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 256,
+        "path": "ms_hikage1_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 257,
+        "path": "ms_hikage1_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 258,
+        "path": "ms_mariwallsl1.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 259,
+        "path": "ms_m_slipsmoke.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 260,
+        "path": "ms_m_blur3.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 261,
+        "path": "ms_m_blur2.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 262,
+        "path": "ms_m_blur2sp.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 263,
+        "path": "ms_m_hamon_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 264,
+        "path": "ms_m_hamon_c.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 265,
+        "path": "ms_m_hamon_d.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 266,
+        "path": "ms_m_mzbhamon_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 267,
+        "path": "ms_m_mzbhamon_c.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 268,
+        "path": "ms_m_awa.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 269,
+        "path": "ms_nozzlesmoke.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 270,
+        "path": "ms_m_blur1.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 271,
+        "path": "ms_m_slidesand_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 272,
+        "path": "ms_m_slidesand_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 273,
+        "path": "ms_m_awa_s.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 274,
+        "path": "ms_m_watslide_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 275,
+        "path": "ms_m_watslide_c.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 276,
+        "path": "ms_m_spinshot_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 277,
+        "path": "ms_m_spinshot_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 278,
+        "path": "ms_m_biri_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 279,
+        "path": "ms_m_biri_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 280,
+        "path": "ms_m_biri_c.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 281,
+        "path": "ms_yos_ase.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 282,
+        "path": "ms_m_sphipd_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 283,
+        "path": "ms_m_sphipd_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 284,
+        "path": "ms_m_sphipd_c.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 285,
+        "path": "ms_m_sphipd_d.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 286,
+        "path": "ms_m_seasmoke.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 287,
+        "path": "ms_toro_wind.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 288,
+        "path": "ms_toro_hibana.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 289,
+        "path": "ms_gesosurf_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 290,
+        "path": "ms_gesosurf_c.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 291,
+        "path": "ms_gesosurf_d.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 292,
+        "path": "ms_poi_zzz.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
         "effect_id": 295,
         "path": "ms_shine_promi.jpa",
         "source_file": "src/System/MarDirectorLoadResource.cpp"
@@ -31561,6 +32651,16 @@
         "source_file": "src/System/MarDirectorLoadResource.cpp"
       },
       {
+        "effect_id": 301,
+        "path": "ms_gene_hit.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 302,
+        "path": "ms_sl_or_damage.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
         "effect_id": 303,
         "path": "ms_poi_kizetsu.jpa",
         "source_file": "src/System/MarDirectorLoadResource.cpp"
@@ -31569,6 +32669,26 @@
         "effect_id": 304,
         "path": "ms_chu_ase.jpa",
         "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 305,
+        "path": "/scene/map/map/gate/ms_gatewind_a.jpa",
+        "source_file": "src/MoveBG/ModelGate.cpp"
+      },
+      {
+        "effect_id": 306,
+        "path": "/scene/map/map/gate/ms_gatewind_a2.jpa",
+        "source_file": "src/MoveBG/ModelGate.cpp"
+      },
+      {
+        "effect_id": 307,
+        "path": "/scene/map/map/gate/ms_gatewind_a3.jpa",
+        "source_file": "src/MoveBG/ModelGate.cpp"
+      },
+      {
+        "effect_id": 308,
+        "path": "/scene/map/map/gate/ms_gatewind_b.jpa",
+        "source_file": "src/MoveBG/ModelGate.cpp"
       },
       {
         "effect_id": 309,
@@ -31584,6 +32704,26 @@
         "effect_id": 311,
         "path": "ms_moe_fire_d.jpa",
         "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 312,
+        "path": "/scene/bgeso/jpa/ms_boge_ase.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 313,
+        "path": "/scene/bgeso/jpa/ms_boge_namida.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 314,
+        "path": "/scene/bgeso/jpa/ms_boge_kiseki.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
+      },
+      {
+        "effect_id": 315,
+        "path": "/scene/bgeso/jpa/ms_boge_wash.jpa",
+        "source_file": "src/Enemy/bossgesso.cpp"
       },
       {
         "effect_id": 316,
@@ -31606,6 +32746,106 @@
         "source_file": "src/System/MarDirectorLoadResource.cpp"
       },
       {
+        "effect_id": 320,
+        "path": "/scene/gatekeeper/jpa/ms_gkpa_bota.jpa",
+        "source_file": "src/Enemy/gatekeeper.cpp"
+      },
+      {
+        "effect_id": 321,
+        "path": "/scene/gatekeeper/jpa/ms_gkpa_yodare_s.jpa",
+        "source_file": "src/Enemy/gatekeeper.cpp"
+      },
+      {
+        "effect_id": 322,
+        "path": "/scene/gatekeeper/jpa/ms_gkpa_yodare_l.jpa",
+        "source_file": "src/Enemy/gatekeeper.cpp"
+      },
+      {
+        "effect_id": 323,
+        "path": "/scene/mapObj/ShiningStone1.jpa",
+        "source_file": "src/MoveBG/MapObjMamma.cpp"
+      },
+      {
+        "effect_id": 324,
+        "path": "/scene/mapObj/ShiningStone2.jpa",
+        "source_file": "src/MoveBG/MapObjMamma.cpp"
+      },
+      {
+        "effect_id": 325,
+        "path": "/scene/mapObj/ShiningStone3.jpa",
+        "source_file": "src/MoveBG/MapObjMamma.cpp"
+      },
+      {
+        "effect_id": 327,
+        "path": "/scene/mapObj/SandBlockBreakA.jpa",
+        "source_file": "src/MoveBG/MapObjBlock.cpp"
+      },
+      {
+        "effect_id": 328,
+        "path": "/scene/mapObj/SandBlockBreakB.jpa",
+        "source_file": "src/MoveBG/MapObjBlock.cpp"
+      },
+      {
+        "effect_id": 329,
+        "path": "/scene/mapObj/mareFallSplash.jpa",
+        "source_file": "src/MoveBG/MapObjMare.cpp"
+      },
+      {
+        "effect_id": 330,
+        "path": "/scene/mapObj/mareFallSmoke.jpa",
+        "source_file": "src/MoveBG/MapObjMare.cpp"
+      },
+      {
+        "effect_id": 331,
+        "path": "/scene/others/marinesnow/ms_mare_marinsnow.jpa",
+        "source_file": "src/Map/MarineSnow.cpp"
+      },
+      {
+        "effect_id": 332,
+        "path": "/scene/map/map/ms_mare_gunwat_a.jpa",
+        "source_file": "src/MoveBG/MapObjMare.cpp"
+      },
+      {
+        "effect_id": 333,
+        "path": "/scene/map/map/ms_mare_gunwat_b.jpa",
+        "source_file": "src/MoveBG/MapObjMare.cpp"
+      },
+      {
+        "effect_id": 334,
+        "path": "/scene/map/map/ms_mare_gunwat_c.jpa",
+        "source_file": "src/MoveBG/MapObjMare.cpp"
+      },
+      {
+        "effect_id": 338,
+        "path": "/scene/mapObj/ms_map_kokuen.jpa",
+        "source_file": "src/MoveBG/MapObjDolpic.cpp"
+      },
+      {
+        "effect_id": 340,
+        "path": "/scene/mapObj/ms_shib_cyl1.jpa",
+        "source_file": "src/MoveBG/MapObjTown.cpp"
+      },
+      {
+        "effect_id": 341,
+        "path": "/scene/mapObj/ms_shib_cub1.jpa",
+        "source_file": "src/MoveBG/MapObjTown.cpp"
+      },
+      {
+        "effect_id": 342,
+        "path": "/scene/map/map/ms_monte_yuge.jpa",
+        "source_file": "src/Map/Map.cpp"
+      },
+      {
+        "effect_id": 343,
+        "path": "/scene/mapObj/IceBlockA.jpa",
+        "source_file": "src/MoveBG/MapObjBlock.cpp"
+      },
+      {
+        "effect_id": 344,
+        "path": "/scene/mapObj/IceBlockB.jpa",
+        "source_file": "src/MoveBG/MapObjBlock.cpp"
+      },
+      {
         "effect_id": 345,
         "path": "/scene/map/map/ms_sunadori_a.jpa",
         "source_file": "src/MoveBG/MapObjMamma.cpp"
@@ -31616,9 +32856,119 @@
         "source_file": "src/MoveBG/MapObjMamma.cpp"
       },
       {
+        "effect_id": 347,
+        "path": "/scene/map/map/ms_mare_blockup.jpa",
+        "source_file": "src/Map/MapEventMare.cpp"
+      },
+      {
+        "effect_id": 348,
+        "path": "/scene/mapObj/ms_funsui_yuge.jpa",
+        "source_file": "src/MoveBG/MapObjEx.cpp"
+      },
+      {
+        "effect_id": 349,
+        "path": "/scene/bosspakkun/jpa/ms_bopa_wathit.jpa",
+        "source_file": "src/Enemy/bosspakkun.cpp"
+      },
+      {
+        "effect_id": 350,
+        "path": "/scene/bosspakkun/jpa/ms_bopa_wathit_w.jpa",
+        "source_file": "src/Enemy/bosspakkun.cpp"
+      },
+      {
+        "effect_id": 351,
+        "path": "/scene/bosspakkun/jpa/ms_bopa_ase.jpa",
+        "source_file": "src/Enemy/bosspakkun.cpp"
+      },
+      {
+        "effect_id": 352,
+        "path": "/scene/bosspakkun/jpa/ms_bopa_blur2.jpa",
+        "source_file": "src/Enemy/bosspakkun.cpp"
+      },
+      {
+        "effect_id": 353,
+        "path": "/scene/bosspakkun/jpa/ms_bopa_jita.jpa",
+        "source_file": "src/Enemy/bosspakkun.cpp"
+      },
+      {
+        "effect_id": 354,
+        "path": "/scene/bosspakkun/jpa/ms_bopa_tr_rock.jpa",
+        "source_file": "src/Enemy/bosspakkun.cpp"
+      },
+      {
+        "effect_id": 355,
+        "path": "/scene/bosspakkun/jpa/ms_bopa_tr_smoke.jpa",
+        "source_file": "src/Enemy/bosspakkun.cpp"
+      },
+      {
+        "effect_id": 356,
+        "path": "/scene/bosspakkun/jpa/ms_bopa_tr_weed.jpa",
+        "source_file": "src/Enemy/bosspakkun.cpp"
+      },
+      {
         "effect_id": 357,
         "path": "ms_geso_kiseki.jpa",
         "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 358,
+        "path": "/scene/cannon/jpa/ms_cannon_smoke.jpa",
+        "source_file": "src/Enemy/cannon.cpp"
+      },
+      {
+        "effect_id": 358,
+        "path": "/scene/mapObj/demoCannon_smoke.jpa",
+        "source_file": "src/MoveBG/MapObjDolpic.cpp"
+      },
+      {
+        "effect_id": 359,
+        "path": "/scene/bwanwan/jpa/ms_bwan_hityuge.jpa",
+        "source_file": "src/Enemy/bosswanwan.cpp"
+      },
+      {
+        "effect_id": 360,
+        "path": "/scene/bwanwan/jpa/ms_bwan_kira.jpa",
+        "source_file": "src/Enemy/bosswanwan.cpp"
+      },
+      {
+        "effect_id": 360,
+        "path": "/scene/firewanwan/jpa/ms_bwan_kira.jpa",
+        "source_file": "src/Enemy/fireWanwan.cpp"
+      },
+      {
+        "effect_id": 361,
+        "path": "ms_boha_jouki2_r_a.jpa",
+        "source_file": "src/Enemy/BossHanachanEffect.cpp"
+      },
+      {
+        "effect_id": 362,
+        "path": "ms_boha_jouki2_r_b.jpa",
+        "source_file": "src/Enemy/BossHanachanEffect.cpp"
+      },
+      {
+        "effect_id": 363,
+        "path": "ms_boha_jouki2_l_a.jpa",
+        "source_file": "src/Enemy/BossHanachanEffect.cpp"
+      },
+      {
+        "effect_id": 364,
+        "path": "ms_boha_jouki2_l_b.jpa",
+        "source_file": "src/Enemy/BossHanachanEffect.cpp"
+      },
+      {
+        "effect_id": 365,
+        "path": "ms_boha_sandsmo_sl.jpa",
+        "source_file": "src/Enemy/BossHanachanEffect.cpp"
+      },
+      {
+        "effect_id": 366,
+        "path": "ms_boha_sand_sl.jpa",
+        "source_file": "src/Enemy/BossHanachanEffect.cpp"
+      },
+      {
+        "effect_id": 367,
+        "path": "ms_boha_kizetsu.jpa",
+        "source_file": "src/Enemy/BossHanachanEffect.cpp"
       },
       {
         "effect_id": 368,
@@ -31721,6 +33071,11 @@
         "source_file": "src/System/MarDirectorLoadResource.cpp"
       },
       {
+        "effect_id": 388,
+        "path": "/scene/Mapobj/amiking.jpa",
+        "source_file": "src/MoveBG/MapObjPinna.cpp"
+      },
+      {
         "effect_id": 389,
         "path": "ms_tama_hit.jpa",
         "source_file": "src/System/MarDirectorLoadResource.cpp"
@@ -31756,6 +33111,26 @@
         "source_file": "src/System/MarDirectorLoadResource.cpp"
       },
       {
+        "effect_id": 396,
+        "path": "/scene/tori/jpa/ms_cooc_ase.jpa",
+        "source_file": "src/Enemy/Kukku.cpp"
+      },
+      {
+        "effect_id": 397,
+        "path": "/scene/tori/jpa/ms_cooc_hane.jpa",
+        "source_file": "src/Enemy/Kukku.cpp"
+      },
+      {
+        "effect_id": 398,
+        "path": "/scene/amenbo/jpa/ms_ame_hamon.jpa",
+        "source_file": "src/Enemy/Amenbo.cpp"
+      },
+      {
+        "effect_id": 399,
+        "path": "/scene/firewanwan/jpa/ms_can_hityuge.jpa",
+        "source_file": "src/Enemy/fireWanwan.cpp"
+      },
+      {
         "effect_id": 400,
         "path": "/scene/wireTrap/jpa/ms_wrt_biri_a.jpa",
         "source_file": "src/Enemy/wireTrap.cpp"
@@ -31764,6 +33139,126 @@
         "effect_id": 401,
         "path": "/scene/wireTrap/jpa/ms_wrt_biri_b.jpa",
         "source_file": "src/Enemy/wireTrap.cpp"
+      },
+      {
+        "effect_id": 414,
+        "path": "/scene/btelesa/jpa/ms_btls_yodare1.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "effect_id": 415,
+        "path": "/scene/btelesa/jpa/ms_btls_yodare2.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "effect_id": 416,
+        "path": "/scene/btelesa/jpa/ms_btls_yodare3.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "effect_id": 417,
+        "path": "/scene/btelesa/jpa/ms_btls_ase.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "effect_id": 418,
+        "path": "/scene/btelesa/jpa/ms_btls_spicy_a.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "effect_id": 419,
+        "path": "/scene/btelesa/jpa/ms_btls_spicy_b.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "effect_id": 420,
+        "path": "/scene/btelesa/jpa/ms_btls_spicy_d.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "effect_id": 421,
+        "path": "/scene/btelesa/jpa/ms_btls_chika_a.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "effect_id": 422,
+        "path": "/scene/btelesa/jpa/ms_btls_chika_b.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "effect_id": 423,
+        "path": "/scene/btelesa/jpa/ms_btls_glow.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "effect_id": 424,
+        "path": "/scene/map/map/ms_pinna_funsui.jpa",
+        "source_file": "src/Enemy/effectObj.cpp"
+      },
+      {
+        "effect_id": 425,
+        "path": "/scene/map/map/ms_bia_funsui.jpa",
+        "source_file": "src/Enemy/effectObj.cpp"
+      },
+      {
+        "effect_id": 426,
+        "path": "/scene/kagemario/jpa/ms_kgm_move_a.jpa",
+        "source_file": "src/Enemy/enemyMario.cpp"
+      },
+      {
+        "effect_id": 427,
+        "path": "/scene/kagemario/jpa/ms_kgm_move_b.jpa",
+        "source_file": "src/Enemy/enemyMario.cpp"
+      },
+      {
+        "effect_id": 446,
+        "path": "/scene/map/map/ms_lkp_yuge1.jpa",
+        "source_file": "src/MoveBG/MapObjCorona.cpp"
+      },
+      {
+        "effect_id": 447,
+        "path": "/scene/map/map/ms_kp_funsui.jpa",
+        "source_file": "src/MoveBG/MapObjCorona.cpp"
+      },
+      {
+        "effect_id": 448,
+        "path": "/scene/koopa/jpa/ms_kp_fire_a.jpa",
+        "source_file": "src/Enemy/Koopa.cpp"
+      },
+      {
+        "effect_id": 448,
+        "path": "/scene/koopa/jpa/ms_kp_fire_a.jpa",
+        "source_file": "src/Enemy/limitkoopa.cpp"
+      },
+      {
+        "effect_id": 449,
+        "path": "/scene/koopa/jpa/ms_kp_fire_b.jpa",
+        "source_file": "src/Enemy/Koopa.cpp"
+      },
+      {
+        "effect_id": 449,
+        "path": "/scene/koopa/jpa/ms_kp_fire_b.jpa",
+        "source_file": "src/Enemy/limitkoopa.cpp"
+      },
+      {
+        "effect_id": 450,
+        "path": "/scene/koopa/jpa/ms_kp_fire_c.jpa",
+        "source_file": "src/Enemy/Koopa.cpp"
+      },
+      {
+        "effect_id": 450,
+        "path": "/scene/koopa/jpa/ms_kp_fire_c.jpa",
+        "source_file": "src/Enemy/limitkoopa.cpp"
+      },
+      {
+        "effect_id": 451,
+        "path": "/scene/koopa/jpa/ms_kp_fire_d.jpa",
+        "source_file": "src/Enemy/Koopa.cpp"
+      },
+      {
+        "effect_id": 451,
+        "path": "/scene/koopa/jpa/ms_kp_fire_d.jpa",
+        "source_file": "src/Enemy/limitkoopa.cpp"
       },
       {
         "effect_id": 452,
@@ -31776,6 +33271,11 @@
         "source_file": "src/System/MarDirectorLoadResource.cpp"
       },
       {
+        "effect_id": 454,
+        "path": "/scene/mapObj/ms_obj_hamon_a.jpa",
+        "source_file": "src/MoveBG/MapObjFloat.cpp"
+      },
+      {
         "effect_id": 465,
         "path": "ms_mpk_fire_a.jpa",
         "source_file": "src/System/MarDirectorLoadResource.cpp"
@@ -31783,6 +33283,26 @@
       {
         "effect_id": 466,
         "path": "ms_mpk_fire_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 468,
+        "path": "/scene/bombColumWater/jpa/ms_m_tobikomi_c.jpa",
+        "source_file": "src/Enemy/effectObj.cpp"
+      },
+      {
+        "effect_id": 468,
+        "path": "ms_m_tobikomi_c.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 469,
+        "path": "ms_m_tobikomi_s_c.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 470,
+        "path": "ms_gatein.jpa",
         "source_file": "src/System/MarDirectorLoadResource.cpp"
       },
       {
@@ -31806,6 +33326,76 @@
         "source_file": "src/System/MarDirectorLoadResource.cpp"
       },
       {
+        "effect_id": 476,
+        "path": "/scene/map/pollution/ms_newfire_b.jpa",
+        "source_file": "src/Map/Map.cpp"
+      },
+      {
+        "effect_id": 477,
+        "path": "/scene/map/map/gate/ms_gatehit_a.jpa",
+        "source_file": "src/MoveBG/ModelGate.cpp"
+      },
+      {
+        "effect_id": 478,
+        "path": "/scene/map/map/gate/ms_gatehit_b.jpa",
+        "source_file": "src/MoveBG/ModelGate.cpp"
+      },
+      {
+        "effect_id": 479,
+        "path": "/scene/gatekeeper/jpa/ms_gkpa_kemuri.jpa",
+        "source_file": "src/Enemy/gatekeeper.cpp"
+      },
+      {
+        "effect_id": 480,
+        "path": "/scene/gatekeeper/jpa/ms_gkpa_kemuri_w.jpa",
+        "source_file": "src/Enemy/gatekeeper.cpp"
+      },
+      {
+        "effect_id": 481,
+        "path": "/scene/map/map/ms_objup_slope_b.jpa",
+        "source_file": "src/Map/MapEventSink.cpp"
+      },
+      {
+        "effect_id": 482,
+        "path": "/scene/map/map/ms_objup_maniya_b.jpa",
+        "source_file": "src/Map/MapEventDolpic.cpp"
+      },
+      {
+        "effect_id": 483,
+        "path": "/scene/map/map/ms_objup_toudai_b.jpa",
+        "source_file": "src/Map/MapEventDolpic.cpp"
+      },
+      {
+        "effect_id": 484,
+        "path": "/scene/map/map/ms_objup_hotel_b.jpa",
+        "source_file": "src/Map/MapEventSirena.cpp"
+      },
+      {
+        "effect_id": 485,
+        "path": "/scene/map/map/ms_mare_objup_b.jpa",
+        "source_file": "src/Map/Map.cpp"
+      },
+      {
+        "effect_id": 487,
+        "path": "ms_gesosurf_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 488,
+        "path": "ms_m_hamon_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 489,
+        "path": "ms_m_mzbhamon_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 490,
+        "path": "ms_m_watslide_a.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
         "effect_id": 492,
         "path": "ms_name_indirect.jpa",
         "source_file": "src/System/MarDirectorLoadResource.cpp"
@@ -31816,9 +33406,34 @@
         "source_file": "src/System/MarDirectorLoadResource.cpp"
       },
       {
+        "effect_id": 494,
+        "path": "/scene/bwanwan/jpa/ms_bwan_yugami.jpa",
+        "source_file": "src/Enemy/bosswanwan.cpp"
+      },
+      {
+        "effect_id": 496,
+        "path": "/scene/btelesa/jpa/ms_btls_spicy_c.jpa",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
         "effect_id": 497,
         "path": "ms_teppanfire_b.jpa",
         "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 499,
+        "path": "/scene/koopa/jpa/ms_kp_fire_e.jpa",
+        "source_file": "src/Enemy/Koopa.cpp"
+      },
+      {
+        "effect_id": 499,
+        "path": "/scene/koopa/jpa/ms_kp_fire_e.jpa",
+        "source_file": "src/Enemy/limitkoopa.cpp"
+      },
+      {
+        "effect_id": 500,
+        "path": "/scene/firewanwan/jpa/ms_can_yugami.jpa",
+        "source_file": "src/Enemy/fireWanwan.cpp"
       },
       {
         "effect_id": 501,
@@ -31826,8 +33441,18 @@
         "source_file": "src/System/MarDirectorLoadResource.cpp"
       },
       {
+        "effect_id": 502,
+        "path": "/scene/mapObj/ms_obj_hamon_b.jpa",
+        "source_file": "src/MoveBG/MapObjFloat.cpp"
+      },
+      {
         "effect_id": 503,
         "path": "ms_npc_hamon_b.jpa",
+        "source_file": "src/System/MarDirectorLoadResource.cpp"
+      },
+      {
+        "effect_id": 504,
+        "path": "ms_mpk_fire_c.jpa",
         "source_file": "src/System/MarDirectorLoadResource.cpp"
       },
       {
@@ -31873,6 +33498,74 @@
     ],
     "actor_particle_bindings": [
       {
+        "class_name": "TBGPolDrop",
+        "effect_id": 314,
+        "target": "ActorOrigin",
+        "source_file": "src/Enemy/bgpoldrop.cpp"
+      },
+      {
+        "class_name": "TBossEel",
+        "effect_id": 212,
+        "target": "ActorOrigin",
+        "source_file": "src/Enemy/bosseel.cpp"
+      },
+      {
+        "class_name": "TBossEel",
+        "effect_id": 409,
+        "target": "ActorOrigin",
+        "source_file": "src/Enemy/bosseel.cpp"
+      },
+      {
+        "class_name": "TBossEelEye",
+        "effect_id": 402,
+        "target": "ActorOrigin",
+        "source_file": "src/Enemy/bosseel.cpp"
+      },
+      {
+        "class_name": "TBossPakkun",
+        "effect_id": 292,
+        "target": "ActorOrigin",
+        "source_file": "src/Enemy/bosspakkun.cpp"
+      },
+      {
+        "class_name": "TBossWanwan",
+        "effect_id": 175,
+        "target": {
+          "ModelJoint": 1
+        },
+        "source_file": "src/Enemy/bosswanwan.cpp"
+      },
+      {
+        "class_name": "TBossWanwan",
+        "effect_id": 176,
+        "target": {
+          "ModelJoint": 1
+        },
+        "source_file": "src/Enemy/bosswanwan.cpp"
+      },
+      {
+        "class_name": "TBossWanwan",
+        "effect_id": 359,
+        "target": {
+          "ModelJoint": 1
+        },
+        "source_file": "src/Enemy/bosswanwan.cpp"
+      },
+      {
+        "class_name": "TBossWanwan",
+        "effect_id": 360,
+        "target": "ActorOrigin",
+        "source_file": "src/Enemy/bosswanwan.cpp"
+      },
+      {
+        "class_name": "TBossWanwan",
+        "effect_id": 494,
+        "target": {
+          "ModelJoint": 1
+        },
+        "source_file": "src/Enemy/bosswanwan.cpp"
+      },
+      {
         "class_name": "TChangeStageMerrygoround",
         "effect_id": 256,
         "target": "ActorOrigin",
@@ -31883,6 +33576,42 @@
         "effect_id": 257,
         "target": "ActorOrigin",
         "source_file": "src/MoveBG/MapObjPinna.cpp"
+      },
+      {
+        "class_name": "TEffectBiancoFunsui",
+        "effect_id": 425,
+        "target": "ActorOrigin",
+        "source_file": "src/Enemy/effectObj.cpp"
+      },
+      {
+        "class_name": "TEffectEnemy",
+        "effect_id": 309,
+        "target": "ActorOrigin",
+        "source_file": "src/Enemy/effectEnemy.cpp"
+      },
+      {
+        "class_name": "TEffectEnemy",
+        "effect_id": 310,
+        "target": "ActorOrigin",
+        "source_file": "src/Enemy/effectEnemy.cpp"
+      },
+      {
+        "class_name": "TEffectEnemy",
+        "effect_id": 311,
+        "target": "ActorOrigin",
+        "source_file": "src/Enemy/effectEnemy.cpp"
+      },
+      {
+        "class_name": "TEffectEnemy",
+        "effect_id": 493,
+        "target": "ActorOrigin",
+        "source_file": "src/Enemy/effectEnemy.cpp"
+      },
+      {
+        "class_name": "TEffectPinnaFunsui",
+        "effect_id": 424,
+        "target": "ActorOrigin",
+        "source_file": "src/Enemy/effectObj.cpp"
       },
       {
         "class_name": "TShine",

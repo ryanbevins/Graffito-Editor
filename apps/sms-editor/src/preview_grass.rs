@@ -155,6 +155,7 @@ pub(super) fn build_procedural_grass_preview(
                 particle_direction: None,
                 particle_color_mode: None,
                 particle_environment_color: None,
+                particle_extra_texture: None,
             });
         }
 

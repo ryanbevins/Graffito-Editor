@@ -279,10 +279,24 @@ pub(super) struct LevelTransformParticlePreview {
     pub(super) effect: JpaEffect,
     pub(super) kind: JpaParticleKind,
     pub(super) shared_simulation_id: Option<u16>,
-    pub(super) origin_offset: [f32; 3],
+    pub(super) bind_transform: ParticleBindTransform,
     pub(super) triangle_range: std::ops::Range<usize>,
     pub(super) particle_capacity: usize,
     pub(super) model_index: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ParticleBindTransform {
+    pub(super) translation: [f32; 3],
+    /// Normalized world-space basis columns, matching setGlobalRTMatrix.
+    pub(super) rotation: [[f32; 3]; 3],
+}
+
+impl ParticleBindTransform {
+    pub(super) const IDENTITY: Self = Self {
+        translation: [0.0; 3],
+        rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -324,6 +338,18 @@ pub(super) struct PreviewTriangle {
     pub(super) particle_direction: Option<[f32; 3]>,
     pub(super) particle_color_mode: Option<u8>,
     pub(super) particle_environment_color: Option<[u8; 4]>,
+    pub(super) particle_extra_texture: Option<ParticleExtraTexturePreview>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct ParticleExtraTexturePreview {
+    pub(super) indirect_mode: u8,
+    pub(super) matrix_mode: u8,
+    pub(super) indirect_matrix: [[f32; 3]; 2],
+    pub(super) exponent: i8,
+    pub(super) indirect_texture_index: usize,
+    pub(super) sub_texture_index: Option<usize>,
+    pub(super) second_texture_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,7 +365,6 @@ pub(super) enum PreviewRenderLayer {
     Shadow,
     Heatwave,
     Particle,
-    ParticleDistortion,
 }
 
 #[derive(Debug, Clone, Copy)]

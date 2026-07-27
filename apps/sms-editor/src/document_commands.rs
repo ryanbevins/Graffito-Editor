@@ -3806,11 +3806,25 @@ impl SmsEditorApp {
         }
         for particles in &mut preview.actor_particles {
             if particles.model_index == Some(model_index) {
-                particles.origin_offset = retransform_preview_point(
-                    particles.origin_offset,
+                particles.bind_transform.translation = retransform_preview_point(
+                    particles.bind_transform.translation,
                     old_preview_transform,
                     new_preview_transform,
                 );
+                let old_rotation = Transform {
+                    translation: [0.0; 3],
+                    scale: [1.0; 3],
+                    ..old_preview_transform
+                };
+                let new_rotation = Transform {
+                    translation: [0.0; 3],
+                    scale: [1.0; 3],
+                    ..new_preview_transform
+                };
+                particles.bind_transform.rotation = particles
+                    .bind_transform
+                    .rotation
+                    .map(|axis| retransform_preview_normal(axis, old_rotation, new_rotation));
             }
         }
 
@@ -3830,10 +3844,7 @@ impl SmsEditorApp {
                 triangle.vertices = triangle.vertices.map(|vertex| {
                     retransform_preview_point(vertex, old_preview_transform, new_preview_transform)
                 });
-                let normals = if matches!(
-                    triangle.render_layer,
-                    PreviewRenderLayer::Particle | PreviewRenderLayer::ParticleDistortion
-                ) {
+                let normals = if triangle.render_layer == PreviewRenderLayer::Particle {
                     triangle.normals
                 } else {
                     triangle.normals.map(|normals| {

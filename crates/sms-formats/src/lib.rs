@@ -76,7 +76,7 @@ pub use jdrama::{
 };
 pub use jpa::{
     JpaBaseShape, JpaChildShape, JpaColorAnimation, JpaColorKey, JpaEffect, JpaEmitter,
-    JpaExtraShape, JpaField, JpaKeyframeCurve, JpaRawBlock,
+    JpaExtraShape, JpaExtraTexture, JpaField, JpaKeyframeCurve, JpaRawBlock, JpaTextureMatrix,
 };
 pub use jpa_rebuild::*;
 pub use mario_record::{MarioRecordBundle, MarioRecordChannel, MarioRecordFile, MarioRecordRun};

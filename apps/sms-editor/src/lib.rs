@@ -2667,6 +2667,7 @@ impl SmsEditorApp {
                                 particle_direction: None,
                                 particle_color_mode: None,
                                 particle_environment_color: None,
+                                particle_extra_texture: None,
                             });
                         }
                     }
@@ -2861,6 +2862,39 @@ impl SmsEditorApp {
                 .or_else(|| catalog_preview.map(|preview| preview.model_path.clone()))
                 .or_else(|| object_inferred_preview_model_path(object, &world_model_paths));
             let Some(model_path) = model_path else {
+                // Particle-only actors have no J3D body by design. Give an
+                // origin-bound emitter its own render identity so it remains
+                // selectable and follows transform edits without inventing a
+                // placeholder model. Joint-bound effects still require the
+                // real actor model and are handled below.
+                let object_preview_transform = actor_runtime_preview_transform(
+                    reset_fruit_preview_transform(
+                        object,
+                        object.transform,
+                        document.registry.as_ref(),
+                    ),
+                    document.actor_preview(object),
+                );
+                let model_index = loaded_models + 1;
+                let particle_count = actor_particles.len();
+                push_actor_particle_previews(
+                    document,
+                    object,
+                    &actor_particle_effects,
+                    &[],
+                    object_preview_transform,
+                    model_index,
+                    &mut textures,
+                    &mut triangles,
+                    &mut next_packet_index,
+                    &mut actor_particles,
+                );
+                if actor_particles.len() > particle_count {
+                    loaded_models = model_index;
+                    object_model_indices.insert(object.id.clone(), model_index);
+                    mirror_actor_positions
+                        .insert(model_index, object_preview_transform.translation);
+                }
                 continue;
             };
             // TMapStaticObj::initUnique submits ReflectSky only to Sunshine's
@@ -3113,6 +3147,7 @@ impl SmsEditorApp {
                         particle_direction: None,
                         particle_color_mode: None,
                         particle_environment_color: None,
+                        particle_extra_texture: None,
                     });
                 }
             }
@@ -3838,6 +3873,7 @@ fn push_attached_preview_triangles(
             particle_direction: None,
             particle_color_mode: None,
             particle_environment_color: None,
+            particle_extra_texture: None,
         });
     }
 }
@@ -3943,6 +3979,7 @@ fn push_circle_shadow(
             particle_direction: None,
             particle_color_mode: None,
             particle_environment_color: None,
+            particle_extra_texture: None,
         });
     }
 }
@@ -4668,9 +4705,7 @@ fn preview_render_layer_for_model_path(path: &str) -> PreviewRenderLayer {
 fn preview_render_layer_is_effect(layer: PreviewRenderLayer) -> bool {
     matches!(
         layer,
-        PreviewRenderLayer::Heatwave
-            | PreviewRenderLayer::Particle
-            | PreviewRenderLayer::ParticleDistortion
+        PreviewRenderLayer::Heatwave | PreviewRenderLayer::Particle
     )
 }
 
@@ -5256,8 +5291,7 @@ fn apply_layer_preview_tint(
         | PreviewRenderLayer::MirrorScene
         | PreviewRenderLayer::Shadow
         | PreviewRenderLayer::Heatwave
-        | PreviewRenderLayer::Particle
-        | PreviewRenderLayer::ParticleDistortion => color,
+        | PreviewRenderLayer::Particle => color,
     }
 }
 

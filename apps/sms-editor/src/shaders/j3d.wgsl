@@ -274,7 +274,7 @@ fn vs_main(input: VertexIn) -> VertexOut {
         dot(input.normal, camera.forward.xyz),
     ));
     let billboard_mode = u32(round(input.billboard_center_mode.w));
-    if (billboard_mode != 0u && input.coordinate_space != 3u && input.coordinate_space != 4u) {
+    if (billboard_mode != 0u && input.coordinate_space != 3u) {
         // J3DModel::calcBBoard runs after the model matrix is concatenated with
         // the view matrix. A full billboard replaces that view-space 3x3 with
         // its axis scales; a Y billboard retains the model's Y axis and builds
@@ -318,7 +318,7 @@ fn vs_main(input: VertexIn) -> VertexOut {
         // quad, so its model coordinates arrive in GX view space.
         view_position = vec3<f32>(input.position.xy, -input.position.z);
         view_normal = normalize(vec3<f32>(input.normal.xy, -input.normal.z));
-    } else if (input.coordinate_space == 3u || input.coordinate_space == 4u) {
+    } else if (input.coordinate_space == 3u) {
         // JPADraw assigns V=0 to positive local Y. ESP1 pivots use 1 as the
         // center, with 0 and 2 anchoring the corresponding sprite edge.
         let pivot = input.billboard_center_mode.xy;
@@ -511,7 +511,6 @@ fn tex_coord(input: VertexOut, index: u32) -> vec2<f32> {
 
 fn screen_copy_sample(coordinate_space: u32, slot: u32) -> bool {
     return ((coordinate_space == 2u
-            || coordinate_space == 4u
             || coordinate_space == 6u) && slot == 1u)
         || (coordinate_space == 5u && slot == 0u);
 }
@@ -976,21 +975,6 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         if (textureSampleLevel(texture1, sampler1, mask_uv, 0.0).r < 0.5) {
             discard;
         }
-    }
-    if (input.coordinate_space == 4u) {
-        let mask = sample_texture(input.coordinate_space, 0u, input.uv0, input.uv0);
-        let target_size = vec2<f32>(textureDimensions(texture1));
-        let screen_uv = input.position.xy / target_size;
-        let displacement = (mask.rg - vec2<f32>(0.5)) * 0.035 * input.color0.a;
-        let scene = sample_texture(
-            input.coordinate_space,
-            1u,
-            screen_uv + displacement,
-            screen_uv,
-        );
-        return apply_source_independent_logic(
-            vec4<f32>(scene.rgb, mask.a * input.color0.a),
-        );
     }
     var previous = vec4<f32>(0.0);
     var reg0 = material.tev_colors[0];

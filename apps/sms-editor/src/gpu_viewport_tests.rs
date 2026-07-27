@@ -438,6 +438,81 @@ fn particle_updates_match_a_full_gpu_repack_byte_for_byte() {
 }
 
 #[test]
+fn jparticle_second_texture_keeps_the_visible_base_stage() {
+    let mut preview = geometry_update_preview();
+    preview.textures = vec![
+        lod_preview_texture(),
+        lod_preview_texture(),
+        lod_preview_texture(),
+    ];
+    let triangle = &mut preview.triangles[0];
+    triangle.render_layer = PreviewRenderLayer::Particle;
+    triangle.texture_index = Some(0);
+    triangle.particle_color_mode = Some(3);
+    triangle.particle_environment_color = Some([199, 227, 255, 255]);
+    triangle.particle_extra_texture = Some(ParticleExtraTexturePreview {
+        indirect_mode: 0,
+        matrix_mode: 0,
+        indirect_matrix: [[0.5, 0.0, 0.0], [0.0, 0.5, 0.0]],
+        exponent: 1,
+        indirect_texture_index: 1,
+        sub_texture_index: None,
+        second_texture_index: Some(2),
+    });
+
+    let scene = GpuSceneData::from_preview(&preview);
+    let location = scene.triangle_vertices[0].unwrap();
+    let material = &scene.materials[scene.batches[location.batch_index].material_index];
+
+    assert_eq!(material.texture_indices[0..3], [1, 2, 3]);
+    assert_eq!(material.uniform.counts, [2, 3, 0, 0]);
+    assert_eq!(material.uniform.tev_orders[0], [1, 1, 4, 0]);
+    assert_eq!(material.uniform.tev_orders[1], [3, 3, 0, 0]);
+    assert_eq!(material.uniform.tev_color_args[1], [15, 8, 0, 15]);
+    assert_eq!(material.uniform.tev_alpha_args[1], [7, 4, 0, 7]);
+    assert_eq!(
+        material.uniform.tex_gens[1][1], 6,
+        "ETX1 second texture derives from preserved raw GX TEX0"
+    );
+    assert_eq!(material.uniform.tex_gens[2][1], 6);
+}
+
+#[test]
+fn jparticle_indirect_texture_uses_the_authored_matrix() {
+    let mut preview = geometry_update_preview();
+    preview.textures = vec![lod_preview_texture(), lod_preview_texture()];
+    let triangle = &mut preview.triangles[0];
+    triangle.render_layer = PreviewRenderLayer::Particle;
+    triangle.texture_index = Some(0);
+    triangle.particle_extra_texture = Some(ParticleExtraTexturePreview {
+        indirect_mode: 1,
+        matrix_mode: 1,
+        indirect_matrix: [[0.5, -0.25, 0.125], [-0.5, 0.25, -0.125]],
+        exponent: 2,
+        indirect_texture_index: 1,
+        sub_texture_index: None,
+        second_texture_index: None,
+    });
+
+    let scene = GpuSceneData::from_preview(&preview);
+    let location = scene.triangle_vertices[0].unwrap();
+    let material = &scene.materials[scene.batches[location.batch_index].material_index];
+
+    assert_eq!(material.uniform.counts, [1, 2, 0, 1]);
+    assert_eq!(material.uniform.tex_gens[1][1], 6);
+    assert_eq!(material.uniform.indirect_orders[0], [2, 2, 0, 0]);
+    assert_eq!(material.uniform.indirect_stages0[0], [0, 0, 7, 1]);
+    assert_eq!(
+        material.uniform.indirect_matrix_rows[0],
+        [2.0, -1.0, 0.5, 0.0]
+    );
+    assert_eq!(
+        material.uniform.indirect_matrix_rows[1],
+        [-2.0, 1.0, -0.5, 0.0]
+    );
+}
+
+#[test]
 fn geometry_updates_limit_uploads_to_the_dirty_vertex_span() {
     let mut preview = geometry_update_preview();
     preview.triangles[1].packet_index = preview.triangles[0].packet_index;
@@ -822,6 +897,7 @@ fn geometry_update_preview() -> ModelPreview {
         particle_direction: None,
         particle_color_mode: None,
         particle_environment_color: None,
+        particle_extra_texture: None,
     };
     ModelPreview {
         points: Vec::<PreviewPoint>::new(),
@@ -1154,10 +1230,6 @@ fn render_layers_select_their_runtime_coordinate_space() {
         coordinate_space_for_render_layer(PreviewRenderLayer::Particle),
         3
     );
-    assert_eq!(
-        coordinate_space_for_render_layer(PreviewRenderLayer::ParticleDistortion),
-        4
-    );
 }
 
 #[test]
@@ -1227,12 +1299,6 @@ fn wave_and_particles_follow_the_indirect_water_phase() {
         material.pipeline_key(PreviewRenderLayer::Particle).pass,
         GpuBatchPass::Particle
     );
-    assert_eq!(
-        material
-            .pipeline_key(PreviewRenderLayer::ParticleDistortion)
-            .pass,
-        GpuBatchPass::Particle
-    );
 }
 
 #[test]
@@ -1240,9 +1306,6 @@ fn only_authored_screen_effect_layers_use_the_efb_copy() {
     assert!(render_layer_uses_efb_copy(PreviewRenderLayer::Heatwave));
     assert!(render_layer_uses_efb_copy(
         PreviewRenderLayer::IndirectWater
-    ));
-    assert!(render_layer_uses_efb_copy(
-        PreviewRenderLayer::ParticleDistortion
     ));
     assert!(!render_layer_uses_efb_copy(PreviewRenderLayer::WaveFoam));
     assert!(!render_layer_uses_efb_copy(PreviewRenderLayer::Particle));
