@@ -2,13 +2,13 @@
 
 # Graffito Editor
 
-**An integrated, data-driven authoring environment for _Super Mario Sunshine_.**
+**A data-driven authoring environment for _Super Mario Sunshine_.**
 
 [![CI](https://github.com/ryanbevins/Graffito-Editor/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ryanbevins/Graffito-Editor/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/JhPr3fWuy)
 
-[Join the Graffito community on Discord](https://discord.gg/JhPr3fWuy) ·
+[Join the Discord community](https://discord.gg/JhPr3fWuy) ·
 [Project format](docs/project-format.md) ·
 [Contributing](CONTRIBUTING.md) ·
 [Security](SECURITY.md)
@@ -16,131 +16,203 @@
 </div>
 
 > [!WARNING]
-> Graffito is an experimental development preview. There are no official
-> binaries or public releases yet, and project formats and workflows may change
-> before the first release. Keep backups and manually verify built stages in
-> Dolphin before relying on them.
+> Graffito is an experimental development preview.
+> The project has no official binary or public release.
+> File formats and workflows can change before the first release.
+> Keep backups and test each build in Dolphin.
 
-Graffito Editor is a Rust-native toolchain for authoring, compiling, building,
-and testing _Super Mario Sunshine_ content. The current source can inspect
-retail stages, create source-free custom stages, author game-backed content,
-build a protected runnable copy of the game, and launch the open stage directly
-in Dolphin.
+Graffito is a Rust application for authoring, building, and testing
+_Super Mario Sunshine_ content.
 
-The editor works from a user-supplied, legally obtained game extraction. It does
-not include Nintendo assets, and it never edits the extracted base game.
-Projects, generated content, and runnable builds live in separate
-editor-managed locations.
+Graffito can inspect retail stages, create source-free stages, author game
+content, build a separate game copy, and open stages in Dolphin.
 
-Format, scene, and rendering behavior are grounded in the
+The user must supply a legally obtained game extraction. Graffito does not
+include Nintendo assets or change the base extraction. Each project stores its
+editable data and builds in separate locations.
+
+Graffito uses the
 [Super Mario Sunshine decompilation project](https://github.com/doldecomp/sms)
-and Nintendo's JSystem/GX behavior. Graffito favors typed, data-derived
-authoring over hardcoded object lists or blind binary patching.
+and Nintendo JSystem/GX behavior as technical references. It uses typed metadata
+instead of hardcoded object lists or unverified binary patches.
 
 ## AI-assisted development
 
-This project is developed with the assistance of AI coding tools for research,
-implementation, tests, documentation, and iteration. AI output is not treated
-as authoritative: format and behavior decisions are checked against the SMS
-decompilation and JSystem/GX behavior, and the maintainer remains responsible
-for the project's design and published code.
+AI coding tools help with research, code, tests, documentation, and iteration.
 
-## What Graffito can do today
+AI output does not define game formats or behavior. The SMS decompilation and
+JSystem/GX behavior remain the technical sources of truth. The maintainer
+reviews the project design and each published change.
 
-| Area | Current source-tree support |
-| --- | --- |
-| **Projects and stages** | Create, open, and reopen `.sms` projects; browse retail stages in localized area folders; import legacy project folders; and create minimal source-free stages with project-owned runtime mappings. |
-| **Unified Content Browser** | Search, filter, sort, favorite, and preview project stages/models alongside read-only game stages, objects, skyboxes, music, sounds, and raw game files. Grid/list views, breadcrumbs, history, and contextual actions share one browser. |
-| **Scene authoring** | Place safe cataloged actors, enemies, NPCs, map objects, and Mario from typed retail-backed templates. Edit transforms with viewport gizmos, snapping, and typed inspector controls; duplicate, delete, undo, and redo while dependency records and required resources are carried with the object. |
-| **Models, terrain, and collision** | Import rigid `.gltf`/`.glb` geometry into native `.smsmodel` assets, edit supported GX material and collision settings, and export models as separate runtime objects, replacement terrain, skyboxes, or constrained decomp-verified stock replacements. |
-| **Routes** | Inspect and author real Sunshine rail graphs in the viewport. Create, duplicate, rename, assign, connect, split, reverse, and disconnect routes; edit one-way or bidirectional links; and bake Bezier handles into runtime nodes. |
-| **NPC dialogue** | Edit resolved dialogue for talk-capable placed actors using retail BMG/SPC routing. Graffito supports per-instance copy-on-write edits, confirmed shared edits, text, known controls, choices, page breaks, voice selection, balloons, and generated talk routes. |
-| **Goop** | Inspect retail pollution layers, generate playable floor layers and depth data from the final terrain, select retail-derived styles and behaviors, paint or erase in the viewport, use connected fill, and rebuild stale resources after terrain changes. Retail wall and wave layers remain read-only. |
-| **Sky, lighting, and audio** | Apply complete retail skybox bundles or authored skybox models; edit stage lights and ambient colors; assign stage music; inspect point, rail, and volume audio helpers; and preview supported JAudio music and sounds directly from the selected game data. |
-| **Viewport** | Preview a growing subset of J3D/GX rendering through `wgpu`, including BMD/BDL models, BMT/BTI materials and textures, supported animation formats, particles, water, goop, grass, wires, collision, and many placed actors. The editor includes game-engine-style selection, views, overlays, gizmos, and camera controls. |
-| **Build and play** | Save editable drafts even when validation issues remain. **Build Game** validates the stage and creates an independent runnable `run-root`; **Launch in Editor** embeds Dolphin on Windows, while **Launch in Dolphin** opens it externally. Both can direct-boot the open stage without modifying the base extraction. |
+## Current support
 
-The companion `sms-cli` package exposes the same lower-level pipeline for
-inspection and automation: model import/compilation, stage creation and
-upgrades, schema generation, asset discovery, validation, source-free rebuilds,
-route-corpus verification, project/stage export, and Dolphin launch.
+### Projects and stages
+
+- Create, open, and reopen `.sms` projects.
+- Browse retail stages by localized area name.
+- Import older Graffito project folders.
+- Create minimal stages without copying retail stage files.
+- Store project-owned runtime mappings for new stages.
+
+### Content Browser
+
+- Browse project stages and models with read-only game content.
+- Browse game stages, objects, skyboxes, music, sounds, and raw files.
+- Search, filter, sort, favorite, and preview items.
+- Use grid or list views, breadcrumbs, history, and context actions.
+
+### Scene authoring
+
+- Place cataloged actors, enemies, NPCs, map objects, and Mario.
+- Create objects from typed templates derived from retail data.
+- Edit transforms with viewport gizmos, snapping, and inspector controls.
+- Duplicate or delete objects, and use undo or redo.
+- Copy required dependencies and resources with each object.
+
+### Models, terrain, and collision
+
+- Import rigid `.gltf` or `.glb` geometry into `.smsmodel` assets.
+- Edit supported GX material and collision settings.
+- Export models as separate runtime objects.
+- Replace terrain or skybox models.
+- Use stock resource replacements that the decompilation confirms.
+
+### Routes
+
+- Inspect Sunshine rail graphs in the viewport.
+- Create, duplicate, rename, assign, connect, split, reverse, or disconnect routes.
+- Edit one-way and two-way links.
+- Bake Bezier handles into runtime nodes.
+
+### NPC dialogue
+
+- Edit dialogue for placed actors with supported retail talk routes.
+- Create per-instance dialogue edits.
+- Confirm edits that affect shared dialogue.
+- Edit text, known controls, choices, page breaks, voices, and balloons.
+- Generate supported talk routes.
+
+### Goop
+
+- Inspect retail pollution layers.
+- Generate floor layers and depth data from the final terrain.
+- Select styles and behavior from retail data.
+- Paint, erase, or fill connected areas in the viewport.
+- Rebuild stale resources after terrain changes.
+- Preserve retail wall and wave layers as read-only data.
+
+### Sky, lighting, and audio
+
+- Apply a full retail skybox bundle.
+- Use an authored model as a skybox.
+- Edit stage lights and ambient colors.
+- Assign stage music.
+- Inspect point, rail, and volume audio helpers.
+- Preview supported JAudio music and sounds from the selected game data.
+
+### Viewport
+
+- Preview BMD and BDL models through `wgpu`.
+- Preview BMT and BTI materials and textures.
+- Preview supported animations, particles, water, goop, grass, and wires.
+- Display collision and supported placed actors.
+- Use selection, camera, gizmo, view, and overlay controls.
+
+### Build and play
+
+- Save editable drafts while validation issues remain.
+- Use **Build Game** to validate and build the project.
+- Create an independent runnable `run-root`.
+- Use **Launch in Editor** to embed Dolphin on Windows.
+- Use **Launch in Dolphin** to start Dolphin separately.
+- Direct-boot the open stage without changing the base extraction.
+
+## Command-line tools
+
+The `sms-cli` package exposes lower-level inspection and automation commands.
+
+It supports model import, model compilation, stage creation, schema generation,
+asset discovery, validation, archive rebuilds, project exports, and Dolphin
+launch. It can also verify route data across retail stage archives.
+
+List all commands:
 
 ```powershell
 cargo run --locked -p sms-cli -- --help
 ```
 
-## How projects and builds work
+## Project and build layout
 
-A Graffito project is identified by a small, human-readable `.sms` descriptor.
-It points to three deliberately separate locations:
+A Graffito project uses a small `.sms` descriptor.
 
 ```text
 My Project.sms          Project identity and paths
-My Project.smsdata/     Editable scene overlays and authored content
+My Project.smsdata/     Editable scenes and authored content
 My Project.smsbuild/    Protected build output
-  run-root/             Complete runnable game directory
+  run-root/             Runnable game directory
 ```
 
-The workflow is intentionally explicit:
+Use this workflow:
 
-1. Create or open a project and select a legally obtained extracted game root.
-2. Open a retail stage or create a new source-free stage.
-3. Author content through the Content Browser, viewport, outliner, and inspector.
-4. Save the project at any time, including while fixing validation errors.
-5. Use **Build Game** when the stage is ready for export validation.
-6. Test the managed `run-root` through **Launch in Editor** or
-   **Launch in Dolphin**.
+1. Create or open a project.
+2. Select a legally obtained extracted game directory.
+3. Open a retail stage or create a source-free stage.
+4. Edit content through the browser, viewport, outliner, and inspector.
+5. Save the project at any time.
+6. Fix all build validation errors.
+7. Select **Build Game**.
+8. Test the `run-root` through Dolphin.
 
-Saving records editable project state; it does not produce a standalone mod.
-Building creates a complete local copy containing user-owned game data, so the
-managed output must not be committed or redistributed. Build ownership markers,
-path-overlap checks, atomic file replacement, and rollback protect both the
-project and its read-only base.
+Saving updates the editable project data. It does not create a runnable mod.
 
-For the descriptor schema, source-free stage layout, and managed-build details,
-see the [project format documentation](docs/project-format.md).
+**Build Game** validates the stage and creates a separate game copy. This copy
+contains user-owned game data. Do not commit or distribute it.
+
+Ownership markers, path checks, atomic file replacement, and rollback protect
+the project and its read-only base data.
+
+See the [project format documentation](docs/project-format.md) for the
+descriptor schema, source-free stage layout, and build structure.
 
 ## Current limitations
 
-- Graffito is pre-1.0 software with no compatibility guarantee or supported
-  installer.
-- Windows 10/11 is the primary desktop target. Core crates and desktop
-  compilation receive Linux CI coverage, but embedded **Launch in Editor** is
-  Windows-only.
-- The viewport is an expanding J3D/GX approximation, not a full emulator.
-  Unsupported renderer state, animation details, and actor behavior may be
-  absent or visually different from the game.
-- Model import currently targets rigid/static geometry. Skins, skeletal
-  animation, and morph targets are rejected; metallic/roughness, normal, AO,
-  and emissive inputs remain diagnostics rather than complete GX mappings.
-- Object placement is limited to classes with safe typed templates and
-  dependency closure. Graffito does not guess arbitrary factories, stock
-  replacements, runtime-linked fields, or service objects.
-- Dialogue authoring follows resolved talk routes; it is not a general event,
-  cutscene, or SPC scripting system. Routing and presentation conditions remain
-  read-only.
-- Audio authoring selects and retargets supported retail music and sound data.
-  Custom audio import and complete JAudio emulation are not implemented.
-- Goop authoring currently edits floor layers. Retail wall and wave layers are
-  preserved but read-only.
-- Automated tests prove parsing, compilation, round trips, and build
-  invariants—not final gameplay or visual behavior. Runtime changes still need
-  manual Dolphin verification.
+- Graffito is pre-1.0 software.
+- The project has no compatibility guarantee or supported installer.
+- Graffito supports Windows 10 and 11 as its primary desktop targets.
+- Linux CI checks the core crates and desktop compilation.
+- **Launch in Editor** works only on Windows.
+- The viewport approximates J3D/GX rendering. It is not an emulator.
+- Unsupported render states, animations, and actor behavior can differ from the game.
+- Model import supports rigid and static geometry only.
+- The importer rejects skins, skeletal animation, and morph targets.
+- Some modern material inputs produce diagnostics instead of GX mappings.
+- Object placement requires a safe typed template and known dependencies.
+- Graffito does not guess unknown factories or runtime-linked fields.
+- Dialogue tools do not edit general events, cutscenes, or SPC scripts.
+- Dialogue routing and presentation conditions remain read-only.
+- Audio tools use supported retail music and sound data.
+- Graffito does not support custom audio import or full JAudio emulation.
+- Goop tools edit floor layers only.
+- Retail wall and wave layers remain read-only.
+- Automated tests do not verify final graphics or gameplay.
+- Runtime changes still need manual Dolphin tests.
 
 ## Build from source
 
 ### Requirements
 
-- Git and Rustup; the repository pins Rust **1.95.0** with Clippy and rustfmt
-- Windows 10 or 11 for the primary supported desktop workflow
-- A current Vulkan, DirectX 12, or OpenGL-capable GPU and driver
-- A legally obtained, extracted copy of _Super Mario Sunshine_
-- A local checkout of the SMS decompilation project only when refreshing or
-  developing the generated schema metadata; normal builds ship a validated,
-  source-free metadata snapshot
-- Dolphin for playtesting, and optionally `nodtool` for CLI-based disc extraction
+- Git and Rustup.
+- Rust 1.95.0 with Clippy and rustfmt.
+- Windows 10 or 11 for the primary desktop workflow.
+- A current Vulkan, DirectX 12, or OpenGL driver.
+- A legally obtained _Super Mario Sunshine_ extraction.
+- Dolphin for playtests.
+- `nodtool` for optional command-line disc extraction.
 
-Clone and run the normal development build:
+Schema development also needs a local checkout of the SMS decompilation.
+Normal builds use the versioned metadata in this repository.
+
+Clone the repository and start Graffito:
 
 ```powershell
 git clone https://github.com/ryanbevins/Graffito-Editor.git graffito-editor
@@ -148,68 +220,83 @@ cd graffito-editor
 cargo run --locked --profile fast-release -p graffito-editor
 ```
 
-Build without launching:
+Build Graffito without starting it:
 
 ```powershell
 cargo build --locked --profile fast-release -p graffito-editor
 ```
 
-The executable is written to
-`target\fast-release\graffito-editor.exe`. The `fast-release` profile uses Thin
-LTO and incremental compilation for practical iteration.
+The executable appears at:
 
-Graffito first uses a configured decomp checkout when one is available, so
-schema developers can test current extractor changes. Installed and
-source-without-decomp builds automatically fall back to the versioned metadata
-in `crates/sms-schema/generated/object-registry.json`. Maintainers refresh and
-verify that artifact from a clean decomp revision with:
+```text
+target\fast-release\graffito-editor.exe
+```
+
+The `fast-release` profile uses Thin LTO and incremental compilation. Use it
+for normal development.
+
+Graffito uses a configured decompilation checkout when one is available. This
+lets schema developers test extractor changes.
+
+Other builds use this versioned metadata file:
+
+```text
+crates/sms-schema/generated/object-registry.json
+```
+
+Refresh and verify the metadata from a clean decompilation checkout:
 
 ```powershell
 cargo schema-bundle --decomp-root ..
 cargo schema-bundle --decomp-root .. --check
 ```
 
-An exported source tree without `.git` can be used with an explicit
-`--source-revision`. The artifact records both that revision and a
-location-independent fingerprint of the scanned source contents.
+For a source archive without `.git`, pass an explicit `--source-revision`.
+The generated artifact records that revision and a source-content fingerprint.
 
-For a fully optimized local distributable build:
+Build a fully optimized executable for local distribution:
 
 ```powershell
 cargo build --locked --release -p graffito-editor
 ```
 
-The fat-LTO release executable is written to
-`target\release\graffito-editor.exe`. No official binaries are currently
-published by this repository.
+The release executable appears at:
 
-To reopen a project descriptor directly:
+```text
+target\release\graffito-editor.exe
+```
+
+This repository does not publish official binaries yet.
+
+Open a project descriptor directly:
 
 ```powershell
 cargo run --locked --profile fast-release -p graffito-editor -- `
   "C:\Mods\My Project.sms"
 ```
 
-## Development and regression testing
+## Development and testing
 
-Run the complete code-only repository gate:
+Run the complete code-only repository checks:
 
 ```powershell
 cargo regression --code-only
 ```
 
-With an unmodified extracted US game, include the retail archive census:
+Add the retail archive tests with an unmodified US game extraction:
 
 ```powershell
 cargo regression --base-root "C:\Games\SunshineUSExport"
 ```
 
-The full gate checks generated glTF fixtures, formatting, strict Clippy,
-workspace tests, a release build, and source-free byte-identical rebuilds across
-all 108 US retail stage archives. Retail assets are read from the supplied path
-and are never copied into the repository.
+The full check covers generated glTF fixtures, formatting, Clippy, workspace
+tests, a release build, and source-free archive rebuilds.
 
-The individual CI commands are:
+With a US extraction, it rebuilds all 108 retail stage archives and compares
+their bytes. The tests read assets from the supplied path and never copy them
+into the repository.
+
+Run the individual CI commands:
 
 ```powershell
 cargo fmt --all -- --check
@@ -218,47 +305,49 @@ cargo test --locked --workspace
 cargo build --locked --release -p graffito-editor
 ```
 
-Automated success should always be reported separately from manual editor and
-Dolphin verification.
+Report automated test results separately from editor and Dolphin tests.
 
 ## Workspace
 
-| Path / package | Responsibility |
+| Path | Purpose |
 | --- | --- |
-| `apps/sms-editor` / `graffito-editor` | Desktop UI, viewport, authoring tools, managed builds, and Dolphin integration |
-| `apps/sms-cli` / `sms-cli` | Inspection, conversion, validation, export, and automation commands |
-| `apps/xtask` / `sms-xtask` | Repository regression and generated-fixture tasks |
-| `crates/sms-authoring` | Secure glTF ingestion, native model/collision authoring, and scene-instance merging |
-| `crates/sms-formats` | Checked big-endian readers and semantic writers for SMS and GameCube formats |
-| `crates/sms-schema` | Registries and metadata generated from the SMS decompilation source |
-| `crates/sms-scene` | Editable stage documents, object/route/goop/dialogue authoring, persistence, validation, and export |
-| `crates/sms-render` | Renderer-facing scene, camera, selection, and viewport support types |
+| `apps/sms-editor` | Desktop UI, viewport, authoring tools, builds, and Dolphin support |
+| `apps/sms-cli` | Inspection, conversion, validation, export, and automation commands |
+| `apps/xtask` | Repository tests and generated-fixture tasks |
+| `crates/sms-authoring` | glTF import, model and collision authoring, and scene merging |
+| `crates/sms-formats` | Checked big-endian readers and semantic writers |
+| `crates/sms-schema` | Registries and metadata derived from the SMS decompilation |
+| `crates/sms-scene` | Scene data, authoring, persistence, validation, and export |
+| `crates/sms-render` | Scene, camera, selection, and viewport support types |
 
-## Community and contributing
+## Community and contributions
 
-Questions, development discussion, testing feedback, and project updates are
-welcome in the [Graffito Discord community](https://discord.gg/JhPr3fWuy).
+Join the [Graffito Discord community](https://discord.gg/JhPr3fWuy) for project
+updates, questions, development discussion, and test feedback.
 
-Before contributing, read [CONTRIBUTING.md](CONTRIBUTING.md) and run the
-repository checks. Do not commit extracted game files, retail assets, disc
-images, managed game trees, generated projects containing copyrighted data, or
-caches.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before you submit a change. Run the
+repository checks before you submit it.
 
-Please report vulnerabilities privately as described in
+Do not commit extracted game files, retail assets, disc images, managed game
+trees, copyrighted project data, or caches.
+
+Report security problems privately through the process in
 [SECURITY.md](SECURITY.md).
 
 ## Credits
 
-Special thanks to the developers and contributors of the
+Thank you to the developers and contributors of the
 [Super Mario Sunshine decompilation project](https://github.com/doldecomp/sms).
-Their research and documentation make Graffito's format, scene, rendering, and
-runtime work possible.
+
+Their research and documentation support Graffito’s work on game formats,
+scenes, rendering, and runtime behavior.
 
 ## Legal
 
-Graffito Editor is an unofficial fan-made development project. It is not
-affiliated with or endorsed by Nintendo. _Super Mario Sunshine_ and related
-names are trademarks of their respective owners. Users must provide their own
-legally obtained game data.
+Graffito Editor is an unofficial fan project. Nintendo does not sponsor or
+endorse it.
 
-Licensed under the [MIT License](LICENSE).
+_Super Mario Sunshine_ and related names are trademarks of their respective
+owners. Users must supply their own legally obtained game data.
+
+Graffito Editor uses the [MIT License](LICENSE).
