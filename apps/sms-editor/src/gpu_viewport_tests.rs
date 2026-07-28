@@ -301,6 +301,60 @@ fn transient_drag_preview_geometry_remains_updateable_after_gpu_batch_packing() 
 }
 
 #[test]
+fn transient_drag_preview_appends_and_detaches_without_repacking_the_stage() {
+    let mut complete_preview = geometry_update_preview();
+    complete_preview.object_model_indices.insert(
+        "base".to_string(),
+        complete_preview.triangles[0].model_index,
+    );
+    complete_preview.object_model_indices.insert(
+        crate::VIEWPORT_DRAG_PREVIEW_OBJECT_ID.to_string(),
+        complete_preview.triangles[1].model_index,
+    );
+    let mut base_preview = complete_preview.clone();
+    base_preview.triangles.truncate(1);
+
+    let mut incremental = GpuSceneData::from_preview(&base_preview);
+    let base_counts = (
+        incremental.textures.len(),
+        incremental.materials.len(),
+        incremental.batches.len(),
+        incremental.triangle_vertices.len(),
+    );
+    let transient_base = incremental.append_transient_preview(
+        &complete_preview,
+        1..2,
+        complete_preview.textures.len(),
+        complete_preview.materials.len(),
+    );
+    let repacked = GpuSceneData::from_preview(&complete_preview);
+
+    assert_eq!(
+        gpu_triangle_vertex_bytes(&incremental, 1),
+        gpu_triangle_vertex_bytes(&repacked, 1)
+    );
+    let incremental_material = &incremental.materials
+        [incremental.batches[incremental.triangle_vertices[1].unwrap().batch_index].material_index];
+    let repacked_material = &repacked.materials
+        [repacked.batches[repacked.triangle_vertices[1].unwrap().batch_index].material_index];
+    assert_eq!(
+        bytemuck::bytes_of(&incremental_material.uniform),
+        bytemuck::bytes_of(&repacked_material.uniform)
+    );
+
+    incremental.truncate_transient_preview(transient_base);
+    assert_eq!(
+        (
+            incremental.textures.len(),
+            incremental.materials.len(),
+            incremental.batches.len(),
+            incremental.triangle_vertices.len(),
+        ),
+        base_counts
+    );
+}
+
+#[test]
 fn geometry_updates_keep_dynamic_particle_shape_metadata() {
     let mut preview = geometry_update_preview();
     preview.triangles[1].particle_type = Some(3);

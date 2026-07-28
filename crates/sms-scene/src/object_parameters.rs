@@ -346,10 +346,9 @@ pub fn apply_object_parameter_edits(
             ParameterApplyMode::AllCanonical => true,
         };
         if should_apply {
-            parsed.insert(
-                descriptor.key.clone(),
-                parse_parameter_value(&descriptor.key, descriptor.kind, parameter.raw())?,
-            );
+            let value = parse_parameter_value(&descriptor.key, descriptor.kind, parameter.raw())?;
+            validate_object_parameter_value(&record.type_name, &descriptor.key, &value)?;
+            parsed.insert(descriptor.key.clone(), value);
         }
     }
 
@@ -414,6 +413,29 @@ enum ParsedParameterValue {
     Vec3F32([f32; 3]),
     ColorRgba8([u8; 4]),
     String(String),
+}
+
+fn validate_object_parameter_value(
+    record_type: &str,
+    key: &str,
+    value: &ParsedParameterValue,
+) -> Result<()> {
+    let record_type = record_type.rsplit("::").next().unwrap_or(record_type);
+    if record_type == "MapObjNail" && key == "event_id" {
+        let ParsedParameterValue::I32(event_id) = value else {
+            return Err(parameter_error(
+                "MapObjNail event_id no longer has its expected i32 type",
+            ));
+        };
+        let is_blue_coin_slot = (0..=49).contains(event_id);
+        let is_supported_item = [-1, 100, 200, 2000, 2001].contains(event_id);
+        if !is_blue_coin_slot && !is_supported_item {
+            return Err(parameter_error(format!(
+                "MapObjNail reward event ID {event_id} is unsafe; use -1 (none), blue-coin slot 0-49, 100 (yellow coin), 200 (red coin), 2000 (1-Up), or 2001 (runaway 1-Up)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn append_field_descriptors(
@@ -649,6 +671,79 @@ fn object_parameter_info(record_type: &str, key: &str) -> Option<ObjectParameter
             "respawn_height" => plain(
                 "Upward ejection speed",
                 "Vertical velocity added when the pickup is released. Any negative value selects the retail default of 20; zero or positive values are used directly.",
+            ),
+            _ => return None,
+        };
+        return Some(info);
+    }
+
+    if record_type == "MapObjNail" {
+        let info = match key {
+            OBJECT_PARAMETER_NAME => plain(
+                "Runtime name",
+                "TNameRef identity used by scripts and runtime lookups.",
+            ),
+            OBJECT_PARAMETER_CHARACTER_NAME => plain(
+                "Character registration",
+                "Character-data registration used to initialize the nail actor and its shared resources.",
+            ),
+            "resource_name" => plain(
+                "Nail resource",
+                "Must remain MapObjNail for the retail nail model (kugi.bmd), collision, and actor data. Respawn the object to change its resource family safely.",
+            ),
+            "event_id" => ObjectParameterInfo {
+                choices: vec![
+                    choice(
+                        "-1",
+                        "No reward",
+                        "Retail nail placements use -1 for an empty nail. The value resolves no object, so the nail still sinks but releases nothing.",
+                    ),
+                    choice(
+                        "100",
+                        "Yellow coin",
+                        "Uses the shared empty-coin event entry, then TMapObjNail replaces it with a regular yellow coin when the third hip drop lands.",
+                    ),
+                    choice(
+                        "200",
+                        "Red coin",
+                        "Creates and releases a red coin through the shared TItem reward path.",
+                    ),
+                    choice(
+                        "2000",
+                        "1-Up mushroom",
+                        "Creates and releases mushroom1up. Event ID 2000 is used by retail nail placements in multiple secret stages.",
+                    ),
+                    choice(
+                        "2001",
+                        "Runaway 1-Up mushroom",
+                        "Creates mushroom1upR. Its type-1 movement reverses the direction toward Mario, causing it to run away from the player.",
+                    ),
+                ],
+                indexed_choice: Some(ObjectParameterIndexedChoice {
+                    label: "Blue coin".to_string(),
+                    index_label: "Slot".to_string(),
+                    description: "Persistent per-area blue-coin slot. Retail Sunshine implements slots 0 through 49, and each slot should be unique within the area.".to_string(),
+                    default_index: 0,
+                    index_range: [0, 49],
+                    retail_index_range: Some([0, 49]),
+                    reserved_indices: Vec::new(),
+                }),
+                ..plain(
+                    "Reward",
+                    "Object released after the third hip drop. Retail nail placements use no reward, yellow coins, and standard 1-Ups; the shared item path also safely supports blue coins, red coins, and the runaway 1-Up variant. Fruits and Shines are excluded because they require special THideObjBase reveal handling that TMapObjNail bypasses.",
+                )
+            },
+            "appear_rate" => plain(
+                "Reward forward speed",
+                "Serialized launch setting for the released reward. Retail multiplies this value by 0.06 and applies the result along the nail's forward direction.",
+            ),
+            "appear_height" => plain(
+                "Reward upward speed",
+                "Vertical velocity added to the released reward. Any negative value selects the retail default of 20; zero or positive values are used directly.",
+            ),
+            "object_timer" => plain(
+                "Unused reward timer",
+                "THideObjBase loads this field, but TMapObjNail's third-hit reward path calls throwObjToFront directly and never applies the timer. Editing it does not change retail nail behavior.",
             ),
             _ => return None,
         };
@@ -1835,6 +1930,129 @@ mod editability_tests {
                 .collect::<Vec<_>>(),
             vec!["-1", "0"]
         );
+    }
+
+    #[test]
+    fn map_obj_nail_parameters_offer_safe_item_rewards_and_editable_tail_values() {
+        let mut record = JDramaRecord {
+            type_name: "MapObjNail".to_string(),
+            name: "nail".to_string(),
+            payload: JDramaRecordPayload::Actor {
+                transform: sms_formats::JDramaTransform {
+                    translation: [0.0; 3],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: "MapObjNail Character".to_string(),
+                light_map: sms_formats::JDramaLightMap::default(),
+                fields: vec![
+                    JDramaField {
+                        name: "resource_name".to_string(),
+                        value: JDramaFieldValue::String("MapObjNail".to_string()),
+                    },
+                    JDramaField {
+                        name: "event_id".to_string(),
+                        value: JDramaFieldValue::I32(100),
+                    },
+                    JDramaField {
+                        name: "appear_rate".to_string(),
+                        value: JDramaFieldValue::F32(100.0),
+                    },
+                    JDramaField {
+                        name: "appear_height".to_string(),
+                        value: JDramaFieldValue::F32(-1.0),
+                    },
+                    JDramaField {
+                        name: "object_timer".to_string(),
+                        value: JDramaFieldValue::I32(0),
+                    },
+                ],
+            },
+        };
+        let parameters = editable_object_parameters(&record).unwrap();
+        let parameter = |key: &str| {
+            parameters
+                .iter()
+                .find(|parameter| parameter.key == key)
+                .unwrap()
+        };
+        let display_name = |key: &str| {
+            parameter(key)
+                .info
+                .as_ref()
+                .unwrap()
+                .display_name
+                .as_deref()
+                .unwrap()
+        };
+
+        assert_eq!(display_name("name"), "Runtime name");
+        assert_eq!(display_name("character_name"), "Character registration");
+        assert_eq!(display_name("resource_name"), "Nail resource");
+        assert_eq!(display_name("event_id"), "Reward");
+        assert_eq!(display_name("appear_rate"), "Reward forward speed");
+        assert_eq!(display_name("appear_height"), "Reward upward speed");
+        assert_eq!(display_name("object_timer"), "Unused reward timer");
+
+        let reward = parameter("event_id").info.as_ref().unwrap();
+        assert_eq!(
+            reward
+                .choices
+                .iter()
+                .map(|choice| choice.raw_value.as_str())
+                .collect::<Vec<_>>(),
+            ["-1", "100", "200", "2000", "2001"]
+        );
+        let blue_coin = reward.indexed_choice.as_ref().unwrap();
+        assert_eq!(blue_coin.label, "Blue coin");
+        assert_eq!(blue_coin.index_range, [0, 49]);
+        assert!(reward.description.contains("bypasses"));
+        assert!(parameter("appear_rate")
+            .info
+            .as_ref()
+            .unwrap()
+            .description
+            .contains("0.06"));
+        assert!(parameter("object_timer")
+            .info
+            .as_ref()
+            .unwrap()
+            .description
+            .contains("never applies"));
+
+        let mut object = SceneObject::new("nail", "MapObjNail");
+        seed_scene_object_parameters(&mut object, &record).unwrap();
+        object.set_raw_param("event_id", "2001");
+        object.set_raw_param("appear_rate", "125");
+        object.set_raw_param("appear_height", "30");
+        object.set_raw_param("object_timer", "45");
+        apply_dirty_object_parameter_edits(&mut record, &object).unwrap();
+
+        let JDramaRecordPayload::Actor { fields, .. } = &record.payload else {
+            unreachable!();
+        };
+        assert_eq!(
+            fields[0].value,
+            JDramaFieldValue::String("MapObjNail".to_string())
+        );
+        assert_eq!(fields[1].value, JDramaFieldValue::I32(2001));
+        assert_eq!(fields[2].value, JDramaFieldValue::F32(125.0));
+        assert_eq!(fields[3].value, JDramaFieldValue::F32(30.0));
+        assert_eq!(fields[4].value, JDramaFieldValue::I32(45));
+
+        object.set_raw_param("event_id", "49");
+        apply_dirty_object_parameter_edits(&mut record, &object).unwrap();
+        let JDramaRecordPayload::Actor { fields, .. } = &record.payload else {
+            unreachable!();
+        };
+        assert_eq!(fields[1].value, JDramaFieldValue::I32(49));
+
+        let record_before_invalid_reward = record.clone();
+        object.set_raw_param("event_id", "1000");
+        let error = apply_dirty_object_parameter_edits(&mut record, &object)
+            .expect_err("generic fruit rewards must not export for MapObjNail");
+        assert!(error.to_string().contains("unsafe"));
+        assert_eq!(record, record_before_invalid_reward);
     }
 
     #[test]

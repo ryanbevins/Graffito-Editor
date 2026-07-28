@@ -2,7 +2,7 @@
   "format_version": 1,
   "source_revision": "01ffd369c94b23be158abde1254c277879c04a9f",
   "source_fingerprint": 15545920352673147969,
-  "generator_fingerprint": 14076704497560109288,
+  "generator_fingerprint": 13590808104583122210,
   "registry": {
     "objects": [
       {
@@ -20360,6 +20360,7 @@
       {
         "actor_name": "BiancoAirWall",
         "model_path": null,
+        "collision_path": "/scene/mapObj/BiaAirWall.col",
         "load_flags": 270598144,
         "sound_id": null,
         "source_file": "src/Map/MapStaticObject.cpp",
@@ -20424,6 +20425,7 @@
       {
         "actor_name": "mareSeaPollutionS34567",
         "model_path": null,
+        "collision_path": "/scene/map/map/mareSeaPollutionS34567.col",
         "load_flags": 270598144,
         "sound_id": null,
         "source_file": "src/Map/MapStaticObject.cpp",
@@ -20432,6 +20434,7 @@
       {
         "actor_name": "riccoSea",
         "model_path": null,
+        "collision_path": "/scene/map/map/riccoSea.col",
         "load_flags": 270598144,
         "sound_id": null,
         "source_file": "src/Map/MapStaticObject.cpp",
@@ -20480,6 +20483,7 @@
       {
         "actor_name": "MonteRiver",
         "model_path": "/scene/map/map/MonteRiver.bmd",
+        "collision_path": "/scene/map/map/MonteRiver.col",
         "load_flags": 270598144,
         "sound_id": null,
         "source_file": "src/Map/MapStaticObject.cpp",
@@ -20512,6 +20516,7 @@
       {
         "actor_name": "mareSeaPollutionS0",
         "model_path": "/scene/map/map/mareSeaPollutionS0.bmd",
+        "collision_path": "/scene/map/map/mareSeaPollutionS0.col",
         "load_flags": 270598144,
         "sound_id": null,
         "source_file": "src/Map/MapStaticObject.cpp",
@@ -20520,6 +20525,7 @@
       {
         "actor_name": "mareSeaPollutionS12",
         "model_path": "/scene/map/map/mareSeaPollutionS12.bmd",
+        "collision_path": "/scene/map/map/mareSeaPollutionS12.col",
         "load_flags": 270598144,
         "sound_id": null,
         "source_file": "src/Map/MapStaticObject.cpp",
@@ -20528,6 +20534,7 @@
       {
         "actor_name": "riccoSeaPollutionS0",
         "model_path": "/scene/map/map/riccoSeaPollutionS0.bmd",
+        "collision_path": "/scene/map/map/riccoSeaPollutionS0.col",
         "load_flags": 287375360,
         "sound_id": null,
         "source_file": "src/Map/MapStaticObject.cpp",
@@ -20536,6 +20543,7 @@
       {
         "actor_name": "riccoSeaPollutionS1",
         "model_path": "/scene/map/map/riccoSeaPollutionS1.bmd",
+        "collision_path": "/scene/map/map/riccoSeaPollutionS1.col",
         "load_flags": 287375360,
         "sound_id": null,
         "source_file": "src/Map/MapStaticObject.cpp",
@@ -20544,6 +20552,7 @@
       {
         "actor_name": "riccoSeaPollutionS2",
         "model_path": "/scene/map/map/riccoSeaPollutionS2.bmd",
+        "collision_path": "/scene/map/map/riccoSeaPollutionS2.col",
         "load_flags": 287375360,
         "sound_id": null,
         "source_file": "src/Map/MapStaticObject.cpp",
@@ -20552,6 +20561,7 @@
       {
         "actor_name": "riccoSeaPollutionS3",
         "model_path": "/scene/map/map/riccoSeaPollutionS3.bmd",
+        "collision_path": "/scene/map/map/riccoSeaPollutionS3.col",
         "load_flags": 287375360,
         "sound_id": null,
         "source_file": "src/Map/MapStaticObject.cpp",
@@ -20560,6 +20570,7 @@
       {
         "actor_name": "riccoSeaPollutionS4",
         "model_path": "/scene/map/map/riccoSeaPollutionS4.bmd",
+        "collision_path": "/scene/map/map/riccoSeaPollutionS4.col",
         "load_flags": 287375360,
         "sound_id": null,
         "source_file": "src/Map/MapStaticObject.cpp",

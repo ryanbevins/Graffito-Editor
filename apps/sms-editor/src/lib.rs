@@ -695,6 +695,10 @@ struct CollisionPreviewBuild {
 
 impl CollisionPreviewBuild {
     fn append_file(&mut self, collision: &ColFile) {
+        self.append_file_with_transform(collision, None);
+    }
+
+    fn append_file_with_transform(&mut self, collision: &ColFile, transform: Option<Transform>) {
         self.file_count += 1;
         for group in collision.groups() {
             self.surface_types.insert(group.surface_type);
@@ -707,8 +711,11 @@ impl CollisionPreviewBuild {
                 ) else {
                     continue;
                 };
+                let vertices = [a.position, b.position, c.position];
                 self.triangles.push(CollisionPreviewTriangle {
-                    vertices: [a.position, b.position, c.position],
+                    vertices: transform.map_or(vertices, |transform| {
+                        transform_preview_vertices(vertices, transform)
+                    }),
                     surface_type: group.surface_type,
                 });
             }
@@ -729,42 +736,64 @@ fn normalized_collision_asset_id(path: &str) -> String {
     path.replace('\\', "/").to_ascii_lowercase()
 }
 
-fn semantic_collision_asset_id(document: &StageDocument, raw_path: &[u8]) -> String {
-    let raw_path = String::from_utf8_lossy(raw_path).replace('\\', "/");
-    document.stage_archive_source_path.as_ref().map_or_else(
-        || normalized_collision_asset_id(&raw_path),
-        |source| {
-            normalized_collision_asset_id(&format!("{}!/{raw_path}", source.to_string_lossy()))
-        },
-    )
+fn collision_resource_key(path: &str) -> String {
+    let normalized = normalized_collision_asset_id(path);
+    normalized
+        .split_once("!/")
+        .map_or(normalized.as_str(), |(_, mounted_path)| mounted_path)
+        .trim_start_matches('/')
+        .to_string()
 }
 
-fn build_collision_preview(document: &StageDocument) -> CollisionPreviewBuild {
-    let mut preview = CollisionPreviewBuild::default();
-    let mut loaded_assets = BTreeSet::new();
-
+fn collect_collision_resources(
+    document: &StageDocument,
+    preview: &mut CollisionPreviewBuild,
+) -> BTreeMap<String, ColFile> {
+    let mut raw_paths = BTreeSet::<Vec<u8>>::new();
     if let Some(archive) = &document.stage_archive {
         for resource in archive.resources() {
-            let StageResourceDocument::Collision(base_collision) = &resource.document else {
-                continue;
-            };
-            let asset_id = semantic_collision_asset_id(document, &resource.raw_path);
-            let collision = document
-                .archive_edits
-                .collisions
-                .iter()
-                .find(|edit| edit.raw_resource_path == resource.raw_path)
-                .map_or(base_collision, |edit| &edit.document);
-            preview.append_file(collision);
-            loaded_assets.insert(asset_id);
+            if matches!(resource.document, StageResourceDocument::Collision(_)) {
+                raw_paths.insert(resource.raw_path.clone());
+            }
+        }
+    }
+    raw_paths.extend(
+        document
+            .archive_edits
+            .resources
+            .iter()
+            .filter(|edit| matches!(edit.document, StageResourceDocument::Collision(_)))
+            .map(|edit| edit.raw_resource_path.clone()),
+    );
+    raw_paths.extend(
+        document
+            .archive_edits
+            .collisions
+            .iter()
+            .map(|edit| edit.raw_resource_path.clone()),
+    );
+
+    let mut resources = BTreeMap::new();
+    for raw_path in raw_paths {
+        let path = String::from_utf8_lossy(&raw_path).replace('\\', "/");
+        match document.effective_resource_clone(&raw_path) {
+            Ok(Some(StageResourceDocument::Collision(collision))) => {
+                resources.insert(collision_resource_key(&path), collision);
+            }
+            Ok(Some(_)) => preview.record_failure(
+                &path,
+                "effective collision resource resolved to another format".to_string(),
+            ),
+            Ok(None) => {}
+            Err(error) => preview.record_failure(&path, format!("resolve collision: {error}")),
         }
     }
 
     for edit in &document.archive_edits.collisions {
-        let asset_id = semantic_collision_asset_id(document, &edit.raw_resource_path);
-        if loaded_assets.insert(asset_id) {
-            preview.append_file(&edit.document);
-        }
+        let path = String::from_utf8_lossy(&edit.raw_resource_path);
+        resources
+            .entry(collision_resource_key(&path))
+            .or_insert_with(|| edit.document.clone());
     }
 
     for asset in document
@@ -773,7 +802,8 @@ fn build_collision_preview(document: &StageDocument) -> CollisionPreviewBuild {
         .filter(|asset| asset.kind == StageAssetKind::Collision)
     {
         let asset_path = asset.path.to_string_lossy().replace('\\', "/");
-        if !loaded_assets.insert(normalized_collision_asset_id(&asset_path)) {
+        let key = collision_resource_key(&asset_path);
+        if resources.contains_key(&key) {
             continue;
         }
         let bytes = match document.read_asset_bytes(&asset.path) {
@@ -784,10 +814,129 @@ fn build_collision_preview(document: &StageDocument) -> CollisionPreviewBuild {
             }
         };
         match ColFile::parse(&bytes) {
-            Ok(collision) => preview.append_file(&collision),
+            Ok(collision) => {
+                resources.insert(key, collision);
+            }
             Err(error) => preview.record_failure(&asset_path, format!("parse COL: {error}")),
         }
     }
+
+    resources
+}
+
+fn is_world_map_collision_resource(path: &str) -> bool {
+    path == "map.col" || path == "map/map.col" || path.ends_with("/map/map.col")
+}
+
+fn collision_resource_for_runtime_path<'a>(
+    resources: &'a BTreeMap<String, ColFile>,
+    runtime_path: &str,
+) -> Option<&'a ColFile> {
+    resources
+        .iter()
+        .find(|(asset_path, _)| runtime_model_path_matches_asset(runtime_path, asset_path))
+        .map(|(_, collision)| collision)
+}
+
+fn map_obj_collision_runtime_path(resource_name: &str) -> String {
+    let resource_name = resource_name.replace('\\', "/");
+    let path = if resource_name.to_ascii_lowercase().ends_with(".col") {
+        resource_name
+    } else {
+        format!("{resource_name}.col")
+    };
+    if path.starts_with('/') {
+        path
+    } else {
+        format!("/scene/mapObj/{path}")
+    }
+}
+
+fn append_active_object_collisions(
+    document: &StageDocument,
+    resources: &BTreeMap<String, ColFile>,
+    preview: &mut CollisionPreviewBuild,
+) {
+    let Some(registry) = document.registry.as_ref() else {
+        return;
+    };
+
+    for object in &document.objects {
+        if registry.is_map_obj_factory(&object.factory_name) {
+            let resource = object
+                .raw_param("actor_tail_string")
+                .and_then(|name| registry.find_map_obj_resource(name))
+                .or_else(|| {
+                    object
+                        .raw_param("resource_name")
+                        .and_then(|name| registry.find_map_obj_resource(name))
+                });
+            if let Some(collision) = resource
+                .and_then(|resource| resource.collision_resources.first())
+                .map(|collision| map_obj_collision_runtime_path(&collision.resource_name))
+                .and_then(|path| collision_resource_for_runtime_path(resources, &path))
+            {
+                // TMapCollisionManager selects entry zero when the object appears.
+                // Later state changes can swap to other entries at runtime.
+                preview.append_file_with_transform(collision, Some(object.transform));
+            }
+        }
+
+        if object.factory_name != "MapStaticObj" {
+            continue;
+        }
+        let Some(actor_name) = object
+            .raw_param("actor_tail_string")
+            .or_else(|| object.raw_param("stream_string_0"))
+        else {
+            continue;
+        };
+        let Some(collision) = registry
+            .map_static_models
+            .iter()
+            .find(|definition| definition.actor_name == actor_name)
+            .and_then(|definition| definition.collision_path.as_deref())
+            .and_then(|path| collision_resource_for_runtime_path(resources, path))
+        else {
+            continue;
+        };
+        preview.append_file_with_transform(collision, Some(object.transform));
+    }
+
+    for definition in registry
+        .map_static_models
+        .iter()
+        .filter(|definition| definition.stage_bootstrap_created)
+    {
+        let Some(collision) = definition
+            .collision_path
+            .as_deref()
+            .and_then(|path| collision_resource_for_runtime_path(resources, path))
+        else {
+            continue;
+        };
+        preview.append_file(collision);
+    }
+}
+
+fn append_runtime_collision_preview(
+    document: &StageDocument,
+    resources: &BTreeMap<String, ColFile>,
+    preview: &mut CollisionPreviewBuild,
+) {
+    for (path, collision) in resources {
+        if is_world_map_collision_resource(path) {
+            preview.append_file(collision);
+        }
+    }
+    append_active_object_collisions(document, resources, preview);
+}
+
+fn build_collision_preview(document: &StageDocument) -> CollisionPreviewBuild {
+    let mut preview = CollisionPreviewBuild::default();
+    let resources = collect_collision_resources(document, &mut preview);
+
+    append_runtime_collision_preview(document, &resources, &mut preview);
 
     preview
 }
@@ -2326,7 +2475,7 @@ impl SmsEditorApp {
                 preview.source_vertices
             ));
             self.log.push(format!(
-                "Collision preview loaded {} file(s), {} triangle(s), and {} surface type(s).",
+                "Collision preview loaded {} active collision source(s), {} triangle(s), and {} surface type(s).",
                 preview.collision_file_count,
                 preview.collision_triangles.len(),
                 preview.collision_surface_count

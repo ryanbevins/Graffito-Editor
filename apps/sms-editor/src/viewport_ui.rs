@@ -780,25 +780,13 @@ impl SmsEditorApp {
         let Some(preview) = self.model_preview.as_ref() else {
             return Some(self.screen_to_world_floor(rect, pos));
         };
-        let has_placement_geometry = preview.triangles.iter().any(|triangle| {
-            preview_triangle_is_placement_surface(triangle)
-                && self
-                    .viewport_drag_preview
-                    .as_ref()
-                    .is_none_or(|drag| triangle.model_index != drag.model_index)
-        });
-        if !has_placement_geometry {
-            // An empty authored stage needs one bootstrap placement before
-            // there is any world geometry to raycast.
-            return Some(self.screen_to_world_floor(rect, pos));
-        }
 
         let size = framebuffer_size_for_rect(rect);
         let framebuffer_pos = [
             (pos.x - rect.left()) * size[0] as f32 / rect.width().max(1.0),
             (pos.y - rect.top()) * size[1] as f32 / rect.height().max(1.0),
         ];
-        let depth = preview
+        let Some(depth) = preview
             .triangles
             .iter()
             .filter(|triangle| {
@@ -816,7 +804,12 @@ impl SmsEditorApp {
                     framebuffer_pos[1],
                 )
             })
-            .min_by(f32::total_cmp)?;
+            .min_by(f32::total_cmp)
+        else {
+            // Prefer visible geometry when available, but preserve free
+            // placement on the camera focus plane when the cursor is over void.
+            return Some(self.screen_to_world_floor(rect, pos));
+        };
 
         let frame = self.camera_frame();
         let focal = perspective_focal_length(rect, self.viewport_zoom);
@@ -941,20 +934,27 @@ impl SmsEditorApp {
             geometry,
             position,
             had_stage_preview,
-            triangle_range,
+            triangle_range: triangle_range.clone(),
             texture_start,
             material_start,
             material_binding_start,
             model_index,
         });
         self.viewport_drag_preview_failed_key = None;
-        if let (Some(target_format), Some(preview)) =
-            (self.gpu_target_format, self.model_preview.as_ref())
-        {
-            self.gpu_viewport = Some(gpu_viewport::GpuViewportScene::from_preview(
-                preview,
-                target_format,
-            ));
+        let appended_incrementally = self
+            .gpu_viewport
+            .as_ref()
+            .zip(self.model_preview.as_ref())
+            .is_some_and(|(gpu_viewport, preview)| {
+                gpu_viewport.append_transient_preview(
+                    preview,
+                    triangle_range,
+                    texture_start,
+                    material_start,
+                )
+            });
+        if !appended_incrementally {
+            self.rebuild_gpu_viewport_scene();
         }
         self.clear_viewport_preview_cache();
     }
@@ -1014,7 +1014,13 @@ impl SmsEditorApp {
         if !state.had_stage_preview {
             self.model_preview = None;
         }
-        self.rebuild_gpu_viewport_scene();
+        if !self
+            .gpu_viewport
+            .as_ref()
+            .is_some_and(gpu_viewport::GpuViewportScene::remove_transient_preview)
+        {
+            self.rebuild_gpu_viewport_scene();
+        }
         self.clear_viewport_preview_cache();
     }
 

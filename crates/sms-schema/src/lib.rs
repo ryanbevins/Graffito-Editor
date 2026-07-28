@@ -636,6 +636,9 @@ pub struct MapStaticModelDefinition {
     /// Primary model passed to `TMapStaticObj::initModel`, if this table row creates one.
     #[serde(default)]
     pub model_path: Option<String>,
+    /// Exact COL path passed to `TMapStaticObj::initMapCollision`, if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collision_path: Option<String>,
     pub load_flags: u32,
     /// Positional sound started by `TMapStaticObj::perform`, when present.
     #[serde(default)]
@@ -2839,10 +2842,18 @@ fn extract_map_static_models(text: &str, source_file: &str) -> Vec<MapStaticMode
         };
         let model_path =
             parse_cpp_string(fields[8]).map(|model_name| format!("{directory}/{model_name}.bmd"));
+        let collision_directory = if resource_flags & 0x2 != 0 {
+            "/scene/mapObj"
+        } else {
+            "/scene/map/map"
+        };
+        let collision_path = parse_cpp_string(fields[10])
+            .map(|collision_name| format!("{collision_directory}/{collision_name}.col"));
         let sound_id = parse_cpp_u32(fields[12]).filter(|sound_id| *sound_id != u32::MAX);
         models.push(MapStaticModelDefinition {
             actor_name,
             model_path,
+            collision_path,
             load_flags,
             sound_id,
             source_file: source_file.to_string(),
@@ -6740,9 +6751,9 @@ mod tests {
         let text = r#"
             static const TMapStaticObj::ActorDataTableEntry actor_data_table[] = {
                 { "BiancoRiver", 0, 0, 0.0f, 0.0f, 0.0f, 0.0f, nullptr,
-                  "BiancoRiver", 0x10210000, nullptr, 0, 0x3022, 0, 0, 0, 0x40 },
+                  "BiancoRiver", 0x10210000, "BiancoRiver", 0, 0x3022, 0, 0, 0, 0x40 },
                 { "CommonThing", 0, 0, 0.0f, 0.0f, 0.0f, 0.0f, nullptr,
-                  "SharedModel", 0x11220000, nullptr, 0, 0xFFFFFFFF, 0, 0, 0, 0x2 },
+                  "SharedModel", 0x11220000, "SharedCollision", 0, 0xFFFFFFFF, 0, 0, 0, 0x2 },
                 { "NoModel", 0, 0, 0.0f, 0.0f, 0.0f, 0.0f, nullptr,
                   nullptr, 0x10210000, nullptr, 0, 0xFFFFFFFF, 0, 0, 0, 0 },
             };
@@ -6757,10 +6768,18 @@ mod tests {
             Some("/scene/map/map/BiancoRiver.bmd")
         );
         assert_eq!(models[0].load_flags, 0x1021_0000);
+        assert_eq!(
+            models[0].collision_path.as_deref(),
+            Some("/scene/map/map/BiancoRiver.col")
+        );
         assert_eq!(models[0].sound_id, Some(0x3022));
         assert_eq!(
             models[1].model_path.as_deref(),
             Some("/common/map/SharedModel.bmd")
+        );
+        assert_eq!(
+            models[1].collision_path.as_deref(),
+            Some("/scene/mapObj/SharedCollision.col")
         );
         assert_eq!(models[1].load_flags, 0x1122_0000);
         assert_eq!(models[2].actor_name, "NoModel");

@@ -4807,6 +4807,7 @@ mod tests {
             map_static_models: vec![sms_schema::MapStaticModelDefinition {
                 actor_name: "mareSeaPollutionS34567".to_string(),
                 model_path: None,
+                collision_path: None,
                 load_flags: 0x1021_0000,
                 sound_id: None,
                 source_file: "src/Map/MapStaticObject.cpp".to_string(),
@@ -5064,6 +5065,7 @@ mod tests {
             .push(sms_schema::MapStaticModelDefinition {
                 actor_name: "MareGate".to_string(),
                 model_path: Some("/scene/map/map/mare_gate_model.bmd".to_string()),
+                collision_path: None,
                 load_flags: 0,
                 sound_id: None,
                 source_file: "fixture.cpp".to_string(),

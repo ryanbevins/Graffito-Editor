@@ -564,6 +564,139 @@ fn collision_preview_expands_col_groups_into_surface_typed_triangles() {
     assert_eq!(preview.surface_types, BTreeSet::from([0x0102]));
 }
 
+fn single_triangle_collision(surface_type: u16) -> ColFile {
+    ColFile::new(
+        vec![
+            sms_formats::ColVertex::new(0.0, 0.0, 0.0),
+            sms_formats::ColVertex::new(10.0, 0.0, 0.0),
+            sms_formats::ColVertex::new(0.0, 0.0, 10.0),
+        ],
+        vec![sms_formats::ColGroup {
+            surface_type,
+            has_per_triangle_data: false,
+            triangles: vec![sms_formats::ColTriangle {
+                vertex_indices: [0, 1, 2],
+                attribute_0: 0,
+                attribute_1: 0,
+                data: None,
+            }],
+        }],
+    )
+}
+
+#[test]
+fn collision_preview_excludes_unplaced_stock_collision_resources() {
+    let mut document = test_document(Vec::new());
+    document.registry = Some(ObjectRegistry::default());
+    let resources = BTreeMap::from([
+        ("map/map.col".to_string(), single_triangle_collision(0)),
+        (
+            "mapobj/biabridge.col".to_string(),
+            single_triangle_collision(0x0003),
+        ),
+        (
+            "mapobj/bigwindmill.col".to_string(),
+            single_triangle_collision(0x0005),
+        ),
+    ]);
+    let mut preview = CollisionPreviewBuild::default();
+
+    append_runtime_collision_preview(&document, &resources, &mut preview);
+
+    assert_eq!(preview.file_count, 1);
+    assert_eq!(preview.triangles.len(), 1);
+    assert_eq!(preview.surface_types, BTreeSet::from([0]));
+}
+
+#[test]
+fn collision_preview_places_only_schema_bound_object_collision() {
+    let mut nail = SceneObject::new("nail", "MapObjNail");
+    nail.set_raw_param("actor_tail_string", "MapObjNail");
+    nail.transform = Transform {
+        translation: [100.0, 200.0, 300.0],
+        rotation_degrees: [0.0, 0.0, 0.0],
+        scale: [2.0, 3.0, 4.0],
+    };
+    let mut air_wall = SceneObject::new("air-wall", "MapStaticObj");
+    air_wall.set_raw_param("actor_tail_string", "BiancoAirWall");
+    air_wall.transform.translation = [-50.0, 25.0, 75.0];
+    let mut document = test_document(vec![nail, air_wall]);
+    document.registry = Some(ObjectRegistry {
+        map_obj_resources: vec![sms_schema::MapObjResourceDefinition {
+            resource_name: "MapObjNail".to_string(),
+            actor_type: 0,
+            object_flags: 0,
+            required_manager_name: "fixture manager".to_string(),
+            has_hold_dependency: false,
+            has_move_dependency: false,
+            uses_resource_name_model_fallback: false,
+            primary_model: Some("kugi.bmd".to_string()),
+            animation_resources: Vec::new(),
+            hold_model_path: None,
+            move_bck_path: None,
+            load_flags: 0,
+            collision_resources: vec![sms_schema::MapObjCollisionResourceDefinition {
+                resource_name: "kugi".to_string(),
+                flags: 2,
+                collision_kind: 2,
+                max_vertices: None,
+            }],
+            source_file: "fixture.cpp".to_string(),
+        }],
+        map_obj_factories: vec!["MapObjNail".to_string()],
+        map_static_models: vec![sms_schema::MapStaticModelDefinition {
+            actor_name: "BiancoAirWall".to_string(),
+            model_path: None,
+            collision_path: Some("/scene/mapObj/BiaAirWall.col".to_string()),
+            load_flags: 0,
+            sound_id: None,
+            source_file: "fixture.cpp".to_string(),
+            stage_bootstrap_created: false,
+        }],
+        ..ObjectRegistry::default()
+    });
+    let resources = BTreeMap::from([
+        (
+            "mapobj/kugi.col".to_string(),
+            single_triangle_collision(0x0005),
+        ),
+        (
+            "mapobj/biaairwall.col".to_string(),
+            single_triangle_collision(0x010A),
+        ),
+        (
+            "mapobj/biabridge.col".to_string(),
+            single_triangle_collision(0x0003),
+        ),
+    ]);
+    let mut preview = CollisionPreviewBuild::default();
+
+    append_runtime_collision_preview(&document, &resources, &mut preview);
+
+    assert_eq!(preview.file_count, 2);
+    assert_eq!(preview.triangles.len(), 2);
+    assert_eq!(preview.surface_types, BTreeSet::from([0x0005, 0x010A]));
+    let nail_triangle = preview
+        .triangles
+        .iter()
+        .find(|triangle| triangle.surface_type == 0x0005)
+        .unwrap();
+    assert_eq!(
+        nail_triangle.vertices,
+        [
+            [100.0, 200.0, 300.0],
+            [120.0, 200.0, 300.0],
+            [100.0, 200.0, 340.0],
+        ]
+    );
+    let air_wall_triangle = preview
+        .triangles
+        .iter()
+        .find(|triangle| triangle.surface_type == 0x010A)
+        .unwrap();
+    assert_eq!(air_wall_triangle.vertices[0], [-50.0, 25.0, 75.0]);
+}
+
 #[test]
 fn collision_surface_colors_are_stable_and_distinguish_types() {
     assert_eq!(
@@ -836,7 +969,7 @@ fn viewport_placement_hits_the_nearest_scene_or_object_geometry() {
 }
 
 #[test]
-fn viewport_placement_rejects_void_when_scene_geometry_exists() {
+fn viewport_placement_falls_back_to_the_focus_plane_over_void() {
     let mut preview = preview_for_texture_alpha(false, false);
     let mut triangle = textured_blended_triangle();
     triangle.vertices = [
@@ -853,7 +986,11 @@ fn viewport_placement_rejects_void_when_scene_geometry_exists() {
     };
     let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
 
-    assert_eq!(app.viewport_placement_position(rect, rect.center()), None);
+    assert_vec3_close(
+        app.viewport_placement_position(rect, rect.center())
+            .expect("placement over void should remain available"),
+        [0.0, 0.0, 1_000.0],
+    );
 }
 
 #[test]
@@ -2927,6 +3064,7 @@ fn decomp_owned_map_static_models_require_a_matching_placement() {
             sms_schema::MapStaticModelDefinition {
                 actor_name: "BiancoRiver".to_string(),
                 model_path: Some("/scene/map/map/BiancoRiver.bmd".to_string()),
+                collision_path: None,
                 load_flags: 0x1021_0000,
                 sound_id: None,
                 source_file: "src/Map/MapStaticObject.cpp".to_string(),
@@ -2935,6 +3073,7 @@ fn decomp_owned_map_static_models_require_a_matching_placement() {
             sms_schema::MapStaticModelDefinition {
                 actor_name: "BiaWaterPollution".to_string(),
                 model_path: Some("/scene/map/map/BiaWaterPollution.bmd".to_string()),
+                collision_path: None,
                 load_flags: 0x1122_0000,
                 sound_id: None,
                 source_file: "src/Map/MapStaticObject.cpp".to_string(),
@@ -2943,6 +3082,7 @@ fn decomp_owned_map_static_models_require_a_matching_placement() {
             sms_schema::MapStaticModelDefinition {
                 actor_name: "sea".to_string(),
                 model_path: Some("/scene/map/map/sea.bmd".to_string()),
+                collision_path: None,
                 load_flags: 0x1022_0000,
                 sound_id: None,
                 source_file: "src/Map/MapStaticObject.cpp".to_string(),
@@ -2951,6 +3091,7 @@ fn decomp_owned_map_static_models_require_a_matching_placement() {
             sms_schema::MapStaticModelDefinition {
                 actor_name: "mareSeaPollutionS34567".to_string(),
                 model_path: None,
+                collision_path: None,
                 load_flags: 0x1021_0000,
                 sound_id: None,
                 source_file: "src/Map/MapStaticObject.cpp".to_string(),
