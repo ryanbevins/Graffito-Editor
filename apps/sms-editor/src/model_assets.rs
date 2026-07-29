@@ -460,6 +460,7 @@ pub(super) struct AuthoredModelPreviewBase {
     camera_bounds_min: [f32; 3],
     camera_bounds_max: [f32; 3],
     goop_surface_model_indices: BTreeSet<usize>,
+    instance_model_indices: BTreeMap<uuid::Uuid, usize>,
 }
 
 pub(super) struct PreparedModelImport {
@@ -1241,34 +1242,32 @@ impl SmsEditorApp {
         let Some(instance) = self.selected_model_instance().cloned() else {
             return false;
         };
-        let corners = transformed_bounds_corners(&instance);
-        let mut minimum = [f32::INFINITY; 3];
-        let mut maximum = [f32::NEG_INFINITY; 3];
-        for corner in corners {
-            for axis in 0..3 {
-                minimum[axis] = minimum[axis].min(corner[axis]);
-                maximum[axis] = maximum[axis].max(corner[axis]);
-            }
-        }
-        if minimum
-            .into_iter()
-            .chain(maximum)
-            .any(|value| !value.is_finite())
-        {
+        let Some(bounds) = model_instance_world_bounds(&instance) else {
             return false;
-        }
-        let focus = std::array::from_fn(|axis| (minimum[axis] + maximum[axis]) * 0.5);
-        let extent = std::array::from_fn::<_, 3, _>(|axis| maximum[axis] - minimum[axis]);
-        let radius =
-            (extent[0] * extent[0] + extent[1] * extent[1] + extent[2] * extent[2]).sqrt() * 0.5;
+        };
+        let (focus, distance) = camera_focus_target_for_bounds(bounds);
         self.stop_camera_fly();
         let camera = self.renderer.camera_mut();
         camera.focus = focus;
-        camera.distance = (radius * 2.8).clamp(250.0, 600_000.0);
+        camera.distance = distance;
         self.viewport_pan = egui::Vec2::ZERO;
         self.viewport_zoom = 1.0;
         self.queue_camera_state_save();
         true
+    }
+
+    /// Framing target for an authored model instance.
+    pub(super) fn model_instance_focus_target(
+        &self,
+        instance_id: uuid::Uuid,
+    ) -> Option<([f32; 3], f32)> {
+        let instance = self
+            .model_instances
+            .iter()
+            .find(|instance| instance.placement.instance_id == instance_id)?;
+        Some(camera_focus_target_for_bounds(model_instance_world_bounds(
+            instance,
+        )?))
     }
 
     pub(super) fn update_selected_model_instance(&mut self, updated: EditorModelInstance) {
@@ -1397,10 +1396,27 @@ impl SmsEditorApp {
         rect: egui::Rect,
         position: egui::Pos2,
     ) -> Option<uuid::Uuid> {
+        // Prefer the mesh, matching how placed world objects are picked. The
+        // origin radius alone only selected an instance when the part of the
+        // model under the cursor happened to sit near its origin.
+        if let Some(hit) = self.model_instance_mesh_hit_at_screen_position(rect, position) {
+            return Some(hit);
+        }
+
+        // The origin radius only covers instances with no preview mesh to test.
+        // Applying it to meshed instances too would let a click on bare terrain
+        // near an instance's origin select and frame it.
+        let meshed = self
+            .model_preview
+            .as_ref()
+            .map(|preview| &preview.instance_model_indices);
         let projection = self.camera_projection(rect);
         self.model_instances
             .iter()
             .filter(|instance| instance.stage_id.eq_ignore_ascii_case(&self.stage_id))
+            .filter(|instance| {
+                meshed.is_none_or(|meshed| !meshed.contains_key(&instance.placement.instance_id))
+            })
             .filter_map(|instance| {
                 let transform = matrix_to_transform(instance.placement.transform);
                 let (screen, depth) = projection.project_world_to_screen(transform.translation)?;
@@ -1409,6 +1425,60 @@ impl SmsEditorApp {
             })
             .min_by(|left, right| left.0.total_cmp(&right.0))
             .map(|(_, id)| id)
+    }
+
+    /// Nearest authored instance whose preview mesh covers `position`.
+    ///
+    /// Instances without cached preview geometry are absent from
+    /// `instance_model_indices`, so they fall back to the origin radius.
+    fn model_instance_mesh_hit_at_screen_position(
+        &self,
+        rect: egui::Rect,
+        position: egui::Pos2,
+    ) -> Option<uuid::Uuid> {
+        if !rect.contains(position) {
+            return None;
+        }
+        let preview = self.model_preview.as_ref()?;
+        if preview.instance_model_indices.is_empty() {
+            return None;
+        }
+        let live = self
+            .model_instances
+            .iter()
+            .filter(|instance| instance.stage_id.eq_ignore_ascii_case(&self.stage_id))
+            .map(|instance| instance.placement.instance_id)
+            .collect::<BTreeSet<_>>();
+        let instances_by_model = preview
+            .instance_model_indices
+            .iter()
+            .filter(|(instance_id, _)| live.contains(*instance_id))
+            .map(|(instance_id, model_index)| (*model_index, *instance_id))
+            .collect::<BTreeMap<_, _>>();
+        if instances_by_model.is_empty() {
+            return None;
+        }
+
+        let size = framebuffer_size_for_rect(rect);
+        let framebuffer_position = [
+            (position.x - rect.left()) * size[0] as f32 / rect.width().max(1.0),
+            (position.y - rect.top()) * size[1] as f32 / rect.height().max(1.0),
+        ];
+        preview
+            .triangles
+            .iter()
+            .filter_map(|triangle| {
+                let instance_id = instances_by_model.get(&triangle.model_index)?;
+                let projected = self.project_preview_triangle(rect, size, triangle)?;
+                let depth = projected_triangle_depth_at_point(
+                    projected.screen,
+                    framebuffer_position[0],
+                    framebuffer_position[1],
+                )?;
+                Some((depth, *instance_id))
+            })
+            .min_by(|left, right| left.0.total_cmp(&right.0))
+            .map(|(_, instance_id)| instance_id)
     }
 
     pub(super) fn paint_model_instances(&self, painter: &egui::Painter, rect: egui::Rect) {
@@ -1648,6 +1718,7 @@ impl SmsEditorApp {
         preview.camera_bounds_min = base.camera_bounds_min;
         preview.camera_bounds_max = base.camera_bounds_max;
         preview.goop_surface_model_indices = base.goop_surface_model_indices;
+        preview.instance_model_indices = base.instance_model_indices;
         if !base.had_stage_preview {
             self.model_preview = None;
         }
@@ -4071,6 +4142,11 @@ pub(super) fn append_authored_model_instances(
         {
             preview.goop_surface_model_indices.insert(next_model_index);
         }
+        if preview.triangles.len() > instance_triangle_start {
+            preview
+                .instance_model_indices
+                .insert(instance.placement.instance_id, next_model_index);
+        }
         next_model_index += 1;
     }
     preview.triangles.len() - triangle_start
@@ -4105,6 +4181,7 @@ pub(super) fn append_authored_model_instances_to_stage_preview(
             camera_bounds_min: stage_preview.camera_bounds_min,
             camera_bounds_max: stage_preview.camera_bounds_max,
             goop_surface_model_indices: stage_preview.goop_surface_model_indices.clone(),
+            instance_model_indices: stage_preview.instance_model_indices.clone(),
         };
         let appended =
             append_authored_model_instances(stage_preview, cache, instances, stage_id, registry);
@@ -4154,6 +4231,7 @@ pub(super) fn empty_authored_model_preview() -> ModelPreview {
         source_textures: 0,
         goop_surface_model_indices: BTreeSet::new(),
         object_model_indices: BTreeMap::new(),
+        instance_model_indices: BTreeMap::new(),
         mirror_actor_positions: BTreeMap::new(),
         mirror_cubes: Vec::new(),
         mirror_model_slots: BTreeMap::new(),
@@ -4175,6 +4253,24 @@ fn transform_matrix_point(matrix: [[f32; 4]; 4], point: [f32; 3]) -> [f32; 3] {
             + matrix[2][row] * point[2]
             + matrix[3][row]
     })
+}
+
+/// World-space bounds of a placed instance, or `None` if the transform
+/// produced non-finite corners.
+fn model_instance_world_bounds(instance: &EditorModelInstance) -> Option<[[f32; 3]; 2]> {
+    let mut minimum = [f32::INFINITY; 3];
+    let mut maximum = [f32::NEG_INFINITY; 3];
+    for corner in transformed_bounds_corners(instance) {
+        for axis in 0..3 {
+            minimum[axis] = minimum[axis].min(corner[axis]);
+            maximum[axis] = maximum[axis].max(corner[axis]);
+        }
+    }
+    minimum
+        .into_iter()
+        .chain(maximum)
+        .all(f32::is_finite)
+        .then_some([minimum, maximum])
 }
 
 fn transformed_bounds_corners(instance: &EditorModelInstance) -> [[f32; 3]; 8] {

@@ -180,6 +180,14 @@ pub(super) struct ProjectCameraState {
     pub(super) viewport_zoom: f32,
     #[serde(default = "default_camera_speed")]
     pub(super) camera_speed: f32,
+    /// Orbit distance that viewport fly speed scales by.
+    ///
+    /// Stored apart from `distance` because framing shrinks that to fit its
+    /// target. Reconstructing it from `distance` on load cannot work: the saved
+    /// orbit distance may be a framing distance, so the navigation scale would
+    /// decay every time a project was saved while an object was framed.
+    #[serde(default = "default_navigation_distance")]
+    pub(super) navigation_distance: f32,
 }
 
 impl ProjectCameraState {
@@ -194,6 +202,8 @@ impl ProjectCameraState {
             && self.viewport_zoom > 0.0
             && self.camera_speed.is_finite()
             && self.camera_speed > 0.0
+            && self.navigation_distance.is_finite()
+            && self.navigation_distance > 0.0
     }
 }
 
@@ -203,6 +213,12 @@ fn default_viewport_zoom() -> f32 {
 
 fn default_camera_speed() -> f32 {
     1.0
+}
+
+/// Stage-sized default for projects saved before the navigation distance was
+/// stored, matching `reset_camera`.
+fn default_navigation_distance() -> f32 {
+    7000.0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1033,6 +1049,7 @@ mod tests {
                 viewport_pan: [12.0, -8.0],
                 viewport_zoom: 1.25,
                 camera_speed: 0.75,
+                navigation_distance: 6_500.0,
             },
         );
         project.stage_music.insert(

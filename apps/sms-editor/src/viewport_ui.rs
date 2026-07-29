@@ -314,6 +314,11 @@ impl SmsEditorApp {
         rect: egui::Rect,
         response: &egui::Response,
     ) {
+        let focus_dt = ui.input(|input| input.stable_dt.clamp(1.0 / 240.0, 1.0 / 15.0));
+        if self.advance_camera_focus_animation(focus_dt) {
+            self.mark_viewport_interaction(ui);
+        }
+
         if let Some(payload) = response.dnd_release_payload::<ObjectPaletteDragPayload>() {
             if let Some(pointer) = ui.input(|input| input.pointer.latest_pos()) {
                 if let Some(world) = self.viewport_placement_position(rect, pointer) {
@@ -534,6 +539,23 @@ impl SmsEditorApp {
                 }
             }
         }
+
+        // Runs after the click branch so the first click has already selected,
+        // and so route splitting and placement keep their own double-click
+        // meaning through that branch's early returns.
+        //
+        // Not gated on the gizmo: it is drawn at a fixed screen size, so a
+        // distant object is covered by its own gizmo, and gating here would
+        // break focus at the distances where framing matters most. A real axis
+        // drag never reaches this point, since egui only reports a double
+        // click when the pointer stayed put.
+        if response.double_clicked() && self.active_placement.is_none() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                if self.focus_camera_on_viewport_position(rect, pos) {
+                    self.mark_viewport_interaction(ui);
+                }
+            }
+        }
     }
 
     fn handle_transform_gizmo_input(
@@ -546,10 +568,7 @@ impl SmsEditorApp {
         let supports_gizmo = if route_origin.is_some() {
             self.tool == EditorTool::Move
         } else {
-            matches!(
-                self.tool,
-                EditorTool::Move | EditorTool::Rotate | EditorTool::Scale
-            )
+            self.tool_supports_transform_gizmo()
         };
         let pointer = ui.input(|input| input.pointer.interact_pos());
         let world_origin = route_origin.or_else(|| {
@@ -1108,11 +1127,136 @@ impl SmsEditorApp {
     }
 
     pub(super) fn viewport_fly_speed(&self) -> f32 {
-        (self.renderer.camera().distance * 0.8).clamp(300.0, 80_000.0) * self.camera_speed
+        (self.camera_navigation_distance * 0.8).clamp(300.0, 80_000.0) * self.camera_speed
     }
 
     pub(super) fn stop_camera_fly(&mut self) {
         self.camera_fly_velocity = [0.0; 3];
+        // Callers reposition the camera themselves; a glide would fight them.
+        self.camera_focus_animation = None;
+    }
+
+    /// Whether the active tool raises a transform gizmo.
+    pub(super) fn tool_supports_transform_gizmo(&self) -> bool {
+        matches!(
+            self.tool,
+            EditorTool::Move | EditorTool::Rotate | EditorTool::Scale
+        )
+    }
+
+    pub(super) fn cancel_camera_focus_animation(&mut self) {
+        self.camera_focus_animation = None;
+    }
+
+    /// Starts a glide toward `focus` at `distance`, replacing any glide already
+    /// running so a second double-click retargets immediately.
+    pub(super) fn begin_camera_focus_animation(&mut self, focus: [f32; 3], distance: f32) {
+        if !focus.iter().all(|axis| axis.is_finite()) || !distance.is_finite() {
+            return;
+        }
+        // Not `stop_camera_fly`: that would clear the glide installed below.
+        self.camera_fly_velocity = [0.0; 3];
+        let camera = self.renderer.camera();
+        self.camera_focus_animation = Some(CameraFocusAnimation {
+            start_focus: camera.focus,
+            target_focus: focus,
+            start_distance: camera.distance,
+            target_distance: distance.clamp(CAMERA_FOCUS_DISTANCE_MIN, CAMERA_FOCUS_DISTANCE_MAX),
+            start_pan: self.viewport_pan,
+            start_zoom: self.viewport_zoom,
+            elapsed: 0.0,
+        });
+    }
+
+    /// Advances a glide by `dt`. Returns whether one was running.
+    pub(super) fn advance_camera_focus_animation(&mut self, dt: f32) -> bool {
+        let Some(mut animation) = self.camera_focus_animation else {
+            return false;
+        };
+        animation.elapsed += dt.max(0.0);
+        let eased = ease_camera_focus(animation.progress());
+        {
+            let camera = self.renderer.camera_mut();
+            camera.focus = std::array::from_fn(|axis| {
+                animation.start_focus[axis]
+                    + (animation.target_focus[axis] - animation.start_focus[axis]) * eased
+            });
+            camera.distance = interpolate_camera_distance(
+                animation.start_distance,
+                animation.target_distance,
+                eased,
+            );
+        }
+        if animation.is_finished() {
+            // Land on exact values rather than the last eased step.
+            self.viewport_pan = egui::Vec2::ZERO;
+            self.viewport_zoom = 1.0;
+            self.camera_focus_animation = None;
+        } else {
+            self.viewport_pan = animation.start_pan * (1.0 - eased);
+            self.viewport_zoom = animation.start_zoom + (1.0 - animation.start_zoom) * eased;
+            self.camera_focus_animation = Some(animation);
+        }
+        self.queue_camera_state_save();
+        true
+    }
+
+    /// Glides onto the object or model instance under `pos`. Returns false
+    /// when the pointer is over bare terrain.
+    pub(super) fn focus_camera_on_viewport_position(
+        &mut self,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+    ) -> bool {
+        let target = self
+            .model_instance_at_screen_position(rect, pos)
+            .and_then(|id| self.model_instance_focus_target(id))
+            .or_else(|| {
+                self.object_at_screen_position(rect, pos)
+                    .and_then(|id| self.object_focus_target(&id))
+            });
+        let Some((focus, distance)) = target else {
+            return false;
+        };
+        self.begin_camera_focus_animation(focus, distance);
+        true
+    }
+
+    /// Framing target for a placed object, measured from its preview geometry
+    /// so small actors and stage-sized map objects frame differently.
+    pub(super) fn object_focus_target(&self, object_id: &str) -> Option<([f32; 3], f32)> {
+        let object = self
+            .document
+            .as_ref()?
+            .objects
+            .iter()
+            .find(|object| object.id == object_id)?;
+        Some(camera_focus_target_from_bounds(
+            self.object_preview_bounds(object_id),
+            object.transform.translation,
+        ))
+    }
+
+    fn object_preview_bounds(&self, object_id: &str) -> Option<[[f32; 3]; 2]> {
+        let preview = self.model_preview.as_ref()?;
+        let model_index = *preview.object_model_indices.get(object_id)?;
+        let mut minimum = [f32::INFINITY; 3];
+        let mut maximum = [f32::NEG_INFINITY; 3];
+        for triangle in preview.triangles.iter().filter(|triangle| {
+            triangle.model_index == model_index && preview_triangle_frames_object(triangle)
+        }) {
+            for vertex in triangle.vertices {
+                for axis in 0..3 {
+                    minimum[axis] = minimum[axis].min(vertex[axis]);
+                    maximum[axis] = maximum[axis].max(vertex[axis]);
+                }
+            }
+        }
+        minimum
+            .into_iter()
+            .chain(maximum)
+            .all(f32::is_finite)
+            .then_some([minimum, maximum])
     }
 
     pub(super) fn release_viewport_mouse_capture_if_needed(&mut self, ctx: &egui::Context) {
@@ -1137,6 +1281,10 @@ impl SmsEditorApp {
         if delta == egui::Vec2::ZERO {
             return;
         }
+        // Look-around recomputes the focus point, so it conflicts with a
+        // glide. Plain orbiting only changes yaw and pitch, so it is left
+        // alone and can run while the camera flies in.
+        self.cancel_camera_focus_animation();
         let old_position = self.camera_frame().position;
         {
             let camera = self.renderer.camera_mut();
@@ -1188,6 +1336,8 @@ impl SmsEditorApp {
         if !delta.iter().all(|value| value.is_finite()) {
             return;
         }
+        // Panning, dollying, and keyboard fly land here; yield to the user.
+        self.cancel_camera_focus_animation();
         let camera = self.renderer.camera_mut();
         camera.focus = vec3_add(camera.focus, delta);
         self.queue_camera_state_save();
@@ -2800,7 +2950,8 @@ pub(super) fn transform_from_gizmo_drag(
             }
             transform.scale[axis] = value.max(0.001);
         }
-        EditorTool::Goop | EditorTool::Place => {}
+        // These tools raise no gizmo, so they never open a drag to resolve.
+        EditorTool::Select | EditorTool::Goop | EditorTool::Place => {}
     }
     transform
 }

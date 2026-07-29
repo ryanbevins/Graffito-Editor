@@ -4222,16 +4222,21 @@ impl SmsEditorApp {
         self.renderer.camera().focus
     }
 
+    /// Frames the current selection, gliding rather than snapping. Shares its
+    /// target with the viewport's double-click focus, so `F`, the Frame
+    /// Selection button, and a double-click all behave identically.
     pub(super) fn frame_selected(&mut self) {
-        if self.frame_selected_model_instance() {
+        let target = self
+            .selected_model_instance_id
+            .and_then(|id| self.model_instance_focus_target(id))
+            .or_else(|| {
+                let object_id = self.selected_object().map(|object| object.id.clone())?;
+                self.object_focus_target(&object_id)
+            });
+        let Some((focus, distance)) = target else {
             return;
-        }
-        self.stop_camera_fly();
-        if let Some(object) = self.selected_object() {
-            self.renderer.camera_mut().focus = object.transform.translation;
-            self.viewport_pan = egui::Vec2::ZERO;
-            self.queue_camera_state_save();
-        }
+        };
+        self.begin_camera_focus_animation(focus, distance);
     }
 
     pub(super) fn reset_camera(&mut self) {
@@ -4244,6 +4249,8 @@ impl SmsEditorApp {
             camera.yaw_degrees = self.startup_camera_yaw.unwrap_or(222.0);
             camera.pitch_degrees = self.startup_camera_pitch.unwrap_or(-30.0);
             camera.distance = (preview.radius() * 4.2).clamp(2500.0, 600_000.0);
+            // Resetting re-establishes the view, so navigation rescales with it.
+            self.camera_navigation_distance = camera.distance;
             self.queue_camera_state_save();
             return;
         }
@@ -4253,6 +4260,7 @@ impl SmsEditorApp {
         camera.yaw_degrees = self.startup_camera_yaw.unwrap_or(222.0);
         camera.pitch_degrees = self.startup_camera_pitch.unwrap_or(-30.0);
         camera.distance = 7000.0;
+        self.camera_navigation_distance = camera.distance;
         self.queue_camera_state_save();
     }
 
@@ -4264,6 +4272,7 @@ impl SmsEditorApp {
             if let Some(distance) = self.startup_camera_distance {
                 camera.distance = distance.max(50.0);
             }
+            self.camera_navigation_distance = camera.distance;
             self.viewport_pan = egui::Vec2::ZERO;
             self.viewport_zoom = 1.0;
             self.log.push(format!(
@@ -4290,6 +4299,7 @@ impl SmsEditorApp {
             let camera = self.renderer.camera_mut();
             camera.focus = object.transform.translation;
             camera.distance = self.startup_camera_distance.unwrap_or(2200.0).max(50.0);
+            self.camera_navigation_distance = camera.distance;
             self.viewport_pan = egui::Vec2::ZERO;
             self.viewport_zoom = 1.0;
             self.selected_object_id = Some(object.id.clone());

@@ -322,12 +322,22 @@ impl SmsEditorApp {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(5.0, 4.0);
             for tool in CORE_VIEWPORT_TOOLS {
+                let active = self.tool == tool;
+                let hint = if active {
+                    format!(
+                        "{} tool ({}) — click again to deselect",
+                        tool.label(),
+                        tool_shortcut(tool)
+                    )
+                } else {
+                    format!("{} tool ({})", tool.label(), tool_shortcut(tool))
+                };
                 if ui
-                    .selectable_label(self.tool == tool, tool.label())
-                    .on_hover_text(format!("{} tool ({})", tool.label(), tool_shortcut(tool)))
+                    .selectable_label(active, tool.label())
+                    .on_hover_text(hint)
                     .clicked()
                 {
-                    self.tool = tool;
+                    self.tool = self.tool.after_toolbar_click(tool);
                 }
             }
 
@@ -2585,6 +2595,7 @@ fn is_palette_service_type(type_name: &str) -> bool {
 
 fn tool_shortcut(tool: EditorTool) -> &'static str {
     match tool {
+        EditorTool::Select => "Q",
         EditorTool::Move => "W",
         EditorTool::Rotate => "E",
         EditorTool::Scale => "R",

@@ -109,6 +109,8 @@ pub fn run() -> eframe::Result<()> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditorTool {
+    /// Selection only: picks and highlights without raising a transform gizmo.
+    Select,
     Move,
     Rotate,
     Scale,
@@ -165,14 +167,99 @@ struct GizmoDrag {
     start_transform: Transform,
 }
 
+const CAMERA_FOCUS_ANIMATION_SECONDS: f32 = 0.45;
+const CAMERA_FOCUS_RADIUS_SCALE: f32 = 2.8;
+const CAMERA_FOCUS_DISTANCE_MIN: f32 = 250.0;
+const CAMERA_FOCUS_DISTANCE_MAX: f32 = 600_000.0;
+const CAMERA_FOCUS_FALLBACK_RADIUS: f32 = 200.0;
+
+/// Glides the orbit camera onto a framing target. Pan and zoom ride along so
+/// the result matches the framing `frame_selected_model_instance` produces.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CameraFocusAnimation {
+    start_focus: [f32; 3],
+    target_focus: [f32; 3],
+    start_distance: f32,
+    target_distance: f32,
+    start_pan: egui::Vec2,
+    start_zoom: f32,
+    elapsed: f32,
+}
+
+impl CameraFocusAnimation {
+    fn progress(self) -> f32 {
+        (self.elapsed / CAMERA_FOCUS_ANIMATION_SECONDS).clamp(0.0, 1.0)
+    }
+
+    fn is_finished(self) -> bool {
+        self.elapsed >= CAMERA_FOCUS_ANIMATION_SECONDS
+    }
+}
+
+/// Smoothstep, so the glide leaves and settles gently at both ends.
+fn ease_camera_focus(progress: f32) -> f32 {
+    let progress = progress.clamp(0.0, 1.0);
+    progress * progress * (3.0 - 2.0 * progress)
+}
+
+/// Interpolates the orbit radius geometrically. A stage-wide approach spans
+/// orders of magnitude, where linear interpolation rushes then crawls.
+fn interpolate_camera_distance(start: f32, target: f32, eased: f32) -> f32 {
+    if start > 0.0 && target > 0.0 {
+        start * (target / start).powf(eased)
+    } else {
+        start + (target - start) * eased
+    }
+}
+
+/// Focus point and orbit distance that frame `bounds`.
+fn camera_focus_target_for_bounds(bounds: [[f32; 3]; 2]) -> ([f32; 3], f32) {
+    let [minimum, maximum] = bounds;
+    let focus = std::array::from_fn(|axis| (minimum[axis] + maximum[axis]) * 0.5);
+    let extent = std::array::from_fn::<_, 3, _>(|axis| maximum[axis] - minimum[axis]);
+    let radius =
+        (extent[0] * extent[0] + extent[1] * extent[1] + extent[2] * extent[2]).sqrt() * 0.5;
+    (focus, camera_framing_distance_for_radius(radius))
+}
+
+/// As [`camera_focus_target_for_bounds`], falling back to a fixed radius for
+/// objects with no preview geometry.
+fn camera_focus_target_from_bounds(
+    bounds: Option<[[f32; 3]; 2]>,
+    fallback_focus: [f32; 3],
+) -> ([f32; 3], f32) {
+    match bounds {
+        Some(bounds) => camera_focus_target_for_bounds(bounds),
+        None => (
+            fallback_focus,
+            camera_framing_distance_for_radius(CAMERA_FOCUS_FALLBACK_RADIUS),
+        ),
+    }
+}
+
+fn camera_framing_distance_for_radius(radius: f32) -> f32 {
+    (radius * CAMERA_FOCUS_RADIUS_SCALE).clamp(CAMERA_FOCUS_DISTANCE_MIN, CAMERA_FOCUS_DISTANCE_MAX)
+}
+
 impl EditorTool {
     fn label(self) -> &'static str {
         match self {
+            Self::Select => "Select",
             Self::Move => "Move",
             Self::Rotate => "Rotate",
             Self::Scale => "Scale",
             Self::Goop => "Goop",
             Self::Place => "Place",
+        }
+    }
+
+    /// Clicking the active tool toggles back to `Select`, dismissing the gizmo
+    /// without reaching for another tool. `Select` is neutral and stays put.
+    fn after_toolbar_click(self, clicked: Self) -> Self {
+        if self == clicked {
+            Self::Select
+        } else {
+            clicked
         }
     }
 
@@ -182,6 +269,7 @@ impl EditorTool {
         }
 
         match key {
+            egui::Key::Q => Self::Select,
             egui::Key::W => Self::Move,
             egui::Key::E => Self::Rotate,
             egui::Key::R => Self::Scale,
@@ -191,6 +279,9 @@ impl EditorTool {
     }
 }
 
+/// Tools with a top-level toolbar button. `Select` is deliberately absent: it
+/// is a state reached by toggling a transform tool off, and a fourth button
+/// wraps the toolbar row and pushes the controls below it out of reach.
 const CORE_VIEWPORT_TOOLS: [EditorTool; 3] =
     [EditorTool::Move, EditorTool::Rotate, EditorTool::Scale];
 
@@ -1187,7 +1278,17 @@ struct SmsEditorApp {
     viewport_pan: egui::Vec2,
     viewport_zoom: f32,
     camera_speed: f32,
+    /// Orbit distance that viewport fly speed is scaled by.
+    ///
+    /// Kept apart from `camera.distance` because framing shrinks that to fit
+    /// its target. Deriving speed from the live value left the camera crawling
+    /// after a double-click, and the shrunken distance was then persisted into
+    /// the stage camera, so the slowdown survived reloads. Only commands that
+    /// establish a view — reset, startup focus, restoring a saved camera —
+    /// update this.
+    camera_navigation_distance: f32,
     camera_fly_velocity: [f32; 3],
+    camera_focus_animation: Option<CameraFocusAnimation>,
     viewport_mouse_captured: bool,
     camera_state_save_pending: bool,
     camera_state_changed_at: Instant,
@@ -1447,7 +1548,9 @@ impl Default for SmsEditorApp {
             viewport_pan: egui::Vec2::ZERO,
             viewport_zoom: 1.0,
             camera_speed: 1.0,
+            camera_navigation_distance: 7000.0,
             camera_fly_velocity: [0.0; 3],
+            camera_focus_animation: None,
             viewport_mouse_captured: false,
             camera_state_save_pending: false,
             camera_state_changed_at: Instant::now(),
@@ -1540,6 +1643,9 @@ impl SmsEditorApp {
         }
         if ctx.input(|i| i.pointer.secondary_down()) {
             return;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Q)) {
+            self.tool = self.tool.after_keyboard_shortcut(egui::Key::Q);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::W)) {
             self.tool = self.tool.after_keyboard_shortcut(egui::Key::W);
@@ -3707,6 +3813,7 @@ impl SmsEditorApp {
             source_textures,
             goop_surface_model_indices,
             object_model_indices,
+            instance_model_indices: BTreeMap::new(),
             mirror_actor_positions,
             mirror_cubes,
             mirror_model_slots,
@@ -4648,14 +4755,10 @@ fn expand_model_preview_bounds(
     let mut bounds_max = [f32::NEG_INFINITY; 3];
     let mut found = false;
     for range in triangle_ranges {
-        for triangle in preview.triangles[range.clone()].iter().filter(|triangle| {
-            !matches!(
-                triangle.render_layer,
-                PreviewRenderLayer::Sky
-                    | PreviewRenderLayer::MirrorScene
-                    | PreviewRenderLayer::Heatwave
-            )
-        }) {
+        for triangle in preview.triangles[range.clone()]
+            .iter()
+            .filter(|triangle| preview_layer_is_world_space(triangle.render_layer))
+        {
             for vertex in triangle.vertices {
                 if !vertex.iter().all(|value| value.is_finite()) {
                     continue;
@@ -4715,14 +4818,9 @@ fn robust_preview_bounds(
     points: &[PreviewPoint],
 ) -> Option<([f32; 3], [f32; 3])> {
     let mut axes = [Vec::new(), Vec::new(), Vec::new()];
-    let has_world_triangles = triangles.iter().any(|triangle| {
-        !matches!(
-            triangle.render_layer,
-            PreviewRenderLayer::Sky
-                | PreviewRenderLayer::MirrorScene
-                | PreviewRenderLayer::Heatwave
-        )
-    });
+    let has_world_triangles = triangles
+        .iter()
+        .any(|triangle| preview_layer_is_world_space(triangle.render_layer));
     if !has_world_triangles {
         for point in points {
             for (axis, value) in axes.iter_mut().zip(point.position) {
@@ -4732,14 +4830,10 @@ fn robust_preview_bounds(
             }
         }
     } else {
-        for triangle in triangles.iter().filter(|triangle| {
-            !matches!(
-                triangle.render_layer,
-                PreviewRenderLayer::Sky
-                    | PreviewRenderLayer::MirrorScene
-                    | PreviewRenderLayer::Heatwave
-            )
-        }) {
+        for triangle in triangles
+            .iter()
+            .filter(|triangle| preview_layer_is_world_space(triangle.render_layer))
+        {
             for vertex in triangle.vertices {
                 for (axis, value) in axes.iter_mut().zip(vertex) {
                     if value.is_finite() {
@@ -4910,6 +5004,30 @@ fn preview_render_layer_for_model_path(path: &str) -> PreviewRenderLayer {
     } else {
         PreviewRenderLayer::Main
     }
+}
+
+/// Whether a layer's vertices describe ordinary world-space geometry.
+///
+/// Sky is stored camera-relative, and MirrorScene and Heatwave are reprojected
+/// effect passes, so none of them say where an object actually sits. Anything
+/// deriving bounds from vertices has to skip them.
+fn preview_layer_is_world_space(layer: PreviewRenderLayer) -> bool {
+    !matches!(
+        layer,
+        PreviewRenderLayer::Sky | PreviewRenderLayer::MirrorScene | PreviewRenderLayer::Heatwave
+    )
+}
+
+/// Whether a triangle should contribute to the bounds used to frame an object.
+///
+/// Billboards are rebuilt from their centre against the live camera, so their
+/// stored vertices are not world positions, and effect layers are reprojected
+/// the same way. A Shine's glow or Petey's effects otherwise inflate the box
+/// far past the model and the camera frames from a huge distance.
+fn preview_triangle_frames_object(triangle: &PreviewTriangle) -> bool {
+    triangle.billboard.is_none()
+        && preview_layer_is_world_space(triangle.render_layer)
+        && !preview_render_layer_is_effect(triangle.render_layer)
 }
 
 fn preview_render_layer_is_effect(layer: PreviewRenderLayer) -> bool {

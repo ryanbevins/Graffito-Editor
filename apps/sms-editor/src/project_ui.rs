@@ -446,6 +446,7 @@ impl SmsEditorApp {
             viewport_pan: [self.viewport_pan.x, self.viewport_pan.y],
             viewport_zoom: self.viewport_zoom,
             camera_speed: self.camera_speed,
+            navigation_distance: self.camera_navigation_distance,
         };
         state.is_valid().then(|| (stage_id.to_string(), state))
     }
@@ -469,6 +470,12 @@ impl SmsEditorApp {
         let camera = self.renderer.camera_mut();
         camera.focus = state.focus;
         camera.distance = state.distance.max(50.0);
+        // Restored verbatim, never derived from the orbit distance: that value
+        // may be a framing distance, so reconstructing from it would decay the
+        // navigation scale on every save made while an object was framed.
+        // Projects saved before this was stored fall back to the stage-sized
+        // default rather than inheriting a framing distance.
+        self.camera_navigation_distance = state.navigation_distance;
         camera.yaw_degrees = state.yaw_degrees;
         camera.pitch_degrees = state.pitch_degrees.clamp(-89.0, 89.0);
         self.viewport_pan = egui::vec2(state.viewport_pan[0], state.viewport_pan[1]);
