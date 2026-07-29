@@ -446,6 +446,7 @@ impl SmsEditorApp {
             document,
             &self.saved_objects,
             &self.saved_lighting,
+            &self.saved_death_barrier,
             &self.saved_archive_edits,
             &self.saved_dialogue_authoring,
             &self.saved_dialogue_library,

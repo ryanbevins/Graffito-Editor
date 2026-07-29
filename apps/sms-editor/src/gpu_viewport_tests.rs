@@ -30,6 +30,19 @@ fn j3d_shader_parses_and_validates() {
 }
 
 #[test]
+fn death_barrier_shader_parses_and_validates() {
+    let module =
+        wgpu::naga::front::wgsl::parse_str(DEATH_BARRIER_SHADER).expect("barrier WGSL parses");
+    wgpu::naga::valid::Validator::new(
+        wgpu::naga::valid::ValidationFlags::all(),
+        wgpu::naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)
+    .expect("barrier WGSL validates");
+    assert!(DEATH_BARRIER_SHADER.contains("48.0 / 255.0, 0.5"));
+}
+
+#[test]
 fn camera_uniform_is_visible_to_fragment_lod_sampling() {
     assert!(camera_binding_visibility(0).contains(wgpu::ShaderStages::VERTEX));
     assert!(camera_binding_visibility(0).contains(wgpu::ShaderStages::FRAGMENT));
@@ -1186,6 +1199,7 @@ fn repository_authored_textured_import_renders_non_black() {
             light_color: [1.0; 4],
             ambient_color: Some([1.0; 4]),
             show_grid: false,
+            death_barrier_y: None,
         },
         [512, 512],
     )
@@ -1607,6 +1621,81 @@ fn world_grid_tests_scene_depth_without_writing_it() {
     assert_eq!(depth.depth_write_enabled, Some(false));
     assert_eq!(depth.depth_compare, Some(wgpu::CompareFunction::LessEqual));
     assert_eq!(WORLD_GRID_VERTEX_COUNT, 88);
+}
+
+#[test]
+fn death_barrier_tests_scene_depth_without_writing_it() {
+    let depth = death_barrier_depth_stencil_state();
+    assert_eq!(depth.format, wgpu::TextureFormat::Depth24Plus);
+    assert_eq!(depth.depth_write_enabled, Some(false));
+    assert_eq!(depth.depth_compare, Some(wgpu::CompareFunction::LessEqual));
+
+    let frame = GpuViewportFrame {
+        death_barrier_y: Some(-2_345.0),
+        ..Default::default()
+    };
+    let uniform = GpuCameraUniform::from_frame(frame, TEST_RENDER_TARGET_SIZE);
+    assert_eq!(uniform.clip[1], -2_345.0);
+    assert_eq!(uniform.clip[2], 1.0);
+    assert_eq!(
+        uniform.clip[3],
+        sms_scene::BLANK_STAGE_SAFETY_PLANE_HALF_EXTENT
+    );
+}
+
+#[test]
+fn death_barrier_is_occluded_by_nearer_geometry() {
+    let mut preview = geometry_update_preview();
+    preview.triangles[0].vertices = [
+        [-100.0, 100.0, -100.0],
+        [100.0, 100.0, -100.0],
+        [100.0, 100.0, 100.0],
+    ];
+    preview.triangles[1].vertices = [
+        [-100.0, 100.0, -100.0],
+        [100.0, 100.0, 100.0],
+        [-100.0, 100.0, 100.0],
+    ];
+    for triangle in &mut preview.triangles {
+        triangle.normals = Some([[0.0, 1.0, 0.0]; 3]);
+        triangle.model_index = 1;
+        triangle.packet_index = 0;
+    }
+
+    let frame = GpuViewportFrame {
+        camera_position: [0.0, 1000.0, 0.0],
+        right: [1.0, 0.0, 0.0],
+        up: [0.0, 0.0, 1.0],
+        forward: [0.0, -1.0, 0.0],
+        focal: 128.0,
+        viewport_size: [256.0, 256.0],
+        near: 1.0,
+        light_position: [0.0, 1000.0, 0.0],
+        light_color: [1.0; 4],
+        ambient_color: Some([1.0; 4]),
+        ..Default::default()
+    };
+    let without_barrier =
+        render_preview_offscreen(&preview, frame, [256, 256]).expect("render geometry");
+    let with_barrier = render_preview_offscreen(
+        &preview,
+        GpuViewportFrame {
+            death_barrier_y: Some(0.0),
+            ..frame
+        },
+        [256, 256],
+    )
+    .expect("render geometry and barrier");
+
+    let center = 128 * 256 + 128;
+    assert_eq!(
+        with_barrier.pixels[center], without_barrier.pixels[center],
+        "the barrier behind the raised quad must fail the scene depth test"
+    );
+    assert!(
+        with_barrier.pixels != without_barrier.pixels,
+        "the barrier must remain visible where no geometry occludes it"
+    );
 }
 
 #[test]

@@ -2025,6 +2025,15 @@ impl SmsEditorApp {
                 .unwrap_or([1.0; 4]),
             ambient_color: lighting.map(|lighting| gpu_viewport::color_u8_to_f32(lighting.ambient)),
             show_grid: self.renderer.config().show_grid,
+            death_barrier_y: (self.selected_world_member
+                == Some(WorldHierarchyMember::DeathBarrier))
+            .then(|| {
+                self.document
+                    .as_ref()
+                    .and_then(|document| document.death_barrier)
+                    .map(|barrier| barrier.y)
+            })
+            .flatten(),
         })
     }
 

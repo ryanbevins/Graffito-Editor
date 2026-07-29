@@ -39,12 +39,15 @@ use object_preview::{
 };
 
 pub use blank_stage::{
-    blank_stage_mario_record, blank_stage_sky_record, runtime_sky_material_table,
-    BlankStageBootstrapKind, BlankStageBootstrapManifest, BlankStageBootstrapRequirement,
-    BlankStageBootstrapResource, BlankStageLightingPreset, BlankStagePreset,
-    BlankStageSkyboxPreset, BlankStageTargetMetadata, BLANK_STAGE_BOOTSTRAP_REQUIREMENTS,
-    BLANK_STAGE_CAMERA_DIRECTORY_MARKER_PATH, BLANK_STAGE_COIN_PARTICLE_PATH,
-    BLANK_STAGE_PRESET_VERSION, DEFAULT_BLANK_STAGE_TARGET_SLOT,
+    blank_stage_mario_record, blank_stage_sky_record, is_blank_stage_infrastructure_group,
+    runtime_sky_material_table, BlankStageBootstrapKind, BlankStageBootstrapManifest,
+    BlankStageBootstrapRequirement, BlankStageBootstrapResource, BlankStageLightingPreset,
+    BlankStagePreset, BlankStageSkyboxPreset, BlankStageTargetMetadata,
+    BLANK_STAGE_BOOTSTRAP_REQUIREMENTS, BLANK_STAGE_CAMERA_DIRECTORY_MARKER_PATH,
+    BLANK_STAGE_COIN_PARTICLE_PATH, BLANK_STAGE_DEATH_BARRIER_SURFACE_TYPE,
+    BLANK_STAGE_PRESET_VERSION, BLANK_STAGE_SAFETY_PLANE_HALF_EXTENT,
+    BLANK_STAGE_SAFETY_PLANE_OFFSET, BLANK_STAGE_SAFETY_PLANE_SURFACE_TYPE,
+    DEFAULT_BLANK_STAGE_DEATH_BARRIER_Y, DEFAULT_BLANK_STAGE_TARGET_SLOT,
 };
 pub use dialogue_authoring::{
     CommonDialogueResourceEdit, CompiledDialogueEdits, DialogueAuthoringDocument,
@@ -262,6 +265,9 @@ pub struct StageDocument {
     pub dialogue_library: ProjectDialogueLibrary,
     pub load_issues: Vec<ValidationIssue>,
     pub lighting: StageLighting,
+    /// Editable generated collision infrastructure for source-free stages.
+    /// Retail stages retain their authored collision and leave this unset.
+    pub death_barrier: Option<StageDeathBarrier>,
     pub actor_previews: BTreeMap<String, ActorPreview>,
     pub loaded_project: Option<LoadedProjectState>,
 }
@@ -312,6 +318,19 @@ impl ResolvedObjectPreview {
 pub struct StageLighting {
     pub lights: Vec<JDramaLight>,
     pub ambients: Vec<JDramaAmbient>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct StageDeathBarrier {
+    pub y: f32,
+}
+
+impl Default for StageDeathBarrier {
+    fn default() -> Self {
+        Self {
+            y: DEFAULT_BLANK_STAGE_DEATH_BARRIER_Y,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -407,6 +426,7 @@ impl StageDocument {
             dialogue_authoring: None,
             dialogue_library: ProjectDialogueLibrary::default(),
             lighting,
+            death_barrier: None,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         })
@@ -455,6 +475,7 @@ impl StageDocument {
             dialogue_authoring: None,
             dialogue_library: ProjectDialogueLibrary::default(),
             lighting,
+            death_barrier: Some(StageDeathBarrier::default()),
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         })
@@ -523,6 +544,7 @@ impl StageDocument {
         self.route_authoring = None;
         self.goop_authoring = None;
         self.dialogue_authoring = None;
+        self.death_barrier = Some(StageDeathBarrier::default());
         self.actor_previews.clear();
         if let Some(registry) = registry {
             self.set_registry(registry);
@@ -539,6 +561,11 @@ impl StageDocument {
             (&self.stage_archive, &self.stage_archive_source_path)
         {
             if let Some(raw_resource_path) = semantic_resource_path_for_asset(source_path, path) {
+                if raw_resource_path == b"map/map.col" && self.death_barrier.is_some() {
+                    if let Some(resource) = self.effective_resource_clone(&raw_resource_path)? {
+                        return Ok(resource.to_bytes()?);
+                    }
+                }
                 if let Some(edit) = self
                     .archive_edits
                     .resources
@@ -652,6 +679,18 @@ impl StageDocument {
                 }
             };
             current = Some(StageResourceDocument::Collision(replacement));
+        }
+        if raw_resource_path == b"map/map.col" {
+            if let Some(death_barrier) = self.death_barrier {
+                if let Some(StageResourceDocument::Collision(collision)) = current.as_ref() {
+                    current = Some(StageResourceDocument::Collision(
+                        blank_stage::reconcile_blank_stage_infrastructure(
+                            collision,
+                            death_barrier.y,
+                        )?,
+                    ));
+                }
+            }
         }
         Ok(current)
     }
@@ -1296,6 +1335,7 @@ impl StageDocument {
             route_authoring: self.route_authoring.clone(),
             goop_authoring: self.goop_authoring.clone(),
             dialogue_authoring: self.dialogue_authoring.clone(),
+            death_barrier: self.death_barrier,
         };
         let bytes = serde_json::to_vec_pretty(&overlay)?;
         self.mark_changed_file(path, bytes)?;
@@ -1407,6 +1447,9 @@ pub struct EditorSceneOverlay {
     pub goop_authoring: Option<GoopAuthoringDocument>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialogue_authoring: Option<DialogueAuthoringDocument>,
+    /// `None` preserves the source-free baseline default for legacy projects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub death_barrier: Option<StageDeathBarrier>,
     /// `None` preserves compatibility with older overlays, whose lighting is
     /// inherited from the semantic stage baseline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3346,6 +3389,7 @@ mod tests {
             dialogue_library: ProjectDialogueLibrary::default(),
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
+            death_barrier: None,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         };
@@ -3409,6 +3453,7 @@ mod tests {
             dialogue_library: ProjectDialogueLibrary::default(),
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
+            death_barrier: None,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         };
@@ -3492,6 +3537,7 @@ mod tests {
             dialogue_library: ProjectDialogueLibrary::default(),
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
+            death_barrier: None,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         };
@@ -3625,6 +3671,7 @@ mod tests {
             dialogue_library: ProjectDialogueLibrary::default(),
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
+            death_barrier: None,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         };
@@ -3657,6 +3704,21 @@ mod tests {
     }
 
     #[test]
+    fn editor_overlay_round_trips_custom_stage_death_barrier_height() {
+        let mut doc = empty_document("test11");
+        doc.death_barrier = Some(StageDeathBarrier { y: -2_345.5 });
+        doc.queue_editor_overlay_change().unwrap();
+
+        let path = PathBuf::from("editor/stages/test11.scene.json");
+        let bytes = doc.changed_files.get(&path).unwrap();
+        let overlay: EditorSceneOverlay = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(
+            overlay.death_barrier,
+            Some(StageDeathBarrier { y: -2_345.5 })
+        );
+    }
+
+    #[test]
     fn ignores_legacy_embedded_archive_with_non_finite_json_nulls() {
         let overlay: EditorSceneOverlay = serde_json::from_str(
             r#"{
@@ -3675,6 +3737,7 @@ mod tests {
         assert_eq!(overlay.archive_edits, StageArchiveEdits::default());
         assert!(overlay.lighting.is_none());
         assert!(overlay.goop_authoring.is_none());
+        assert!(overlay.death_barrier.is_none());
     }
 
     #[test]
@@ -4612,6 +4675,7 @@ mod tests {
             dialogue_library: ProjectDialogueLibrary::default(),
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
+            death_barrier: None,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         }

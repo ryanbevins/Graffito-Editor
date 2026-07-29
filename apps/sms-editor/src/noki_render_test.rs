@@ -225,6 +225,7 @@ fn bianco0_renders_the_retail_fountain_particle_actor() {
             light_color: [1.0; 4],
             ambient_color: Some([1.0; 4]),
             show_grid: false,
+            death_barrier_y: None,
         },
         [512, 512],
     )
@@ -1911,6 +1912,7 @@ fn render_isolated_noki(
             light_color: gpu_viewport::color_u8_to_f32(lighting.color),
             ambient_color: Some(gpu_viewport::color_u8_to_f32(lighting.ambient)),
             show_grid: false,
+            death_barrier_y: None,
         },
         size,
     )

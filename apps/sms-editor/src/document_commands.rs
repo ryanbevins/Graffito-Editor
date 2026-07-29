@@ -1781,6 +1781,7 @@ impl SmsEditorApp {
                 Ok(outcome) => {
                     self.saved_objects = document.objects.clone();
                     self.saved_lighting = document.lighting.clone();
+                    self.saved_death_barrier = document.death_barrier;
                     self.saved_archive_edits = document.archive_edits.clone();
                     self.saved_dialogue_authoring = document.dialogue_authoring.clone();
                     self.saved_dialogue_library = document.dialogue_library.clone();
@@ -1970,6 +1971,7 @@ impl SmsEditorApp {
                     document,
                     &self.saved_objects,
                     &self.saved_lighting,
+                    &self.saved_death_barrier,
                     &self.saved_archive_edits,
                     &self.saved_dialogue_authoring,
                     &self.saved_dialogue_library,
@@ -2504,6 +2506,7 @@ impl SmsEditorApp {
                 document,
                 &self.saved_objects,
                 &self.saved_lighting,
+                &self.saved_death_barrier,
                 &self.saved_archive_edits,
                 &self.saved_dialogue_authoring,
                 &self.saved_dialogue_library,
@@ -2958,12 +2961,41 @@ impl SmsEditorApp {
             document,
             &self.saved_objects,
             &self.saved_lighting,
+            &self.saved_death_barrier,
             &self.saved_archive_edits,
             &self.saved_dialogue_authoring,
             &self.saved_dialogue_library,
         );
         self.flush_document_change();
         self.rebuild_gpu_viewport_scene();
+        self.clear_viewport_preview_cache();
+    }
+
+    pub(super) fn update_stage_death_barrier(&mut self, y: f32) {
+        if !y.is_finite() || y - sms_scene::BLANK_STAGE_SAFETY_PLANE_OFFSET <= -32_767.0 {
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let Some(current) = document.death_barrier.as_mut() else {
+            return;
+        };
+        if current.y == y {
+            return;
+        }
+        current.y = y;
+        self.document_dirty = stage_document_differs_from_saved(
+            document,
+            &self.saved_objects,
+            &self.saved_lighting,
+            &self.saved_death_barrier,
+            &self.saved_archive_edits,
+            &self.saved_dialogue_authoring,
+            &self.saved_dialogue_library,
+        );
+        self.flush_document_change();
+        self.rebuild_model_preview_from_document_async();
         self.clear_viewport_preview_cache();
     }
 
@@ -3519,6 +3551,7 @@ impl SmsEditorApp {
                     document,
                     &self.saved_objects,
                     &self.saved_lighting,
+                    &self.saved_death_barrier,
                     &self.saved_archive_edits,
                     &self.saved_dialogue_authoring,
                     &self.saved_dialogue_library,
@@ -3572,6 +3605,7 @@ impl SmsEditorApp {
                 document,
                 &self.saved_objects,
                 &self.saved_lighting,
+                &self.saved_death_barrier,
                 &self.saved_archive_edits,
                 &self.saved_dialogue_authoring,
                 &self.saved_dialogue_library,
@@ -3683,6 +3717,7 @@ impl SmsEditorApp {
                 document,
                 &self.saved_objects,
                 &self.saved_lighting,
+                &self.saved_death_barrier,
                 &self.saved_archive_edits,
                 &self.saved_dialogue_authoring,
                 &self.saved_dialogue_library,
@@ -3747,6 +3782,7 @@ impl SmsEditorApp {
                 document,
                 &self.saved_objects,
                 &self.saved_lighting,
+                &self.saved_death_barrier,
                 &self.saved_archive_edits,
                 &self.saved_dialogue_authoring,
                 &self.saved_dialogue_library,
@@ -3798,6 +3834,7 @@ impl SmsEditorApp {
                 document,
                 &self.saved_objects,
                 &self.saved_lighting,
+                &self.saved_death_barrier,
                 &self.saved_archive_edits,
                 &self.saved_dialogue_authoring,
                 &self.saved_dialogue_library,
@@ -4327,6 +4364,7 @@ mod tests {
             dialogue_library: Default::default(),
             load_issues: Vec::new(),
             lighting: StageLighting::default(),
+            death_barrier: None,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         }
@@ -5520,6 +5558,7 @@ mod tests {
             registry: None,
             load_issues: Vec::new(),
             lighting: sms_scene::StageLighting::default(),
+            death_barrier: None,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         };
@@ -5599,6 +5638,7 @@ mod tests {
             registry: None,
             load_issues: Vec::new(),
             lighting: sms_scene::StageLighting::default(),
+            death_barrier: None,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         };
@@ -6762,6 +6802,7 @@ mod tests {
             &document,
             &document.objects,
             &document.lighting,
+            &document.death_barrier,
             &saved_archive_edits,
             &document.dialogue_authoring,
             &document.dialogue_library,
@@ -6772,6 +6813,7 @@ mod tests {
             &document,
             &document.objects,
             &document.lighting,
+            &document.death_barrier,
             &saved_archive_edits,
             &document.dialogue_authoring,
             &document.dialogue_library,

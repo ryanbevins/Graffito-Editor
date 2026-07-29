@@ -3336,7 +3336,11 @@ fn goop_collision_triangles(collision: &ColFile) -> Vec<GoopTerrainTriangle> {
     collision
         .groups()
         .iter()
-        .flat_map(|group| {
+        .enumerate()
+        .filter(|(group_index, _)| {
+            !sms_scene::is_blank_stage_infrastructure_group(collision, *group_index)
+        })
+        .flat_map(|(_, group)| {
             group.triangles.iter().filter_map(|triangle| {
                 let [a, b, c] = triangle.vertex_indices;
                 let vertices = [a, b, c].map(|index| {
@@ -4003,6 +4007,7 @@ mod tests {
             dialogue_library: Default::default(),
             load_issues: Vec::new(),
             lighting: Default::default(),
+            death_barrier: None,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         };
@@ -4116,6 +4121,7 @@ mod tests {
             dialogue_library: Default::default(),
             load_issues: Vec::new(),
             lighting: Default::default(),
+            death_barrier: None,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         };
@@ -4198,6 +4204,7 @@ mod tests {
             dialogue_library: Default::default(),
             load_issues: Vec::new(),
             lighting: Default::default(),
+            death_barrier: None,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         };
@@ -4333,6 +4340,7 @@ mod tests {
             dialogue_library: Default::default(),
             load_issues: Vec::new(),
             lighting: Default::default(),
+            death_barrier: None,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         };
@@ -4391,6 +4399,7 @@ mod tests {
             dialogue_library: Default::default(),
             load_issues: Vec::new(),
             lighting: Default::default(),
+            death_barrier: None,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         };
@@ -4437,6 +4446,7 @@ mod tests {
             dialogue_library: Default::default(),
             load_issues: Vec::new(),
             lighting: Default::default(),
+            death_barrier: None,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         };
@@ -4540,6 +4550,84 @@ mod tests {
             0x0801
         ));
         assert_eq!(goop_collision_triangles(&collision).len(), 2);
+    }
+
+    #[test]
+    fn generated_depth_ignores_custom_stage_death_and_safety_planes() {
+        let extent = sms_scene::BLANK_STAGE_SAFETY_PLANE_HALF_EXTENT;
+        let death_y = sms_scene::DEFAULT_BLANK_STAGE_DEATH_BARRIER_Y;
+        let safety_y = death_y - sms_scene::BLANK_STAGE_SAFETY_PLANE_OFFSET;
+        let collision = sms_formats::ColFile::new(
+            vec![
+                sms_formats::ColVertex::new(0.0, 0.0, 0.0),
+                sms_formats::ColVertex::new(0.0, 0.0, 100.0),
+                sms_formats::ColVertex::new(100.0, 0.0, 0.0),
+                sms_formats::ColVertex::new(-extent, death_y, -extent),
+                sms_formats::ColVertex::new(-extent, death_y, extent),
+                sms_formats::ColVertex::new(extent, death_y, extent),
+                sms_formats::ColVertex::new(extent, death_y, -extent),
+                sms_formats::ColVertex::new(-extent, safety_y, -extent),
+                sms_formats::ColVertex::new(-extent, safety_y, extent),
+                sms_formats::ColVertex::new(extent, safety_y, extent),
+                sms_formats::ColVertex::new(extent, safety_y, -extent),
+            ],
+            vec![
+                sms_formats::ColGroup {
+                    surface_type: 0,
+                    has_per_triangle_data: false,
+                    triangles: vec![sms_formats::ColTriangle {
+                        vertex_indices: [0, 1, 2],
+                        attribute_0: 0,
+                        attribute_1: 0,
+                        data: None,
+                    }],
+                },
+                sms_formats::ColGroup {
+                    surface_type: sms_scene::BLANK_STAGE_DEATH_BARRIER_SURFACE_TYPE,
+                    has_per_triangle_data: false,
+                    triangles: vec![
+                        sms_formats::ColTriangle {
+                            vertex_indices: [3, 4, 5],
+                            attribute_0: 0,
+                            attribute_1: 0,
+                            data: None,
+                        },
+                        sms_formats::ColTriangle {
+                            vertex_indices: [3, 5, 6],
+                            attribute_0: 0,
+                            attribute_1: 0,
+                            data: None,
+                        },
+                    ],
+                },
+                sms_formats::ColGroup {
+                    surface_type: sms_scene::BLANK_STAGE_SAFETY_PLANE_SURFACE_TYPE,
+                    has_per_triangle_data: false,
+                    triangles: vec![
+                        sms_formats::ColTriangle {
+                            vertex_indices: [7, 8, 9],
+                            attribute_0: 0,
+                            attribute_1: 0,
+                            data: None,
+                        },
+                        sms_formats::ColTriangle {
+                            vertex_indices: [7, 9, 10],
+                            attribute_0: 0,
+                            attribute_1: 0,
+                            data: None,
+                        },
+                    ],
+                },
+            ],
+        );
+
+        assert!(sms_scene::is_blank_stage_infrastructure_group(
+            &collision, 1
+        ));
+        assert!(sms_scene::is_blank_stage_infrastructure_group(
+            &collision, 2
+        ));
+        assert_eq!(goop_collision_triangles(&collision).len(), 1);
     }
 
     #[test]

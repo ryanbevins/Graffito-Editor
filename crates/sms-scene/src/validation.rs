@@ -383,6 +383,31 @@ fn goop_stage_heap_issue(estimate: crate::GoopStageHeapEstimate) -> Option<Valid
 
 pub(super) fn validate_document(document: &StageDocument) -> Vec<ValidationIssue> {
     let mut issues = document.load_issues.clone();
+    let authored_blank = document
+        .stage_archive
+        .as_ref()
+        .is_some_and(|archive| matches!(archive.origin(), super::StageOrigin::Blank { .. }));
+    match document.death_barrier {
+        Some(_) if !authored_blank => issues.push(ValidationIssue::error(
+            "retail-stage-generated-death-barrier",
+            "Generated death barriers may only be authored for custom stages.",
+        )),
+        Some(death_barrier) if !death_barrier.y.is_finite() => {
+            issues.push(ValidationIssue::error(
+                "invalid-death-barrier-height",
+                "The custom-stage death barrier height must be finite.",
+            ))
+        }
+        Some(death_barrier)
+            if death_barrier.y - super::BLANK_STAGE_SAFETY_PLANE_OFFSET <= -32_767.0 =>
+        {
+            issues.push(ValidationIssue::error(
+                "death-barrier-safety-floor-out-of-range",
+                "Raise the custom-stage death barrier so its safety floor remains above Sunshine's invalid floor sentinel.",
+            ))
+        }
+        Some(_) | None => {}
+    }
     validate_runtime_actor_links(document, &mut issues);
     validate_routes(document, &mut issues);
     issues.extend(super::dialogue_authoring::validate_dialogue_document(

@@ -492,6 +492,16 @@ pub(super) fn load_project_overlay(
     document.route_authoring = overlay.route_authoring;
     document.goop_authoring = overlay.goop_authoring;
     document.dialogue_authoring = overlay.dialogue_authoring;
+    if let Some(death_barrier) = overlay.death_barrier {
+        if document.death_barrier.is_some() {
+            document.death_barrier = Some(death_barrier);
+        } else {
+            document.load_issues.push(super::ValidationIssue::warning(
+                "retail-stage-death-barrier-overlay-ignored",
+                "Saved custom-stage death barrier settings were ignored because this is a retail stage.",
+            ));
+        }
+    }
     if let Some(authoring) = &mut document.goop_authoring {
         authoring.stale |= authoring.requires_generator_upgrade();
     }
@@ -1485,6 +1495,7 @@ mod tests {
             dialogue_library: Default::default(),
             load_issues: Vec::new(),
             lighting: Default::default(),
+            death_barrier: None,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         };

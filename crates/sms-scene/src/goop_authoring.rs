@@ -3083,6 +3083,7 @@ mod tests {
             dialogue_library: Default::default(),
             load_issues: Vec::new(),
             lighting: Default::default(),
+            death_barrier: None,
             actor_previews: std::collections::BTreeMap::new(),
             loaded_project: None,
         };

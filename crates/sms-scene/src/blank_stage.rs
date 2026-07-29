@@ -4,10 +4,10 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use sms_formats::{
-    compile_static_bmd3, ColFile, FormatError, GxMaterial, J3dRebuildDocument,
-    J3dRebuildSectionData, JDramaDocument, JDramaField, JDramaFieldValue, JDramaLightMap,
-    JDramaRecord, JDramaRecordPayload, JDramaTransform, JpaxDocument, StaticModel, StaticModelMesh,
-    StaticModelVertex,
+    compile_static_bmd3, ColFile, ColGroup, ColTriangle, ColVertex, FormatError, GxMaterial,
+    J3dRebuildDocument, J3dRebuildSectionData, JDramaDocument, JDramaField, JDramaFieldValue,
+    JDramaLightMap, JDramaRecord, JDramaRecordPayload, JDramaTransform, JpaxDocument, StaticModel,
+    StaticModelMesh, StaticModelVertex,
 };
 
 use crate::stage_archive::parse_resource;
@@ -16,10 +16,18 @@ use crate::{
     StageResourceDocument,
 };
 
-pub const BLANK_STAGE_PRESET_VERSION: u32 = 6;
+pub const BLANK_STAGE_PRESET_VERSION: u32 = 8;
 pub const DEFAULT_BLANK_STAGE_TARGET_SLOT: &str = "test11";
 pub const BLANK_STAGE_CAMERA_DIRECTORY_MARKER_PATH: &[u8] = b"map/camera/sms_runtime_directory.bmd";
 pub const BLANK_STAGE_COIN_PARTICLE_PATH: &[u8] = b"mapobj/ms_watcoin_kira.jpa";
+/// Rounded stage-level mean from the exact `0x0800` collision planes found in
+/// 34 Japanese retail stage archives. Sunshine stages use different coordinate
+/// origins, so this is only the editable custom-stage starting point.
+pub const DEFAULT_BLANK_STAGE_DEATH_BARRIER_Y: f32 = -1_800.0;
+pub const BLANK_STAGE_SAFETY_PLANE_OFFSET: f32 = 1_000.0;
+pub const BLANK_STAGE_SAFETY_PLANE_HALF_EXTENT: f32 = 41_984.0;
+pub const BLANK_STAGE_SAFETY_PLANE_SURFACE_TYPE: u16 = 0;
+pub const BLANK_STAGE_DEATH_BARRIER_SURFACE_TYPE: u16 = 0x0800;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlankStageBootstrapKind {
@@ -461,15 +469,16 @@ impl BlankStagePreset {
 
     /// Builds an empty but structurally complete authored stage shell.
     ///
-    /// The internal map model is a canonical degenerate triangle and the
-    /// collision document is empty. They exist because Sunshine's
-    /// `TMapModelManager` unconditionally opens both resources; neither is
-    /// user-authored world content. A later map-terrain placement can replace
-    /// the model and append its collision through the normal semantic edits.
-    /// Mario and the sky actor are absent unless explicitly supplied by this
-    /// preset, while neutral editable lighting records remain because the
-    /// retail runtime dereferences `AmbAry`, `LightAry`, and `SunMgr` during
-    /// setup without null checks.
+    /// The internal map model is a canonical degenerate triangle. Its collision
+    /// contains only a collision-query safety plane below playable space and
+    /// the stage's death barrier. This gives airborne movement a legal floor
+    /// result after Mario's collision wrapper skips the pass-through death
+    /// surface, without adding visible geometry or a reachable floor. A later
+    /// map-terrain placement can replace the model and append its collision
+    /// through the normal semantic edits. Mario and the sky actor are absent
+    /// unless explicitly supplied by this preset, while neutral editable
+    /// lighting records remain because the retail runtime dereferences
+    /// `AmbAry`, `LightAry`, and `SunMgr` during setup without null checks.
     pub fn build(&self, bootstrap: BlankStageBootstrapManifest) -> Result<SourceFreeStageArchive> {
         self.build_with_world(
             blank_world_model()?,
@@ -516,7 +525,10 @@ impl BlankStagePreset {
         )?;
         archive.insert_resource(
             b"map/map.col".to_vec(),
-            StageResourceDocument::Collision(world_collision),
+            StageResourceDocument::Collision(reconcile_blank_stage_infrastructure(
+                &world_collision,
+                DEFAULT_BLANK_STAGE_DEATH_BARRIER_Y,
+            )?),
         )?;
         // CPolarSubCamera constructs TCameraBck during scene loading, and
         // MActorAnmData::init unconditionally enumerates /scene/map/camera
@@ -596,6 +608,9 @@ pub fn ensure_blank_stage_runtime_resources(archive: &mut SourceFreeStageArchive
         )?;
         changed = true;
     }
+    if ensure_blank_stage_infrastructure(archive)? {
+        changed = true;
+    }
     if preset_version < BLANK_STAGE_PRESET_VERSION {
         archive.set_origin(crate::StageOrigin::Blank {
             target_slot,
@@ -604,6 +619,179 @@ pub fn ensure_blank_stage_runtime_resources(archive: &mut SourceFreeStageArchive
         changed = true;
     }
     Ok(changed)
+}
+
+fn ensure_blank_stage_infrastructure(archive: &mut SourceFreeStageArchive) -> Result<bool> {
+    let collision = match archive.resource(b"map/map.col") {
+        Some(StageResourceDocument::Collision(collision)) => collision,
+        Some(_) => {
+            return Err(blank_stage_error(
+                "blank stage map/map.col is not typed collision data",
+            ));
+        }
+        None => {
+            archive.insert_resource(
+                b"map/map.col".to_vec(),
+                StageResourceDocument::Collision(blank_stage_infrastructure(
+                    DEFAULT_BLANK_STAGE_DEATH_BARRIER_Y,
+                )),
+            )?;
+            return Ok(true);
+        }
+    };
+    let replacement =
+        reconcile_blank_stage_infrastructure(collision, DEFAULT_BLANK_STAGE_DEATH_BARRIER_Y)?;
+    if replacement == *collision {
+        return Ok(false);
+    }
+
+    archive.replace_resource(
+        b"map/map.col",
+        StageResourceDocument::Collision(replacement),
+    )?;
+    Ok(true)
+}
+
+fn blank_stage_infrastructure(death_barrier_y: f32) -> ColFile {
+    let extent = BLANK_STAGE_SAFETY_PLANE_HALF_EXTENT;
+    let safety_y = death_barrier_y - BLANK_STAGE_SAFETY_PLANE_OFFSET;
+    ColFile::new(
+        vec![
+            ColVertex::new(-extent, death_barrier_y, -extent),
+            ColVertex::new(-extent, death_barrier_y, extent),
+            ColVertex::new(extent, death_barrier_y, extent),
+            ColVertex::new(extent, death_barrier_y, -extent),
+            ColVertex::new(-extent, safety_y, -extent),
+            ColVertex::new(-extent, safety_y, extent),
+            ColVertex::new(extent, safety_y, extent),
+            ColVertex::new(extent, safety_y, -extent),
+        ],
+        vec![
+            ColGroup {
+                surface_type: BLANK_STAGE_DEATH_BARRIER_SURFACE_TYPE,
+                has_per_triangle_data: false,
+                triangles: generated_plane_triangles(0),
+            },
+            ColGroup {
+                surface_type: BLANK_STAGE_SAFETY_PLANE_SURFACE_TYPE,
+                has_per_triangle_data: false,
+                triangles: generated_plane_triangles(4),
+            },
+        ],
+    )
+}
+
+fn generated_plane_triangles(base: u16) -> Vec<ColTriangle> {
+    vec![
+        ColTriangle {
+            vertex_indices: [base, base + 1, base + 2],
+            attribute_0: 0,
+            attribute_1: 0,
+            data: None,
+        },
+        ColTriangle {
+            vertex_indices: [base, base + 2, base + 3],
+            attribute_0: 0,
+            attribute_1: 0,
+            data: None,
+        },
+    ]
+}
+
+pub(crate) fn reconcile_blank_stage_infrastructure(
+    collision: &ColFile,
+    death_barrier_y: f32,
+) -> Result<ColFile> {
+    if !death_barrier_y.is_finite() {
+        return Err(blank_stage_error(
+            "custom-stage death barrier height must be finite",
+        ));
+    }
+    let safety_y = death_barrier_y - BLANK_STAGE_SAFETY_PLANE_OFFSET;
+    if safety_y <= -32_767.0 {
+        return Err(blank_stage_error(format!(
+            "custom-stage death barrier Y {death_barrier_y} places its safety floor at or below Sunshine's invalid floor sentinel"
+        )));
+    }
+
+    let generated = collision
+        .groups()
+        .iter()
+        .enumerate()
+        .filter_map(|(group_index, group)| {
+            blank_stage_infrastructure_group_y(collision, group_index)
+                .map(|y| (group.surface_type, y))
+        })
+        .collect::<Vec<_>>();
+    if generated.len() == 2
+        && generated.contains(&(BLANK_STAGE_DEATH_BARRIER_SURFACE_TYPE, death_barrier_y))
+        && generated.contains(&(BLANK_STAGE_SAFETY_PLANE_SURFACE_TYPE, safety_y))
+    {
+        return Ok(collision.clone());
+    }
+
+    let retained_groups = collision
+        .groups()
+        .iter()
+        .enumerate()
+        .filter(|(group_index, _)| !is_blank_stage_infrastructure_group(collision, *group_index))
+        .map(|(_, group)| group.clone())
+        .collect();
+    let retained = ColFile::new(collision.vertices().to_vec(), retained_groups);
+    crate::stage_export::append_collision_document(
+        &retained,
+        &blank_stage_infrastructure(death_barrier_y),
+        b"map/map.col",
+    )
+}
+
+/// Returns whether one collision group is a generated custom-stage death
+/// barrier or safety floor. Terrain authoring ignores both runtime helpers.
+pub fn is_blank_stage_infrastructure_group(collision: &ColFile, group_index: usize) -> bool {
+    blank_stage_infrastructure_group_y(collision, group_index).is_some()
+}
+
+fn blank_stage_infrastructure_group_y(collision: &ColFile, group_index: usize) -> Option<f32> {
+    let group = collision.groups().get(group_index)?;
+    if !matches!(
+        group.surface_type,
+        BLANK_STAGE_SAFETY_PLANE_SURFACE_TYPE | BLANK_STAGE_DEATH_BARRIER_SURFACE_TYPE
+    ) || group.has_per_triangle_data
+        || group.triangles.len() != 2
+    {
+        return None;
+    }
+
+    let vertices = group
+        .triangles
+        .iter()
+        .flat_map(|triangle| triangle.vertex_indices)
+        .filter_map(|index| collision.vertices().get(usize::from(index)))
+        .collect::<Vec<_>>();
+    if vertices.len() != 6
+        || vertices
+            .iter()
+            .any(|vertex| !vertex.position[1].is_finite())
+    {
+        return None;
+    }
+    let y = vertices[0].position[1];
+    let extent = BLANK_STAGE_SAFETY_PLANE_HALF_EXTENT;
+    let expected_positions = [
+        [-extent, y, -extent],
+        [-extent, y, extent],
+        [extent, y, extent],
+        [-extent, y, -extent],
+        [extent, y, extent],
+        [extent, y, -extent],
+    ];
+    (group.triangles.iter().all(|triangle| {
+        triangle.attribute_0 == 0 && triangle.attribute_1 == 0 && triangle.data.is_none()
+    }) && vertices
+        .iter()
+        .zip(expected_positions)
+        .all(|(actual, expected)| actual.position == expected))
+    .then_some(y)
 }
 
 fn blank_scene_document(
@@ -1965,7 +2153,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_stage_uses_hidden_canonical_map_resources() {
+    fn empty_stage_uses_hidden_canonical_map_resources_and_query_safety_plane() {
         let archive = BlankStagePreset::default().build(bootstrap()).unwrap();
         let StageResourceDocument::Model(model) = archive.resource(b"map/map/map.bmd").unwrap()
         else {
@@ -1986,8 +2174,41 @@ mod tests {
         else {
             panic!("map collision is not typed")
         };
-        assert!(collision.vertices().is_empty());
-        assert!(collision.groups().is_empty());
+        assert_eq!(collision.vertices().len(), 8);
+        assert_eq!(collision.groups().len(), 2);
+        assert!(is_blank_stage_infrastructure_group(collision, 0));
+        assert!(is_blank_stage_infrastructure_group(collision, 1));
+        assert_eq!(
+            collision.groups()[0].surface_type,
+            BLANK_STAGE_DEATH_BARRIER_SURFACE_TYPE
+        );
+        assert_eq!(
+            collision.groups()[1].surface_type,
+            BLANK_STAGE_SAFETY_PLANE_SURFACE_TYPE
+        );
+        assert_eq!(BLANK_STAGE_SAFETY_PLANE_SURFACE_TYPE, 0);
+        assert_eq!(BLANK_STAGE_DEATH_BARRIER_SURFACE_TYPE, 0x0800);
+        let death_y = collision.vertices()[0].position[1];
+        let safety_y = collision.vertices()[4].position[1];
+        let safety_extent = collision.vertices()[0].position[0].abs();
+        assert_eq!(death_y, DEFAULT_BLANK_STAGE_DEATH_BARRIER_Y);
+        assert_eq!(safety_y, death_y - BLANK_STAGE_SAFETY_PLANE_OFFSET);
+        assert!(safety_y > -32_767.0);
+        assert!(safety_extent > 40.0 * 1_024.0);
+        assert!(collision.vertices().iter().all(|vertex| {
+            vertex.position[0].abs() == BLANK_STAGE_SAFETY_PLANE_HALF_EXTENT
+                && vertex.position[2].abs() == BLANK_STAGE_SAFETY_PLANE_HALF_EXTENT
+        }));
+        for group in collision.groups() {
+            for triangle in &group.triangles {
+                let [a, b, c] = triangle
+                    .vertex_indices
+                    .map(|index| collision.vertices()[usize::from(index)].position);
+                let first = [b[0] - a[0], b[2] - a[2]];
+                let second = [c[0] - b[0], c[2] - b[2]];
+                assert!(first[1] * second[0] - first[0] * second[1] > 0.0);
+            }
+        }
 
         let StageResourceDocument::Model(camera_directory_marker) = archive
             .resource(BLANK_STAGE_CAMERA_DIRECTORY_MARKER_PATH)
@@ -2025,6 +2246,12 @@ mod tests {
             .unwrap();
         archive
             .remove_resource(BLANK_STAGE_COIN_PARTICLE_PATH)
+            .unwrap();
+        archive
+            .replace_resource(
+                b"map/map.col",
+                StageResourceDocument::Collision(floor_collision()),
+            )
             .unwrap();
         let StageResourceDocument::Placement(placement) =
             archive.resource_mut(b"map/scene.bin").unwrap()
@@ -2087,6 +2314,13 @@ mod tests {
                 "missing or duplicate migrated {type_name}"
             );
         }
+        let StageResourceDocument::Collision(collision) = archive.resource(b"map/map.col").unwrap()
+        else {
+            panic!("map collision is not typed")
+        };
+        assert_eq!(&collision.groups()[0], &floor_collision().groups()[0]);
+        assert!(is_blank_stage_infrastructure_group(collision, 1));
+        assert!(is_blank_stage_infrastructure_group(collision, 2));
         let after_scene = archive.resource_bytes(b"map/scene.bin").unwrap().unwrap();
         let mario_offset_after = after_scene
             .windows(b"Mario".len())
@@ -2102,10 +2336,51 @@ mod tests {
         let archive = BlankStagePreset::default()
             .build_with_world(empty_model(), collision.clone(), bootstrap())
             .unwrap();
+        let StageResourceDocument::Collision(built) = archive.resource(b"map/map.col").unwrap()
+        else {
+            panic!("map collision is not typed")
+        };
         assert_eq!(
-            archive.resource(b"map/map.col"),
-            Some(&StageResourceDocument::Collision(collision))
+            &built.vertices()[..collision.vertices().len()],
+            collision.vertices()
         );
+        assert_eq!(
+            &built.groups()[..collision.groups().len()],
+            collision.groups()
+        );
+        assert!(is_blank_stage_infrastructure_group(built, 1));
+        assert!(is_blank_stage_infrastructure_group(built, 2));
+    }
+
+    #[test]
+    fn death_barrier_reconciliation_is_editable_and_idempotent() {
+        let collision = reconcile_blank_stage_infrastructure(&floor_collision(), -2_500.0).unwrap();
+        let repeated = reconcile_blank_stage_infrastructure(&collision, -2_500.0).unwrap();
+        assert_eq!(repeated, collision);
+
+        let edited = reconcile_blank_stage_infrastructure(&collision, -1_200.0).unwrap();
+        let generated = edited
+            .groups()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| is_blank_stage_infrastructure_group(&edited, *index))
+            .map(|(_, group)| {
+                let vertex =
+                    edited.vertices()[usize::from(group.triangles[0].vertex_indices[0])].position;
+                (group.surface_type, vertex[1])
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            generated,
+            vec![
+                (BLANK_STAGE_DEATH_BARRIER_SURFACE_TYPE, -1_200.0),
+                (
+                    BLANK_STAGE_SAFETY_PLANE_SURFACE_TYPE,
+                    -1_200.0 - BLANK_STAGE_SAFETY_PLANE_OFFSET
+                ),
+            ]
+        );
+        assert_eq!(&edited.groups()[0], &floor_collision().groups()[0]);
     }
 
     #[test]

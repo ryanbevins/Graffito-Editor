@@ -1397,6 +1397,66 @@ impl SmsEditorApp {
             self.stage_music_controls(ui);
             return;
         }
+        if self.selected_world_member == Some(WorldHierarchyMember::DeathBarrier) {
+            ui.heading("Death Barrier");
+            ui.label(
+                egui::RichText::new("Generated custom-stage collision")
+                    .small()
+                    .color(egui::Color32::GRAY),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                "Mario dies when he contacts this invisible 0x0800 plane. The red plane in the viewport is an editor-only selection helper.",
+            );
+            ui.add_space(8.0);
+
+            let Some(mut death_barrier) = self
+                .document
+                .as_ref()
+                .and_then(|document| document.death_barrier)
+            else {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 180, 90),
+                    "Death barriers are generated only for custom stages.",
+                );
+                return;
+            };
+            let response = ui.horizontal(|ui| {
+                ui.label("Height (Y)");
+                ui.add(
+                    egui::DragValue::new(&mut death_barrier.y)
+                        .speed(10.0)
+                        .range(-31_766.0..=100_000.0),
+                )
+            });
+            let response = response.inner.on_hover_text(
+                "Vertical position of the death collision. Drag or type an exact Sunshine world-space Y value.",
+            );
+            if response.changed() {
+                self.update_stage_death_barrier(death_barrier.y);
+            }
+            if ui
+                .small_button("Reset to Sunshine average")
+                .on_hover_text(
+                    "Uses Y -1800, the rounded mean of explicit death planes in 34 Japanese retail stage archives.",
+                )
+                .clicked()
+            {
+                self.update_stage_death_barrier(
+                    sms_scene::DEFAULT_BLANK_STAGE_DEATH_BARRIER_Y,
+                );
+                death_barrier.y = sms_scene::DEFAULT_BLANK_STAGE_DEATH_BARRIER_Y;
+            }
+            ui.separator();
+            ui.label(format!(
+                "Hidden safety floor: Y {:.1}",
+                death_barrier.y - sms_scene::BLANK_STAGE_SAFETY_PLANE_OFFSET
+            ));
+            ui.small(
+                "The safety floor follows 1000 units below the death plane. Mario's floor query can land on it after the game skips the pass-through death surface, but normal play cannot reach it.",
+            );
+            return;
+        }
         if self.audio_helper_inspector(ui) {
             self.stage_lighting_panel(ui);
             return;

@@ -28,8 +28,8 @@ use sms_scene::{
     AssetRef, AssetRole, DialogueAuthoringDocument, DialogueGameConsumerIndex, DialogueRouteIndex,
     ObjectAuthoringCatalog, ObjectAuthoringCatalogWarning, ProjectDialogueLibrary,
     ResolvedObjectPreview, RouteAuthoringDocument, SceneError, SceneObject, StageArchiveEdits,
-    StageDocument, StageLighting, StageResourceDocument, StageResourceEdit, Transform,
-    ValidationIssue, ValidationSeverity,
+    StageDeathBarrier, StageDocument, StageLighting, StageResourceDocument, StageResourceEdit,
+    Transform, ValidationIssue, ValidationSeverity,
 };
 use sms_schema::{
     bundled_object_registry, ObjectDefinition, ObjectRegistry, ParticleBindingTarget,
@@ -540,12 +540,14 @@ fn stage_document_differs_from_saved(
     document: &StageDocument,
     saved_objects: &[SceneObject],
     saved_lighting: &StageLighting,
+    saved_death_barrier: &Option<StageDeathBarrier>,
     saved_archive_edits: &StageArchiveEdits,
     saved_dialogue_authoring: &Option<DialogueAuthoringDocument>,
     saved_dialogue_library: &ProjectDialogueLibrary,
 ) -> bool {
     document.objects != saved_objects
         || document.lighting != *saved_lighting
+        || document.death_barrier != *saved_death_barrier
         || document.archive_edits != *saved_archive_edits
         || document.dialogue_authoring != *saved_dialogue_authoring
         || document.dialogue_library != *saved_dialogue_library
@@ -1194,6 +1196,7 @@ struct SmsEditorApp {
     next_object_serial: u32,
     saved_objects: Vec<SceneObject>,
     saved_lighting: StageLighting,
+    saved_death_barrier: Option<StageDeathBarrier>,
     saved_archive_edits: StageArchiveEdits,
     saved_dialogue_authoring: Option<DialogueAuthoringDocument>,
     saved_dialogue_library: ProjectDialogueLibrary,
@@ -1453,6 +1456,7 @@ impl Default for SmsEditorApp {
             next_object_serial: 1,
             saved_objects: Vec::new(),
             saved_lighting: StageLighting::default(),
+            saved_death_barrier: None,
             saved_archive_edits: StageArchiveEdits::default(),
             saved_dialogue_authoring: None,
             saved_dialogue_library: ProjectDialogueLibrary::default(),
@@ -2065,6 +2069,7 @@ impl SmsEditorApp {
                                     document,
                                     &self.saved_objects,
                                     &self.saved_lighting,
+                                    &self.saved_death_barrier,
                                     &self.saved_archive_edits,
                                     &self.saved_dialogue_authoring,
                                     &self.saved_dialogue_library,
@@ -2534,6 +2539,7 @@ impl SmsEditorApp {
         self.route_handle_drag = None;
         self.saved_objects = document.objects.clone();
         self.saved_lighting = document.lighting.clone();
+        self.saved_death_barrier = document.death_barrier;
         self.saved_archive_edits = document.archive_edits.clone();
         self.saved_dialogue_authoring = document.dialogue_authoring.clone();
         self.saved_dialogue_library = document.dialogue_library.clone();

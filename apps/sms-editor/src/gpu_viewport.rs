@@ -32,6 +32,7 @@ static NEXT_SCENE_GENERATION: AtomicU64 = AtomicU64::new(1);
 const J3D_SHADER: &str = include_str!("shaders/j3d.wgsl");
 const COMPOSITE_SHADER: &str = include_str!("shaders/composite.wgsl");
 const GRID_SHADER: &str = include_str!("shaders/grid.wgsl");
+const DEATH_BARRIER_SHADER: &str = include_str!("shaders/death_barrier.wgsl");
 const WORLD_GRID_VERTEX_COUNT: u32 = 88;
 
 #[derive(Clone)]
@@ -214,6 +215,7 @@ pub(super) fn render_preview_offscreen(
         active_mirror_slot,
         mirror_plane_y,
         frame.show_grid,
+        frame.death_barrier_y,
     );
     let target = resources
         .viewport_target
@@ -281,6 +283,7 @@ pub struct GpuViewportFrame {
     pub light_color: [f32; 4],
     pub ambient_color: Option<[f32; 4]>,
     pub show_grid: bool,
+    pub death_barrier_y: Option<f32>,
 }
 
 impl Default for GpuViewportFrame {
@@ -299,6 +302,7 @@ impl Default for GpuViewportFrame {
             light_color: [1.0; 4],
             ambient_color: None,
             show_grid: false,
+            death_barrier_y: None,
         }
     }
 }
@@ -399,6 +403,7 @@ impl CallbackTrait for GpuViewportCallback {
                 active_mirror_slot,
                 mirror_plane_y,
                 shared.frame.show_grid,
+                shared.frame.death_barrier_y,
             );
             resources.offscreen_frame_state = Some(frame_state);
         }
@@ -2428,7 +2433,16 @@ impl GpuCameraUniform {
                 frame.viewport_pan[0] / half_width,
                 -frame.viewport_pan[1] / half_height,
             ],
-            clip: [frame.near, 0.0, 0.0, 0.0],
+            clip: [
+                frame.near,
+                frame.death_barrier_y.unwrap_or(0.0),
+                if frame.death_barrier_y.is_some() {
+                    1.0
+                } else {
+                    0.0
+                },
+                sms_scene::BLANK_STAGE_SAFETY_PLANE_HALF_EXTENT,
+            ],
             light_position: vec4(frame.light_position, 0.0),
             light_color: frame.light_color,
             ambient_color: frame.ambient_color.unwrap_or([1.0; 4]),
@@ -2467,6 +2481,7 @@ struct GpuViewportResources {
     j3d_shader: wgpu::ShaderModule,
     wave_mask_pipeline: wgpu::RenderPipeline,
     grid_pipeline: wgpu::RenderPipeline,
+    death_barrier_pipeline: wgpu::RenderPipeline,
     composite_layout: wgpu::BindGroupLayout,
     composite_pipeline: wgpu::RenderPipeline,
     composite_sampler: wgpu::Sampler,
@@ -2551,6 +2566,7 @@ impl GpuViewportResources {
         });
         let wave_mask_pipeline = create_wave_mask_pipeline(device, &pipeline_layout, &j3d_shader);
         let grid_pipeline = create_grid_pipeline(device, &camera_layout);
+        let death_barrier_pipeline = create_death_barrier_pipeline(device, &camera_layout);
         let composite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("sms viewport composite layout"),
             entries: &[
@@ -2627,6 +2643,7 @@ impl GpuViewportResources {
             j3d_shader,
             wave_mask_pipeline,
             grid_pipeline,
+            death_barrier_pipeline,
             composite_layout,
             composite_pipeline,
             composite_sampler,
@@ -3120,6 +3137,7 @@ impl GpuViewportResources {
         active_mirror_slot: Option<usize>,
         mirror_plane_y: Option<f32>,
         show_grid: bool,
+        death_barrier_y: Option<f32>,
     ) {
         let Some(target) = &self.viewport_target else {
             return;
@@ -3256,6 +3274,9 @@ impl GpuViewportResources {
                 render_pass.set_bind_group(1, material, &[]);
                 draw_gpu_batch(&mut render_pass, batch);
             }
+            if death_barrier_y.is_some() && !has_post_snapshot {
+                self.draw_death_barrier(&mut render_pass);
+            }
             if show_grid && !has_post_snapshot {
                 self.draw_world_grid(&mut render_pass);
             }
@@ -3375,6 +3396,9 @@ impl GpuViewportResources {
             render_pass.set_bind_group(1, material, &[]);
             draw_gpu_batch(&mut render_pass, batch);
         }
+        if death_barrier_y.is_some() {
+            self.draw_death_barrier(&mut render_pass);
+        }
         if show_grid {
             self.draw_world_grid(&mut render_pass);
         }
@@ -3383,6 +3407,11 @@ impl GpuViewportResources {
     fn draw_world_grid<'pass>(&'pass self, render_pass: &mut wgpu::RenderPass<'pass>) {
         render_pass.set_pipeline(&self.grid_pipeline);
         render_pass.draw(0..WORLD_GRID_VERTEX_COUNT, 0..1);
+    }
+
+    fn draw_death_barrier<'pass>(&'pass self, render_pass: &mut wgpu::RenderPass<'pass>) {
+        render_pass.set_pipeline(&self.death_barrier_pipeline);
+        render_pass.draw(0..6, 0..1);
     }
 
     fn composite(&self, render_pass: &mut wgpu::RenderPass<'static>) {
@@ -3872,6 +3901,58 @@ fn create_grid_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+fn create_death_barrier_pipeline(
+    device: &wgpu::Device,
+    camera_layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("sms viewport death barrier pipeline layout"),
+        bind_group_layouts: &[Some(camera_layout)],
+        immediate_size: 0,
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("sms viewport death barrier shader"),
+        source: wgpu::ShaderSource::Wgsl(DEATH_BARRIER_SHADER.into()),
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("sms viewport death barrier pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: GX_COLOR_FORMAT,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Cw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(death_barrier_depth_stencil_state()),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn death_barrier_depth_stencil_state() -> wgpu::DepthStencilState {
+    world_grid_depth_stencil_state()
 }
 
 fn world_grid_depth_stencil_state() -> wgpu::DepthStencilState {

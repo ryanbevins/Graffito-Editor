@@ -4404,6 +4404,7 @@ mod tests {
             dialogue_library: Default::default(),
             load_issues: Vec::new(),
             lighting: sms_scene::StageLighting::default(),
+            death_barrier: None,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         });
@@ -5128,6 +5129,7 @@ mod tests {
             registry: None,
             load_issues: Vec::new(),
             lighting: sms_scene::StageLighting::default(),
+            death_barrier: None,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         };

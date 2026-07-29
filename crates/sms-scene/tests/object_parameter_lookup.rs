@@ -39,6 +39,7 @@ fn document_with_archive(archive: SourceFreeStageArchive) -> StageDocument {
         dialogue_library: Default::default(),
         load_issues: Vec::new(),
         lighting: StageLighting::default(),
+        death_barrier: None,
         actor_previews: BTreeMap::new(),
         loaded_project: None,
     }

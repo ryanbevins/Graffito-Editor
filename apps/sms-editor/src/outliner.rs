@@ -19,6 +19,7 @@ enum OutlinerNodeKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WorldHierarchyMember {
     StageMusic,
+    DeathBarrier,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +90,21 @@ pub(super) fn build_outliner_tree(
         world_member: Some(WorldHierarchyMember::StageMusic),
         children: Vec::new(),
     }];
+    if let Some(death_barrier) = document.death_barrier {
+        stage_children.push(OutlinerNode {
+            key: "stage-member:death-barrier".to_string(),
+            label: "Death Barrier".to_string(),
+            detail: format!("Y {:.1}", death_barrier.y),
+            search_text: format!(
+                "death barrier kill plane collision y {:.1}",
+                death_barrier.y
+            ),
+            kind: OutlinerNodeKind::StageMember,
+            object_id: None,
+            world_member: Some(WorldHierarchyMember::DeathBarrier),
+            children: Vec::new(),
+        });
+    }
     stage_children.extend(builder.semantic_resource_nodes());
     stage_children.extend(builder.remaining_object_nodes());
 
@@ -479,14 +495,26 @@ fn show_stage_member_node(
     clicked: &mut Option<OutlinerSelection>,
 ) {
     let selected = node.world_member == selected_world_member;
+    let (icon, hover) = match node.world_member {
+        Some(WorldHierarchyMember::StageMusic) => (
+            "♫",
+            "Sunshine stage-wide music state (MSMainProc::MSStageInfo). Select to edit.",
+        ),
+        Some(WorldHierarchyMember::DeathBarrier) => (
+            "▰",
+            "Custom-stage death collision and its hidden query safety floor. Select to edit.",
+        ),
+        None => ("◆", "Select to edit this stage setting."),
+    };
     let response = ui
         .add_sized(
             [ui.available_width(), 38.0],
-            egui::Button::selectable(selected, format!("♫  {}\n    {}", node.label, node.detail)),
+            egui::Button::selectable(
+                selected,
+                format!("{icon}  {}\n    {}", node.label, node.detail),
+            ),
         )
-        .on_hover_text(
-            "Sunshine stage-wide music state (MSMainProc::MSStageInfo). Select to edit.",
-        );
+        .on_hover_text(hover);
     if response.clicked() {
         *clicked = node.world_member.map(OutlinerSelection::WorldMember);
     }
@@ -577,6 +605,7 @@ mod tests {
             dialogue_library: Default::default(),
             load_issues: Vec::new(),
             lighting: Default::default(),
+            death_barrier: None,
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         }
@@ -746,5 +775,22 @@ mod tests {
             Some(WorldHierarchyMember::StageMusic)
         );
         assert_eq!(tree.visible_objects, 0);
+    }
+
+    #[test]
+    fn custom_stage_death_barrier_is_a_searchable_world_member() {
+        let mut document = document(Vec::new());
+        document.death_barrier = Some(sms_scene::StageDeathBarrier { y: -2_345.0 });
+        let tree = build_outliner_tree(&document, "death", "Game default");
+        assert_eq!(tree.roots.len(), 1);
+        let barrier = &tree.roots[0].children[0];
+        assert_eq!(
+            barrier.world_member,
+            Some(WorldHierarchyMember::DeathBarrier)
+        );
+        assert_eq!(barrier.kind, OutlinerNodeKind::StageMember);
+        assert_eq!(barrier.label, "Death Barrier");
+        assert_eq!(barrier.detail, "Y -2345.0");
+        assert!(barrier.object_id.is_none());
     }
 }

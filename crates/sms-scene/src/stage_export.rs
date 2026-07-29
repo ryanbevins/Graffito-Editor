@@ -389,6 +389,27 @@ impl StageDocument {
         let baseline = archive.encode()?;
 
         apply_resource_edits(&mut archive, edits)?;
+        if let Some(death_barrier) = self.death_barrier {
+            let collision = match archive.resource(b"map/map.col") {
+                Some(StageResourceDocument::Collision(collision)) => collision,
+                Some(_) => {
+                    return Err(stage_export_error(
+                        "custom-stage map/map.col is not typed collision data",
+                    ));
+                }
+                None => {
+                    return Err(stage_export_error(
+                        "custom stage is missing required map/map.col collision",
+                    ));
+                }
+            };
+            let collision = crate::blank_stage::reconcile_blank_stage_infrastructure(
+                collision,
+                death_barrier.y,
+            )?;
+            archive
+                .replace_resource(b"map/map.col", StageResourceDocument::Collision(collision))?;
+        }
         let has_goop = self
             .goop_authoring
             .as_ref()
@@ -4310,6 +4331,7 @@ mod tests {
                 dialogue_library: Default::default(),
                 load_issues: Vec::new(),
                 lighting: crate::StageLighting::default(),
+                death_barrier: None,
                 actor_previews: BTreeMap::new(),
                 loaded_project: None,
             }
