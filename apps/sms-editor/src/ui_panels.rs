@@ -1297,8 +1297,25 @@ impl SmsEditorApp {
         }
         ui.separator();
 
+        // A pick made outside this panel has to be surfaced here: expand its
+        // ancestors and scroll to it. The request survives across frames
+        // because a group that was collapsed does not render its children
+        // until the expand animation has started.
+        if self.outliner_observed_selection != selected_id {
+            self.outliner_observed_selection = selected_id.clone();
+            self.outliner_reveal_pending = selected_id.clone();
+        }
+        let reveal_id = self.outliner_reveal_pending.clone();
+        let render = OutlinerRender {
+            selected_id: selected_id.as_deref(),
+            selected_world_member,
+            force_open: !self.outliner_filter.trim().is_empty(),
+            reveal_id: reveal_id.as_deref(),
+        };
+
         let mut clicked_selection = None;
         let mut clicked_model_instance = None;
+        let mut revealed = reveal_id.is_none();
         let model_instances = self
             .model_instances
             .iter()
@@ -1337,13 +1354,9 @@ impl SmsEditorApp {
                 });
                 return;
             };
-            clicked_selection = show_outliner_tree(
-                ui,
-                tree,
-                selected_id.as_deref(),
-                selected_world_member,
-                !self.outliner_filter.trim().is_empty(),
-            );
+            let outliner = show_outliner_tree(ui, tree, &render);
+            clicked_selection = outliner.clicked;
+            revealed |= outliner.revealed;
             if tree.visible_objects == 0 {
                 ui.add_space(16.0);
                 ui.vertical_centered(|ui| {
@@ -1352,6 +1365,13 @@ impl SmsEditorApp {
                 });
             }
         });
+        if revealed {
+            self.outliner_reveal_pending = None;
+        } else {
+            // The node was still inside a group that had not started opening.
+            // Ask for another frame so the animation can render it.
+            ui.ctx().request_repaint();
+        }
         if clicked_selection.is_some() || clicked_model_instance.is_some() {
             self.content_browser.inspector_active = false;
         }
