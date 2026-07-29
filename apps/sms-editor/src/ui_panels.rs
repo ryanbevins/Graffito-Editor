@@ -490,8 +490,13 @@ impl SmsEditorApp {
             |ui| self.outliner_panel(ui),
         );
         ui.separator();
-        egui::ScrollArea::vertical()
+        // Scroll on both axes and refuse to shrink to content. A vertical-only
+        // scroll area still reports its content's full width, and a panel grows
+        // to whatever its contents demand, so the inspector's widest row set the
+        // dock's minimum width and dragging narrower than that snapped back.
+        egui::ScrollArea::both()
             .id_salt("inspector-scroll")
+            .auto_shrink([false, false])
             .show(ui, |ui| self.inspector_panel(ui));
     }
 
@@ -1246,53 +1251,55 @@ impl SmsEditorApp {
             .filter(|instance| instance.stage_id.eq_ignore_ascii_case(&self.stage_id))
             .cloned()
             .collect::<Vec<_>>();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            if !model_instances.is_empty() {
-                egui::CollapsingHeader::new("Authored Model Instances")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        for instance in &model_instances {
-                            if ui
-                                .selectable_label(
-                                    self.selected_model_instance_id
-                                        == Some(instance.placement.instance_id),
-                                    format!(
-                                        "{}  ({})",
-                                        bilingual_game_text(&instance.placement.name),
-                                        instance.placement.instance_id
-                                    ),
-                                )
-                                .clicked()
-                            {
-                                clicked_model_instance = Some(instance.placement.instance_id);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if !model_instances.is_empty() {
+                    egui::CollapsingHeader::new("Authored Model Instances")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            for instance in &model_instances {
+                                if ui
+                                    .selectable_label(
+                                        self.selected_model_instance_id
+                                            == Some(instance.placement.instance_id),
+                                        format!(
+                                            "{}  ({})",
+                                            bilingual_game_text(&instance.placement.name),
+                                            instance.placement.instance_id
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    clicked_model_instance = Some(instance.placement.instance_id);
+                                }
                             }
-                        }
+                        });
+                    ui.separator();
+                }
+                let Some(tree) = tree.as_ref() else {
+                    ui.add_space(16.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("No level open").color(egui::Color32::GRAY));
+                        ui.small("Open a level to browse its scene hierarchy.");
                     });
-                ui.separator();
-            }
-            let Some(tree) = tree.as_ref() else {
-                ui.add_space(16.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("No level open").color(egui::Color32::GRAY));
-                    ui.small("Open a level to browse its scene hierarchy.");
-                });
-                return;
-            };
-            clicked_selection = show_outliner_tree(
-                ui,
-                tree,
-                selected_id.as_deref(),
-                selected_world_member,
-                !self.outliner_filter.trim().is_empty(),
-            );
-            if tree.visible_objects == 0 {
-                ui.add_space(16.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("No matching objects").strong());
-                    ui.small("Try a factory, class, object name, or identifier.");
-                });
-            }
-        });
+                    return;
+                };
+                clicked_selection = show_outliner_tree(
+                    ui,
+                    tree,
+                    selected_id.as_deref(),
+                    selected_world_member,
+                    !self.outliner_filter.trim().is_empty(),
+                );
+                if tree.visible_objects == 0 {
+                    ui.add_space(16.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("No matching objects").strong());
+                        ui.small("Try a factory, class, object name, or identifier.");
+                    });
+                }
+            });
         if clicked_selection.is_some() || clicked_model_instance.is_some() {
             self.content_browser.inspector_active = false;
         }
