@@ -1631,12 +1631,35 @@ impl SmsEditorApp {
         }
     }
 
+    /// Leaves placement mode without spawning anything. Returns whether there
+    /// was anything to leave.
+    fn cancel_active_placement(&mut self) -> bool {
+        let had_placement = self.active_placement.take().is_some();
+        let was_placing = self.tool == EditorTool::Place;
+        if !had_placement && !was_placing {
+            return false;
+        }
+        self.clear_viewport_drag_preview();
+        if was_placing {
+            self.tool = EditorTool::Select;
+        }
+        true
+    }
+
     fn handle_editor_shortcuts(&mut self, ctx: &egui::Context) {
         if text_editor_owns_shortcuts(ctx) {
             return;
         }
 
         self.content_browser_keyboard(ctx);
+
+        // Escape backs out of placement. Handled here rather than in the
+        // viewport so it works with the pointer anywhere, including over the
+        // content browser the placement was started from.
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) && self.cancel_active_placement()
+        {
+            return;
+        }
 
         if ctx.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::Z)) {
             self.undo();

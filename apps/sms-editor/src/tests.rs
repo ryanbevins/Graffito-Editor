@@ -5041,3 +5041,22 @@ fn k_keeps_a_downward_camera_angle_alone() {
     app.frame_world_origin();
     assert_eq!(app.renderer.camera().pitch_degrees, -45.0);
 }
+
+#[test]
+fn escape_leaves_placement_mode() {
+    let mut app = SmsEditorApp {
+        tool: EditorTool::Place,
+        active_placement: Some(ActivePlacement::Object {
+            factory_name: "Amenbo".to_string(),
+        }),
+        ..SmsEditorApp::default()
+    };
+
+    assert!(app.cancel_active_placement());
+    assert!(app.active_placement.is_none());
+    // Place is a mode, so leaving it has to land somewhere usable.
+    assert_eq!(app.tool, EditorTool::Select);
+
+    // Nothing to cancel, so Escape stays available to whatever else wants it.
+    assert!(!app.cancel_active_placement());
+}
