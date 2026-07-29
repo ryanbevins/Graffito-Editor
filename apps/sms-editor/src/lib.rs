@@ -1171,8 +1171,9 @@ struct SmsEditorApp {
     /// Selection the outliner last observed, used to notice a pick made
     /// elsewhere (the viewport, undo, startup focus) and reveal it.
     outliner_observed_selection: Option<String>,
-    /// Object the outliner still needs to expand to and scroll into view.
-    outliner_reveal_pending: Option<String>,
+    /// Object the outliner still needs to expand to and scroll into view, with
+    /// a frame budget so a target that never renders cannot pin the scroll.
+    outliner_reveal_pending: Option<(String, u8)>,
     object_filter: String,
     scene_filter: String,
     skybox_filter: String,
