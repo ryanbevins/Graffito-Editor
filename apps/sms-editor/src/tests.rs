@@ -5001,3 +5001,89 @@ fn framing_bounds_ignore_billboards_and_effect_layers() {
         );
     }
 }
+
+#[test]
+fn a_skybox_only_stage_still_gets_the_origin_grid() {
+    // A source-free stage holds nothing but its skybox. Sky is drawn
+    // camera-relative and gives the grid no depth buffer to render against, so
+    // treating "has any triangles" as a depth pass left a new project with no
+    // grid at all.
+    let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(640.0, 480.0));
+    let mut app = camera_app();
+
+    let mut sky = textured_blended_triangle();
+    sky.render_layer = PreviewRenderLayer::Sky;
+    let mut preview = preview_for_texture_alpha(false, false);
+    preview.triangles = vec![sky];
+    app.model_preview = Some(preview);
+    assert!(
+        !app.world_grid_is_depth_rendered(rect),
+        "a sky-only preview must fall back to the painted grid"
+    );
+
+    // Once the stage has real terrain the depth-rendered grid takes over again.
+    let mut ground = textured_blended_triangle();
+    ground.render_layer = PreviewRenderLayer::Main;
+    if let Some(preview) = app.model_preview.as_mut() {
+        preview.triangles.push(ground);
+    }
+    assert!(app.world_grid_is_depth_rendered(rect));
+}
+
+#[test]
+fn an_empty_stage_frames_the_origin_instead_of_nan() {
+    // Sky is excluded from camera bounds, so a source-free stage leaves them at
+    // their empty INFINITY seeds. The midpoint of those is NaN, which reached
+    // the camera focus and made every world-space projection return None, so
+    // the grid, gizmo and object markers all vanished.
+    let mut preview = preview_for_texture_alpha(false, false);
+    // The seeds a freshly built preview starts from when nothing widens them.
+    preview.camera_bounds_min = [f32::INFINITY; 3];
+    preview.camera_bounds_max = [f32::NEG_INFINITY; 3];
+    assert_eq!(preview.center(), [0.0, 0.0, 0.0]);
+    assert!(preview.radius().is_finite());
+
+    let mut app = camera_app();
+    app.model_preview = Some(preview);
+    app.reset_camera();
+    let camera = app.renderer.camera();
+    assert!(
+        camera.focus.iter().all(|axis| axis.is_finite()),
+        "an empty stage must not leave the camera focus non-finite"
+    );
+    assert!(camera.distance.is_finite() && camera.distance > 0.0);
+}
+
+#[test]
+fn k_frames_the_origin_grid_from_a_lost_camera() {
+    let mut app = camera_app();
+    // Camera shoved far away and tipped up at the sky, where the ground plane
+    // is off screen entirely.
+    {
+        let camera = app.renderer.camera_mut();
+        camera.focus = [250_000.0, 90_000.0, -180_000.0];
+        camera.pitch_degrees = 60.0;
+        camera.distance = 400_000.0;
+    }
+
+    app.frame_world_origin();
+    while app.advance_camera_focus_animation(1.0 / 60.0) {}
+
+    let camera = app.renderer.camera();
+    assert_eq!(camera.focus, [0.0, 0.0, 0.0]);
+    assert!(
+        camera.pitch_degrees <= -5.0,
+        "an upward camera must be tipped down so the ground plane is visible"
+    );
+    // Close enough to see the grid, far enough to hold all of it.
+    assert!(camera.distance > crate::viewport_ui::WORLD_GRID_HALF_EXTENT);
+    assert!(camera.distance < 100_000.0);
+}
+
+#[test]
+fn k_keeps_a_downward_camera_angle_alone() {
+    let mut app = camera_app();
+    app.renderer.camera_mut().pitch_degrees = -45.0;
+    app.frame_world_origin();
+    assert_eq!(app.renderer.camera().pitch_degrees, -45.0);
+}

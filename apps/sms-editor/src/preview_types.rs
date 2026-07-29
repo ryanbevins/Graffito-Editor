@@ -188,7 +188,16 @@ impl ModelPreview {
         !self.level_transform_models.is_empty() || !self.level_transform_particles.is_empty()
     }
 
+    /// Centre of the camera bounds, or the origin when there are none.
+    ///
+    /// A source-free stage holds nothing but its skybox, and sky is excluded
+    /// from bounds, so the min/max stay at their empty `INFINITY` seeds. The
+    /// midpoint of those is `NaN`, which reached the camera focus and made
+    /// every world-space projection fail: no grid, no gizmo, no object markers.
     pub(super) fn center(&self) -> [f32; 3] {
+        if !bounds_are_finite(self.camera_bounds_min, self.camera_bounds_max) {
+            return [0.0; 3];
+        }
         [
             (self.camera_bounds_min[0] + self.camera_bounds_max[0]) * 0.5,
             (self.camera_bounds_min[1] + self.camera_bounds_max[1]) * 0.5,
@@ -196,7 +205,12 @@ impl ModelPreview {
         ]
     }
 
+    /// Radius of the camera bounds, floored so an empty stage still frames the
+    /// origin grid rather than resolving to an infinite distance.
     pub(super) fn radius(&self) -> f32 {
+        if !bounds_are_finite(self.camera_bounds_min, self.camera_bounds_max) {
+            return 1000.0;
+        }
         let dx = self.camera_bounds_max[0] - self.camera_bounds_min[0];
         let dy = self.camera_bounds_max[1] - self.camera_bounds_min[1];
         let dz = self.camera_bounds_max[2] - self.camera_bounds_min[2];

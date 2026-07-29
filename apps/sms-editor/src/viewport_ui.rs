@@ -42,6 +42,10 @@ pub(super) fn viewport_mouse_capture_should_release(
     captured && (!secondary_down || !window_focused)
 }
 
+/// Half-width of the world grid, shared by the painter and the `K` command so
+/// framing it cannot drift from where it is drawn.
+pub(super) const WORLD_GRID_HALF_EXTENT: f32 = 5000.0;
+
 fn visit_world_grid_segments(mut visitor: impl FnMut([f32; 3], [f32; 3], egui::Color32, f32)) {
     let minor = egui::Color32::from_rgba_unmultiplied(178, 186, 178, 32);
     let major = egui::Color32::from_rgba_unmultiplied(213, 200, 160, 58);
@@ -439,6 +443,11 @@ impl SmsEditorApp {
 
         if response.hovered() && ui.input(|input| input.key_pressed(egui::Key::F)) {
             self.frame_selected();
+            self.mark_viewport_interaction(ui);
+        }
+
+        if response.hovered() && ui.input(|input| input.key_pressed(egui::Key::K)) {
+            self.frame_world_origin();
             self.mark_viewport_interaction(ui);
         }
 
@@ -1142,6 +1151,23 @@ impl SmsEditorApp {
             self.tool,
             EditorTool::Move | EditorTool::Rotate | EditorTool::Scale
         )
+    }
+
+    /// Glides the camera onto the world origin grid.
+    ///
+    /// A recovery command: an empty stage, a stray focus, or a camera left
+    /// pointing at the skybox can all put the grid somewhere the viewport is
+    /// not looking, and this brings it back into view without touching the
+    /// scene. Pitch is forced downward only when the camera is level or looking
+    /// up, where the ground plane would otherwise stay off screen.
+    pub(super) fn frame_world_origin(&mut self) {
+        let half = WORLD_GRID_HALF_EXTENT;
+        let (focus, distance) =
+            camera_focus_target_for_bounds([[-half, 0.0, -half], [half, 0.0, half]]);
+        if self.renderer.camera().pitch_degrees > -5.0 {
+            self.renderer.camera_mut().pitch_degrees = -30.0;
+        }
+        self.begin_camera_focus_animation(focus, distance);
     }
 
     pub(super) fn cancel_camera_focus_animation(&mut self) {
@@ -2408,7 +2434,7 @@ impl SmsEditorApp {
         })
     }
 
-    fn world_grid_is_depth_rendered(&self, rect: egui::Rect) -> bool {
+    pub(super) fn world_grid_is_depth_rendered(&self, rect: egui::Rect) -> bool {
         if rect.width() < 2.0 || rect.height() < 2.0 {
             return false;
         }
@@ -2418,7 +2444,14 @@ impl SmsEditorApp {
         if self.view_mode == ViewMode::Collision {
             self.renderer.config().show_collision && !preview.collision_triangles.is_empty()
         } else {
-            !preview.triangles.is_empty()
+            // Only world-space geometry gives the grid a depth buffer to render
+            // against. A source-free stage holds nothing but its skybox, which
+            // is drawn camera-relative, so treating "has any triangles" as a
+            // depth pass left a new project with no grid at all.
+            preview
+                .triangles
+                .iter()
+                .any(|triangle| preview_layer_is_world_space(triangle.render_layer))
         }
     }
 
