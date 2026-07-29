@@ -1,6 +1,12 @@
 use super::*;
 
 #[test]
+fn content_dock_window_clamp_does_not_replace_the_preferred_height() {
+    assert_eq!(preferred_content_dock_height(700.0, 320.0, false), 700.0);
+    assert_eq!(preferred_content_dock_height(700.0, 480.0, true), 480.0);
+}
+
+#[test]
 fn animated_viewport_repaint_is_bounded_to_the_sunshine_frame_clock() {
     let ctx = egui::Context::default();
     let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
