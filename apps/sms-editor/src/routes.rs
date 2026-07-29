@@ -67,6 +67,18 @@ impl SmsEditorApp {
         });
     }
 
+    /// Label for a control point: the number the viewport draws beside it.
+    ///
+    /// Raw ids like `g0000:n0004` say nothing about which point on screen they
+    /// are, so the panel uses the same 1-based numbering the viewport paints.
+    fn route_control_label(graph: &sms_scene::RouteGraph, id: &str) -> String {
+        graph
+            .controls
+            .iter()
+            .position(|control| control.id == id)
+            .map_or_else(|| id.to_string(), |index| (index + 1).to_string())
+    }
+
     pub(super) fn route_inspector_panel(&mut self, ui: &mut egui::Ui) -> bool {
         if !self.route_mode {
             return false;
@@ -218,7 +230,10 @@ impl SmsEditorApp {
 
         if let Some(control_id) = self.selected_route_controls.iter().next().cloned() {
             if let Some(control) = graph.control(&control_id) {
-                ui.strong("Control Point");
+                ui.strong(format!(
+                    "Control Point {}",
+                    Self::route_control_label(&graph, &control_id)
+                ));
                 let mut position = control.node.position;
                 let mut changed = false;
                 ui.horizontal(|ui| {
@@ -270,9 +285,11 @@ impl SmsEditorApp {
                     if ui
                         .selectable_label(
                             self.selected_route_link.as_deref() == Some(link.id.as_str()),
-                            format!("{arrow}  {other}"),
+                            format!("{arrow}  {}", Self::route_control_label(&graph, other)),
                         )
-                        .on_hover_text("Select this connection to reverse, split or delete it")
+                        .on_hover_text(format!(
+                            "Connection to {other}. Select it to reverse, split or delete it"
+                        ))
                         .clicked()
                     {
                         self.selected_route_link = Some(link.id.clone());
@@ -301,7 +318,11 @@ impl SmsEditorApp {
             if let Some(link) = graph.links.iter().find(|link| link.id == link_id) {
                 ui.separator();
                 ui.strong("Connection");
-                ui.small(format!("{} -> {}", link.from, link.to));
+                ui.small(format!(
+                    "{} -> {}",
+                    Self::route_control_label(&graph, &link.from),
+                    Self::route_control_label(&graph, &link.to)
+                ));
                 let forward = link.forward.is_some();
                 let reverse = link.reverse.is_some();
                 ui.horizontal(|ui| {
