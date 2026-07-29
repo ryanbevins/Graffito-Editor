@@ -42,6 +42,10 @@ pub(super) fn viewport_mouse_capture_should_release(
     captured && (!secondary_down || !window_focused)
 }
 
+/// Half-width of the world grid, shared by the painter and the `K` command so
+/// framing it cannot drift from where it is drawn.
+pub(super) const WORLD_GRID_HALF_EXTENT: f32 = 5000.0;
+
 fn visit_world_grid_segments(mut visitor: impl FnMut([f32; 3], [f32; 3], egui::Color32, f32)) {
     let minor = egui::Color32::from_rgba_unmultiplied(178, 186, 178, 32);
     let major = egui::Color32::from_rgba_unmultiplied(213, 200, 160, 58);
@@ -52,8 +56,18 @@ fn visit_world_grid_segments(mut visitor: impl FnMut([f32; 3], [f32; 3], egui::C
         } else {
             (minor, 1.0)
         };
-        visitor([offset, 0.0, -5000.0], [offset, 0.0, 5000.0], color, width);
-        visitor([-5000.0, 0.0, offset], [5000.0, 0.0, offset], color, width);
+        visitor(
+            [offset, 0.0, -WORLD_GRID_HALF_EXTENT],
+            [offset, 0.0, WORLD_GRID_HALF_EXTENT],
+            color,
+            width,
+        );
+        visitor(
+            [-WORLD_GRID_HALF_EXTENT, 0.0, offset],
+            [WORLD_GRID_HALF_EXTENT, 0.0, offset],
+            color,
+            width,
+        );
     }
     visitor(
         [-5200.0, 0.0, 0.0],
@@ -439,6 +453,11 @@ impl SmsEditorApp {
 
         if response.hovered() && ui.input(|input| input.key_pressed(egui::Key::F)) {
             self.frame_selected();
+            self.mark_viewport_interaction(ui);
+        }
+
+        if response.hovered() && ui.input(|input| input.key_pressed(egui::Key::K)) {
+            self.frame_world_origin();
             self.mark_viewport_interaction(ui);
         }
 
@@ -1146,6 +1165,20 @@ impl SmsEditorApp {
 
     pub(super) fn cancel_camera_focus_animation(&mut self) {
         self.camera_focus_animation = None;
+    }
+
+    /// Glides the camera onto the world origin grid.
+    ///
+    /// Pitch is forced downward only when the camera is level or looking up,
+    /// where the ground plane would otherwise stay off screen.
+    pub(super) fn frame_world_origin(&mut self) {
+        let half = WORLD_GRID_HALF_EXTENT;
+        let (focus, distance) =
+            camera_focus_target_for_bounds([[-half, 0.0, -half], [half, 0.0, half]]);
+        if self.renderer.camera().pitch_degrees > -5.0 {
+            self.renderer.camera_mut().pitch_degrees = -30.0;
+        }
+        self.begin_camera_focus_animation(focus, distance);
     }
 
     /// Starts a glide toward `focus` at `distance`, replacing any glide already

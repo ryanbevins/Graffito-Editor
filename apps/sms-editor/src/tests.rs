@@ -5001,3 +5001,34 @@ fn framing_bounds_ignore_billboards_and_effect_layers() {
         );
     }
 }
+
+#[test]
+fn k_frames_the_origin_grid_from_a_lost_camera() {
+    let mut app = camera_app();
+    {
+        let camera = app.renderer.camera_mut();
+        camera.focus = [250_000.0, 90_000.0, -180_000.0];
+        camera.pitch_degrees = 60.0;
+        camera.distance = 400_000.0;
+    }
+
+    app.frame_world_origin();
+    while app.advance_camera_focus_animation(1.0 / 60.0) {}
+
+    let camera = app.renderer.camera();
+    assert_eq!(camera.focus, [0.0, 0.0, 0.0]);
+    assert!(
+        camera.pitch_degrees <= -5.0,
+        "an upward camera must be tipped down so the ground plane is visible"
+    );
+    assert!(camera.distance > crate::viewport_ui::WORLD_GRID_HALF_EXTENT);
+    assert!(camera.distance < 100_000.0);
+}
+
+#[test]
+fn k_keeps_a_downward_camera_angle_alone() {
+    let mut app = camera_app();
+    app.renderer.camera_mut().pitch_degrees = -45.0;
+    app.frame_world_origin();
+    assert_eq!(app.renderer.camera().pitch_degrees, -45.0);
+}
