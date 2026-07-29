@@ -347,8 +347,9 @@ impl PrmValueKind {
 }
 
 // @generated from decomp TParam declarations and the complete Japanese retail
-// stage corpus (159 files, 521 unique names). Regenerate instead of editing an
-// entry by hand; the ignored corpus census below is the acceptance check.
+// stage corpus (159 files, 521 retail names plus 45 decomp-declared NPC
+// individual parameters). Regenerate instead of editing an entry by hand; the
+// ignored corpus census below is the acceptance check.
 /// Exact semantic schemas observed across all 159 Japanese retail stage PRMs.
 ///
 /// Most types come directly from TParamRT declarations in the SMS decomp. The
@@ -876,6 +877,53 @@ const PRM_VALUE_SCHEMA: &[(&str, PrmValueKind)] = &[
     ("mWaterCtMax", PrmValueKind::I16),
     ("mXRotStart", PrmValueKind::F32),
     ("mYButtonRotateChase", PrmValueKind::I16),
+    // TNpcSaveIndividual is decomp-typed but its standalone PRM is absent from
+    // the Japanese retail stage corpus used by the original generator.
+    ("mAllDLLockDist", PrmValueKind::F32),
+    ("mBodyTurnSearchAware", PrmValueKind::F32),
+    ("mBodyTurnSearchDegree", PrmValueKind::F32),
+    ("mBodyTurnSearchDist", PrmValueKind::F32),
+    ("mBodyTurnSearchHeight", PrmValueKind::F32),
+    ("mCircleShadowSize", PrmValueKind::F32),
+    ("mFirstStateTurnSpeed", PrmValueKind::F32),
+    ("mLodChangeDist", PrmValueKind::F32),
+    ("mMadSearchAware", PrmValueKind::F32),
+    ("mMadSearchDegree", PrmValueKind::F32),
+    ("mMadSearchDist", PrmValueKind::F32),
+    ("mMadSearchHeight", PrmValueKind::F32),
+    ("mMadTurnSpeed", PrmValueKind::F32),
+    ("mMarchAccel", PrmValueKind::F32),
+    ("mMarchDecrease", PrmValueKind::F32),
+    ("mMaxMarchSpeed", PrmValueKind::F32),
+    ("mNeckAngleXSpeed", PrmValueKind::I16),
+    ("mNeckAngleYSpeed", PrmValueKind::I16),
+    ("mNeckMaxAngleX", PrmValueKind::I16),
+    ("mNeckMaxAngleY", PrmValueKind::I16),
+    ("mNeckMinAngleX", PrmValueKind::I16),
+    ("mNeckTurnSearchDist", PrmValueKind::F32),
+    ("mNeckTurnSearchHeight", PrmValueKind::F32),
+    ("mPollutionCleanSpeed", PrmValueKind::F32),
+    ("mPollutionMax", PrmValueKind::U8),
+    ("mSinkHeight", PrmValueKind::F32),
+    ("mSinkSpeed", PrmValueKind::F32),
+    ("mSLBodyHeight", PrmValueKind::F32),
+    ("mSLCursorHeight", PrmValueKind::F32),
+    ("mSLDamageRadiusSmall", PrmValueKind::F32),
+    ("mSLLookatHeight", PrmValueKind::F32),
+    ("mSLMaxRunAnmRate", PrmValueKind::F32),
+    ("mSLMaxRunSpeed", PrmValueKind::F32),
+    ("mSLMaxWalkAnmRate", PrmValueKind::F32),
+    ("mSLMinMarchSpeed", PrmValueKind::F32),
+    ("mSLMinWalkAnmRate", PrmValueKind::F32),
+    ("mSLRunAccel", PrmValueKind::F32),
+    ("mTurnAnmMaxRate", PrmValueKind::F32),
+    ("mTurnAnmMinRate", PrmValueKind::F32),
+    ("mTurnAnmRate", PrmValueKind::F32),
+    ("mUTurnSpeed", PrmValueKind::F32),
+    ("mWaitAnmOffDist0", PrmValueKind::F32),
+    ("mWaitAnmOffDist1", PrmValueKind::F32),
+    ("mWaitTurnSpeed", PrmValueKind::F32),
+    ("mWalkTurnSpeed", PrmValueKind::F32),
 ];
 
 fn prm_value_kind(name: &str) -> Option<PrmValueKind> {
@@ -1105,7 +1153,7 @@ mod tests {
             assert!(names.insert(*name), "duplicate schema name {name}");
             assert!(matches!(kind.encoded_len(), 1 | 2 | 4 | 12 | 16));
         }
-        assert_eq!(names.len(), 521);
+        assert_eq!(names.len(), 566);
     }
 
     #[test]

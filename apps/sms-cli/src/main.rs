@@ -12,9 +12,10 @@ use sms_authoring::{
     TargetLoaderProfile,
 };
 use sms_formats::{
-    discover_scene_archives, read_stage_asset_bytes, validate_materials_for_loader,
-    GxDiagnosticSeverity, J3dFile, J3dTriangle, JDramaDocument, JDramaField, JDramaFieldValue,
-    JDramaLightMap, JDramaRecord, JDramaRecordPayload, JDramaTransform, StageAssetKind,
+    discover_scene_archives, ensure_jdrama_scenario_archive_slot, read_stage_asset_bytes,
+    validate_materials_for_loader, GxDiagnosticSeverity, J3dFile, J3dTriangle, JDramaDocument,
+    JDramaField, JDramaFieldValue, JDramaLightMap, JDramaRecord, JDramaRecordPayload,
+    JDramaTransform, StageAssetKind,
 };
 use sms_scene::{
     BlankStageBootstrapManifest, BlankStageBootstrapResource, BlankStagePreset,
@@ -135,6 +136,17 @@ enum Commands {
         /// New external `.szs` output. Existing files are never replaced.
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Import an external stage archive as a managed custom project stage.
+    ImportCustomStage {
+        #[arg(long)]
+        base_root: PathBuf,
+        #[arg(long)]
+        project_root: PathBuf,
+        #[arg(long)]
+        archive: PathBuf,
+        #[arg(long = "stage-id")]
+        stage_id: String,
     },
     /// Upgrade one project-owned authored stage to the current runtime shell.
     UpgradeAuthoredProjectStage {
@@ -435,6 +447,12 @@ fn main() -> Result<()> {
             stage_id,
             out,
         } => create_blank_stage_command(base_root, stage_id, out),
+        Commands::ImportCustomStage {
+            base_root,
+            project_root,
+            archive,
+            stage_id,
+        } => import_custom_stage_command(base_root, project_root, archive, stage_id),
         Commands::UpgradeAuthoredProjectStage {
             base_root,
             project_root,
@@ -1069,6 +1087,83 @@ fn create_blank_stage_command(base_root: PathBuf, stage_id: String, out: PathBuf
             "stage_table_entry_required": true,
             "retail_assets_copied": false,
             "base_game_modified": false,
+        }))?
+    );
+    Ok(())
+}
+
+fn import_custom_stage_command(
+    base_root: PathBuf,
+    project_root: PathBuf,
+    archive_path: PathBuf,
+    stage_id: String,
+) -> Result<()> {
+    let existing_stage_ids = sms_scene::discover_authored_project_stage_ids(&project_root)
+        .with_context(|| format!("inspect managed project {}", project_root.display()))?;
+    if existing_stage_ids
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&stage_id))
+    {
+        bail!(
+            "managed project {} already contains authored stage '{}'",
+            project_root.display(),
+            stage_id
+        );
+    }
+
+    let source = std::fs::read(&archive_path)
+        .with_context(|| format!("read custom stage archive {}", archive_path.display()))?;
+    let mut document = StageDocument::from_imported_custom_archive(&base_root, &stage_id, &source)
+        .with_context(|| format!("import custom stage archive {}", archive_path.display()))?;
+    document
+        .load_project_folder(&project_root)
+        .with_context(|| format!("load managed project {}", project_root.display()))?;
+
+    let project_stage_table = project_root.join("files/data/stageArc.bin");
+    let base_stage_table = base_root.join("files/data/stageArc.bin");
+    let stage_table_path = if project_stage_table.is_file() {
+        project_stage_table
+    } else {
+        base_stage_table
+    };
+    let stage_table = std::fs::read(&stage_table_path)
+        .with_context(|| format!("read runtime stage table {}", stage_table_path.display()))?;
+    let runtime_slot =
+        ensure_jdrama_scenario_archive_slot(&stage_table, &format!("{stage_id}.arc"))
+            .with_context(|| format!("allocate runtime stage slot for '{stage_id}'"))?;
+    document
+        .mark_changed_file("data/stageArc.bin", runtime_slot.bytes.clone())
+        .context("queue project runtime stage table")?;
+
+    let import_warnings = document
+        .load_issues
+        .iter()
+        .filter(|issue| issue.code.starts_with("custom-stage-import-warning-"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let outcome = document
+        .save_project_folder(&project_root)
+        .with_context(|| format!("save imported custom stage '{stage_id}'"))?;
+    for warning in &outcome.warnings {
+        eprintln!(
+            "save warning (recovery path {}): {}",
+            warning.recovery_path.display(),
+            warning.message
+        );
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "stage_id": stage_id,
+            "archive": archive_path,
+            "project_root": project_root,
+            "project_revision": outcome.manifest.revision,
+            "runtime_slot": runtime_slot.entry,
+            "runtime_slot_inserted": runtime_slot.inserted,
+            "warnings": import_warnings,
+            "source_archive_modified": false,
+            "blank_stage_bootstrap_applied": false,
         }))?
     );
     Ok(())
@@ -2148,6 +2243,8 @@ fn launch_dolphin(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]
@@ -2194,6 +2291,35 @@ mod tests {
         assert_eq!(base_root, PathBuf::from("base"));
         assert_eq!(stage_id, "custom_stage0");
         assert_eq!(out, PathBuf::from("custom_stage0.szs"));
+    }
+
+    #[test]
+    fn imported_custom_stage_cli_requires_archive_project_and_runtime_id() {
+        let parsed = Args::try_parse_from([
+            "sms-cli",
+            "import-custom-stage",
+            "--base-root",
+            "base",
+            "--project-root",
+            "project",
+            "--archive",
+            "town1.szs",
+            "--stage-id",
+            "town1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Commands::ImportCustomStage {
+                base_root,
+                project_root,
+                archive,
+                stage_id,
+            } if base_root.as_path() == Path::new("base")
+                && project_root.as_path() == Path::new("project")
+                && archive.as_path() == Path::new("town1.szs")
+                && stage_id == "town1"
+        ));
     }
 
     #[test]

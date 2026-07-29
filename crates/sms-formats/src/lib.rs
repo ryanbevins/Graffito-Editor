@@ -83,8 +83,8 @@ pub use mario_record::{MarioRecordBundle, MarioRecordChannel, MarioRecordFile, M
 pub use marker::{MarkerLineEnding, MarkerTextFile};
 pub use prm::{PrmEntry, PrmFile, PrmValue};
 pub use rarc::{
-    rarc_name_hash, RarcArchive, RarcBuilder, RarcDocument, RarcEntryRecord, RarcFileEntry,
-    RarcHeader, RarcLayout, RarcNodeRecord,
+    rarc_name_hash, RarcArchive, RarcBuilder, RarcCreatorNormalization, RarcDocument,
+    RarcEntryRecord, RarcFileEntry, RarcHeader, RarcLayout, RarcNodeRecord,
 };
 pub use raw::{RawFile, RawFormat};
 pub use stage_assets::{

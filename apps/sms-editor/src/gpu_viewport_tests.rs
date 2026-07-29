@@ -986,6 +986,7 @@ fn geometry_update_preview() -> ModelPreview {
         camera_bounds_max: [11.0, 1.0, 0.0],
         loaded_models: 2,
         failed_models: 0,
+        model_warnings: Vec::new(),
         model_failures: Vec::new(),
         source_vertices: 6,
         source_triangles: 2,

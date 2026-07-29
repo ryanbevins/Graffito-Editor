@@ -1947,6 +1947,7 @@ fn stay_pakkun_preview_replaces_every_dummy_with_the_stage_goop_texture() {
         materials: Vec::new(),
         bounds_min: [0.0; 3],
         bounds_max: [0.0; 3],
+        adjusted_zero_normals: 0,
     };
 
     apply_actor_runtime_textures(
@@ -2332,6 +2333,7 @@ fn preview_for_texture_alpha(has_alpha: bool, has_translucent_alpha: bool) -> Mo
         camera_bounds_max: [1.0, 1.0, 1.0],
         loaded_models: 1,
         failed_models: 0,
+        model_warnings: Vec::new(),
         model_failures: Vec::new(),
         source_vertices: 0,
         source_triangles: 0,
@@ -3493,6 +3495,7 @@ fn updating_object_transform_moves_cached_preview_mesh() {
             camera_bounds_max: [1.0, 2.0, 3.0],
             loaded_models: 1,
             failed_models: 0,
+            model_warnings: Vec::new(),
             model_failures: Vec::new(),
             source_vertices: 3,
             source_triangles: 1,

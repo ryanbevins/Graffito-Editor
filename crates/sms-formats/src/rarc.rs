@@ -96,6 +96,13 @@ pub struct RarcEntryRecord {
     pub data: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RarcCreatorNormalization {
+    pub first_difference: usize,
+    pub source_size: usize,
+    pub canonical_size: usize,
+}
+
 /// High-level, source-free RARC tree builder.
 ///
 /// Directories are inferred from slash-separated raw paths. The builder owns
@@ -622,6 +629,22 @@ impl RarcEntryRecord {
 impl RarcDocument {
     pub fn parse(bytes: impl AsRef<[u8]>) -> Result<Self> {
         let bytes = bytes.as_ref();
+        let (document, normalization) = Self::parse_allowing_noncanonical_creator_data(bytes)?;
+        if let Some(normalization) = normalization {
+            return Err(noncanonical_import_error(normalization));
+        }
+        Ok(document)
+    }
+
+    /// Imports a structurally valid archive while reporting creator-only
+    /// metadata and layout that will be normalized by the semantic writer.
+    ///
+    /// File payloads remain exact inputs. Callers must still prove every child
+    /// codec rebuilds to the canonical container before accepting the import.
+    pub fn parse_allowing_noncanonical_creator_data(
+        bytes: impl AsRef<[u8]>,
+    ) -> Result<(Self, Option<RarcCreatorNormalization>)> {
+        let bytes = bytes.as_ref();
         let archive = RarcArchive::parse(bytes)?;
         let header = archive.header().clone();
         let declared_size = header.file_size as usize;
@@ -663,8 +686,9 @@ impl RarcDocument {
                 entries: Vec::new(),
             };
             document.canonicalize_layout()?;
-            reject_noncanonical_import(bytes, &build_rarc_document(&document)?)?;
-            return Ok(document);
+            let rebuilt = build_rarc_document(&document)?;
+            let normalization = creator_normalization(bytes, &rebuilt);
+            return Ok((document, normalization));
         }
 
         let info = header.header_size as usize;
@@ -764,8 +788,9 @@ impl RarcDocument {
         // not source data. Rebuild them solely from the semantic tree and
         // payloads, then require the retail creator layout to agree exactly.
         document.canonicalize_layout()?;
-        reject_noncanonical_import(bytes, &build_rarc_document(&document)?)?;
-        Ok(document)
+        let rebuilt = build_rarc_document(&document)?;
+        let normalization = creator_normalization(bytes, &rebuilt);
+        Ok((document, normalization))
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
@@ -2058,21 +2083,30 @@ fn build_rarc_document(document: &RarcDocument) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-fn reject_noncanonical_import(source: &[u8], rebuilt: &[u8]) -> Result<()> {
+fn creator_normalization(source: &[u8], rebuilt: &[u8]) -> Option<RarcCreatorNormalization> {
     if source == rebuilt {
-        return Ok(());
+        return None;
     }
     let difference = source
         .iter()
         .zip(rebuilt)
         .position(|(source, rebuilt)| source != rebuilt)
         .unwrap_or_else(|| source.len().min(rebuilt.len()));
-    Err(FormatError::Unsupported {
+    Some(RarcCreatorNormalization {
+        first_difference: difference,
+        source_size: source.len(),
+        canonical_size: rebuilt.len(),
+    })
+}
+
+fn noncanonical_import_error(normalization: RarcCreatorNormalization) -> FormatError {
+    FormatError::Unsupported {
         format: FORMAT,
         message: format!(
-            "source-free import rejects noncanonical RARC creator data at offset {difference:#X}"
+            "source-free import rejects noncanonical RARC creator data at offset {:#X}",
+            normalization.first_difference
         ),
-    })
+    }
 }
 
 fn write_name(table: &mut [u8], claimed: &mut [bool], offset: u32, name: &[u8]) -> Result<()> {
@@ -2399,11 +2433,16 @@ mod tests {
         let mut info_reserved = source.clone();
         info_reserved[0x20 + 0x1B] = 1;
         assert!(matches!(
-            RarcDocument::parse(info_reserved),
+            RarcDocument::parse(&info_reserved),
             Err(FormatError::Unsupported { .. })
         ));
+        let (normalized, warning) =
+            RarcDocument::parse_allowing_noncanonical_creator_data(&info_reserved).unwrap();
+        let warning = warning.expect("creator normalization warning");
+        assert_eq!(warning.first_difference, 0x20 + 0x1B);
+        assert_eq!(normalized.to_bytes().unwrap(), source);
 
-        let mut entry_reserved = source;
+        let mut entry_reserved = source.clone();
         let info = be_u32(&entry_reserved, 0x08, FORMAT).unwrap() as usize;
         let entry_offset = be_u32(&entry_reserved, info + 0x0C, FORMAT).unwrap() as usize;
         entry_reserved[info + entry_offset + 0x13] = 1;

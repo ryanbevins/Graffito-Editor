@@ -399,7 +399,15 @@ impl StageDocument {
         let (objects, mut load_issues, lighting) = load_scene_objects_from_assets(&assets);
         let (stage_archive_source_path, stage_archive) =
             match stage_export::import_exact_stage_archive(&base_root, &stage_id) {
-                Ok((source_path, archive)) => (Some(source_path), Some(archive)),
+                Ok((source_path, archive, warnings)) => {
+                    load_issues.extend(warnings.into_iter().enumerate().map(|(index, warning)| {
+                        ValidationIssue::warning(
+                            format!("stage-archive-normalized-{index}"),
+                            warning,
+                        )
+                    }));
+                    (Some(source_path), Some(archive))
+                }
                 Err(error) => {
                     load_issues.push(ValidationIssue::error(
                         "stage-semantic-import-failed",
@@ -450,13 +458,31 @@ impl StageDocument {
         let stage_id = stage_id.into();
         validate_stage_id(&stage_id)?;
         validate_authored_archive_target(&archive, &stage_id)?;
-        blank_stage::ensure_blank_stage_runtime_resources(&mut archive)?;
+        let authored_blank = matches!(archive.origin(), StageOrigin::Blank { .. });
+        if authored_blank {
+            blank_stage::ensure_blank_stage_runtime_resources(&mut archive)?;
+        }
+        let import_warnings = match archive.origin() {
+            StageOrigin::ImportedCustom { warnings, .. } => warnings.clone(),
+            StageOrigin::ImportedArchive | StageOrigin::Blank { .. } => Vec::new(),
+        };
         let source_path = authored_stage_virtual_source_path(&base_root, &stage_id)?;
         let assets = authored_stage_assets(&base_root, &source_path, &archive)?;
-        let (objects, load_issues, lighting) =
+        let (objects, mut load_issues, lighting) =
             load_scene_objects_from_assets_with_reader(&assets, |path| {
                 read_semantic_stage_asset_bytes(&archive, &source_path, path)
             });
+        load_issues.extend(
+            import_warnings
+                .into_iter()
+                .enumerate()
+                .map(|(index, warning)| {
+                    ValidationIssue::warning(
+                        format!("custom-stage-import-warning-{index}"),
+                        warning,
+                    )
+                }),
+        );
         let semantic_json = archive.to_semantic_json()?;
         let archive = SourceFreeStageArchive::from_semantic_json(&semantic_json)?;
         Ok(Self {
@@ -475,10 +501,35 @@ impl StageDocument {
             dialogue_authoring: None,
             dialogue_library: ProjectDialogueLibrary::default(),
             lighting,
-            death_barrier: Some(StageDeathBarrier::default()),
+            death_barrier: authored_blank.then(StageDeathBarrier::default),
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         })
+    }
+
+    /// Promotes an external RARC/Yaz0 stage archive into a managed custom stage.
+    ///
+    /// Creator-specific container layout is normalized with persistent project
+    /// warnings. Existing stage resources are otherwise retained and the
+    /// blank-stage bootstrap is deliberately not applied.
+    pub fn from_imported_custom_archive(
+        base_root: impl AsRef<Path>,
+        stage_id: impl Into<String>,
+        source: &[u8],
+    ) -> Result<Self> {
+        let stage_id = stage_id.into();
+        validate_stage_id(&stage_id)?;
+        let (mut archive, mut warnings) =
+            SourceFreeStageArchive::parse_allowing_creator_normalization(source)?;
+        warnings.push(
+            "This project stage was imported from an external archive. Graffito preserves its semantic resources, but rebuilt output uses canonical RARC/Yaz0 container metadata rather than the creator's exact wrapper bytes."
+                .to_string(),
+        );
+        archive.set_origin(StageOrigin::ImportedCustom {
+            target_slot: stage_id.clone(),
+            warnings,
+        });
+        Self::from_authored_archive(base_root, stage_id, archive)
     }
 
     /// Reopens an authored stage directly from a managed project baseline.
@@ -515,7 +566,14 @@ impl StageDocument {
         mut archive: SourceFreeStageArchive,
     ) -> Result<()> {
         validate_authored_archive_target(&archive, &self.stage_id)?;
-        blank_stage::ensure_blank_stage_runtime_resources(&mut archive)?;
+        let authored_blank = matches!(archive.origin(), StageOrigin::Blank { .. });
+        if authored_blank {
+            blank_stage::ensure_blank_stage_runtime_resources(&mut archive)?;
+        }
+        let import_warnings = match archive.origin() {
+            StageOrigin::ImportedCustom { warnings, .. } => warnings.clone(),
+            StageOrigin::ImportedArchive | StageOrigin::Blank { .. } => Vec::new(),
+        };
 
         // Normalize through the public detached document format. Besides
         // proving a stable semantic rebuild, this prevents a caller-owned
@@ -528,10 +586,21 @@ impl StageDocument {
             None => authored_stage_virtual_source_path(&self.base_root, &self.stage_id)?,
         };
         let assets = authored_stage_assets(&self.base_root, &source_path, &archive)?;
-        let (objects, load_issues, lighting) =
+        let (objects, mut load_issues, lighting) =
             load_scene_objects_from_assets_with_reader(&assets, |path| {
                 read_semantic_stage_asset_bytes(&archive, &source_path, path)
             });
+        load_issues.extend(
+            import_warnings
+                .into_iter()
+                .enumerate()
+                .map(|(index, warning)| {
+                    ValidationIssue::warning(
+                        format!("custom-stage-import-warning-{index}"),
+                        warning,
+                    )
+                }),
+        );
 
         let registry = self.registry.take();
         self.assets = assets;
@@ -544,7 +613,7 @@ impl StageDocument {
         self.route_authoring = None;
         self.goop_authoring = None;
         self.dialogue_authoring = None;
-        self.death_barrier = Some(StageDeathBarrier::default());
+        self.death_barrier = authored_blank.then(StageDeathBarrier::default);
         self.actor_previews.clear();
         if let Some(registry) = registry {
             self.set_registry(registry);
@@ -1366,7 +1435,10 @@ impl StageDocument {
         let Some(archive) = self.stage_archive.as_ref() else {
             return Ok(());
         };
-        if !matches!(archive.origin(), StageOrigin::Blank { .. }) {
+        if !matches!(
+            archive.origin(),
+            StageOrigin::Blank { .. } | StageOrigin::ImportedCustom { .. }
+        ) {
             return Ok(());
         }
         validate_authored_archive_target(archive, &self.stage_id)?;
@@ -1997,9 +2069,19 @@ fn validate_authored_archive_target(
         StageOrigin::Blank { target_slot, .. } if target_slot.eq_ignore_ascii_case(stage_id) => {
             Ok(())
         }
+        StageOrigin::ImportedCustom { target_slot, .. }
+            if target_slot.eq_ignore_ascii_case(stage_id) =>
+        {
+            Ok(())
+        }
         StageOrigin::Blank { target_slot, .. } => Err(SceneError::StageExport(format!(
             "authored stage target '{target_slot}' does not match document stage '{stage_id}'"
         ))),
+        StageOrigin::ImportedCustom { target_slot, .. } => {
+            Err(SceneError::StageExport(format!(
+                "imported custom stage target '{target_slot}' does not match document stage '{stage_id}'"
+            )))
+        }
         StageOrigin::ImportedArchive => Err(SceneError::StageExport(format!(
             "stage '{stage_id}' requires a blank authored archive origin"
         ))),
@@ -2338,6 +2420,8 @@ fn insert_typed_jdrama_params(object: &mut SceneObject, record: &JDramaRecord) {
     };
     for field in fields {
         let raw_value = match &field.value {
+            JDramaFieldValue::U8(value) => value.to_string(),
+            JDramaFieldValue::Bytes3(_) => continue,
             JDramaFieldValue::U32(value) => value.to_string(),
             JDramaFieldValue::I32(value) => value.to_string(),
             JDramaFieldValue::F32(value) => value.to_string(),

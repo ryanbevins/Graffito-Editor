@@ -4,7 +4,7 @@ use crate::{FormatError, Result};
 
 const FORMAT: &str = "stage marker text";
 
-/// Line-ending convention of a tiny stage marker file such as `delete.me`.
+/// Final line-ending convention of stage authoring text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MarkerLineEnding {
     None,
@@ -12,8 +12,9 @@ pub enum MarkerLineEnding {
     CarriageReturnLineFeed,
 }
 
-/// Source-free semantic representation of the ASCII marker files shipped in
-/// stage archives. These are authoring/build markers, not arbitrary blobs.
+/// Source-free semantic representation of ASCII authoring text shipped in
+/// stage archives, including tiny markers such as `delete.me` and multiline
+/// creator manifests such as `wszst-setup.txt`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarkerTextFile {
     pub text: String,
@@ -30,14 +31,12 @@ impl MarkerTextFile {
         } else {
             (bytes, MarkerLineEnding::None)
         };
-        if body.is_empty()
-            || !body
-                .iter()
-                .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
-        {
+        if !is_valid_authoring_text(body) {
             return Err(FormatError::Unsupported {
                 format: FORMAT,
-                message: "marker must contain non-empty printable ASCII text".to_string(),
+                message:
+                    "authoring text must contain non-empty printable ASCII, tabs, and line endings"
+                        .to_string(),
             });
         }
         Ok(Self {
@@ -47,16 +46,12 @@ impl MarkerTextFile {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
-        if self.text.is_empty()
-            || !self
-                .text
-                .as_bytes()
-                .iter()
-                .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
-        {
+        if !is_valid_authoring_text(self.text.as_bytes()) {
             return Err(FormatError::Unsupported {
                 format: FORMAT,
-                message: "marker must contain non-empty printable ASCII text".to_string(),
+                message:
+                    "authoring text must contain non-empty printable ASCII, tabs, and line endings"
+                        .to_string(),
             });
         }
         let mut bytes = self.text.as_bytes().to_vec();
@@ -67,6 +62,13 @@ impl MarkerTextFile {
         }
         Ok(bytes)
     }
+}
+
+fn is_valid_authoring_text(bytes: &[u8]) -> bool {
+    !bytes.is_empty()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_graphic() || matches!(*byte, b' ' | b'\t' | b'\r' | b'\n'))
 }
 
 #[cfg(test)]
@@ -80,6 +82,18 @@ mod tests {
         source.fill(0xA5);
         assert_eq!(marker.text, "dummy");
         assert_eq!(marker.encode().unwrap(), b"dummy\r\n");
+    }
+
+    #[test]
+    fn multiline_creator_manifest_round_trips_with_tabs_and_crlf() {
+        let source = b"\r\n[encode]\r\nBTI,I4,5\t= ./map/wave.bti\r\n";
+        let document = MarkerTextFile::parse(source).unwrap();
+
+        assert_eq!(
+            document.line_ending,
+            MarkerLineEnding::CarriageReturnLineFeed
+        );
+        assert_eq!(document.encode().unwrap(), source);
     }
 
     #[test]

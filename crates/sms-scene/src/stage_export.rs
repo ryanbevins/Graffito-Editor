@@ -2472,17 +2472,18 @@ pub(crate) fn exact_stage_archive_path(base_root: &Path, stage_id: &str) -> Resu
 pub(crate) fn import_exact_stage_archive(
     base_root: &Path,
     stage_id: &str,
-) -> Result<(PathBuf, SourceFreeStageArchive)> {
+) -> Result<(PathBuf, SourceFreeStageArchive, Vec<String>)> {
     let source_path = exact_stage_archive_path(base_root, stage_id)?;
     let source = fs::read(&source_path)?;
-    let archive = SourceFreeStageArchive::parse(&source)?;
+    let (archive, warnings) =
+        SourceFreeStageArchive::parse_allowing_creator_normalization(&source)?;
     let rebuilt = archive.encode()?;
-    if rebuilt != source {
+    if rebuilt != source && warnings.is_empty() {
         return Err(stage_export_error(format!(
             "the unedited semantic rebuild of '{stage_id}' was not byte-identical"
         )));
     }
-    Ok((source_path, archive))
+    Ok((source_path, archive, warnings))
 }
 
 fn checked_external_output(base_root: &Path, output_path: &Path) -> Result<PathBuf> {

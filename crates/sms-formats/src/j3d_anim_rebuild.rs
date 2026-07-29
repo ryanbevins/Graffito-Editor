@@ -19,6 +19,9 @@ pub enum J3dAnimationHeaderTag {
     AllFf,
     Svr1,
     AllZero,
+    /// Printable creator attribution stored in the otherwise loader-ignored
+    /// 16-byte J3D header tag.
+    CreatorText([u8; 16]),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1413,6 +1416,14 @@ fn parse_header_tag(bytes: &[u8]) -> Result<J3dAnimationHeaderTag> {
         Ok(J3dAnimationHeaderTag::Svr1)
     } else if bytes == [0; 16] {
         Ok(J3dAnimationHeaderTag::AllZero)
+    } else if bytes
+        .iter()
+        .all(|byte| *byte == 0 || byte.is_ascii_graphic() || *byte == b' ')
+        && bytes.iter().any(|byte| byte.is_ascii_graphic())
+    {
+        let mut text = [0; 16];
+        text.copy_from_slice(bytes);
+        Ok(J3dAnimationHeaderTag::CreatorText(text))
     } else {
         Err(unsupported("unrecognized 16-byte J3D file header tag"))
     }
@@ -1426,6 +1437,7 @@ fn write_header_tag(bytes: &mut [u8], tag: J3dAnimationHeaderTag) {
             bytes[..4].copy_from_slice(b"SVR1");
         }
         J3dAnimationHeaderTag::AllZero => bytes.fill(0),
+        J3dAnimationHeaderTag::CreatorText(text) => bytes.copy_from_slice(&text),
     }
 }
 
@@ -1672,6 +1684,17 @@ fn unsupported(message: impl Into<String>) -> FormatError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn printable_creator_animation_header_tag_round_trips() {
+        let source = *b"Discord:9HG8UMC\0";
+        let parsed = parse_header_tag(&source).unwrap();
+        assert_eq!(parsed, J3dAnimationHeaderTag::CreatorText(source));
+
+        let mut rebuilt = [0; 16];
+        write_header_tag(&mut rebuilt, parsed);
+        assert_eq!(rebuilt, source);
+    }
 
     #[test]
     fn j3d_name_hash_is_derived_from_the_encoded_name() {

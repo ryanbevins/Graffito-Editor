@@ -486,11 +486,19 @@ pub struct J3dPaddingSpan {
     pub kind: J3dPaddingKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum J3dPaddingKind {
     Zero,
     Ones,
-    RetailMessage { phase: u8 },
+    RetailMessage {
+        phase: u8,
+    },
+    /// Printable RiiStudio build/version padding, retained as an explicitly
+    /// modeled creator string rather than treated as opaque section data.
+    RiiStudioMessage(Vec<u8>),
+    /// SuperBMD's section-alignment signature, which is commonly truncated at
+    /// the next section boundary.
+    SuperBmdMessage(Vec<u8>),
 }
 
 impl J3dRebuildDocument {
@@ -1697,6 +1705,36 @@ fn classify_padding_run(bytes: &[u8]) -> Option<(J3dPaddingKind, usize)> {
             return Some((J3dPaddingKind::RetailMessage { phase: phase as u8 }, length));
         }
     }
+    const RIISTUDIO_PADDING_PREFIX: &[u8] = b"Alpha ";
+    if let Some(next_message) = bytes[1..]
+        .windows(RIISTUDIO_PADDING_PREFIX.len())
+        .position(|window| window == RIISTUDIO_PADDING_PREFIX)
+        .map(|position| position + 1)
+    {
+        let leading_fragment = &bytes[..next_message];
+        if RIISTUDIO_PADDING_PREFIX.starts_with(leading_fragment) {
+            return Some((
+                J3dPaddingKind::RiiStudioMessage(leading_fragment.to_vec()),
+                leading_fragment.len(),
+            ));
+        }
+    }
+    let is_prefix_fragment = bytes.len() <= RIISTUDIO_PADDING_PREFIX.len()
+        && RIISTUDIO_PADDING_PREFIX.starts_with(bytes);
+    let is_printable_message = bytes.starts_with(RIISTUDIO_PADDING_PREFIX)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_graphic() || *byte == b' ');
+    if is_prefix_fragment || is_printable_message {
+        return Some((
+            J3dPaddingKind::RiiStudioMessage(bytes.to_vec()),
+            bytes.len(),
+        ));
+    }
+    const SUPER_BMD_PADDING: &[u8] = b"Model made with SuperBMD";
+    if SUPER_BMD_PADDING.starts_with(bytes) {
+        return Some((J3dPaddingKind::SuperBmdMessage(bytes.to_vec()), bytes.len()));
+    }
     None
 }
 
@@ -1708,13 +1746,33 @@ fn write_padding(out: &mut [u8], spans: &[J3dPaddingSpan]) -> Result<()> {
         let target = out
             .get_mut(offset..offset.saturating_add(length))
             .ok_or_else(|| invalid_offset(offset, out_len))?;
-        match span.kind {
+        match &span.kind {
             J3dPaddingKind::Zero => target.fill(0),
             J3dPaddingKind::Ones => target.fill(0xff),
             J3dPaddingKind::RetailMessage { phase } => {
                 for (index, byte) in target.iter_mut().enumerate() {
-                    *byte = RETAIL_PADDING[(phase as usize + index) % RETAIL_PADDING.len()];
+                    *byte = RETAIL_PADDING[(*phase as usize + index) % RETAIL_PADDING.len()];
                 }
+            }
+            J3dPaddingKind::RiiStudioMessage(bytes) => {
+                if bytes.len() != target.len() {
+                    return Err(unsupported(format!(
+                        "RiiStudio padding length {} does not match declared span length {}",
+                        bytes.len(),
+                        target.len()
+                    )));
+                }
+                target.copy_from_slice(bytes);
+            }
+            J3dPaddingKind::SuperBmdMessage(bytes) => {
+                if bytes.len() != target.len() {
+                    return Err(unsupported(format!(
+                        "SuperBMD padding length {} does not match declared span length {}",
+                        bytes.len(),
+                        target.len()
+                    )));
+                }
+                target.copy_from_slice(bytes);
             }
         }
     }
@@ -3344,6 +3402,50 @@ fn encode_mdl3(out: &mut [u8], data: &J3dMaterialDisplayListSection) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn riistudio_version_padding_is_modeled_and_rebuilt_exactly() {
+        let mut bytes = vec![0; 0x20];
+        bytes[..4].copy_from_slice(b"EVP1");
+        bytes[4..8].copy_from_slice(&0x20u32.to_be_bytes());
+        bytes[8..10].copy_from_slice(&0u16.to_be_bytes());
+        bytes[10..12].copy_from_slice(&u16::MAX.to_be_bytes());
+        bytes[0x1c..].copy_from_slice(b"Alph");
+
+        let section = parse_section(&bytes).unwrap();
+
+        assert_eq!(
+            section.padding,
+            vec![J3dPaddingSpan {
+                offset: 0x1c,
+                length: 4,
+                kind: J3dPaddingKind::RiiStudioMessage(b"Alph".to_vec()),
+            }]
+        );
+        assert_eq!(encode_section(&section).unwrap(), bytes);
+        assert_eq!(
+            classify_padding_run(b"AlAlpha 5.11.5"),
+            Some((J3dPaddingKind::RiiStudioMessage(b"Al".to_vec()), 2))
+        );
+    }
+
+    #[test]
+    fn superbmd_creator_padding_fragments_are_modeled_exactly() {
+        assert_eq!(
+            classify_padding_run(b"Model made with "),
+            Some((
+                J3dPaddingKind::SuperBmdMessage(b"Model made with ".to_vec()),
+                16
+            ))
+        );
+        assert_eq!(
+            classify_padding_run(b"Model made with SuperBMD"),
+            Some((
+                J3dPaddingKind::SuperBmdMessage(b"Model made with SuperBMD".to_vec()),
+                24
+            ))
+        );
+    }
 
     fn synthetic_dummy_texture_document() -> J3dRebuildDocument {
         let name = "H_ma_rak_dummy";

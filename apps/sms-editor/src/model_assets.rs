@@ -4225,6 +4225,7 @@ pub(super) fn empty_authored_model_preview() -> ModelPreview {
         camera_bounds_max: [1.0; 3],
         loaded_models: 0,
         failed_models: 0,
+        model_warnings: Vec::new(),
         model_failures: Vec::new(),
         source_vertices: 0,
         source_triangles: 0,

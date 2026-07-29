@@ -862,6 +862,7 @@ fn prepared_display_lists_match_legacy_pose_and_topology_exactly() {
     }
     display_list.push(0);
 
+    let mut adjusted_zero_normals = 0;
     let prepared_display_list = decode_prepared_display_list(
         &display_list,
         &[],
@@ -871,8 +872,10 @@ fn prepared_display_lists_match_legacy_pose_and_topology_exactly() {
         position_format,
         vertex_arrays,
         &group_matrices,
+        &mut adjusted_zero_normals,
     )
     .unwrap();
+    assert_eq!(adjusted_zero_normals, 0);
     let source_triangle_count = prepared_display_list.triangle_indices.len();
     let max_packet_vertex_count = prepared_display_list.vertices.len();
     let prepared = J3dPreparedAnimatedTriangles {
@@ -905,6 +908,7 @@ fn prepared_display_lists_match_legacy_pose_and_topology_exactly() {
         vec![None, Some(nonuniform)],
         vec![Some(collapsed), Some(collapsed)],
     ] {
+        let mut adjusted_zero_normals = 0;
         let legacy = decode_display_list(
             &display_list,
             &[],
@@ -918,11 +922,87 @@ fn prepared_display_lists_match_legacy_pose_and_topology_exactly() {
             None,
             J3dMaterialRenderState::default(),
             None,
+            &mut adjusted_zero_normals,
         )
         .unwrap();
+        assert_eq!(adjusted_zero_normals, 0);
 
         assert_eq!(prepared.pose(&draw_matrices), legacy);
     }
+}
+
+#[test]
+fn display_list_preview_replaces_and_reports_zero_length_normals() {
+    let descs = [
+        VertexDesc {
+            attr: GX_VA_POS,
+            attr_type: GX_DIRECT,
+        },
+        VertexDesc {
+            attr: GX_VA_NRM,
+            attr_type: GX_DIRECT,
+        },
+    ];
+    let attr_formats = [
+        AttributeFormat {
+            attr: GX_VA_POS,
+            cnt: GX_POS_XYZ,
+            component_type: GX_F32,
+            frac: 0,
+        },
+        AttributeFormat {
+            attr: GX_VA_NRM,
+            cnt: GX_NRM_XYZ,
+            component_type: GX_F32,
+            frac: 0,
+        },
+    ];
+    let position_format = PositionFormat {
+        component_type: GX_F32,
+        frac: 0,
+    };
+    let vertex_arrays = VertexArrays {
+        normal_offset: None,
+        normal_format: Some(NormalFormat {
+            component_type: GX_F32,
+            frac: 0,
+            components: 3,
+        }),
+        color_offsets: [None; 2],
+        color_formats: [None; 2],
+        tex_offsets: [None; TEX_COORD_COUNT],
+        tex_formats: [None; TEX_COORD_COUNT],
+    };
+    let mut display_list = vec![GX_DRAW_TRIANGLES];
+    display_list.extend_from_slice(&3u16.to_be_bytes());
+    for position in [[0.0_f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+        for component in position.into_iter().chain([0.0; 3]) {
+            display_list.extend_from_slice(&component.to_bits().to_be_bytes());
+        }
+    }
+    display_list.push(0);
+
+    let mut adjusted_zero_normals = 0;
+    let triangles = decode_display_list(
+        &display_list,
+        &[],
+        &[],
+        &descs,
+        &attr_formats,
+        position_format,
+        vertex_arrays,
+        &[],
+        &[],
+        None,
+        J3dMaterialRenderState::default(),
+        None,
+        &mut adjusted_zero_normals,
+    )
+    .unwrap();
+
+    assert_eq!(adjusted_zero_normals, 3);
+    assert_eq!(triangles.len(), 1);
+    assert_eq!(triangles[0].normals, Some([[0.0, 1.0, 0.0]; 3]));
 }
 
 fn push_direct_test_vertex(

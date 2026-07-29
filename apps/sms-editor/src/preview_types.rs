@@ -25,6 +25,7 @@ pub(super) struct ModelPreview {
     pub(super) camera_bounds_max: [f32; 3],
     pub(super) loaded_models: usize,
     pub(super) failed_models: usize,
+    pub(super) model_warnings: Vec<PreviewModelFailure>,
     pub(super) model_failures: Vec<PreviewModelFailure>,
     pub(super) source_vertices: usize,
     pub(super) source_triangles: usize,

@@ -376,11 +376,21 @@ pub struct JpaxTextureBlock {
     pub texture: JpaxTextureImage,
 }
 
-/// A TEX1 ResTIMG with the complete native GX mip chain authored by JPAC.
+/// The native GX mip allocation policy used by a TEX1 ResTIMG.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JpaxMipStorage {
+    /// Store every tiled level down to 1x1, as Nintendo's JPAC does.
+    #[default]
+    CompleteChain,
+    /// Store only the runtime-visible prefix named by `active_mipmap_count`.
+    ActiveLevels,
+}
+
+/// A TEX1 ResTIMG with its native GX mip chain.
 ///
-/// `active_mipmap_count` is the runtime-visible header value. For mipmapped
-/// textures JPAC stores all tiled levels down to 1x1 even when only a prefix is
-/// active; non-mipmapped textures store only the base level.
+/// `active_mipmap_count` is the runtime-visible header value. Nintendo's JPAC
+/// stores all tiled levels down to 1x1, while some compatible creators store
+/// only the active prefix. `mip_storage` preserves that allocation choice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JpaxTextureImage {
     pub allocation_size: u32,
@@ -406,6 +416,8 @@ pub struct JpaxTextureImage {
     pub reserved_19: u8,
     pub lod_bias: i16,
     pub image_offset: u32,
+    #[serde(default)]
+    pub mip_storage: JpaxMipStorage,
     pub encoded_mip_levels: Vec<Vec<u8>>,
 }
 
@@ -678,9 +690,9 @@ fn parse_dynamics(block: &[u8]) -> Result<JpaxDynamicsBlock> {
 
 fn parse_base_shape(block: &[u8]) -> Result<JpaxBaseShapeBlock> {
     expect_tag(block, b"BSP1")?;
-    if !matches!(block.len(), 0xa0 | 0xc0 | 0xe0) {
+    if !valid_base_shape_allocation_size(block.len()) {
         return Err(unsupported(format!(
-            "BSP1 allocation size {:#x} is not a retail layout",
+            "BSP1 allocation size {:#x} is not a supported aligned layout",
             block.len()
         )));
     }
@@ -1002,7 +1014,35 @@ impl JpaxTextureImage {
             }
         }
 
-        let level_count = stored_mip_level_count(width, height, bytes[0x10]);
+        let complete_level_count = stored_mip_level_count(width, height, bytes[0x10]);
+        let active_level_count = usize::from(bytes[0x18].max(1));
+        if active_level_count > complete_level_count {
+            return Err(unsupported(format!(
+                "TEX1 activates {active_level_count} mip levels but dimensions permit only {complete_level_count}"
+            )));
+        }
+        let complete_end = mip_chain_end(
+            image_offset as usize,
+            bytes[0],
+            width,
+            height,
+            complete_level_count,
+        )?;
+        let (mip_storage, level_count) = if complete_end <= bytes.len() {
+            (JpaxMipStorage::CompleteChain, complete_level_count)
+        } else {
+            let active_end = mip_chain_end(
+                image_offset as usize,
+                bytes[0],
+                width,
+                height,
+                active_level_count,
+            )?;
+            if active_end > bytes.len() {
+                return Err(invalid(active_end, bytes.len()));
+            }
+            (JpaxMipStorage::ActiveLevels, active_level_count)
+        };
         let mut encoded_mip_levels = Vec::with_capacity(level_count);
         let mut cursor = image_offset as usize;
         for level in 0..level_count {
@@ -1041,6 +1081,7 @@ impl JpaxTextureImage {
             reserved_19: bytes[0x19],
             lod_bias: be_i16(bytes, 0x1a, FORMAT)?,
             image_offset,
+            mip_storage,
             encoded_mip_levels,
         })
     }
@@ -1053,17 +1094,22 @@ impl JpaxTextureImage {
                 self.width, self.height
             )));
         }
-        let expected_levels = stored_mip_level_count(self.width, self.height, self.mipmap_enabled);
-        if self.encoded_mip_levels.len() != expected_levels {
+        let complete_levels = stored_mip_level_count(self.width, self.height, self.mipmap_enabled);
+        let active_levels = usize::from(self.active_mipmap_count.max(1));
+        if active_levels > complete_levels {
             return Err(unsupported(format!(
-                "TEX1 has {} native mip levels, expected complete {expected_levels}-level chain",
-                self.encoded_mip_levels.len()
+                "TEX1 activates {active_levels} mip levels but dimensions permit only {complete_levels}"
             )));
         }
-        if usize::from(self.active_mipmap_count.max(1)) > expected_levels {
+        let expected_levels = match self.mip_storage {
+            JpaxMipStorage::CompleteChain => complete_levels,
+            JpaxMipStorage::ActiveLevels => active_levels,
+        };
+        if self.encoded_mip_levels.len() != expected_levels {
             return Err(unsupported(format!(
-                "TEX1 activates {} mip levels but stores only {expected_levels}",
-                self.active_mipmap_count
+                "TEX1 has {} native mip levels, expected {expected_levels} for {:?} storage",
+                self.encoded_mip_levels.len(),
+                self.mip_storage
             )));
         }
         if self.palette_entries.len() > u16::MAX as usize {
@@ -1136,6 +1182,24 @@ fn stored_mip_level_count(width: u16, height: u16, mipmap_enabled: u8) -> usize 
         count += 1;
     }
     count
+}
+
+fn mip_chain_end(
+    image_offset: usize,
+    format: u8,
+    width: u16,
+    height: u16,
+    level_count: usize,
+) -> Result<usize> {
+    let mut cursor = image_offset;
+    for level in 0..level_count {
+        let level_width = (width >> level).max(1);
+        let level_height = (height >> level).max(1);
+        cursor = cursor
+            .checked_add(encoded_gx_texture_size(format, level_width, level_height)?)
+            .ok_or_else(|| invalid(cursor, usize::MAX))?;
+    }
+    Ok(cursor)
 }
 
 fn encoded_gx_texture_size(format: u8, width: u16, height: u16) -> Result<usize> {
@@ -1213,9 +1277,9 @@ fn encode_dynamics(value: &JpaxDynamicsBlock) -> Result<Vec<u8>> {
 
 fn encode_base_shape(value: &JpaxBaseShapeBlock) -> Result<Vec<u8>> {
     let size = value.allocation_size as usize;
-    if !matches!(size, 0xa0 | 0xc0 | 0xe0) {
+    if !valid_base_shape_allocation_size(size) {
         return Err(unsupported(format!(
-            "BSP1 allocation size {size:#x} is not a retail layout"
+            "BSP1 allocation size {size:#x} is not a supported aligned layout"
         )));
     }
     let mut block = new_block(b"BSP1", size)?;
@@ -1287,6 +1351,10 @@ fn encode_base_shape(value: &JpaxBaseShapeBlock) -> Result<Vec<u8>> {
         "BSP1 environment colors",
     )?;
     Ok(block)
+}
+
+fn valid_base_shape_allocation_size(size: usize) -> bool {
+    size >= 0xa0 && size <= u16::MAX as usize + 1 && size.is_multiple_of(0x20)
 }
 
 fn encode_extra_shape(value: &JpaxExtraShapeBlock) -> Result<Vec<u8>> {
@@ -1754,6 +1822,61 @@ fn unsupported(message: impl Into<String>) -> FormatError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extended_aligned_base_shape_color_tables_round_trip() {
+        let mut block = new_block(b"BSP1", 0x160).unwrap();
+        put_u16(&mut block, 0x14, 0xa0).unwrap();
+        put_u16(&mut block, 0x16, 0x130).unwrap();
+        block[0x62] = 24;
+        block[0x63] = 6;
+        for index in 0..24 {
+            let offset = 0xa0 + index * 6;
+            put_i16(&mut block, offset, index as i16).unwrap();
+            put_bytes(
+                &mut block,
+                offset + 2,
+                &[index as u8, 255 - index as u8, 64, 255],
+            )
+            .unwrap();
+        }
+        for index in 0..6 {
+            let offset = 0x130 + index * 6;
+            put_i16(&mut block, offset, index as i16).unwrap();
+            put_bytes(&mut block, offset + 2, &[255, index as u8, 128, 255]).unwrap();
+        }
+
+        let parsed = parse_base_shape(&block).unwrap();
+
+        assert_eq!(parsed.allocation_size, 0x160);
+        assert_eq!(parsed.primary_colors.len(), 24);
+        assert_eq!(parsed.environment_colors.len(), 6);
+        assert_eq!(encode_base_shape(&parsed).unwrap(), block);
+    }
+
+    #[test]
+    fn active_mip_prefix_texture_round_trips_without_inventing_levels() {
+        let mut bytes = vec![0; 0x560];
+        bytes[0] = 2;
+        put_u16(&mut bytes, 2, 32).unwrap();
+        put_u16(&mut bytes, 4, 32).unwrap();
+        bytes[0x10] = 1;
+        bytes[0x18] = 3;
+        put_u32(&mut bytes, 0x1c, 0x20).unwrap();
+
+        let parsed = JpaxTextureImage::parse(&bytes).unwrap();
+
+        assert_eq!(parsed.mip_storage, JpaxMipStorage::ActiveLevels);
+        assert_eq!(
+            parsed
+                .encoded_mip_levels
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            vec![0x400, 0x100, 0x40]
+        );
+        assert_eq!(parsed.encode().unwrap(), bytes);
+    }
 
     fn zero_dynamics() -> JpaxDynamicsBlock {
         JpaxDynamicsBlock {

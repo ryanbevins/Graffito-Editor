@@ -225,6 +225,8 @@ pub struct JDramaField {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum JDramaFieldValue {
+    U8(u8),
+    Bytes3([u8; 3]),
     U32(u32),
     I32(i32),
     F32(f32),
@@ -356,6 +358,13 @@ impl<'a> StrictCursor<'a> {
         Ok(value)
     }
 
+    fn u8(&mut self) -> Result<u8> {
+        self.require(1)?;
+        let value = self.bytes[self.offset];
+        self.offset += 1;
+        Ok(value)
+    }
+
     fn i32(&mut self) -> Result<i32> {
         Ok(self.u32()? as i32)
     }
@@ -381,6 +390,15 @@ impl<'a> StrictCursor<'a> {
             .try_into()
             .expect("four bytes were bounds checked");
         self.offset += 4;
+        Ok(value)
+    }
+
+    fn bytes3(&mut self) -> Result<[u8; 3]> {
+        self.require(3)?;
+        let value = self.bytes[self.offset..self.offset + 3]
+            .try_into()
+            .expect("three bytes were bounds checked");
+        self.offset += 3;
         Ok(value)
     }
 
@@ -1193,12 +1211,21 @@ fn parse_actor_tail(cursor: &mut StrictCursor<'_>, short_type: &str) -> Result<V
             field("appear_rate", JDramaFieldValue::F32(cursor.f32()?)),
             field("appear_height", JDramaFieldValue::F32(cursor.f32()?)),
         ],
-        "MapObjSmoke" => vec![
-            field("resource_name", JDramaFieldValue::String(cursor.string()?)),
-            field("event_id", JDramaFieldValue::I32(cursor.i32()?)),
-            field("appear_rate", JDramaFieldValue::F32(cursor.f32()?)),
-            field("appear_height", JDramaFieldValue::F32(cursor.f32()?)),
-        ],
+        "MapObjSmoke" => {
+            let mut fields = vec![
+                field("resource_name", JDramaFieldValue::String(cursor.string()?)),
+                field("event_id", JDramaFieldValue::I32(cursor.i32()?)),
+                field("appear_rate", JDramaFieldValue::F32(cursor.f32()?)),
+                field("appear_height", JDramaFieldValue::F32(cursor.f32()?)),
+            ];
+            // THideObjBase::load passes a fourth output to loadHideObjInfo.
+            // Some record-bounded streams omit it and accept the default;
+            // this stage stores the complete tail.
+            if cursor.remaining() == 4 {
+                fields.push(field("object_timer", JDramaFieldValue::I32(cursor.i32()?)));
+            }
+            fields
+        }
         "Door" => vec![
             field("resource_name", JDramaFieldValue::String(cursor.string()?)),
             field("door_type", JDramaFieldValue::I32(cursor.i32()?)),
@@ -1376,12 +1403,16 @@ fn parse_actor_tail(cursor: &mut StrictCursor<'_>, short_type: &str) -> Result<V
         | "HaneHamuKuri2" | "Gesso" | "HanaSambo" | "SamboHead" | "DebuTelesa" | "Yumbo"
         | "TabePuku" | "LandGesso" | "PoiHana" | "PoiHanaRed" | "SleepPoiHana" | "FireWanwan"
         | "AmiNoko" | "Kumokun" | "FireHamuKuri" | "DoroHaneKuri" | "TamaNoko"
-        | "BossDangoHamuKuri" | "Rocket" | "ElecNokonoko" => vec![
+        | "BossDangoHamuKuri" | "Rocket" | "ElecNokonoko" | "NameKuri" => vec![
             field("manager_name", JDramaFieldValue::String(cursor.string()?)),
             field("graph_name", JDramaFieldValue::String(cursor.string()?)),
             field("coin_id", JDramaFieldValue::I32(cursor.i32()?)),
         ],
         "Amenbo" | "Kazekun" => vec![field(
+            "manager_name",
+            JDramaFieldValue::String(cursor.string()?),
+        )],
+        "PollutionDrop" => vec![field(
             "manager_name",
             JDramaFieldValue::String(cursor.string()?),
         )],
@@ -1467,6 +1498,41 @@ fn parse_actor_tail(cursor: &mut StrictCursor<'_>, short_type: &str) -> Result<V
             field("graph_name", JDramaFieldValue::String(cursor.string()?)),
             field("fish_count", JDramaFieldValue::U32(cursor.u32()?)),
             field("group_id", JDramaFieldValue::I32(cursor.i32()?)),
+        ],
+        // Better Sunshine Engine's TSoundBox::load reads these exact fields
+        // after JDrama::TActor. Keep the final BoundingType byte narrow so a
+        // semantic rebuild retains the custom actor's 17-byte tail.
+        "SoundBox" => vec![
+            field("sound_id", JDramaFieldValue::I32(cursor.i32()?)),
+            field("volume", JDramaFieldValue::F32(cursor.f32()?)),
+            field("pitch", JDramaFieldValue::F32(cursor.f32()?)),
+            field("spawn_rate", JDramaFieldValue::I32(cursor.i32()?)),
+            field("bounding_shape", JDramaFieldValue::U8(cursor.u8()?)),
+        ],
+        // Better Sunshine Engine's TGenericRailObj::load reads two strings,
+        // its rail/animation/audio controls, and two explicit three-byte
+        // skips after JDrama::TActor.
+        "GenericRailObj" => vec![
+            field("model_name", JDramaFieldValue::String(cursor.string()?)),
+            field("rail_name", JDramaFieldValue::String(cursor.string()?)),
+            field(
+                "base_rotation",
+                JDramaFieldValue::Vec3F32(cursor.vec3_f32()?),
+            ),
+            field("frame_rate", JDramaFieldValue::F32(cursor.f32()?)),
+            field("sound_id", JDramaFieldValue::U32(cursor.u32()?)),
+            field("sound_speed", JDramaFieldValue::U32(cursor.u32()?)),
+            field("sound_strength", JDramaFieldValue::F32(cursor.f32()?)),
+            field(
+                "reserved_before_contact",
+                JDramaFieldValue::Bytes3(cursor.bytes3()?),
+            ),
+            field("contact_animation", JDramaFieldValue::U8(cursor.u8()?)),
+            field(
+                "reserved_before_cull",
+                JDramaFieldValue::Bytes3(cursor.bytes3()?),
+            ),
+            field("cull_model", JDramaFieldValue::U8(cursor.u8()?)),
         ],
         value if is_npc_actor_type(value) => {
             let mut fields = vec![
@@ -1754,6 +1820,8 @@ fn write_strict_record(bytes: &mut Vec<u8>, record: &JDramaRecord) -> Result<()>
 fn write_fields(bytes: &mut Vec<u8>, fields: &[JDramaField]) -> Result<()> {
     for field in fields {
         match &field.value {
+            JDramaFieldValue::U8(value) => bytes.push(*value),
+            JDramaFieldValue::Bytes3(value) => bytes.extend_from_slice(value),
             JDramaFieldValue::U32(value) => bytes.extend_from_slice(&value.to_be_bytes()),
             JDramaFieldValue::I32(value) => bytes.extend_from_slice(&value.to_be_bytes()),
             JDramaFieldValue::F32(value) => bytes.extend_from_slice(&value.to_bits().to_be_bytes()),
@@ -3136,6 +3204,91 @@ mod tests {
         let bytes = name_ref_record("Opaque", "object", &[1, 2, 3, 4]);
         let error = parse_jdrama_document(&bytes).unwrap_err().to_string();
         assert!(error.contains("no typed payload for Opaque"), "{error}");
+    }
+
+    #[test]
+    fn strict_parser_round_trips_better_sms_sound_box_tail() {
+        let mut payload = Vec::new();
+        for value in [1.0_f32, 2.0, 3.0, 0.0, 90.0, 0.0, 4.0, 5.0, 6.0] {
+            payload.extend_from_slice(&value.to_be_bytes());
+        }
+        put_len_string(&mut payload, b"");
+        payload.extend_from_slice(&0_u32.to_be_bytes());
+        payload.extend_from_slice(&0x5006_i32.to_be_bytes());
+        payload.extend_from_slice(&1.0_f32.to_be_bytes());
+        payload.extend_from_slice(&0.75_f32.to_be_bytes());
+        payload.extend_from_slice(&30_i32.to_be_bytes());
+        payload.push(4);
+        let bytes = name_ref_record("SoundBox", "Sound Box 1", &payload);
+
+        let document = JDramaDocument::parse(&bytes).unwrap();
+
+        let JDramaRecordPayload::Actor { fields, .. } = &document.root.payload else {
+            panic!("expected SoundBox actor");
+        };
+        assert_eq!(
+            fields,
+            &[
+                field("sound_id", JDramaFieldValue::I32(0x5006)),
+                field("volume", JDramaFieldValue::F32(1.0)),
+                field("pitch", JDramaFieldValue::F32(0.75)),
+                field("spawn_rate", JDramaFieldValue::I32(30)),
+                field("bounding_shape", JDramaFieldValue::U8(4)),
+            ]
+        );
+        assert_eq!(document.to_bytes().unwrap(), bytes);
+    }
+
+    #[test]
+    fn strict_parser_round_trips_better_sms_generic_rail_obj_tail() {
+        let mut payload = Vec::new();
+        for value in [1.0_f32, 2.0, 3.0, 0.0, 90.0, 0.0, 4.0, 5.0, 6.0] {
+            payload.extend_from_slice(&value.to_be_bytes());
+        }
+        put_len_string(&mut payload, b"");
+        payload.extend_from_slice(&0_u32.to_be_bytes());
+        put_len_string(&mut payload, b"windmill");
+        put_len_string(&mut payload, b"rail");
+        for value in [0.0_f32, 15.0, 0.0, 1.5] {
+            payload.extend_from_slice(&value.to_be_bytes());
+        }
+        payload.extend_from_slice(&0x5006_u32.to_be_bytes());
+        payload.extend_from_slice(&60_u32.to_be_bytes());
+        payload.extend_from_slice(&0.5_f32.to_be_bytes());
+        payload.extend_from_slice(&[1, 2, 3]);
+        payload.push(2);
+        payload.extend_from_slice(&[4, 5, 6]);
+        payload.push(1);
+        let bytes = name_ref_record("GenericRailObj", "moving object", &payload);
+
+        let document = JDramaDocument::parse(&bytes).unwrap();
+
+        let JDramaRecordPayload::Actor { fields, .. } = &document.root.payload else {
+            panic!("expected GenericRailObj actor");
+        };
+        assert_eq!(
+            fields,
+            &[
+                field(
+                    "model_name",
+                    JDramaFieldValue::String("windmill".to_string())
+                ),
+                field("rail_name", JDramaFieldValue::String("rail".to_string())),
+                field("base_rotation", JDramaFieldValue::Vec3F32([0.0, 15.0, 0.0])),
+                field("frame_rate", JDramaFieldValue::F32(1.5)),
+                field("sound_id", JDramaFieldValue::U32(0x5006)),
+                field("sound_speed", JDramaFieldValue::U32(60)),
+                field("sound_strength", JDramaFieldValue::F32(0.5)),
+                field(
+                    "reserved_before_contact",
+                    JDramaFieldValue::Bytes3([1, 2, 3])
+                ),
+                field("contact_animation", JDramaFieldValue::U8(2)),
+                field("reserved_before_cull", JDramaFieldValue::Bytes3([4, 5, 6])),
+                field("cull_model", JDramaFieldValue::U8(1)),
+            ]
+        );
+        assert_eq!(document.to_bytes().unwrap(), bytes);
     }
 
     #[test]

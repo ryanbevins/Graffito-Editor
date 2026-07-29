@@ -664,6 +664,15 @@ fn validation_issues_for_preview(
     let Some(preview) = preview else {
         return issues;
     };
+    for (index, warning) in preview.model_warnings.iter().enumerate() {
+        issues.push(ValidationIssue::warning(
+            format!("renderer-model-preview-adjusted-{index}"),
+            format!(
+                "Model preview adjusted for '{}': {}",
+                warning.asset_path, warning.error
+            ),
+        ));
+    }
     for (index, failure) in preview.model_failures.iter().enumerate() {
         issues.push(ValidationIssue::warning(
             format!("renderer-model-preview-failed-{index}"),
@@ -2862,6 +2871,7 @@ impl SmsEditorApp {
         let mut camera_bound_points = Vec::new();
         let mut loaded_models = 0;
         let mut failed_model_assets = BTreeSet::new();
+        let mut model_warnings = Vec::new();
         let mut model_failures = Vec::new();
         let mut source_vertices = 0;
         let mut source_triangles = 0;
@@ -2918,6 +2928,15 @@ impl SmsEditorApp {
             };
             match preview_result {
                 Ok(mut preview) => {
+                    if preview.adjusted_zero_normals > 0 {
+                        model_warnings.push(PreviewModelFailure {
+                            asset_path: asset_path.clone(),
+                            error: format!(
+                                "replaced {} referenced zero-length normal(s) with the up vector for preview; source model bytes were not changed",
+                                preview.adjusted_zero_normals
+                            ),
+                        });
+                    }
                     apply_level_transform_visibility(
                         &file,
                         &level_targets,
@@ -3366,6 +3385,15 @@ impl SmsEditorApp {
                         continue;
                     }
                 };
+                if preview.adjusted_zero_normals > 0 {
+                    model_warnings.push(PreviewModelFailure {
+                        asset_path: model_path.clone(),
+                        error: format!(
+                            "replaced {} referenced zero-length normal(s) with the up vector for preview; source model bytes were not changed",
+                            preview.adjusted_zero_normals
+                        ),
+                    });
+                }
                 apply_model_material_table(document, &model_path, loader_flags, &mut preview);
                 apply_actor_runtime_textures(document, object, &mut preview);
                 apply_object_preview_appearance(resolved_object_preview.as_ref(), &mut preview);
@@ -3639,6 +3667,15 @@ impl SmsEditorApp {
                             continue;
                         }
                     };
+                    if preview.adjusted_zero_normals > 0 {
+                        model_warnings.push(PreviewModelFailure {
+                            asset_path: asset_path.clone(),
+                            error: format!(
+                                "replaced {} referenced zero-length normal(s) with the up vector for preview; source model bytes were not changed",
+                                preview.adjusted_zero_normals
+                            ),
+                        });
+                    }
                     // Parts are ordinary J3D models. Give them the same BMT
                     // resolution as bodies and map objects so dummy textures
                     // (including custom-model placeholders) resolve by asset
@@ -3864,6 +3901,7 @@ impl SmsEditorApp {
             camera_bounds_max,
             loaded_models,
             failed_models: failed_model_assets.len(),
+            model_warnings,
             model_failures,
             source_vertices,
             source_triangles,

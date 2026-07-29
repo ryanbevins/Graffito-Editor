@@ -2283,6 +2283,25 @@ fn object_parameter_control(
         };
     }
     match parameter.kind {
+        ObjectParameterKind::U8 => {
+            let parsed = parameter.raw_value.trim().parse::<u8>();
+            let mut error = parsed
+                .as_ref()
+                .err()
+                .map(|error| format!("Expected u8: {error}"));
+            let mut value = parsed.unwrap_or_default();
+            let response = ui.add(egui::DragValue::new(&mut value).speed(1.0));
+            let edit = object_parameter_widget_response(&response);
+            let raw_value = edit.changed.then(|| value.to_string());
+            if raw_value.is_some() {
+                error = None;
+            }
+            ObjectParameterControlResponse {
+                edit,
+                raw_value,
+                error,
+            }
+        }
         ObjectParameterKind::U32 => {
             let parsed = parameter.raw_value.trim().parse::<u32>();
             let mut error = parsed

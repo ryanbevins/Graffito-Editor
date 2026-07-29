@@ -247,6 +247,9 @@ pub struct J3dGeometryPreview {
     pub materials: Vec<J3dMaterial>,
     pub bounds_min: [f32; 3],
     pub bounds_max: [f32; 3],
+    /// Referenced zero-length normals replaced with a stable preview-only up
+    /// vector. The source model bytes are never changed.
+    pub adjusted_zero_normals: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -1143,6 +1146,7 @@ impl J3dFile {
             &[],
             draw_matrices,
         )
+        .map(|(triangles, _)| triangles)
     }
 
     pub fn triangles_with_joint_overrides(
@@ -1297,7 +1301,7 @@ impl J3dFile {
             .collect::<Vec<_>>();
         let material_textures = self.material_texture_bindings(&textures, &material_colors)?;
         let draw_matrices = self.preview_draw_matrices(loader_flags, animation, overrides)?;
-        let triangles = self.read_shape_triangles(
+        let (triangles, adjusted_zero_normals) = self.read_shape_triangles(
             shp1.offset as usize,
             &vertex_preview.positions,
             &attr_formats,
@@ -1328,6 +1332,7 @@ impl J3dFile {
             materials,
             bounds_min,
             bounds_max,
+            adjusted_zero_normals,
         })
     }
 
@@ -1427,7 +1432,7 @@ impl J3dFile {
         material_render_states: &[J3dMaterialRenderState],
         material_textures: &[Option<MaterialPreviewBinding>],
         draw_matrices: &[Option<Mtx34>],
-    ) -> Result<Vec<J3dTriangle>> {
+    ) -> Result<(Vec<J3dTriangle>, usize)> {
         let shape_count = be_u16(&self.bytes, shape_offset + 0x08, FORMAT)? as usize;
         let shape_init_offset = relative_offset(&self.bytes, shape_offset, 0x0C)?;
         let index_table_offset = relative_offset(&self.bytes, shape_offset, 0x10)?;
@@ -1439,6 +1444,7 @@ impl J3dFile {
 
         let mut triangles = Vec::new();
         let mut packet_index = 0usize;
+        let mut adjusted_zero_normals = 0usize;
         for shape_no in 0..shape_count {
             let index = be_u16(&self.bytes, index_table_offset + shape_no * 2, FORMAT)? as usize;
             let init_offset = shape_init_offset + index * 0x28;
@@ -1495,6 +1501,7 @@ impl J3dFile {
                     color,
                     render_state,
                     texture_binding,
+                    &mut adjusted_zero_normals,
                 )?;
                 for triangle in &mut shape_triangles {
                     triangle.material_index = material_index;
@@ -1525,7 +1532,7 @@ impl J3dFile {
             }
         }
 
-        Ok(triangles)
+        Ok((triangles, adjusted_zero_normals))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1548,6 +1555,7 @@ impl J3dFile {
 
         let mut packets = Vec::new();
         let mut packet_index = 0usize;
+        let mut adjusted_zero_normals = 0usize;
         for shape_no in 0..shape_count {
             let index = be_u16(&self.bytes, index_table_offset + shape_no * 2, FORMAT)? as usize;
             let init_offset = shape_init_offset + index * 0x28;
@@ -1587,6 +1595,7 @@ impl J3dFile {
                     position_format,
                     vertex_arrays,
                     &group_matrices,
+                    &mut adjusted_zero_normals,
                 )?;
                 let billboard = if matches!(shape_mtx_type, 0x01 | 0x02) {
                     group_matrices
@@ -4500,6 +4509,7 @@ fn decode_display_list(
     color: Option<[u8; 4]>,
     render_state: J3dMaterialRenderState,
     texture_binding: Option<MaterialPreviewBinding>,
+    adjusted_zero_normals: &mut usize,
 ) -> Result<Vec<J3dTriangle>> {
     let mut offset = 0usize;
     let mut triangles = Vec::new();
@@ -4534,6 +4544,7 @@ fn decode_display_list(
                 vertex_arrays,
                 group_matrices,
                 draw_matrices,
+                adjusted_zero_normals,
             )?);
         }
 
@@ -4628,6 +4639,7 @@ fn decode_prepared_display_list(
     position_format: PositionFormat,
     vertex_arrays: VertexArrays,
     group_matrices: &[u16],
+    adjusted_zero_normals: &mut usize,
 ) -> Result<PreparedDisplayList> {
     let mut offset = 0usize;
     let mut vertices = Vec::new();
@@ -4662,6 +4674,7 @@ fn decode_prepared_display_list(
                 position_format,
                 vertex_arrays,
                 group_matrices,
+                adjusted_zero_normals,
             )?);
         }
 
@@ -4742,6 +4755,7 @@ fn read_primitive_vertex(
     vertex_arrays: VertexArrays,
     group_matrices: &[u16],
     draw_matrices: &[Option<Mtx34>],
+    adjusted_zero_normals: &mut usize,
 ) -> Result<PrimitiveVertex> {
     read_prepared_primitive_vertex(
         bytes,
@@ -4753,6 +4767,7 @@ fn read_primitive_vertex(
         position_format,
         vertex_arrays,
         group_matrices,
+        adjusted_zero_normals,
     )
     .map(|vertex| vertex.pose(draw_matrices))
 }
@@ -4768,6 +4783,7 @@ fn read_prepared_primitive_vertex(
     position_format: PositionFormat,
     vertex_arrays: VertexArrays,
     group_matrices: &[u16],
+    adjusted_zero_normals: &mut usize,
 ) -> Result<PreparedPrimitiveVertex> {
     let mut position = None;
     let mut matrix_slot = None;
@@ -4785,7 +4801,12 @@ fn read_prepared_primitive_vertex(
                     position = Some(read_direct_position(bytes, offset, position_format)?);
                 } else if desc.attr == GX_VA_NRM {
                     if let Some(format) = vertex_arrays.normal_format {
-                        normal = Some(read_direct_normal(bytes, offset, format)?);
+                        normal = Some(read_direct_normal(
+                            bytes,
+                            offset,
+                            format,
+                            adjusted_zero_normals,
+                        )?);
                     } else {
                         let size = direct_attribute_size(desc.attr, attr_formats)?;
                         checked_slice(FORMAT, bytes, *offset, size)?;
@@ -4824,7 +4845,12 @@ fn read_prepared_primitive_vertex(
                 } else if desc.attr == GX_VA_POS {
                     position = positions.get(index).copied();
                 } else if desc.attr == GX_VA_NRM {
-                    normal = Some(read_indexed_normal(source_bytes, index, vertex_arrays)?);
+                    normal = Some(read_indexed_normal(
+                        source_bytes,
+                        index,
+                        vertex_arrays,
+                        adjusted_zero_normals,
+                    )?);
                 } else if desc.attr == GX_VA_CLR0 || desc.attr == GX_VA_CLR1 {
                     let color_index = (desc.attr - GX_VA_CLR0) as usize;
                     colors[color_index] = Some(read_indexed_vertex_color(
@@ -4852,7 +4878,12 @@ fn read_prepared_primitive_vertex(
                 } else if desc.attr == GX_VA_POS {
                     position = positions.get(index).copied();
                 } else if desc.attr == GX_VA_NRM {
-                    normal = Some(read_indexed_normal(source_bytes, index, vertex_arrays)?);
+                    normal = Some(read_indexed_normal(
+                        source_bytes,
+                        index,
+                        vertex_arrays,
+                        adjusted_zero_normals,
+                    )?);
                 } else if desc.attr == GX_VA_CLR0 || desc.attr == GX_VA_CLR1 {
                     let color_index = (desc.attr - GX_VA_CLR0) as usize;
                     colors[color_index] = Some(read_indexed_vertex_color(
@@ -4951,7 +4982,12 @@ fn read_direct_tex_coord(
     Ok(tex)
 }
 
-fn read_direct_normal(bytes: &[u8], offset: &mut usize, format: NormalFormat) -> Result<[f32; 3]> {
+fn read_direct_normal(
+    bytes: &[u8],
+    offset: &mut usize,
+    format: NormalFormat,
+    adjusted_zero_normals: &mut usize,
+) -> Result<[f32; 3]> {
     let mut components = Vec::with_capacity(format.components.max(3));
     for _ in 0..format.components {
         components.push(read_normal_component(bytes, offset, format)?);
@@ -4961,9 +4997,20 @@ fn read_direct_normal(bytes: &[u8], offset: &mut usize, format: NormalFormat) ->
         *components.get(1).unwrap_or(&0.0),
         *components.get(2).unwrap_or(&1.0),
     ];
+    let len_sq = normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2];
+    if !len_sq.is_finite() {
+        return Err(FormatError::Unsupported {
+            format: FORMAT,
+            message: "normal vector is not finite".to_string(),
+        });
+    }
+    if len_sq <= f32::EPSILON {
+        *adjusted_zero_normals = (*adjusted_zero_normals).saturating_add(1);
+        return Ok([0.0, 1.0, 0.0]);
+    }
     normalize_vec3(normal).ok_or_else(|| FormatError::Unsupported {
         format: FORMAT,
-        message: "normal vector has zero length".to_string(),
+        message: "normal vector could not be normalized".to_string(),
     })
 }
 
@@ -5076,6 +5123,7 @@ fn read_indexed_normal(
     bytes: &[u8],
     index: usize,
     vertex_arrays: VertexArrays,
+    adjusted_zero_normals: &mut usize,
 ) -> Result<[f32; 3]> {
     let Some(array_offset) = vertex_arrays.normal_offset else {
         return Err(FormatError::Unsupported {
@@ -5091,7 +5139,7 @@ fn read_indexed_normal(
     };
     let stride = normal_stride(format);
     let mut offset = array_offset + index * stride;
-    read_direct_normal(bytes, &mut offset, format)
+    read_direct_normal(bytes, &mut offset, format, adjusted_zero_normals)
 }
 
 fn read_indexed_vertex_color(

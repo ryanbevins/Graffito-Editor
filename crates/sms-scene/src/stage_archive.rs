@@ -53,6 +53,13 @@ pub struct SourceFreeStageArchive {
 pub enum StageOrigin {
     #[default]
     ImportedArchive,
+    /// An external archive promoted into a managed project stage without
+    /// applying the blank-stage bootstrap or safety geometry.
+    ImportedCustom {
+        target_slot: String,
+        #[serde(default)]
+        warnings: Vec<String>,
+    },
     Blank {
         target_slot: String,
         preset_version: u32,
@@ -143,6 +150,16 @@ impl SourceFreeStageArchive {
     /// This constructor succeeds only when every child has a semantic writer.
     /// Unsupported resources are reported by exact archive path.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::parse_impl(bytes, false).map(|(archive, _)| archive)
+    }
+
+    pub(crate) fn parse_allowing_creator_normalization(
+        bytes: &[u8],
+    ) -> Result<(Self, Vec<String>)> {
+        Self::parse_impl(bytes, true)
+    }
+
+    fn parse_impl(bytes: &[u8], allow_creator_normalization: bool) -> Result<(Self, Vec<String>)> {
         let (compression, rarc_bytes) = if bytes.starts_with(b"Yaz0") {
             let Yaz0Document { reserved, data } = Yaz0Document::parse(bytes)?;
             (Some(StageCompression::Yaz0 { reserved }), data)
@@ -158,7 +175,14 @@ impl SourceFreeStageArchive {
             .iter()
             .map(|entry| entry.raw_path.clone())
             .collect::<Vec<_>>();
-        let mut archive = RarcDocument::parse(&rarc_bytes)?;
+        let (mut archive, creator_normalization) = if allow_creator_normalization {
+            RarcDocument::parse_allowing_noncanonical_creator_data(&rarc_bytes)?
+        } else {
+            (RarcDocument::parse(&rarc_bytes)?, None)
+        };
+        let canonical_input = allow_creator_normalization
+            .then(|| archive.to_bytes())
+            .transpose()?;
         drop(index);
         drop(rarc_bytes);
 
@@ -185,12 +209,43 @@ impl SourceFreeStageArchive {
             }));
         }
 
-        Ok(Self {
+        let document = Self {
             archive,
             compression,
             resources,
             origin: StageOrigin::ImportedArchive,
-        })
+        };
+        let mut warnings = Vec::new();
+        if let Some(normalization) = creator_normalization {
+            warnings.push(format!(
+                "The source RARC uses noncanonical creator metadata/layout (first difference at {:#X}; source {} bytes, canonical {} bytes). Graffito preserved every semantic resource and will use canonical RARC metadata when rebuilding.",
+                normalization.first_difference,
+                normalization.source_size,
+                normalization.canonical_size
+            ));
+        }
+        if allow_creator_normalization {
+            let rebuilt = document.encode()?;
+            let rebuilt_rarc = if rebuilt.starts_with(b"Yaz0") {
+                Yaz0Document::parse(&rebuilt)?.data
+            } else {
+                rebuilt.clone()
+            };
+            if canonical_input.as_deref() != Some(rebuilt_rarc.as_slice()) {
+                return Err(SceneError::Format(FormatError::Unsupported {
+                    format: "stage archive",
+                    message: "semantic child resources changed while normalizing noncanonical RARC creator data"
+                        .to_string(),
+                }));
+            }
+            if rebuilt != bytes && warnings.is_empty() {
+                warnings.push(
+                    "The source Yaz0 stream uses a noncanonical compressor layout. Graffito preserved the decompressed archive and will use canonical Yaz0 compression when rebuilding."
+                        .to_string(),
+                );
+            }
+        }
+        Ok((document, warnings))
     }
 
     pub fn origin(&self) -> &StageOrigin {
@@ -1098,7 +1153,7 @@ pub(crate) fn parse_resource(
             payload,
         )?));
     }
-    if lower.ends_with(b".me") {
+    if lower.ends_with(b".me") || lower.ends_with(b".txt") {
         return Ok(StageResourceDocument::Marker(MarkerTextFile::parse(
             payload,
         )?));
@@ -1183,7 +1238,7 @@ fn document_matches_path(raw_path: &[u8], document: &StageResourceDocument) -> b
         StageResourceDocument::Bitmap(_) => lower.ends_with(b".bmp"),
         StageResourceDocument::Collision(_) => lower.ends_with(b".col"),
         StageResourceDocument::Message(_) => lower.ends_with(b".bmg"),
-        StageResourceDocument::Marker(_) => lower.ends_with(b".me"),
+        StageResourceDocument::Marker(_) => lower.ends_with(b".me") || lower.ends_with(b".txt"),
         StageResourceDocument::Model(document) => {
             (lower.ends_with(b".bmd") && document.file_type.starts_with(b"bmd"))
                 || (lower.ends_with(b".bdl") && document.file_type.starts_with(b"bdl"))
@@ -1332,6 +1387,62 @@ mod tests {
         source.fill(0xA5);
         let rebuilt = document.encode().expect("strict source-free export");
         assert_eq!(rebuilt, expected);
+    }
+
+    #[test]
+    fn editor_import_normalizes_creator_metadata_with_a_warning() {
+        let canonical = fixture_archive(false);
+        let mut noncanonical = canonical.clone();
+        noncanonical[0x20 + 0x1B] = 1;
+
+        assert!(SourceFreeStageArchive::parse(&noncanonical).is_err());
+        let (document, warnings) =
+            SourceFreeStageArchive::parse_allowing_creator_normalization(&noncanonical).unwrap();
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("noncanonical creator metadata/layout"));
+        assert_eq!(document.encode().unwrap(), canonical);
+    }
+
+    #[test]
+    fn imported_custom_stage_keeps_existing_resources_and_persistent_warnings() {
+        let canonical = fixture_archive(false);
+        let mut noncanonical = canonical.clone();
+        noncanonical[0x20 + 0x1B] = 1;
+        let base_root = std::env::temp_dir().join(format!(
+            "graffito-imported-custom-stage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base_root).unwrap();
+
+        let document =
+            crate::StageDocument::from_imported_custom_archive(&base_root, "town1", &noncanonical)
+                .unwrap();
+        let archive = document.stage_archive.as_ref().unwrap();
+
+        assert!(matches!(
+            archive.origin(),
+            StageOrigin::ImportedCustom { target_slot, warnings }
+                if target_slot == "town1"
+                    && warnings.len() == 2
+                    && warnings[0].contains("noncanonical creator metadata/layout")
+        ));
+        assert_eq!(archive.encode().unwrap(), canonical);
+        assert!(document.death_barrier.is_none());
+        assert_eq!(
+            document
+                .load_issues
+                .iter()
+                .filter(|issue| issue.code.starts_with("custom-stage-import-warning-"))
+                .count(),
+            2
+        );
+
+        std::fs::remove_dir_all(base_root).unwrap();
     }
 
     #[test]

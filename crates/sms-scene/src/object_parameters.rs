@@ -40,6 +40,7 @@ const SOURCE_PARAMETER_ALIASES: [(&str, &str); 11] = [
 /// The exact scalar/vector type stored in a strict JDrama record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectParameterKind {
+    U8,
     U32,
     I32,
     F32,
@@ -406,6 +407,7 @@ pub fn apply_all_object_parameters(record: &mut JDramaRecord, object: &SceneObje
 
 #[derive(Debug, Clone, PartialEq)]
 enum ParsedParameterValue {
+    U8(u8),
     U32(u32),
     I32(i32),
     F32(f32),
@@ -1251,6 +1253,8 @@ fn record_fields_mut(record: &mut JDramaRecord) -> Option<&mut [JDramaField]> {
 
 fn field_kind(value: &JDramaFieldValue) -> Option<ObjectParameterKind> {
     Some(match value {
+        JDramaFieldValue::U8(_) => ObjectParameterKind::U8,
+        JDramaFieldValue::Bytes3(_) => return None,
         JDramaFieldValue::U32(_) => ObjectParameterKind::U32,
         JDramaFieldValue::I32(_) => ObjectParameterKind::I32,
         JDramaFieldValue::F32(_) => ObjectParameterKind::F32,
@@ -1264,6 +1268,8 @@ fn field_kind(value: &JDramaFieldValue) -> Option<ObjectParameterKind> {
 
 fn canonical_field_value(value: &JDramaFieldValue) -> String {
     match value {
+        JDramaFieldValue::U8(value) => value.to_string(),
+        JDramaFieldValue::Bytes3(_) => String::new(),
         JDramaFieldValue::U32(value) => value.to_string(),
         JDramaFieldValue::I32(value) => value.to_string(),
         JDramaFieldValue::F32(value) => value.to_string(),
@@ -1285,6 +1291,11 @@ fn parse_parameter_value(
     raw: &str,
 ) -> Result<ParsedParameterValue> {
     match kind {
+        ObjectParameterKind::U8 => raw
+            .trim()
+            .parse::<u8>()
+            .map(ParsedParameterValue::U8)
+            .map_err(|error| invalid_value(key, raw, "u8", error)),
         ObjectParameterKind::U32 => raw
             .trim()
             .parse::<u32>()
@@ -1364,6 +1375,7 @@ fn split_exact<'a, const N: usize>(
 
 fn replace_field_value(field: &mut JDramaField, value: ParsedParameterValue) -> Result<()> {
     match (&mut field.value, value) {
+        (JDramaFieldValue::U8(current), ParsedParameterValue::U8(value)) => *current = value,
         (JDramaFieldValue::U32(current), ParsedParameterValue::U32(value)) => *current = value,
         (JDramaFieldValue::I32(current), ParsedParameterValue::I32(value)) => *current = value,
         (JDramaFieldValue::F32(current), ParsedParameterValue::F32(value)) => *current = value,
