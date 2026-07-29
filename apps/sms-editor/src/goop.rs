@@ -2324,6 +2324,26 @@ impl SmsEditorApp {
         self.finish_goop_document_change("Deleted generated goop layer");
     }
 
+    /// Regenerates goop when a terrain edit has left it stale.
+    ///
+    /// Goop is baked against the final terrain, so moved geometry cannot carry
+    /// it along and it has to be rebuilt rather than shifted. The rebuild runs
+    /// on a background thread and declines while another one is in flight, in
+    /// which case the stale banner stays up for a manual rebuild.
+    pub(super) fn rebuild_generated_goop_layers_if_stale(&mut self) {
+        if self.background_receiver.is_some() {
+            return;
+        }
+        let stale = self
+            .document
+            .as_ref()
+            .and_then(|document| document.goop_authoring.as_ref())
+            .is_some_and(|goop| goop.stale);
+        if stale {
+            self.rebuild_generated_goop_layers();
+        }
+    }
+
     fn rebuild_generated_goop_layers(&mut self) {
         if self.background_receiver.is_some() {
             self.log

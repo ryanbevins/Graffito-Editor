@@ -1301,9 +1301,11 @@ impl SmsEditorApp {
             } else {
                 // Moving an instance leaves its loader flags alone, so this is
                 // the branch a transform edit lands in. Goop is baked against
-                // the final terrain, so it has to be re-checked here or it
-                // stays behind at the geometry's old position.
+                // the final terrain, so moved geometry leaves it behind at the
+                // old position: re-check, then regenerate rather than only
+                // flagging it for a manual rebuild.
                 self.refresh_goop_stale_from_final_terrain();
+                self.rebuild_generated_goop_layers_if_stale();
                 self.rebuild_gpu_viewport_scene();
                 self.clear_viewport_preview_cache();
             }
@@ -1455,25 +1457,32 @@ impl SmsEditorApp {
             return Some(hit);
         }
 
-        // The origin radius only covers instances with no preview mesh to test.
-        // Applying it to meshed instances too would let a click on bare terrain
-        // near an instance's origin select and frame it.
-        let meshed = self
-            .model_preview
-            .as_ref()
-            .map(|preview| &preview.instance_model_indices);
+        // Falling back to the drawn bounding box. The mesh test only works
+        // once an instance's geometry is in the stage preview, which needs a
+        // cached asset preview, and the old origin-radius fallback only
+        // covered a 28px dot that is nowhere near the visible model for
+        // anything but a tiny prop. The box is what the viewport already
+        // outlines for a selected instance, so clicking inside it is the
+        // behaviour the drawing implies.
         let projection = self.camera_projection(rect);
         self.model_instances
             .iter()
             .filter(|instance| instance.stage_id.eq_ignore_ascii_case(&self.stage_id))
-            .filter(|instance| {
-                meshed.is_none_or(|meshed| !meshed.contains_key(&instance.placement.instance_id))
-            })
             .filter_map(|instance| {
-                let transform = matrix_to_transform(instance.placement.transform);
-                let (screen, depth) = projection.project_world_to_screen(transform.translation)?;
-                (screen.distance(position) <= 28.0)
-                    .then_some((depth, instance.placement.instance_id))
+                let mut minimum = egui::Pos2::new(f32::INFINITY, f32::INFINITY);
+                let mut maximum = egui::Pos2::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+                let mut nearest = f32::INFINITY;
+                for corner in transformed_bounds_corners(instance) {
+                    let (screen, depth) = projection.project_world_to_screen(corner)?;
+                    minimum = minimum.min(screen);
+                    maximum = maximum.max(screen);
+                    nearest = nearest.min(depth);
+                }
+                // A degenerate or edge-on box still deserves a grab margin.
+                let bounds = egui::Rect::from_min_max(minimum, maximum).expand(4.0);
+                bounds
+                    .contains(position)
+                    .then_some((nearest, instance.placement.instance_id))
             })
             .min_by(|left, right| left.0.total_cmp(&right.0))
             .map(|(_, id)| id)
