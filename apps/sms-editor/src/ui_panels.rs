@@ -490,91 +490,37 @@ impl SmsEditorApp {
             |ui| self.outliner_panel(ui),
         );
         ui.separator();
-        egui::ScrollArea::vertical()
+        // Scroll on both axes and refuse to shrink to content. A vertical-only
+        // scroll area still reports its content's full width, and a panel grows
+        // to whatever its contents demand, so the inspector's widest row set the
+        // dock's minimum width and dragging narrower than that snapped back.
+        egui::ScrollArea::both()
             .id_salt("inspector-scroll")
+            .auto_shrink([false, false])
             .show(ui, |ui| self.inspector_panel(ui));
     }
 
-    pub(super) fn bottom_dock(&mut self, ui: &mut egui::Ui, max_height: f32) {
-        self.content_dock_resize_handle(ui, max_height);
-
+    pub(super) fn bottom_dock(&mut self, ui: &mut egui::Ui) {
         if !self.show_console && self.bottom_tab == BottomTab::Console {
             self.bottom_tab = BottomTab::Content;
         }
-        let mut persist_height = false;
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.bottom_tab, BottomTab::Content, "Content Browser");
-            if self.show_console {
+        // Each dock panel names itself in its own toolbar, so the tab row only
+        // earns its space when the console gives it something to switch to.
+        // Maximize is gone with it: the panel's top edge drags to any height,
+        // which covers what the button did without spending a row on it.
+        if self.show_console {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.bottom_tab, BottomTab::Content, "Content Browser");
                 ui.selectable_value(&mut self.bottom_tab, BottomTab::Console, "Console");
-            }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let current_height = self
-                    .content_browser
-                    .settings
-                    .dock_height
-                    .clamp(BROWSER_DOCK_MIN_HEIGHT, max_height);
-                let maximized = (max_height - current_height).abs() <= 2.0;
-                let label = if maximized { "Restore" } else { "Maximize" };
-                let tooltip = if maximized {
-                    "Restore the Content Browser to its default height"
-                } else {
-                    "Expand the Content Browser while keeping the viewport accessible"
-                };
-                if ui.small_button(label).on_hover_text(tooltip).clicked() {
-                    self.content_browser.settings.dock_height =
-                        toggled_content_dock_height(current_height, max_height);
-                    persist_height = true;
-                }
             });
-        });
-        if persist_height {
-            self.persist_content_browser_settings();
+            ui.separator();
         }
-        ui.separator();
 
         match self.bottom_tab {
             BottomTab::Content => self.content_browser_panel(ui),
             BottomTab::Console => self.console(ui),
         }
         ui.take_available_space();
-    }
-
-    fn content_dock_resize_handle(&mut self, ui: &mut egui::Ui, max_height: f32) {
-        let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 12.0), egui::Sense::drag());
-        if response.hovered() || response.dragged() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
-        }
-
-        let active = response.hovered() || response.dragged();
-        let color = if active {
-            egui::Color32::from_rgb(48, 176, 190)
-        } else {
-            egui::Color32::from_rgb(73, 80, 82)
-        };
-        ui.painter().line_segment(
-            [
-                egui::pos2(rect.center().x - 34.0, rect.center().y),
-                egui::pos2(rect.center().x + 34.0, rect.center().y),
-            ],
-            egui::Stroke::new(if active { 3.0 } else { 2.0 }, color),
-        );
-
-        if response.dragged() {
-            let pointer_delta_y = ui.input(|input| input.pointer.delta().y);
-            self.content_browser.settings.dock_height = resized_content_dock_height(
-                self.content_browser.settings.dock_height,
-                pointer_delta_y,
-                max_height,
-            );
-            ui.ctx().request_repaint();
-        }
-        if response.drag_stopped() {
-            self.persist_content_browser_settings();
-        }
-
-        response.on_hover_text("Drag to resize the Content Browser");
     }
 
     pub(super) fn project_settings_window(&mut self, ctx: &egui::Context) {
@@ -1326,49 +1272,51 @@ impl SmsEditorApp {
             .filter(|instance| instance.stage_id.eq_ignore_ascii_case(&self.stage_id))
             .cloned()
             .collect::<Vec<_>>();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            if !model_instances.is_empty() {
-                egui::CollapsingHeader::new("Authored Model Instances")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        for instance in &model_instances {
-                            if ui
-                                .selectable_label(
-                                    self.selected_model_instance_id
-                                        == Some(instance.placement.instance_id),
-                                    format!(
-                                        "{}  ({})",
-                                        bilingual_game_text(&instance.placement.name),
-                                        instance.placement.instance_id
-                                    ),
-                                )
-                                .clicked()
-                            {
-                                clicked_model_instance = Some(instance.placement.instance_id);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if !model_instances.is_empty() {
+                    egui::CollapsingHeader::new("Authored Model Instances")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            for instance in &model_instances {
+                                if ui
+                                    .selectable_label(
+                                        self.selected_model_instance_id
+                                            == Some(instance.placement.instance_id),
+                                        format!(
+                                            "{}  ({})",
+                                            bilingual_game_text(&instance.placement.name),
+                                            instance.placement.instance_id
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    clicked_model_instance = Some(instance.placement.instance_id);
+                                }
                             }
-                        }
+                        });
+                    ui.separator();
+                }
+                let Some(tree) = tree.as_ref() else {
+                    ui.add_space(16.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("No level open").color(egui::Color32::GRAY));
+                        ui.small("Open a level to browse its scene hierarchy.");
                     });
-                ui.separator();
-            }
-            let Some(tree) = tree.as_ref() else {
-                ui.add_space(16.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("No level open").color(egui::Color32::GRAY));
-                    ui.small("Open a level to browse its scene hierarchy.");
-                });
-                return;
-            };
-            let outliner = show_outliner_tree(ui, tree, &render);
-            clicked_selection = outliner.clicked;
-            revealed |= outliner.revealed;
-            if tree.visible_objects == 0 {
-                ui.add_space(16.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("No matching objects").strong());
-                    ui.small("Try a factory, class, object name, or identifier.");
-                });
-            }
-        });
+                    return;
+                };
+                let outliner = show_outliner_tree(ui, tree, &render);
+                clicked_selection = outliner.clicked;
+                revealed |= outliner.revealed;
+                if tree.visible_objects == 0 {
+                    ui.add_space(16.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("No matching objects").strong());
+                        ui.small("Try a factory, class, object name, or identifier.");
+                    });
+                }
+            });
         if revealed {
             self.outliner_reveal_pending = None;
         } else if let Some((_, budget)) = self.outliner_reveal_pending.as_mut() {
@@ -2656,21 +2604,6 @@ fn rgba8_drag(ui: &mut egui::Ui, color: &mut [u8; 4]) -> bool {
     changed
 }
 
-fn resized_content_dock_height(current_height: f32, pointer_delta_y: f32, max_height: f32) -> f32 {
-    (current_height - pointer_delta_y).clamp(
-        BROWSER_DOCK_MIN_HEIGHT,
-        max_height.max(BROWSER_DOCK_MIN_HEIGHT),
-    )
-}
-
-fn toggled_content_dock_height(current_height: f32, max_height: f32) -> f32 {
-    let max_height = max_height.max(BROWSER_DOCK_MIN_HEIGHT);
-    if (max_height - current_height).abs() <= 2.0 {
-        BROWSER_DOCK_DEFAULT_HEIGHT.min(max_height)
-    } else {
-        max_height
-    }
-}
 #[cfg(test)]
 mod parameter_control_tests {
     use super::{
@@ -2706,27 +2639,5 @@ mod parameter_control_tests {
         assert!(is_palette_service_type("MapObjManager"));
         assert!(!is_palette_service_type("TBEelTears"));
         assert!(!is_palette_service_type("DirectorSwitch"));
-    }
-}
-#[cfg(test)]
-mod content_dock_tests {
-    use super::{resized_content_dock_height, toggled_content_dock_height};
-
-    #[test]
-    fn upward_drag_grows_and_downward_drag_shrinks_the_dock() {
-        assert_eq!(resized_content_dock_height(420.0, -80.0, 700.0), 500.0);
-        assert_eq!(resized_content_dock_height(420.0, 80.0, 700.0), 340.0);
-    }
-
-    #[test]
-    fn resize_clamps_to_the_supported_window_range() {
-        assert_eq!(resized_content_dock_height(200.0, 100.0, 700.0), 180.0);
-        assert_eq!(resized_content_dock_height(680.0, -100.0, 700.0), 700.0);
-    }
-
-    #[test]
-    fn maximize_control_toggles_between_maximum_and_default_height() {
-        assert_eq!(toggled_content_dock_height(320.0, 700.0), 700.0);
-        assert_eq!(toggled_content_dock_height(700.0, 700.0), 420.0);
     }
 }

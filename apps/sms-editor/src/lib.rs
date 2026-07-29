@@ -1168,6 +1168,7 @@ struct SmsEditorApp {
     object_clipboard: Option<ObjectClipboard>,
     selected_world_member: Option<WorldHierarchyMember>,
     active_placement: Option<ActivePlacement>,
+    content_dock_height_dirty: bool,
     /// Selection the outliner last observed, used to notice a pick made
     /// elsewhere (the viewport, undo, startup focus) and reveal it.
     outliner_observed_selection: Option<String>,
@@ -1444,6 +1445,7 @@ impl Default for SmsEditorApp {
             object_clipboard: None,
             selected_world_member: None,
             active_placement: None,
+            content_dock_height_dirty: false,
             outliner_observed_selection: None,
             outliner_reveal_pending: None,
             object_filter: String::new(),
@@ -1732,10 +1734,27 @@ impl eframe::App for SmsEditorApp {
             .settings
             .dock_height
             .clamp(BROWSER_DOCK_MIN_HEIGHT, max_content_dock_height);
-        egui::Panel::bottom("content_dock_v2")
-            .exact_size(content_dock_height)
+        // Resize from the panel's own top edge rather than a handle laid out
+        // inside it. An in-flow handle is the first thing squeezed out when the
+        // dock is dragged short, and once it is gone there is nothing left to
+        // grab, which locks the dock at that height. A panel edge is a boundary
+        // and cannot be clipped by its own contents.
+        let dock_height = egui::Panel::bottom("content_dock_v2")
+            .resizable(true)
+            // Idle keeps the old borderless look; egui still draws the
+            // separator while the edge is hovered or dragged, so the grab
+            // affordance is there when reached for.
             .show_separator_line(false)
-            .show(root_ui, |ui| self.bottom_dock(ui, max_content_dock_height));
+            .default_size(content_dock_height)
+            .size_range(BROWSER_DOCK_MIN_HEIGHT..=max_content_dock_height)
+            .show(root_ui, |ui| self.bottom_dock(ui))
+            .response
+            .rect
+            .height();
+        if (dock_height - self.content_browser.settings.dock_height).abs() > 0.5 {
+            self.content_browser.settings.dock_height = dock_height;
+            self.content_dock_height_dirty = true;
+        }
 
         egui::CentralPanel::default().show(root_ui, |ui| {
             self.viewport_toolbar(ui);
@@ -1747,6 +1766,11 @@ impl eframe::App for SmsEditorApp {
             }
         });
         let primary_pointer_down = root_ui.input(|input| input.pointer.primary_down());
+        // Write the dock height once the drag ends rather than every frame of it.
+        if self.content_dock_height_dirty && !primary_pointer_down {
+            self.content_dock_height_dirty = false;
+            self.persist_content_browser_settings();
+        }
         self.finish_pointer_undo_transaction_if_released(primary_pointer_down);
         self.project_settings_window(root_ui.ctx());
         self.new_stage_dialog(root_ui.ctx());
