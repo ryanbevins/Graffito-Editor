@@ -1241,34 +1241,32 @@ impl SmsEditorApp {
         let Some(instance) = self.selected_model_instance().cloned() else {
             return false;
         };
-        let corners = transformed_bounds_corners(&instance);
-        let mut minimum = [f32::INFINITY; 3];
-        let mut maximum = [f32::NEG_INFINITY; 3];
-        for corner in corners {
-            for axis in 0..3 {
-                minimum[axis] = minimum[axis].min(corner[axis]);
-                maximum[axis] = maximum[axis].max(corner[axis]);
-            }
-        }
-        if minimum
-            .into_iter()
-            .chain(maximum)
-            .any(|value| !value.is_finite())
-        {
+        let Some(bounds) = model_instance_world_bounds(&instance) else {
             return false;
-        }
-        let focus = std::array::from_fn(|axis| (minimum[axis] + maximum[axis]) * 0.5);
-        let extent = std::array::from_fn::<_, 3, _>(|axis| maximum[axis] - minimum[axis]);
-        let radius =
-            (extent[0] * extent[0] + extent[1] * extent[1] + extent[2] * extent[2]).sqrt() * 0.5;
+        };
+        let (focus, distance) = camera_focus_target_for_bounds(bounds);
         self.stop_camera_fly();
         let camera = self.renderer.camera_mut();
         camera.focus = focus;
-        camera.distance = (radius * 2.8).clamp(250.0, 600_000.0);
+        camera.distance = distance;
         self.viewport_pan = egui::Vec2::ZERO;
         self.viewport_zoom = 1.0;
         self.queue_camera_state_save();
         true
+    }
+
+    /// Framing target for an authored model instance.
+    pub(super) fn model_instance_focus_target(
+        &self,
+        instance_id: uuid::Uuid,
+    ) -> Option<([f32; 3], f32)> {
+        let instance = self
+            .model_instances
+            .iter()
+            .find(|instance| instance.placement.instance_id == instance_id)?;
+        Some(camera_focus_target_for_bounds(model_instance_world_bounds(
+            instance,
+        )?))
     }
 
     pub(super) fn update_selected_model_instance(&mut self, updated: EditorModelInstance) {
@@ -4175,6 +4173,24 @@ fn transform_matrix_point(matrix: [[f32; 4]; 4], point: [f32; 3]) -> [f32; 3] {
             + matrix[2][row] * point[2]
             + matrix[3][row]
     })
+}
+
+/// World-space bounds of a placed instance, or `None` if the transform
+/// produced non-finite corners.
+fn model_instance_world_bounds(instance: &EditorModelInstance) -> Option<[[f32; 3]; 2]> {
+    let mut minimum = [f32::INFINITY; 3];
+    let mut maximum = [f32::NEG_INFINITY; 3];
+    for corner in transformed_bounds_corners(instance) {
+        for axis in 0..3 {
+            minimum[axis] = minimum[axis].min(corner[axis]);
+            maximum[axis] = maximum[axis].max(corner[axis]);
+        }
+    }
+    minimum
+        .into_iter()
+        .chain(maximum)
+        .all(f32::is_finite)
+        .then_some([minimum, maximum])
 }
 
 fn transformed_bounds_corners(instance: &EditorModelInstance) -> [[f32; 3]; 8] {

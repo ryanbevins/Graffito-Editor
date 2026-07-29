@@ -4185,16 +4185,21 @@ impl SmsEditorApp {
         self.renderer.camera().focus
     }
 
+    /// Frames the current selection, gliding rather than snapping. Shares its
+    /// target with the viewport's double-click focus, so `F`, the Frame
+    /// Selection button, and a double-click all behave identically.
     pub(super) fn frame_selected(&mut self) {
-        if self.frame_selected_model_instance() {
+        let target = self
+            .selected_model_instance_id
+            .and_then(|id| self.model_instance_focus_target(id))
+            .or_else(|| {
+                let object_id = self.selected_object().map(|object| object.id.clone())?;
+                self.object_focus_target(&object_id)
+            });
+        let Some((focus, distance)) = target else {
             return;
-        }
-        self.stop_camera_fly();
-        if let Some(object) = self.selected_object() {
-            self.renderer.camera_mut().focus = object.transform.translation;
-            self.viewport_pan = egui::Vec2::ZERO;
-            self.queue_camera_state_save();
-        }
+        };
+        self.begin_camera_focus_animation(focus, distance);
     }
 
     pub(super) fn reset_camera(&mut self) {

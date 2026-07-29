@@ -92,6 +92,11 @@ fn viewport_toolbar_keeps_only_core_transform_tools_top_level() {
         [EditorTool::Move, EditorTool::Rotate, EditorTool::Scale]
     );
     assert!(!CORE_VIEWPORT_TOOLS.contains(&EditorTool::Goop));
+    assert!(!CORE_VIEWPORT_TOOLS.contains(&EditorTool::Place));
+    // Select is a state reached by toggling a transform tool off, not a
+    // button. A fourth button wrapped the row and pushed out the controls
+    // below it.
+    assert!(!CORE_VIEWPORT_TOOLS.contains(&EditorTool::Select));
 }
 
 #[test]
@@ -4675,4 +4680,209 @@ fn software_grid_segments_respect_geometry_depth() {
         grid_color,
     );
     assert!(image.pixels.iter().all(|pixel| *pixel != black));
+}
+
+#[test]
+fn camera_focus_easing_is_clamped_and_symmetric() {
+    assert_eq!(ease_camera_focus(0.0), 0.0);
+    assert_eq!(ease_camera_focus(1.0), 1.0);
+    assert_eq!(ease_camera_focus(-1.0), 0.0);
+    assert_eq!(ease_camera_focus(2.0), 1.0);
+    assert!((ease_camera_focus(0.5) - 0.5).abs() < 1e-6);
+    // Smoothstep leaves the start slowly, so early progress trails linear.
+    assert!(ease_camera_focus(0.25) < 0.25);
+    assert!(ease_camera_focus(0.75) > 0.75);
+}
+
+#[test]
+fn camera_distance_interpolates_geometrically() {
+    assert!((interpolate_camera_distance(100.0, 10_000.0, 0.0) - 100.0).abs() < 1e-3);
+    assert!((interpolate_camera_distance(100.0, 10_000.0, 1.0) - 10_000.0).abs() < 1e-1);
+    // Halfway through a hundred-fold approach sits at the geometric mean,
+    // not the arithmetic midpoint of 5050.
+    assert!((interpolate_camera_distance(100.0, 10_000.0, 0.5) - 1_000.0).abs() < 1e-1);
+    // A degenerate start distance must not produce NaN.
+    assert!(interpolate_camera_distance(0.0, 500.0, 0.5).is_finite());
+}
+
+#[test]
+fn camera_focus_target_centers_bounds_and_scales_with_size() {
+    let (focus, distance) =
+        camera_focus_target_for_bounds([[-100.0, 0.0, -100.0], [100.0, 400.0, 100.0]]);
+    assert!((focus[0] - 0.0).abs() < 1e-3);
+    assert!((focus[1] - 200.0).abs() < 1e-3);
+    assert!((focus[2] - 0.0).abs() < 1e-3);
+    assert!(distance >= CAMERA_FOCUS_DISTANCE_MIN);
+
+    let (_, far) = camera_focus_target_for_bounds([[-5_000.0; 3], [5_000.0; 3]]);
+    assert!(
+        far > distance,
+        "a larger object must be framed from farther"
+    );
+}
+
+#[test]
+fn camera_focus_target_without_geometry_frames_the_origin() {
+    let (focus, distance) = camera_focus_target_from_bounds(None, [10.0, 20.0, 30.0]);
+    assert_eq!(focus, [10.0, 20.0, 30.0]);
+    assert_eq!(
+        distance,
+        (CAMERA_FOCUS_FALLBACK_RADIUS * CAMERA_FOCUS_RADIUS_SCALE)
+            .clamp(CAMERA_FOCUS_DISTANCE_MIN, CAMERA_FOCUS_DISTANCE_MAX)
+    );
+}
+
+#[test]
+fn camera_focus_animation_lands_exactly_on_its_target() {
+    let mut app = camera_app();
+    app.viewport_pan = egui::vec2(40.0, -25.0);
+    app.viewport_zoom = 0.35;
+    app.begin_camera_focus_animation([500.0, 100.0, -250.0], 800.0);
+
+    let mut steps = 0;
+    while app.advance_camera_focus_animation(1.0 / 60.0) {
+        steps += 1;
+        assert!(steps < 600, "the glide must terminate");
+    }
+
+    assert!(steps > 1, "the glide must take more than one frame");
+    let camera = app.renderer.camera();
+    assert_eq!(camera.focus, [500.0, 100.0, -250.0]);
+    assert!((camera.distance - 800.0).abs() < 1e-1);
+    assert_eq!(app.viewport_pan, egui::Vec2::ZERO);
+    assert_eq!(app.viewport_zoom, 1.0);
+}
+
+#[test]
+fn manual_camera_movement_cancels_an_in_flight_glide() {
+    let mut app = camera_app();
+    app.begin_camera_focus_animation([9_000.0, 0.0, 0.0], 400.0);
+    app.advance_camera_focus_animation(1.0 / 60.0);
+
+    app.translate_camera([10.0, 0.0, 0.0]);
+    assert!(
+        !app.advance_camera_focus_animation(1.0 / 60.0),
+        "panning or flying must hand control back to the user"
+    );
+
+    // Orbiting is deliberately allowed to run alongside the glide.
+    app.begin_camera_focus_animation([9_000.0, 0.0, 0.0], 400.0);
+    app.orbit_camera(egui::vec2(5.0, 0.0));
+    assert!(app.advance_camera_focus_animation(1.0 / 60.0));
+}
+
+#[test]
+fn framing_commands_supersede_a_running_glide() {
+    let mut app = camera_app();
+    app.begin_camera_focus_animation([9_000.0, 0.0, 0.0], 400.0);
+    app.stop_camera_fly();
+    assert!(!app.advance_camera_focus_animation(1.0 / 60.0));
+}
+
+#[test]
+fn camera_focus_animation_rejects_non_finite_targets() {
+    let mut app = camera_app();
+    app.begin_camera_focus_animation([f32::NAN, 0.0, 0.0], 400.0);
+    assert!(!app.advance_camera_focus_animation(1.0 / 60.0));
+    app.begin_camera_focus_animation([0.0, 0.0, 0.0], f32::INFINITY);
+    assert!(!app.advance_camera_focus_animation(1.0 / 60.0));
+}
+
+#[test]
+fn select_tool_is_reachable_and_raises_no_gizmo() {
+    // Q switches to Select from every transform tool, matching W/E/R.
+    for tool in [EditorTool::Move, EditorTool::Rotate, EditorTool::Scale] {
+        assert_eq!(
+            tool.after_keyboard_shortcut(egui::Key::Q),
+            EditorTool::Select
+        );
+    }
+    // Select still hands off to the other tools.
+    assert_eq!(
+        EditorTool::Select.after_keyboard_shortcut(egui::Key::W),
+        EditorTool::Move
+    );
+    assert_eq!(
+        EditorTool::Select.after_keyboard_shortcut(egui::Key::G),
+        EditorTool::Goop
+    );
+    // Goop keeps owning its own shortcuts.
+    assert_eq!(
+        EditorTool::Goop.after_keyboard_shortcut(egui::Key::Q),
+        EditorTool::Goop
+    );
+
+    let mut app = camera_app();
+    app.tool = EditorTool::Select;
+    assert!(
+        !app.tool_supports_transform_gizmo(),
+        "the Select tool must not raise a transform gizmo"
+    );
+    for tool in [EditorTool::Move, EditorTool::Rotate, EditorTool::Scale] {
+        app.tool = tool;
+        assert!(app.tool_supports_transform_gizmo());
+    }
+}
+
+#[test]
+fn frame_selected_glides_instead_of_snapping() {
+    let mut app = camera_app();
+    let mut object = SceneObject::new("actor", "Toad");
+    object.transform.translation = [4_000.0, 250.0, -1_500.0];
+    app.document = Some(test_document(vec![object]));
+    app.selected_object_id = Some("actor".to_string());
+
+    let before_focus = app.renderer.camera().focus;
+    app.frame_selected();
+
+    // The camera must not have jumped on the command frame.
+    assert_eq!(app.renderer.camera().focus, before_focus);
+    assert!(
+        app.advance_camera_focus_animation(1.0 / 60.0),
+        "F must start a glide"
+    );
+
+    while app.advance_camera_focus_animation(1.0 / 60.0) {}
+    assert_eq!(app.renderer.camera().focus, [4_000.0, 250.0, -1_500.0]);
+    // No preview geometry, so the object frames at the fallback distance.
+    assert_eq!(
+        app.renderer.camera().distance,
+        (CAMERA_FOCUS_FALLBACK_RADIUS * CAMERA_FOCUS_RADIUS_SCALE)
+            .clamp(CAMERA_FOCUS_DISTANCE_MIN, CAMERA_FOCUS_DISTANCE_MAX)
+    );
+}
+
+#[test]
+fn frame_selected_without_a_selection_does_nothing() {
+    let mut app = camera_app();
+    let before_focus = app.renderer.camera().focus;
+    let before_distance = app.renderer.camera().distance;
+    app.frame_selected();
+    assert!(!app.advance_camera_focus_animation(1.0 / 60.0));
+    assert_eq!(app.renderer.camera().focus, before_focus);
+    assert_eq!(app.renderer.camera().distance, before_distance);
+}
+
+#[test]
+fn clicking_the_active_toolbar_tool_returns_to_select() {
+    // Clicking an inactive tool activates it.
+    assert_eq!(
+        EditorTool::Select.after_toolbar_click(EditorTool::Move),
+        EditorTool::Move
+    );
+    assert_eq!(
+        EditorTool::Move.after_toolbar_click(EditorTool::Scale),
+        EditorTool::Scale
+    );
+
+    // Clicking the active tool toggles it off, back to Select.
+    for tool in [EditorTool::Move, EditorTool::Rotate, EditorTool::Scale] {
+        assert_eq!(tool.after_toolbar_click(tool), EditorTool::Select);
+    }
+
+    // Select is the neutral state, so it has nothing to toggle off to.
+    assert_eq!(
+        EditorTool::Select.after_toolbar_click(EditorTool::Select),
+        EditorTool::Select
+    );
 }
