@@ -460,6 +460,7 @@ pub(super) struct AuthoredModelPreviewBase {
     camera_bounds_min: [f32; 3],
     camera_bounds_max: [f32; 3],
     goop_surface_model_indices: BTreeSet<usize>,
+    instance_model_indices: BTreeMap<uuid::Uuid, usize>,
 }
 
 pub(super) struct PreparedModelImport {
@@ -1395,6 +1396,13 @@ impl SmsEditorApp {
         rect: egui::Rect,
         position: egui::Pos2,
     ) -> Option<uuid::Uuid> {
+        // Prefer the mesh, matching how placed world objects are picked. The
+        // origin radius alone only selected an instance when the part of the
+        // model under the cursor happened to sit near its origin.
+        if let Some(hit) = self.model_instance_mesh_hit_at_screen_position(rect, position) {
+            return Some(hit);
+        }
+
         let projection = self.camera_projection(rect);
         self.model_instances
             .iter()
@@ -1407,6 +1415,60 @@ impl SmsEditorApp {
             })
             .min_by(|left, right| left.0.total_cmp(&right.0))
             .map(|(_, id)| id)
+    }
+
+    /// Nearest authored instance whose preview mesh covers `position`.
+    ///
+    /// Instances without cached preview geometry are absent from
+    /// `instance_model_indices`, so they fall back to the origin radius.
+    fn model_instance_mesh_hit_at_screen_position(
+        &self,
+        rect: egui::Rect,
+        position: egui::Pos2,
+    ) -> Option<uuid::Uuid> {
+        if !rect.contains(position) {
+            return None;
+        }
+        let preview = self.model_preview.as_ref()?;
+        if preview.instance_model_indices.is_empty() {
+            return None;
+        }
+        let live = self
+            .model_instances
+            .iter()
+            .filter(|instance| instance.stage_id.eq_ignore_ascii_case(&self.stage_id))
+            .map(|instance| instance.placement.instance_id)
+            .collect::<BTreeSet<_>>();
+        let instances_by_model = preview
+            .instance_model_indices
+            .iter()
+            .filter(|(instance_id, _)| live.contains(*instance_id))
+            .map(|(instance_id, model_index)| (*model_index, *instance_id))
+            .collect::<BTreeMap<_, _>>();
+        if instances_by_model.is_empty() {
+            return None;
+        }
+
+        let size = framebuffer_size_for_rect(rect);
+        let framebuffer_position = [
+            (position.x - rect.left()) * size[0] as f32 / rect.width().max(1.0),
+            (position.y - rect.top()) * size[1] as f32 / rect.height().max(1.0),
+        ];
+        preview
+            .triangles
+            .iter()
+            .filter_map(|triangle| {
+                let instance_id = instances_by_model.get(&triangle.model_index)?;
+                let projected = self.project_preview_triangle(rect, size, triangle)?;
+                let depth = projected_triangle_depth_at_point(
+                    projected.screen,
+                    framebuffer_position[0],
+                    framebuffer_position[1],
+                )?;
+                Some((depth, *instance_id))
+            })
+            .min_by(|left, right| left.0.total_cmp(&right.0))
+            .map(|(_, instance_id)| instance_id)
     }
 
     pub(super) fn paint_model_instances(&self, painter: &egui::Painter, rect: egui::Rect) {
@@ -1646,6 +1708,7 @@ impl SmsEditorApp {
         preview.camera_bounds_min = base.camera_bounds_min;
         preview.camera_bounds_max = base.camera_bounds_max;
         preview.goop_surface_model_indices = base.goop_surface_model_indices;
+        preview.instance_model_indices = base.instance_model_indices;
         if !base.had_stage_preview {
             self.model_preview = None;
         }
@@ -4069,6 +4132,11 @@ pub(super) fn append_authored_model_instances(
         {
             preview.goop_surface_model_indices.insert(next_model_index);
         }
+        if preview.triangles.len() > instance_triangle_start {
+            preview
+                .instance_model_indices
+                .insert(instance.placement.instance_id, next_model_index);
+        }
         next_model_index += 1;
     }
     preview.triangles.len() - triangle_start
@@ -4103,6 +4171,7 @@ pub(super) fn append_authored_model_instances_to_stage_preview(
             camera_bounds_min: stage_preview.camera_bounds_min,
             camera_bounds_max: stage_preview.camera_bounds_max,
             goop_surface_model_indices: stage_preview.goop_surface_model_indices.clone(),
+            instance_model_indices: stage_preview.instance_model_indices.clone(),
         };
         let appended =
             append_authored_model_instances(stage_preview, cache, instances, stage_id, registry);
@@ -4152,6 +4221,7 @@ pub(super) fn empty_authored_model_preview() -> ModelPreview {
         source_textures: 0,
         goop_surface_model_indices: BTreeSet::new(),
         object_model_indices: BTreeMap::new(),
+        instance_model_indices: BTreeMap::new(),
         mirror_actor_positions: BTreeMap::new(),
         mirror_cubes: Vec::new(),
         mirror_model_slots: BTreeMap::new(),

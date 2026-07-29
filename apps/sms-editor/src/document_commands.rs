@@ -4212,6 +4212,8 @@ impl SmsEditorApp {
             camera.yaw_degrees = self.startup_camera_yaw.unwrap_or(222.0);
             camera.pitch_degrees = self.startup_camera_pitch.unwrap_or(-30.0);
             camera.distance = (preview.radius() * 4.2).clamp(2500.0, 600_000.0);
+            // Resetting re-establishes the view, so navigation rescales with it.
+            self.camera_navigation_distance = camera.distance;
             self.queue_camera_state_save();
             return;
         }
@@ -4221,6 +4223,7 @@ impl SmsEditorApp {
         camera.yaw_degrees = self.startup_camera_yaw.unwrap_or(222.0);
         camera.pitch_degrees = self.startup_camera_pitch.unwrap_or(-30.0);
         camera.distance = 7000.0;
+        self.camera_navigation_distance = camera.distance;
         self.queue_camera_state_save();
     }
 
@@ -4232,6 +4235,7 @@ impl SmsEditorApp {
             if let Some(distance) = self.startup_camera_distance {
                 camera.distance = distance.max(50.0);
             }
+            self.camera_navigation_distance = camera.distance;
             self.viewport_pan = egui::Vec2::ZERO;
             self.viewport_zoom = 1.0;
             self.log.push(format!(
@@ -4258,6 +4262,7 @@ impl SmsEditorApp {
             let camera = self.renderer.camera_mut();
             camera.focus = object.transform.translation;
             camera.distance = self.startup_camera_distance.unwrap_or(2200.0).max(50.0);
+            self.camera_navigation_distance = camera.distance;
             self.viewport_pan = egui::Vec2::ZERO;
             self.viewport_zoom = 1.0;
             self.selected_object_id = Some(object.id.clone());

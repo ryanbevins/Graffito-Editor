@@ -33,6 +33,9 @@ pub(super) struct ModelPreview {
     /// anchor the goop brush. Main-layer props are intentionally excluded.
     pub(super) goop_surface_model_indices: BTreeSet<usize>,
     pub(super) object_model_indices: BTreeMap<String, usize>,
+    /// Model index per authored instance, so instances can be picked by mesh
+    /// like placed objects instead of by a radius around their origin.
+    pub(super) instance_model_indices: BTreeMap<uuid::Uuid, usize>,
     pub(super) mirror_actor_positions: BTreeMap<usize, [f32; 3]>,
     pub(super) mirror_cubes: Vec<PreviewMirrorCube>,
     pub(super) mirror_model_slots: BTreeMap<usize, usize>,

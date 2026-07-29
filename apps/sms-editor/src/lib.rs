@@ -1270,6 +1270,15 @@ struct SmsEditorApp {
     viewport_pan: egui::Vec2,
     viewport_zoom: f32,
     camera_speed: f32,
+    /// Orbit distance that viewport fly speed is scaled by.
+    ///
+    /// Kept apart from `camera.distance` because framing shrinks that to fit
+    /// its target. Deriving speed from the live value left the camera crawling
+    /// after a double-click, and the shrunken distance was then persisted into
+    /// the stage camera, so the slowdown survived reloads. Only commands that
+    /// establish a view — reset, startup focus, restoring a saved camera —
+    /// update this.
+    camera_navigation_distance: f32,
     camera_fly_velocity: [f32; 3],
     camera_focus_animation: Option<CameraFocusAnimation>,
     viewport_mouse_captured: bool,
@@ -1525,6 +1534,7 @@ impl Default for SmsEditorApp {
             viewport_pan: egui::Vec2::ZERO,
             viewport_zoom: 1.0,
             camera_speed: 1.0,
+            camera_navigation_distance: 7000.0,
             camera_fly_velocity: [0.0; 3],
             camera_focus_animation: None,
             viewport_mouse_captured: false,
@@ -3773,6 +3783,7 @@ impl SmsEditorApp {
             source_textures,
             goop_surface_model_indices,
             object_model_indices,
+            instance_model_indices: BTreeMap::new(),
             mirror_actor_positions,
             mirror_cubes,
             mirror_model_slots,
@@ -4714,14 +4725,10 @@ fn expand_model_preview_bounds(
     let mut bounds_max = [f32::NEG_INFINITY; 3];
     let mut found = false;
     for range in triangle_ranges {
-        for triangle in preview.triangles[range.clone()].iter().filter(|triangle| {
-            !matches!(
-                triangle.render_layer,
-                PreviewRenderLayer::Sky
-                    | PreviewRenderLayer::MirrorScene
-                    | PreviewRenderLayer::Heatwave
-            )
-        }) {
+        for triangle in preview.triangles[range.clone()]
+            .iter()
+            .filter(|triangle| preview_layer_is_world_space(triangle.render_layer))
+        {
             for vertex in triangle.vertices {
                 if !vertex.iter().all(|value| value.is_finite()) {
                     continue;
@@ -4781,14 +4788,9 @@ fn robust_preview_bounds(
     points: &[PreviewPoint],
 ) -> Option<([f32; 3], [f32; 3])> {
     let mut axes = [Vec::new(), Vec::new(), Vec::new()];
-    let has_world_triangles = triangles.iter().any(|triangle| {
-        !matches!(
-            triangle.render_layer,
-            PreviewRenderLayer::Sky
-                | PreviewRenderLayer::MirrorScene
-                | PreviewRenderLayer::Heatwave
-        )
-    });
+    let has_world_triangles = triangles
+        .iter()
+        .any(|triangle| preview_layer_is_world_space(triangle.render_layer));
     if !has_world_triangles {
         for point in points {
             for (axis, value) in axes.iter_mut().zip(point.position) {
@@ -4798,14 +4800,10 @@ fn robust_preview_bounds(
             }
         }
     } else {
-        for triangle in triangles.iter().filter(|triangle| {
-            !matches!(
-                triangle.render_layer,
-                PreviewRenderLayer::Sky
-                    | PreviewRenderLayer::MirrorScene
-                    | PreviewRenderLayer::Heatwave
-            )
-        }) {
+        for triangle in triangles
+            .iter()
+            .filter(|triangle| preview_layer_is_world_space(triangle.render_layer))
+        {
             for vertex in triangle.vertices {
                 for (axis, value) in axes.iter_mut().zip(vertex) {
                     if value.is_finite() {
@@ -4976,6 +4974,18 @@ fn preview_render_layer_for_model_path(path: &str) -> PreviewRenderLayer {
     } else {
         PreviewRenderLayer::Main
     }
+}
+
+/// Whether a layer's vertices describe ordinary world-space geometry.
+///
+/// Sky is stored camera-relative, and MirrorScene and Heatwave are reprojected
+/// effect passes, so none of them say where an object actually sits. Anything
+/// deriving bounds from vertices has to skip them.
+fn preview_layer_is_world_space(layer: PreviewRenderLayer) -> bool {
+    !matches!(
+        layer,
+        PreviewRenderLayer::Sky | PreviewRenderLayer::MirrorScene | PreviewRenderLayer::Heatwave
+    )
 }
 
 fn preview_render_layer_is_effect(layer: PreviewRenderLayer) -> bool {

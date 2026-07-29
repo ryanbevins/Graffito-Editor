@@ -1127,7 +1127,7 @@ impl SmsEditorApp {
     }
 
     pub(super) fn viewport_fly_speed(&self) -> f32 {
-        (self.renderer.camera().distance * 0.8).clamp(300.0, 80_000.0) * self.camera_speed
+        (self.camera_navigation_distance * 0.8).clamp(300.0, 80_000.0) * self.camera_speed
     }
 
     pub(super) fn stop_camera_fly(&mut self) {
@@ -1242,10 +1242,9 @@ impl SmsEditorApp {
         let model_index = *preview.object_model_indices.get(object_id)?;
         let mut minimum = [f32::INFINITY; 3];
         let mut maximum = [f32::NEG_INFINITY; 3];
-        // Sky vertices are camera-relative and would smear the box across the
-        // whole stage.
         for triangle in preview.triangles.iter().filter(|triangle| {
-            triangle.model_index == model_index && triangle.render_layer != PreviewRenderLayer::Sky
+            triangle.model_index == model_index
+                && preview_layer_is_world_space(triangle.render_layer)
         }) {
             for vertex in triangle.vertices {
                 for axis in 0..3 {

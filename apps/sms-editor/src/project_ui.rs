@@ -469,6 +469,11 @@ impl SmsEditorApp {
         let camera = self.renderer.camera_mut();
         camera.focus = state.focus;
         camera.distance = state.distance.max(50.0);
+        // Framing persists a small orbit distance, so a saved camera cannot be
+        // trusted as a navigation scale or the slowdown would come back on
+        // every reload. Floor it at the stage-sized minimum `reset_camera`
+        // uses, and let Reset Camera re-establish the real value.
+        self.camera_navigation_distance = camera.distance.max(2500.0);
         camera.yaw_degrees = state.yaw_degrees;
         camera.pitch_degrees = state.pitch_degrees.clamp(-89.0, 89.0);
         self.viewport_pan = egui::vec2(state.viewport_pan[0], state.viewport_pan[1]);

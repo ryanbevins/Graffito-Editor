@@ -2330,6 +2330,7 @@ fn preview_for_texture_alpha(has_alpha: bool, has_translucent_alpha: bool) -> Mo
         source_textures: 1,
         goop_surface_model_indices: BTreeSet::new(),
         object_model_indices: BTreeMap::new(),
+        instance_model_indices: BTreeMap::new(),
         mirror_actor_positions: BTreeMap::new(),
         mirror_cubes: Vec::new(),
         mirror_model_slots: BTreeMap::new(),
@@ -3489,6 +3490,7 @@ fn updating_object_transform_moves_cached_preview_mesh() {
             source_triangles: 1,
             source_textures: 0,
             goop_surface_model_indices: BTreeSet::new(),
+            instance_model_indices: BTreeMap::new(),
             object_model_indices,
             mirror_actor_positions: BTreeMap::from([(7, old_transform.translation)]),
             mirror_cubes: Vec::new(),
@@ -4737,7 +4739,7 @@ fn camera_focus_animation_lands_exactly_on_its_target() {
     let mut app = camera_app();
     app.viewport_pan = egui::vec2(40.0, -25.0);
     app.viewport_zoom = 0.35;
-    app.begin_camera_focus_animation([500.0, 100.0, -250.0], 800.0);
+    app.begin_camera_focus_animation([500.0, 100.0, -250.0], 8_000.0);
 
     let mut steps = 0;
     while app.advance_camera_focus_animation(1.0 / 60.0) {
@@ -4748,9 +4750,28 @@ fn camera_focus_animation_lands_exactly_on_its_target() {
     assert!(steps > 1, "the glide must take more than one frame");
     let camera = app.renderer.camera();
     assert_eq!(camera.focus, [500.0, 100.0, -250.0]);
-    assert!((camera.distance - 800.0).abs() < 1e-1);
+    assert!((camera.distance - 8_000.0).abs() < 1e-1);
     assert_eq!(app.viewport_pan, egui::Vec2::ZERO);
     assert_eq!(app.viewport_zoom, 1.0);
+}
+
+#[test]
+fn camera_focus_never_frames_closer_than_the_navigation_floor() {
+    // Fly speed scales with the orbit distance and the distance is persisted
+    // with the stage camera, so framing must not strand the user crawling.
+    let mut app = camera_app();
+    app.begin_camera_focus_animation([0.0, 0.0, 0.0], 10.0);
+    while app.advance_camera_focus_animation(1.0 / 60.0) {}
+    assert_eq!(app.renderer.camera().distance, CAMERA_FOCUS_DISTANCE_MIN);
+
+    // Exercise the real speed formula rather than the constants: framing must
+    // leave fly speed clear of its own lower clamp, or navigation is pinned to
+    // minimum speed after every framing command.
+    app.camera_speed = 1.0;
+    assert!(
+        app.viewport_fly_speed() > 300.0,
+        "framing left the camera at minimum fly speed"
+    );
 }
 
 #[test]
@@ -4885,4 +4906,60 @@ fn clicking_the_active_toolbar_tool_returns_to_select() {
         EditorTool::Select.after_toolbar_click(EditorTool::Select),
         EditorTool::Select
     );
+}
+
+#[test]
+fn framing_does_not_change_viewport_fly_speed() {
+    // Fly speed used to read camera.distance directly, so framing an actor
+    // shrank it and the camera crawled afterwards. Worse, the shrunken value
+    // was persisted with the stage camera, so the slowdown survived reloads.
+    let mut app = camera_app();
+    app.camera_speed = 8.0;
+    app.camera_navigation_distance = 7000.0;
+    let before = app.viewport_fly_speed();
+
+    app.begin_camera_focus_animation([0.0, 0.0, 0.0], 426.0);
+    while app.advance_camera_focus_animation(1.0 / 60.0) {}
+
+    assert!(
+        (app.renderer.camera().distance - 426.0).abs() < 1.0,
+        "framing still sets the orbit distance"
+    );
+    assert_eq!(
+        app.viewport_fly_speed(),
+        before,
+        "framing must not change navigation speed"
+    );
+}
+
+#[test]
+fn resetting_the_camera_re_establishes_navigation_speed() {
+    let mut app = camera_app();
+    app.camera_speed = 8.0;
+    app.camera_navigation_distance = 426.0;
+    let slow = app.viewport_fly_speed();
+    app.reset_camera();
+    assert!(
+        app.viewport_fly_speed() > slow,
+        "Reset Camera has to recover speed from a poisoned project"
+    );
+    assert_eq!(app.camera_navigation_distance, 7000.0);
+}
+
+#[test]
+fn preview_bounds_skip_every_non_world_space_layer() {
+    // The framing bounds originally excluded only Sky, while the existing
+    // bounds path also excludes MirrorScene and Heatwave. Those are
+    // reprojected effect passes and do not say where an object sits.
+    for layer in [
+        PreviewRenderLayer::Sky,
+        PreviewRenderLayer::MirrorScene,
+        PreviewRenderLayer::Heatwave,
+    ] {
+        assert!(
+            !preview_layer_is_world_space(layer),
+            "{layer:?} is not world-space geometry"
+        );
+    }
+    assert!(preview_layer_is_world_space(PreviewRenderLayer::Main));
 }
