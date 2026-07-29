@@ -272,6 +272,23 @@ impl SmsEditorApp {
                     // active tool again drops back to Select.
                     self.tool = self.tool.after_toolbar_click(EditorTool::Goop);
                 }
+
+                ui.separator();
+                // Placeholders for tools that do not exist yet. Deliberately
+                // disabled rather than inert-but-clickable, so the menu cannot
+                // imply behaviour the editor does not have.
+                for (label, hint) in [
+                    (
+                        "Route Tool",
+                        "Not implemented yet. Routes are edited from the Edit menu.",
+                    ),
+                    ("Vertex Color Tool", "Not implemented yet."),
+                    ("Sound Instance Tool", "Not implemented yet."),
+                    ("Camera Tool", "Not implemented yet."),
+                ] {
+                    ui.add_enabled(false, egui::Button::new(label))
+                        .on_disabled_hover_text(hint);
+                }
             });
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
