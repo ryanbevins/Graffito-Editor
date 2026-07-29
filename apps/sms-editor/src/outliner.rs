@@ -436,9 +436,10 @@ pub(super) struct OutlinerRender<'a> {
 }
 
 impl OutlinerRender<'_> {
-    fn reveals(&self, node: &OutlinerNode) -> bool {
-        self.reveal_id
-            .is_some_and(|object_id| node.contains_object(object_id))
+    fn opens_for_reveal(&self, node: &OutlinerNode) -> bool {
+        self.reveal_id.is_some_and(|object_id| {
+            node.object_id.as_deref() != Some(object_id) && node.contains_object(object_id)
+        })
     }
 }
 
@@ -498,7 +499,7 @@ fn show_outliner_node(
     let response = egui::CollapsingHeader::new(title)
         .id_salt(&node.key)
         .default_open(depth < 2)
-        .open((render.force_open || render.reveals(node)).then_some(true))
+        .open((render.force_open || render.opens_for_reveal(node)).then_some(true))
         .show_background(true)
         .show(ui, |ui| {
             for child in &node.children {
@@ -571,7 +572,7 @@ fn show_object_node(
     let id = ui.make_persistent_id(("outliner-related", &node.key));
     let mut header =
         egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, depth < 2);
-    if render.force_open || render.reveals(node) {
+    if render.force_open || render.opens_for_reveal(node) {
         header.set_open(true);
     }
     let (_toggle, header, _body) = header
@@ -666,6 +667,23 @@ mod tests {
         assert!(manager_node.contains_object("actor"));
         assert!(manager_node.contains_object("manager"));
         assert!(!manager_node.contains_object("missing"));
+
+        let reveal_manager = OutlinerRender {
+            selected_id: Some("manager"),
+            selected_world_member: None,
+            force_open: false,
+            reveal_id: Some("manager"),
+        };
+        assert!(!reveal_manager.opens_for_reveal(manager_node));
+
+        let reveal_actor = OutlinerRender {
+            selected_id: Some("actor"),
+            selected_world_member: None,
+            force_open: false,
+            reveal_id: Some("actor"),
+        };
+        assert!(reveal_actor.opens_for_reveal(stage));
+        assert!(reveal_actor.opens_for_reveal(manager_node));
     }
 
     #[test]
