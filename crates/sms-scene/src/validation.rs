@@ -315,6 +315,72 @@ fn validate_routes(document: &StageDocument, issues: &mut Vec<ValidationIssue>) 
     }
 }
 
+fn goop_runtime_payload_issue(
+    estimate: crate::GoopRuntimePayloadEstimate,
+) -> Option<ValidationIssue> {
+    let total = estimate.total_bytes();
+    let message = || {
+        format!(
+            "{} generated goop regions use an estimated {:.2} MiB of runtime pollution resources ({:.2} MiB models, {:.2} MiB masks). Sunshine has a fixed stage heap; reduce or merge regions before Dolphin testing.",
+            estimate.generated_layer_count,
+            total as f64 / (1024.0 * 1024.0),
+            estimate.model_bytes as f64 / (1024.0 * 1024.0),
+            estimate.bitmap_bytes as f64 / (1024.0 * 1024.0),
+        )
+    };
+    if total >= crate::GOOP_RUNTIME_PAYLOAD_ERROR_BYTES {
+        Some(ValidationIssue::error(
+            "unsafe-goop-runtime-payload",
+            format!(
+                "{} Build is blocked because this exceeds Graffito's conservative {:.0} MiB generated-goop safety limit and can prevent the stage from booting.",
+                message(),
+                crate::GOOP_RUNTIME_PAYLOAD_ERROR_BYTES as f64 / (1024.0 * 1024.0),
+            ),
+        ))
+    } else if total >= crate::GOOP_RUNTIME_PAYLOAD_WARNING_BYTES {
+        Some(ValidationIssue::warning(
+            "large-goop-runtime-payload",
+            message(),
+        ))
+    } else {
+        None
+    }
+}
+
+fn goop_stage_heap_issue(estimate: crate::GoopStageHeapEstimate) -> Option<ValidationIssue> {
+    let total = estimate.total_bytes();
+    let message = || {
+        format!(
+            "Estimated Sunshine stage-heap pressure is {:.2} MiB: {:.2} MiB decompressed base archive, {:.2} MiB generated archive resources, and {:.2} MiB generated J3D runtime allowance.",
+            total as f64 / (1024.0 * 1024.0),
+            estimate.base_archive_bytes as f64 / (1024.0 * 1024.0),
+            estimate.generated_archive_bytes as f64 / (1024.0 * 1024.0),
+            estimate.j3d_runtime_bytes as f64 / (1024.0 * 1024.0),
+        )
+    };
+    if total >= crate::GOOP_STAGE_HEAP_ERROR_BYTES {
+        Some(ValidationIssue::warning(
+            "high-goop-stage-heap-risk",
+            format!(
+                "{} This exceeds Graffito's conservative {:.2} MiB threshold and can trigger a JKRHeap abort or freeze the stage on a black screen.",
+                message(),
+                crate::GOOP_STAGE_HEAP_ERROR_BYTES as f64 / (1024.0 * 1024.0),
+            ),
+        ))
+    } else if total >= crate::GOOP_STAGE_HEAP_WARNING_BYTES {
+        Some(ValidationIssue::warning(
+            "low-goop-stage-heap-headroom",
+            format!(
+                "{} Only {:.2} MiB remains before Graffito's conservative build limit.",
+                message(),
+                estimate.remaining_bytes() as f64 / (1024.0 * 1024.0),
+            ),
+        ))
+    } else {
+        None
+    }
+}
+
 pub(super) fn validate_document(document: &StageDocument) -> Vec<ValidationIssue> {
     let mut issues = document.load_issues.clone();
     validate_runtime_actor_links(document, &mut issues);
@@ -323,11 +389,38 @@ pub(super) fn validate_document(document: &StageDocument) -> Vec<ValidationIssue
         document,
     ));
     if let Some(goop) = &document.goop_authoring {
+        let capacity = crate::goop_runtime_layer_capacity(&document.stage_id);
+        if goop.layers.len() > capacity {
+            issues.push(ValidationIssue::error(
+                "too-many-runtime-goop-layers",
+                format!(
+                    "{} supports at most {capacity} runtime goop layers, got {}",
+                    document.stage_id,
+                    goop.layers.len()
+                ),
+            ));
+        }
         if let Err(error) = goop.validate() {
             issues.push(ValidationIssue::error(
                 "invalid-goop-authoring",
                 error.to_string(),
             ));
+        }
+        if let Some(issue) = goop_runtime_payload_issue(crate::estimate_goop_runtime_payload(goop))
+        {
+            issues.push(issue);
+        }
+        match document.estimate_goop_stage_heap() {
+            Ok(Some(estimate)) => {
+                if let Some(issue) = goop_stage_heap_issue(estimate) {
+                    issues.push(issue);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => issues.push(ValidationIssue::warning(
+                "goop-stage-heap-estimate-failed",
+                format!("Could not estimate Sunshine stage-heap pressure: {error}"),
+            )),
         }
     }
 
@@ -532,8 +625,15 @@ pub(super) fn validate_document(document: &StageDocument) -> Vec<ValidationIssue
 
 #[cfg(test)]
 mod tests {
-    use super::route_reference_requires_named_graph;
-    use crate::{AuthoredPlacement, PlacementBinding, SceneObject};
+    use super::{
+        goop_runtime_payload_issue, goop_stage_heap_issue, route_reference_requires_named_graph,
+    };
+    use crate::{
+        AuthoredPlacement, GoopRuntimePayloadEstimate, GoopStageHeapEstimate, PlacementBinding,
+        SceneObject, ValidationSeverity, GOOP_RUNTIME_PAYLOAD_ERROR_BYTES,
+        GOOP_RUNTIME_PAYLOAD_WARNING_BYTES, GOOP_STAGE_HEAP_ERROR_BYTES,
+        GOOP_STAGE_HEAP_WARNING_BYTES,
+    };
     use sms_formats::{JDramaRecord, JDramaRecordPayload};
 
     #[test]
@@ -569,5 +669,54 @@ mod tests {
             dependencies: Vec::new(),
         }));
         assert!(route_reference_requires_named_graph(&object, None));
+    }
+
+    #[test]
+    fn generated_goop_payload_warns_before_blocking_unsafe_builds() {
+        let warning = goop_runtime_payload_issue(GoopRuntimePayloadEstimate {
+            generated_layer_count: 4,
+            model_bytes: GOOP_RUNTIME_PAYLOAD_WARNING_BYTES,
+            bitmap_bytes: 0,
+        })
+        .unwrap();
+        assert_eq!(warning.severity, ValidationSeverity::Warning);
+        assert_eq!(warning.code, "large-goop-runtime-payload");
+        assert!(warning.message.contains("fixed stage heap"));
+
+        let error = goop_runtime_payload_issue(GoopRuntimePayloadEstimate {
+            generated_layer_count: 7,
+            model_bytes: GOOP_RUNTIME_PAYLOAD_ERROR_BYTES,
+            bitmap_bytes: 0,
+        })
+        .unwrap();
+        assert_eq!(error.severity, ValidationSeverity::Error);
+        assert_eq!(error.code, "unsafe-goop-runtime-payload");
+        assert!(error.message.contains("prevent the stage from booting"));
+    }
+
+    #[test]
+    fn whole_stage_heap_estimate_warns_before_jkrheap_abort() {
+        let warning = goop_stage_heap_issue(GoopStageHeapEstimate {
+            generated_layer_count: 1,
+            base_archive_bytes: GOOP_STAGE_HEAP_WARNING_BYTES,
+            generated_archive_bytes: 0,
+            j3d_runtime_bytes: 0,
+        })
+        .unwrap();
+        assert_eq!(warning.severity, ValidationSeverity::Warning);
+        assert_eq!(warning.code, "low-goop-stage-heap-headroom");
+        assert!(warning.message.contains("decompressed base archive"));
+
+        let error = goop_stage_heap_issue(GoopStageHeapEstimate {
+            generated_layer_count: 1,
+            base_archive_bytes: GOOP_STAGE_HEAP_ERROR_BYTES,
+            generated_archive_bytes: 0,
+            j3d_runtime_bytes: 0,
+        })
+        .unwrap();
+        assert_eq!(error.severity, ValidationSeverity::Warning);
+        assert_eq!(error.code, "high-goop-stage-heap-risk");
+        assert!(error.message.contains("JKRHeap"));
+        assert!(error.message.contains("black screen"));
     }
 }

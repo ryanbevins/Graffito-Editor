@@ -61,11 +61,18 @@ pub use dialogue_authoring::{
     PROJECT_DIALOGUE_LIBRARY_PATH, STAGE_DIALOGUE_MESSAGE_PATH, SYSTEM_DIALOGUE_MESSAGE_PATH,
 };
 pub use goop_authoring::{
-    generate_floor_depth_map, generate_floor_pollution_model, terrain_fingerprint,
-    whole_terrain_region, GoopAuthoringDocument, GoopBehavior, GoopLayerAuthoring, GoopLayerOrigin,
-    GoopPlane, GoopRegion, GoopRenderTriangle, GoopStyleSource, GoopTerrainTriangle,
-    GOOP_AUTHORING_FORMAT_VERSION, GOOP_CELL_SIZE, GOOP_DEPTH_WORLD_UNITS_PER_CODE,
-    GOOP_MAX_DIMENSION, GOOP_MAX_LAYERS, GOOP_RESOURCE_PATH,
+    automatic_goop_region, balanced_goop_expansion, carve_compatible_goop_overlap_depths,
+    estimate_goop_runtime_payload, expanded_goop_region, generate_floor_depth_map,
+    generate_floor_depth_map_for_surface, generate_floor_pollution_model,
+    generate_floor_pollution_model_for_surface, goop_layer_accepts_height, goop_layers_can_overlap,
+    goop_runtime_layer_capacity, position_goop_region_avoiding, reproject_goop_mask,
+    terrain_fingerprint, whole_terrain_region, GoopAuthoringDocument, GoopBehavior,
+    GoopLayerAuthoring, GoopLayerOrigin, GoopPaintBounds, GoopPlane, GoopRegion,
+    GoopRenderTriangle, GoopRuntimePayloadEstimate, GoopStageHeapEstimate, GoopStyleSource,
+    GoopSurfaceAnchor, GoopTerrainTriangle, GOOP_AUTHORING_FORMAT_VERSION,
+    GOOP_AUTO_INITIAL_DIMENSION, GOOP_CELL_SIZE, GOOP_DEPTH_WORLD_UNITS_PER_CODE,
+    GOOP_MAX_DIMENSION, GOOP_MAX_LAYERS, GOOP_RESOURCE_PATH, GOOP_RUNTIME_PAYLOAD_ERROR_BYTES,
+    GOOP_RUNTIME_PAYLOAD_WARNING_BYTES, GOOP_STAGE_HEAP_ERROR_BYTES, GOOP_STAGE_HEAP_WARNING_BYTES,
 };
 pub use object_authoring::{
     ObjectAuthoringCatalog, ObjectAuthoringCatalogBuild, ObjectAuthoringCatalogWarning,
@@ -907,6 +914,18 @@ impl StageDocument {
     ) {
         self.archive_edits
             .upsert_resource(raw_resource_path.into(), document);
+        self.sync_archive_edit_assets();
+    }
+
+    /// Replaces the complete authored archive overlay and refreshes the
+    /// document's virtual asset catalog to match it.
+    ///
+    /// Background authoring transactions and structural undo/redo restore the
+    /// overlay as a snapshot. Routing those restores through this method keeps
+    /// newly inserted resources discoverable and removes assets that no longer
+    /// exist in the restored snapshot.
+    pub fn replace_archive_edits(&mut self, archive_edits: StageArchiveEdits) {
+        self.archive_edits = archive_edits;
         self.sync_archive_edit_assets();
     }
 
@@ -3368,6 +3387,51 @@ mod tests {
             .iter()
             .any(|asset| asset.path == baseline_path));
         assert!(document.archive_edits.resources.is_empty());
+    }
+
+    #[test]
+    fn replacing_archive_edits_refreshes_new_model_assets() {
+        let source_path = PathBuf::from("virtual/custom0.szs");
+        let inserted_path = PathBuf::from("virtual/custom0.szs!/map/pollution/pollution00.bmd");
+        let mut document = StageDocument {
+            stage_id: "custom0".to_string(),
+            base_root: PathBuf::from("."),
+            assets: Vec::new(),
+            objects: Vec::new(),
+            changed_files: BTreeMap::new(),
+            stage_archive: Some(SourceFreeStageArchive::new().unwrap()),
+            stage_archive_source_path: Some(source_path),
+            archive_edits: StageArchiveEdits::default(),
+            registry: None,
+            route_authoring: None,
+            goop_authoring: None,
+            dialogue_authoring: None,
+            dialogue_library: ProjectDialogueLibrary::default(),
+            load_issues: Vec::new(),
+            lighting: StageLighting::default(),
+            actor_previews: BTreeMap::new(),
+            loaded_project: None,
+        };
+        let mut edits = StageArchiveEdits::default();
+        edits.upsert_resource(
+            b"map/pollution/pollution00.bmd".to_vec(),
+            StageResourceDocument::Parameters(PrmFile {
+                entries: Vec::new(),
+            }),
+        );
+
+        document.replace_archive_edits(edits);
+
+        assert!(document
+            .assets
+            .iter()
+            .any(|asset| { asset.path == inserted_path && asset.kind == StageAssetKind::Model }));
+
+        document.replace_archive_edits(StageArchiveEdits::default());
+        assert!(!document
+            .assets
+            .iter()
+            .any(|asset| asset.path == inserted_path));
     }
 
     #[test]

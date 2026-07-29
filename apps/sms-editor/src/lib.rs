@@ -525,6 +525,7 @@ enum BackgroundResult {
     CreateStage(Result<Box<LoadedStage>, String>),
     RetailSkybox(Result<RetailSkyboxSelection, String>),
     GoopRebuild(Result<Box<GoopRebuildOutcome>, String>),
+    GoopAdaptive(Result<Box<GoopAdaptiveOutcome>, String>),
     Build(Result<managed_build::ManagedGameBuildOutcome, String>),
     BuildAndRun {
         mode: DolphinLaunchMode,
@@ -1115,7 +1116,9 @@ struct SmsEditorApp {
     last_auto_refresh_attempt_root: String,
     tool: EditorTool,
     selected_goop_layer: usize,
+    goop_authoring_mode: GoopAuthoringMode,
     selected_goop_template: usize,
+    goop_use_default_style: bool,
     show_incompatible_goop_templates: bool,
     goop_brush_radius: f32,
     goop_brush_hardness: f32,
@@ -1128,6 +1131,9 @@ struct SmsEditorApp {
     goop_region_height_cells: u16,
     goop_cursor_world: Option<[f32; 3]>,
     goop_stroke: Option<GoopStroke>,
+    pending_goop_heap_confirmation: Option<GoopAdaptiveOutcome>,
+    suppress_goop_heap_warning_for_session: bool,
+    confirm_delete_generated_goop: bool,
     goop_undo_stack: VecDeque<GoopUndoRecord>,
     goop_redo_stack: VecDeque<GoopUndoRecord>,
     view_mode: ViewMode,
@@ -1369,7 +1375,9 @@ impl Default for SmsEditorApp {
             last_auto_refresh_attempt_root: String::new(),
             tool: EditorTool::Move,
             selected_goop_layer: 0,
+            goop_authoring_mode: GoopAuthoringMode::Simple,
             selected_goop_template: 0,
+            goop_use_default_style: true,
             show_incompatible_goop_templates: false,
             goop_brush_radius: 200.0,
             goop_brush_hardness: 0.65,
@@ -1382,6 +1390,9 @@ impl Default for SmsEditorApp {
             goop_region_height_cells: 4,
             goop_cursor_world: None,
             goop_stroke: None,
+            pending_goop_heap_confirmation: None,
+            suppress_goop_heap_warning_for_session: false,
+            confirm_delete_generated_goop: false,
             goop_undo_stack: VecDeque::new(),
             goop_redo_stack: VecDeque::new(),
             view_mode: ViewMode::Lit,
@@ -1623,6 +1634,7 @@ impl eframe::App for SmsEditorApp {
         self.new_stage_dialog(root_ui.ctx());
         self.issues_window(root_ui.ctx());
         self.content_browser_preview_window(root_ui.ctx());
+        self.goop_heap_warning_dialog(root_ui.ctx());
         self.unsaved_changes_dialog(root_ui.ctx());
     }
 
@@ -2216,6 +2228,15 @@ impl SmsEditorApp {
                         }
                         Err(err) => self.log.push(format!("Goop rebuild failed: {err}")),
                     },
+                    BackgroundResult::GoopAdaptive(result) => match result {
+                        Ok(outcome) => self.apply_adaptive_goop(*outcome),
+                        Err(err) if err == "goop rebuild cancelled" => self
+                            .log
+                            .push("Adaptive goop generation cancelled.".to_string()),
+                        Err(err) => self
+                            .log
+                            .push(format!("Adaptive goop generation failed: {err}")),
+                    },
                     BackgroundResult::Build(result) => match result {
                         Ok(outcome) => {
                             self.log.push(format!(
@@ -2434,7 +2455,10 @@ impl SmsEditorApp {
         self.goop_templates_indexed = false;
         self.selected_goop_layer = 0;
         self.selected_goop_template = 0;
+        self.goop_use_default_style = true;
         self.goop_stroke = None;
+        self.pending_goop_heap_confirmation = None;
+        self.confirm_delete_generated_goop = false;
         self.goop_undo_stack.clear();
         self.goop_redo_stack.clear();
         if has_scene_index {

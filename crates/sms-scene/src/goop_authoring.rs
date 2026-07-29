@@ -1,3 +1,7 @@
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs::File;
+use std::io::Read;
+
 use serde::{Deserialize, Serialize};
 use sms_formats::{
     compile_static_bmd3, compile_texture_section, BmpFile, GxEncodedTexture, GxMaterial,
@@ -21,7 +25,23 @@ pub const GOOP_DEPTH_WORLD_UNITS_PER_CODE: f32 = 40.0;
 pub const GOOP_MIN_MUTABLE_DEPTH: u8 = 1;
 pub const GOOP_MAX_LAYERS: usize = 20;
 pub const GOOP_MAX_DIMENSION: usize = 1024;
-pub const GOOP_AUTHORING_FORMAT_VERSION: u32 = 9;
+pub const GOOP_AUTO_INITIAL_DIMENSION: usize = 256;
+pub const GOOP_AUTHORING_FORMAT_VERSION: u32 = 12;
+/// Generated pollution resources above this size deserve an explicit warning:
+/// they consume Sunshine's fixed stage heap in addition to the map and actors.
+pub const GOOP_RUNTIME_PAYLOAD_WARNING_BYTES: usize = 2 * 1024 * 1024;
+/// A deliberately conservative release gate below the payload that reproduced
+/// JKRHeap exhaustion while J3D was creating pollution material blocks.
+pub const GOOP_RUNTIME_PAYLOAD_ERROR_BYTES: usize = 4 * 1024 * 1024;
+/// Warn before the decompressed stage archive plus generated pollution model
+/// expansion reaches the range where retail stages have very little heap
+/// headroom left.
+pub const GOOP_STAGE_HEAP_WARNING_BYTES: usize = 6 * 1024 * 1024;
+/// Conservative stage-load gate calibrated against a JKRHeap abort while
+/// constructing generated pollution J3D material blocks. This is deliberately
+/// below the point where the failing stage was observed because actors and
+/// other stage systems share the same heap.
+pub const GOOP_STAGE_HEAP_ERROR_BYTES: usize = 6 * 1024 * 1024 + 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -116,6 +136,13 @@ pub struct GoopStyleSource {
     pub behavior_code: u16,
     #[serde(default)]
     pub forced_incompatible: bool,
+    #[serde(default)]
+    pub resource_stem: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GoopSurfaceAnchor {
+    pub world: [f32; 3],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -167,6 +194,8 @@ pub struct GoopLayerAuthoring {
     pub resource_stem: String,
     #[serde(default)]
     pub metadata_dirty: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_anchor: Option<GoopSurfaceAnchor>,
 }
 
 fn default_true() -> bool {
@@ -227,8 +256,239 @@ pub struct GoopAuthoringDocument {
     pub layers: Vec<GoopLayerAuthoring>,
     #[serde(default)]
     pub terrain_fingerprint: u64,
+    /// Resident byte count of the pristine, decompressed stage archive used
+    /// by the heap-pressure estimator. Persisting this also covers authored
+    /// stages whose virtual source path has no physical SZS.
+    #[serde(default)]
+    pub stage_archive_resident_bytes: usize,
     #[serde(default)]
     pub stale: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GoopRuntimePayloadEstimate {
+    pub generated_layer_count: usize,
+    pub model_bytes: usize,
+    pub bitmap_bytes: usize,
+}
+
+impl GoopRuntimePayloadEstimate {
+    pub fn total_bytes(self) -> usize {
+        self.model_bytes.saturating_add(self.bitmap_bytes)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GoopStageHeapEstimate {
+    pub generated_layer_count: usize,
+    /// Exact decompressed byte count declared by the source Yaz0 stream, or
+    /// the file size for an uncompressed RARC.
+    pub base_archive_bytes: usize,
+    /// Generated BMD, BMP, YMP depth/table, and companion animation bytes
+    /// inserted into the resident stage archive.
+    pub generated_archive_bytes: usize,
+    /// Conservative allowance for J3D's runtime copy/expansion of generated
+    /// pollution models while their BMD bytes remain resident in the archive.
+    pub j3d_runtime_bytes: usize,
+}
+
+impl GoopStageHeapEstimate {
+    pub fn total_bytes(self) -> usize {
+        self.base_archive_bytes
+            .saturating_add(self.generated_archive_bytes)
+            .saturating_add(self.j3d_runtime_bytes)
+    }
+
+    pub fn remaining_bytes(self) -> usize {
+        GOOP_STAGE_HEAP_ERROR_BYTES.saturating_sub(self.total_bytes())
+    }
+}
+
+pub fn estimate_goop_runtime_payload(
+    authoring: &GoopAuthoringDocument,
+) -> GoopRuntimePayloadEstimate {
+    let mut estimate = GoopRuntimePayloadEstimate::default();
+    for layer in authoring
+        .layers
+        .iter()
+        .filter(|layer| layer.origin == GoopLayerOrigin::Generated)
+    {
+        estimate.generated_layer_count += 1;
+        if let Some(model) = &layer.generated_model {
+            estimate.model_bytes = estimate.model_bytes.saturating_add(
+                0x20usize.saturating_add(
+                    model
+                        .sections
+                        .iter()
+                        .map(|section| section.declared_size as usize)
+                        .sum::<usize>(),
+                ),
+            );
+        }
+        if let Some(bitmap) = &layer.bitmap {
+            let trailing = if bitmap.trailing_bytes.is_empty() {
+                bitmap.trailing_zero_bytes as usize
+            } else {
+                bitmap.trailing_bytes.len()
+            };
+            estimate.bitmap_bytes = estimate.bitmap_bytes.saturating_add(
+                54usize
+                    .saturating_add(bitmap.palette.len().saturating_mul(4))
+                    .saturating_add(bitmap.encoded_pixels.len())
+                    .saturating_add(trailing),
+            );
+        }
+    }
+    estimate
+}
+
+fn resident_stage_archive_bytes(path: &std::path::Path) -> std::io::Result<usize> {
+    let mut file = File::open(path)?;
+    let file_len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+    let mut header = [0u8; 8];
+    let read = file.read(&mut header)?;
+    Ok(resident_stage_archive_bytes_from_header(
+        &header[..read],
+        file_len,
+    ))
+}
+
+fn resident_stage_archive_bytes_from_header(header: &[u8], file_len: usize) -> usize {
+    if header.len() >= 8 && &header[..4] == b"Yaz0" {
+        u32::from_be_bytes(header[4..8].try_into().expect("four bytes")) as usize
+    } else {
+        file_len
+    }
+}
+
+fn generated_goop_resource_stems(authoring: &GoopAuthoringDocument) -> BTreeSet<&str> {
+    authoring
+        .layers
+        .iter()
+        .filter(|layer| layer.origin == GoopLayerOrigin::Generated)
+        .map(|layer| layer.resource_stem.as_str())
+        .filter(|stem| !stem.is_empty())
+        .collect()
+}
+
+fn is_generated_goop_companion(path: &[u8], stems: &BTreeSet<&str>) -> bool {
+    let Ok(path) = std::str::from_utf8(path) else {
+        return false;
+    };
+    let Some(file_name) = path.strip_prefix("map/pollution/") else {
+        return false;
+    };
+    let Some((stem, extension)) = file_name.rsplit_once('.') else {
+        return false;
+    };
+    stems.contains(stem) && matches!(extension, "btk" | "btp" | "bpk" | "brk" | "bck" | "bas")
+}
+
+impl StageDocument {
+    /// Estimates pressure on Sunshine's stage heap from generated pollution.
+    ///
+    /// The base term is exact for a file-backed stage because `SMSLoadArchive`
+    /// allocates the Yaz0-decompressed RARC in the current heap. Generated
+    /// resources are then counted as archive additions, with generated BMD
+    /// bytes counted once more as a conservative J3D runtime expansion
+    /// allowance. `None` means the source archive identity is unavailable and
+    /// a whole-stage estimate cannot be made.
+    pub fn estimate_goop_stage_heap(&self) -> Result<Option<GoopStageHeapEstimate>> {
+        let Some(authoring) = self.goop_authoring.as_ref() else {
+            return Ok(None);
+        };
+        let payload = estimate_goop_runtime_payload(authoring);
+        if payload.generated_layer_count == 0 {
+            return Ok(None);
+        }
+        let base_archive_bytes = if authoring.stage_archive_resident_bytes != 0 {
+            authoring.stage_archive_resident_bytes
+        } else {
+            let Some(source_path) = self.stage_archive_source_path.as_deref() else {
+                return Ok(None);
+            };
+            match resident_stage_archive_bytes(source_path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
+        };
+
+        // Each generated layer contributes a 0x2c YMP table record and its
+        // depth texture. Alignment is conservatively charged per layer.
+        let depth_bytes = authoring
+            .layers
+            .iter()
+            .filter(|layer| layer.origin == GoopLayerOrigin::Generated)
+            .fold(0usize, |total, layer| {
+                total
+                    .saturating_add(0x2c)
+                    .saturating_add(layer.runtime.depth_map.len())
+                    .saturating_add(0x1f)
+            });
+        let stems = generated_goop_resource_stems(authoring);
+        let companion_bytes = self
+            .archive_edits
+            .resources
+            .iter()
+            .filter(|edit| is_generated_goop_companion(&edit.raw_resource_path, &stems))
+            .try_fold(0usize, |total, edit| {
+                Ok::<_, SceneError>(total.saturating_add(edit.document.to_bytes()?.len()))
+            })?;
+        let generated_archive_bytes = payload
+            .total_bytes()
+            .saturating_add(depth_bytes)
+            .saturating_add(companion_bytes);
+        Ok(Some(GoopStageHeapEstimate {
+            generated_layer_count: payload.generated_layer_count,
+            base_archive_bytes,
+            generated_archive_bytes,
+            j3d_runtime_bytes: payload.model_bytes,
+        }))
+    }
+
+    /// Captures the immutable base archive's decompressed residency once.
+    /// File-backed stages use the Yaz0 header directly; source-free stages
+    /// rebuild their semantic baseline once and persist the result.
+    pub fn ensure_goop_stage_heap_baseline(&mut self) -> Result<()> {
+        let needs_baseline = self
+            .goop_authoring
+            .as_ref()
+            .is_some_and(|authoring| authoring.stage_archive_resident_bytes == 0);
+        if !needs_baseline {
+            return Ok(());
+        }
+        let source_result = self
+            .stage_archive_source_path
+            .as_deref()
+            .map(resident_stage_archive_bytes)
+            .transpose();
+        let resident_bytes = match source_result {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => self.semantic_stage_archive_resident_bytes()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.semantic_stage_archive_resident_bytes()?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(authoring) = self.goop_authoring.as_mut() {
+            authoring.stage_archive_resident_bytes = resident_bytes;
+        }
+        Ok(())
+    }
+
+    fn semantic_stage_archive_resident_bytes(&self) -> Result<usize> {
+        let archive = self.stage_archive.as_ref().ok_or_else(|| {
+            SceneError::StageExport(
+                "cannot estimate stage heap without a semantic stage archive".to_string(),
+            )
+        })?;
+        let encoded = archive.encode()?;
+        Ok(resident_stage_archive_bytes_from_header(
+            &encoded,
+            encoded.len(),
+        ))
+    }
 }
 
 impl Default for GoopAuthoringDocument {
@@ -237,6 +497,7 @@ impl Default for GoopAuthoringDocument {
             format_version: GOOP_AUTHORING_FORMAT_VERSION,
             layers: Vec::new(),
             terrain_fingerprint: 0,
+            stage_archive_resident_bytes: 0,
             stale: false,
         }
     }
@@ -291,12 +552,6 @@ impl GoopAuthoringDocument {
                 }
             }
             if layer.origin == GoopLayerOrigin::Generated {
-                if (layer.runtime.vertical_scale - GOOP_CELL_SIZE).abs() > f32::EPSILON {
-                    return Err(SceneError::StageExport(format!(
-                        "generated goop layer {} must use the canonical {GOOP_CELL_SIZE}-unit scale, got {}",
-                        layer.id, layer.runtime.vertical_scale
-                    )));
-                }
                 if layer.bitmap.is_none() || layer.generated_model.is_none() {
                     return Err(SceneError::StageExport(format!(
                         "generated goop layer {} is missing its bitmap or pollution model",
@@ -342,6 +597,7 @@ impl GoopAuthoringDocument {
                     && self.layers[left].plane == GoopPlane::Floor
                     && self.layers[right].plane == GoopPlane::Floor
                     && self.layers[left].region.overlaps(self.layers[right].region)
+                    && !goop_layers_can_overlap(&self.layers[left], &self.layers[right])
                 {
                     return Err(SceneError::StageExport(format!(
                         "goop regions {} and {} overlap",
@@ -417,6 +673,414 @@ pub struct GoopRenderTriangle {
     pub normals: Option<[[f32; 3]; 3]>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GoopPaintBounds {
+    pub min_x: f32,
+    pub min_z: f32,
+    pub max_x: f32,
+    pub max_z: f32,
+}
+
+impl GoopPaintBounds {
+    pub fn around(world: [f32; 3], radius: f32) -> Self {
+        Self {
+            min_x: world[0] - radius,
+            min_z: world[2] - radius,
+            max_x: world[0] + radius,
+            max_z: world[2] + radius,
+        }
+    }
+
+    pub fn include(&mut self, other: Self) {
+        self.min_x = self.min_x.min(other.min_x);
+        self.min_z = self.min_z.min(other.min_z);
+        self.max_x = self.max_x.max(other.max_x);
+        self.max_z = self.max_z.max(other.max_z);
+    }
+}
+
+pub fn goop_runtime_layer_capacity(stage_id: &str) -> usize {
+    if stage_id.to_ascii_lowercase().starts_with("mare") {
+        9
+    } else {
+        GOOP_MAX_LAYERS
+    }
+}
+
+pub fn automatic_goop_region(
+    bounds: GoopPaintBounds,
+    cell_size: f32,
+) -> Result<(GoopRegion, u16, u16)> {
+    if !cell_size.is_finite() || cell_size <= 0.0 {
+        return Err(SceneError::StageExport(format!(
+            "automatic goop cell size must be finite and positive, got {cell_size}"
+        )));
+    }
+    let needed_x = (((bounds.max_x - bounds.min_x).max(0.0) / cell_size).ceil() as usize)
+        .max(GOOP_AUTO_INITIAL_DIMENSION)
+        .next_power_of_two();
+    let needed_z = (((bounds.max_z - bounds.min_z).max(0.0) / cell_size).ceil() as usize)
+        .max(GOOP_AUTO_INITIAL_DIMENSION)
+        .next_power_of_two();
+    if needed_x > GOOP_MAX_DIMENSION || needed_z > GOOP_MAX_DIMENSION {
+        return Err(SceneError::StageExport(format!(
+            "painted area requires a {needed_x}x{needed_z} goopmap, exceeding 1024x1024"
+        )));
+    }
+    let center_x = (bounds.min_x + bounds.max_x) * 0.5;
+    let center_z = (bounds.min_z + bounds.max_z) * 0.5;
+    let width_world = needed_x as f32 * cell_size;
+    let height_world = needed_z as f32 * cell_size;
+    let min_x = ((center_x - width_world * 0.5) / cell_size).floor() * cell_size;
+    let min_z = ((center_z - height_world * 0.5) / cell_size).floor() * cell_size;
+    Ok((
+        GoopRegion {
+            min_x,
+            min_z,
+            max_x: min_x + width_world,
+            max_z: min_z + height_world,
+        },
+        needed_x.trailing_zeros() as u16,
+        needed_z.trailing_zeros() as u16,
+    ))
+}
+
+/// Repositions a fixed-size automatic region on its cell lattice so it still
+/// contains the complete stroke while minimizing overlap with incompatible
+/// runtime rectangles. The centered automatic region remains the tie-breaker.
+pub fn position_goop_region_avoiding(
+    preferred: GoopRegion,
+    bounds: GoopPaintBounds,
+    cell_size: f32,
+    lattice_origin: [f32; 2],
+    blocked: &[GoopRegion],
+) -> Result<GoopRegion> {
+    if !cell_size.is_finite() || cell_size <= 0.0 {
+        return Err(SceneError::StageExport(format!(
+            "automatic goop cell size must be finite and positive, got {cell_size}"
+        )));
+    }
+    let width = preferred.max_x - preferred.min_x;
+    let height = preferred.max_z - preferred.min_z;
+    if width + 0.0001 < bounds.max_x - bounds.min_x || height + 0.0001 < bounds.max_z - bounds.min_z
+    {
+        return Err(SceneError::StageExport(
+            "automatic goop region is smaller than the painted bounds".to_string(),
+        ));
+    }
+
+    let aligned_values = |minimum: f32, maximum: f32, origin: f32| {
+        let first = ((minimum - origin) / cell_size).ceil() as i64;
+        let last = ((maximum - origin) / cell_size).floor() as i64;
+        (first..=last)
+            .map(|cell| origin + cell as f32 * cell_size)
+            .collect::<Vec<_>>()
+    };
+    let x_origins = aligned_values(bounds.max_x - width, bounds.min_x, lattice_origin[0]);
+    let z_origins = aligned_values(bounds.max_z - height, bounds.min_z, lattice_origin[1]);
+    if x_origins.is_empty() || z_origins.is_empty() {
+        return Err(SceneError::StageExport(
+            "painted bounds cannot fit on the automatic goop cell lattice".to_string(),
+        ));
+    }
+
+    let overlap_area = |left: GoopRegion, right: GoopRegion| {
+        let width = (left.max_x.min(right.max_x) - left.min_x.max(right.min_x)).max(0.0);
+        let height = (left.max_z.min(right.max_z) - left.min_z.max(right.min_z)).max(0.0);
+        width * height
+    };
+    let mut best = preferred;
+    let mut best_score = (f64::INFINITY, usize::MAX, f64::INFINITY);
+    for min_x in x_origins {
+        for &min_z in &z_origins {
+            let candidate = GoopRegion {
+                min_x,
+                min_z,
+                max_x: min_x + width,
+                max_z: min_z + height,
+            };
+            let mut area = 0.0f64;
+            let mut count = 0usize;
+            for &obstacle in blocked {
+                let overlap = overlap_area(candidate, obstacle) as f64;
+                if overlap > 0.0 {
+                    area += overlap;
+                    count += 1;
+                }
+            }
+            let dx = f64::from(min_x - preferred.min_x);
+            let dz = f64::from(min_z - preferred.min_z);
+            let score = (area, count, dx * dx + dz * dz);
+            if score < best_score {
+                best = candidate;
+                best_score = score;
+            }
+        }
+    }
+    Ok(best)
+}
+
+pub fn expanded_goop_region(
+    layer: &GoopLayerAuthoring,
+    bounds: GoopPaintBounds,
+) -> Result<(GoopRegion, u16, u16)> {
+    let (mut width, mut height) = layer.dimensions()?;
+    let cell_size = layer.runtime.vertical_scale;
+    let mut region = layer.region;
+    while bounds.min_x < region.min_x || bounds.max_x > region.max_x {
+        if width >= GOOP_MAX_DIMENSION {
+            return Err(SceneError::StageExport(
+                "goop region cannot expand beyond 1024 cells on X".to_string(),
+            ));
+        }
+        let old_world = width as f32 * cell_size;
+        width *= 2;
+        if bounds.min_x < region.min_x {
+            region.min_x -= old_world;
+        } else {
+            region.max_x += old_world;
+        }
+        region.max_x = region.min_x + width as f32 * cell_size;
+    }
+    while bounds.min_z < region.min_z || bounds.max_z > region.max_z {
+        if height >= GOOP_MAX_DIMENSION {
+            return Err(SceneError::StageExport(
+                "goop region cannot expand beyond 1024 cells on Z".to_string(),
+            ));
+        }
+        let old_world = height as f32 * cell_size;
+        height *= 2;
+        if bounds.min_z < region.min_z {
+            region.min_z -= old_world;
+        } else {
+            region.max_z += old_world;
+        }
+        region.max_z = region.min_z + height as f32 * cell_size;
+    }
+    Ok((
+        region,
+        width.trailing_zeros() as u16,
+        height.trailing_zeros() as u16,
+    ))
+}
+
+pub fn balanced_goop_expansion(
+    old_dimensions: (usize, usize),
+    expanded_dimensions: (usize, usize),
+    fresh_dimensions: (usize, usize),
+) -> bool {
+    let old_area = old_dimensions.0.saturating_mul(old_dimensions.1);
+    let expanded_area = expanded_dimensions.0.saturating_mul(expanded_dimensions.1);
+    let fresh_area = fresh_dimensions.0.saturating_mul(fresh_dimensions.1);
+    expanded_area.saturating_sub(old_area) <= fresh_area
+}
+
+pub fn reproject_goop_mask(
+    old_layer: &GoopLayerAuthoring,
+    new_layer: &GoopLayerAuthoring,
+) -> Result<Vec<u8>> {
+    let (old_width, old_height) = old_layer.dimensions()?;
+    let (new_width, new_height) = new_layer.dimensions()?;
+    let old_mask = old_layer.mask()?;
+    let scale = old_layer.runtime.vertical_scale;
+    if (scale - new_layer.runtime.vertical_scale).abs() > f32::EPSILON {
+        return Err(SceneError::StageExport(
+            "goop mask reprojection requires an unchanged cell scale".to_string(),
+        ));
+    }
+    let offset_x_float = (old_layer.region.min_x - new_layer.region.min_x) / scale;
+    let offset_y_float = (old_layer.region.min_z - new_layer.region.min_z) / scale;
+    let offset_x = offset_x_float.round() as isize;
+    let offset_y = offset_y_float.round() as isize;
+    if (offset_x_float - offset_x as f32).abs() > 0.0001
+        || (offset_y_float - offset_y as f32).abs() > 0.0001
+    {
+        return Err(SceneError::StageExport(
+            "goop mask reprojection lost its cell lattice".to_string(),
+        ));
+    }
+    let mut mask = vec![0; new_width * new_height];
+    for old_y in 0..old_height {
+        for old_x in 0..old_width {
+            let new_x = old_x as isize + offset_x;
+            let new_y = old_y as isize + offset_y;
+            if new_x < 0 || new_y < 0 || new_x >= new_width as isize || new_y >= new_height as isize
+            {
+                continue;
+            }
+            let new_x = new_x as usize;
+            let new_y = new_y as usize;
+            if new_layer.valid_cell(new_x, new_y) {
+                mask[new_y * new_width + new_x] = old_mask[old_y * old_width + old_x];
+            }
+        }
+    }
+    Ok(mask)
+}
+
+pub fn goop_layer_accepts_height(layer: &GoopLayerAuthoring, world: [f32; 3]) -> bool {
+    let Some((x, y)) = layer.world_to_cell(world[0], world[2]) else {
+        return false;
+    };
+    let Ok(depth) = layer.runtime.depth_at(x, y) else {
+        return false;
+    };
+    if depth == 0xff {
+        return false;
+    }
+    let encoded =
+        ((world[1] - layer.runtime.vertical_offset) / GOOP_DEPTH_WORLD_UNITS_PER_CODE).trunc();
+    encoded.is_finite() && encoded >= f32::from(depth) - 2.0 && encoded <= f32::from(depth) + 2.0
+}
+
+pub fn goop_layers_can_overlap(left: &GoopLayerAuthoring, right: &GoopLayerAuthoring) -> bool {
+    if left.origin == GoopLayerOrigin::Imported && right.origin == GoopLayerOrigin::Imported {
+        return true;
+    }
+    if !goop_layers_share_runtime_behavior(left, right) {
+        return false;
+    }
+    overlap_depths_are_disjoint(left, right) && overlap_depths_are_disjoint(right, left)
+}
+
+fn goop_layers_share_runtime_behavior(
+    left: &GoopLayerAuthoring,
+    right: &GoopLayerAuthoring,
+) -> bool {
+    // TPollutionManager::getPollutionType selects the first layer whose X/Z
+    // rectangle contains Mario and does not consult the depth map. Overlapping
+    // pages must therefore agree on behavior. Their BMD/BMP style provenance
+    // may differ because stamping, cleaning, and rendering remain depth-gated
+    // per layer.
+    left.behavior == right.behavior
+}
+
+/// Removes candidate depth cells already owned by compatible floor layers.
+///
+/// Automatic pages are deliberately large, so a page filling a narrow gap can
+/// overlap the X/Z rectangles of both neighboring pages. The runtime overlap is
+/// safe when only one layer has a valid Sunshine depth window in each shared
+/// cell. Preserve the existing layer and make the candidate sparse instead of
+/// rejecting an otherwise paintable corridor.
+pub fn carve_compatible_goop_overlap_depths(
+    candidate: &mut GoopLayerAuthoring,
+    existing: &[GoopLayerAuthoring],
+    skip_index: Option<usize>,
+) -> Result<usize> {
+    let (width, height) = candidate.dimensions()?;
+    let scale = candidate.runtime.vertical_scale;
+    let mut carved = 0usize;
+
+    for (index, other) in existing.iter().enumerate() {
+        if skip_index == Some(index)
+            || candidate.plane != GoopPlane::Floor
+            || other.plane != GoopPlane::Floor
+            || !candidate.region.overlaps(other.region)
+        {
+            continue;
+        }
+        if !goop_layers_share_runtime_behavior(candidate, other) {
+            return Err(SceneError::StageExport(format!(
+                "goop region {} overlaps {} with a different runtime behavior",
+                candidate.id, other.id
+            )));
+        }
+
+        for y in 0..height {
+            for x in 0..width {
+                let depth = candidate.runtime.depth_at(x, y)?;
+                if depth == 0xff {
+                    continue;
+                }
+                let world = [
+                    candidate.region.min_x + (x as f32 + 0.5) * scale,
+                    candidate.runtime.vertical_offset
+                        + f32::from(depth) * GOOP_DEPTH_WORLD_UNITS_PER_CODE,
+                    candidate.region.min_z + (y as f32 + 0.5) * scale,
+                ];
+                if other.region.contains(world[0], world[2])
+                    && goop_layer_accepts_height(other, world)
+                {
+                    candidate.runtime.set_depth(x, y, 0xff)?;
+                    carved += 1;
+                }
+            }
+        }
+
+        // The two regions may use offset cell lattices or different scales.
+        // Candidate-center sampling alone can therefore report disjoint while
+        // an existing cell center still lands in a valid candidate window.
+        // Preserve the existing layer and carve the candidate in that reverse
+        // direction as well so overlap safety is symmetric.
+        let (other_width, other_height) = other.dimensions()?;
+        let other_scale = other.runtime.vertical_scale;
+        for other_y in 0..other_height {
+            for other_x in 0..other_width {
+                let other_depth = other.runtime.depth_at(other_x, other_y)?;
+                if other_depth == 0xff {
+                    continue;
+                }
+                let world = [
+                    other.region.min_x + (other_x as f32 + 0.5) * other_scale,
+                    other.runtime.vertical_offset
+                        + f32::from(other_depth) * GOOP_DEPTH_WORLD_UNITS_PER_CODE,
+                    other.region.min_z + (other_y as f32 + 0.5) * other_scale,
+                ];
+                let Some((candidate_x, candidate_y)) = candidate.world_to_cell(world[0], world[2])
+                else {
+                    continue;
+                };
+                if goop_layer_accepts_height(candidate, world) {
+                    candidate
+                        .runtime
+                        .set_depth(candidate_x, candidate_y, 0xff)?;
+                    carved += 1;
+                }
+            }
+        }
+
+        let candidate_is_disjoint = overlap_depths_are_disjoint(candidate, other);
+        let existing_is_disjoint = overlap_depths_are_disjoint(other, candidate);
+        if !candidate_is_disjoint || !existing_is_disjoint {
+            return Err(SceneError::StageExport(format!(
+                "goop region {} cannot safely share its X/Z area with {} \
+                 (candidate depth disjoint: {candidate_is_disjoint}, existing depth disjoint: \
+                 {existing_is_disjoint})",
+                candidate.id, other.id,
+            )));
+        }
+    }
+    Ok(carved)
+}
+
+fn overlap_depths_are_disjoint(sampled: &GoopLayerAuthoring, other: &GoopLayerAuthoring) -> bool {
+    let Ok((width, height)) = sampled.dimensions() else {
+        return false;
+    };
+    let scale = sampled.runtime.vertical_scale;
+    for y in 0..height {
+        for x in 0..width {
+            let Ok(depth) = sampled.runtime.depth_at(x, y) else {
+                return false;
+            };
+            if depth == 0xff {
+                continue;
+            }
+            let world = [
+                sampled.region.min_x + (x as f32 + 0.5) * scale,
+                sampled.runtime.vertical_offset
+                    + f32::from(depth) * GOOP_DEPTH_WORLD_UNITS_PER_CODE,
+                sampled.region.min_z + (y as f32 + 0.5) * scale,
+            ];
+            if other.region.contains(world[0], world[2]) && goop_layer_accepts_height(other, world)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 pub fn whole_terrain_region(triangles: &[GoopTerrainTriangle]) -> Result<(GoopRegion, u16, u16)> {
     let mut min_x = f32::INFINITY;
     let mut min_z = f32::INFINITY;
@@ -467,6 +1131,24 @@ pub fn generate_floor_depth_map(
     width_log2: u16,
     height_log2: u16,
 ) -> Result<(f32, Vec<u8>)> {
+    generate_floor_depth_map_for_surface(
+        triangles,
+        region,
+        width_log2,
+        height_log2,
+        GOOP_CELL_SIZE,
+        None,
+    )
+}
+
+pub fn generate_floor_depth_map_for_surface(
+    triangles: &[GoopTerrainTriangle],
+    region: GoopRegion,
+    width_log2: u16,
+    height_log2: u16,
+    cell_size: f32,
+    surface_anchor: Option<GoopSurfaceAnchor>,
+) -> Result<(f32, Vec<u8>)> {
     let width = 1usize << width_log2;
     let height = 1usize << height_log2;
     if width < 8 || height < 4 || width > GOOP_MAX_DIMENSION || height > GOOP_MAX_DIMENSION {
@@ -474,6 +1156,15 @@ pub fn generate_floor_depth_map(
             "invalid goopmap dimensions {width}x{height}"
         )));
     }
+    if !cell_size.is_finite() || cell_size <= 0.0 {
+        return Err(SceneError::StageExport(format!(
+            "invalid goopmap cell size {cell_size}"
+        )));
+    }
+    let selected_triangles = surface_anchor
+        .map(|anchor| connected_goop_surface(triangles, anchor.world))
+        .transpose()?;
+    let triangles = selected_triangles.as_deref().unwrap_or(triangles);
     let mut samples = vec![None; width * height];
     let mut minimum = f32::INFINITY;
     // Prefer the center height used by runtime stamps. Near a terrain edge,
@@ -486,16 +1177,16 @@ pub fn generate_floor_depth_map(
     // pollution-reset event when it swaps a buried-building pollution object.
     // Static authored layers therefore retain this generated YMP at runtime.
     let offsets = [
-        [GOOP_CELL_SIZE * 0.5, GOOP_CELL_SIZE * 0.5],
-        [GOOP_CELL_SIZE * 0.25, GOOP_CELL_SIZE * 0.25],
-        [GOOP_CELL_SIZE * 0.75, GOOP_CELL_SIZE * 0.25],
-        [GOOP_CELL_SIZE * 0.25, GOOP_CELL_SIZE * 0.75],
-        [GOOP_CELL_SIZE * 0.75, GOOP_CELL_SIZE * 0.75],
+        [cell_size * 0.5, cell_size * 0.5],
+        [cell_size * 0.25, cell_size * 0.25],
+        [cell_size * 0.75, cell_size * 0.25],
+        [cell_size * 0.25, cell_size * 0.75],
+        [cell_size * 0.75, cell_size * 0.75],
     ];
     for y in 0..height {
         for x in 0..width {
-            let world_x = region.min_x + x as f32 * GOOP_CELL_SIZE;
-            let world_z = region.min_z + y as f32 * GOOP_CELL_SIZE;
+            let world_x = region.min_x + x as f32 * cell_size;
+            let world_z = region.min_z + y as f32 * cell_size;
             let Some(sample) = offsets.iter().find_map(|offset| {
                 topmost_height(triangles, world_x + offset[0], world_z + offset[1])
             }) else {
@@ -523,7 +1214,7 @@ pub fn generate_floor_depth_map(
         flags: 0,
         reserved: 0,
         vertical_offset,
-        vertical_scale: GOOP_CELL_SIZE,
+        vertical_scale: cell_size,
         min_x: region.min_x,
         min_z: region.min_z,
         max_x: region.max_x,
@@ -549,6 +1240,75 @@ pub fn generate_floor_depth_map(
         }
     }
     Ok((vertical_offset, layer.depth_map))
+}
+
+type QuantizedVertex = [i64; 3];
+type QuantizedEdge = [QuantizedVertex; 2];
+
+fn connected_goop_surface(
+    triangles: &[GoopTerrainTriangle],
+    anchor: [f32; 3],
+) -> Result<Vec<GoopTerrainTriangle>> {
+    let seed = triangles
+        .iter()
+        .enumerate()
+        .filter_map(|(index, triangle)| {
+            triangle_height_at(triangle.vertices, anchor[0], anchor[2])
+                .map(|height| (index, (height - anchor[1]).abs()))
+        })
+        .min_by(|left, right| left.1.total_cmp(&right.1))
+        .map(|(index, _)| index)
+        .ok_or_else(|| {
+            SceneError::StageExport(
+                "the goop surface anchor does not intersect runtime ground".to_string(),
+            )
+        })?;
+
+    let mut edge_owners = BTreeMap::<QuantizedEdge, Vec<usize>>::new();
+    for (index, triangle) in triangles.iter().enumerate() {
+        for edge in [[0, 1], [1, 2], [2, 0]] {
+            edge_owners
+                .entry(quantized_edge(
+                    triangle.vertices[edge[0]],
+                    triangle.vertices[edge[1]],
+                ))
+                .or_default()
+                .push(index);
+        }
+    }
+    let mut neighbors = vec![Vec::new(); triangles.len()];
+    for owners in edge_owners.values() {
+        for &left in owners {
+            for &right in owners {
+                if left != right {
+                    neighbors[left].push(right);
+                }
+            }
+        }
+    }
+    let mut visited = BTreeSet::new();
+    let mut pending = VecDeque::from([seed]);
+    while let Some(index) = pending.pop_front() {
+        if !visited.insert(index) {
+            continue;
+        }
+        pending.extend(neighbors[index].iter().copied());
+    }
+    Ok(visited.into_iter().map(|index| triangles[index]).collect())
+}
+
+fn quantized_edge(left: [f32; 3], right: [f32; 3]) -> QuantizedEdge {
+    let left = quantized_vertex(left);
+    let right = quantized_vertex(right);
+    if left <= right {
+        [left, right]
+    } else {
+        [right, left]
+    }
+}
+
+fn quantized_vertex(vertex: [f32; 3]) -> QuantizedVertex {
+    vertex.map(|value| (value * 100.0).round() as i64)
 }
 
 fn topmost_height(triangles: &[GoopTerrainTriangle], x: f32, z: f32) -> Option<f32> {
@@ -580,10 +1340,44 @@ pub fn terrain_fingerprint(model: &[u8], collision: &[u8]) -> u64 {
 }
 
 /// Builds a source-free floor pollution model while retaining the template's
-/// active material-zero MAT3 state and every TEX1 texture after texture zero.
+/// active material-zero MAT3 state and only the TEX1 textures it can reach.
 pub fn generate_floor_pollution_model(
     template: &J3dRebuildDocument,
     triangles: &[GoopRenderTriangle],
+    runtime: &YmpLayer,
+    allow_incompatible_template: bool,
+) -> Result<J3dRebuildDocument> {
+    generate_floor_pollution_model_inner(
+        template,
+        triangles,
+        None,
+        runtime,
+        allow_incompatible_template,
+    )
+}
+
+pub fn generate_floor_pollution_model_for_surface(
+    template: &J3dRebuildDocument,
+    triangles: &[GoopRenderTriangle],
+    collision_triangles: &[GoopTerrainTriangle],
+    surface_anchor: GoopSurfaceAnchor,
+    runtime: &YmpLayer,
+    allow_incompatible_template: bool,
+) -> Result<J3dRebuildDocument> {
+    let surface_component = connected_goop_surface(collision_triangles, surface_anchor.world)?;
+    generate_floor_pollution_model_inner(
+        template,
+        triangles,
+        Some(&surface_component),
+        runtime,
+        allow_incompatible_template,
+    )
+}
+
+fn generate_floor_pollution_model_inner(
+    template: &J3dRebuildDocument,
+    triangles: &[GoopRenderTriangle],
+    surface_component: Option<&[GoopTerrainTriangle]>,
     runtime: &YmpLayer,
     allow_incompatible_template: bool,
 ) -> Result<J3dRebuildDocument> {
@@ -671,6 +1465,7 @@ pub fn generate_floor_pollution_model(
     )?;
     let detail_uv_gradients = template_detail_uv_gradients(template)?;
     retain_material_zero_only(&mut material_section)?;
+    retain_active_material_textures(&mut material_section, &mut textures)?;
     redirect_detail_tex_gens(&mut material_section, &detail_uv_gradients)?;
 
     let mut vertices = Vec::new();
@@ -680,6 +1475,11 @@ pub fn generate_floor_pollution_model(
             continue;
         };
         for mut polygon in runtime_safe_surface_polygons(surface_vertices, runtime)? {
+            if surface_component.is_some_and(|component| {
+                !render_polygon_matches_surface_component(&polygon, component)
+            }) {
+                continue;
+            }
             // `compile_static_bmd3` accepts conventional geometric winding and
             // reverses it when emitting GX's clockwise display-list winding.
             // J3D preview exposes GX's clockwise runtime winding. Convert it
@@ -814,6 +1614,91 @@ fn retain_material_zero_only(material_section: &mut sms_formats::J3dRebuildSecti
             )));
         }
         bytes.truncate(INDIRECT_MATERIAL_RECORD_SIZE);
+    }
+    Ok(())
+}
+
+fn retain_active_material_textures(
+    material_section: &mut sms_formats::J3dRebuildSection,
+    textures: &mut Vec<GxEncodedTexture>,
+) -> Result<()> {
+    let J3dRebuildSectionData::Materials(materials) = &mut material_section.data else {
+        return Err(SceneError::StageExport(
+            "goop template material section is not MAT3".to_string(),
+        ));
+    };
+    let active_record = materials.material_init_records.first().ok_or_else(|| {
+        SceneError::StageExport("goop template MAT3 has no active material record".to_string())
+    })?;
+    let texture_numbers = materials
+        .tables
+        .iter()
+        .find(|table| table.kind == J3dMaterialTableKind::TextureNumber)
+        .ok_or_else(|| {
+            SceneError::StageExport("goop template MAT3 has no texture-number table".to_string())
+        })?;
+    let J3dScalarArray::Unsigned16(texture_numbers) = &texture_numbers.allocation else {
+        return Err(SceneError::StageExport(
+            "goop template MAT3 texture-number table is malformed".to_string(),
+        ));
+    };
+
+    let mut retained = BTreeSet::from([0usize]);
+    for table_index in active_record
+        .texture_number_indices
+        .iter()
+        .copied()
+        .filter(|index| *index != u16::MAX)
+    {
+        let texture_index = texture_numbers
+            .get(usize::from(table_index))
+            .copied()
+            .ok_or_else(|| {
+                SceneError::StageExport(format!(
+                    "goop material texture-number index {table_index} is out of bounds"
+                ))
+            })?;
+        if texture_index == u16::MAX {
+            continue;
+        }
+        if usize::from(texture_index) >= textures.len() {
+            return Err(SceneError::StageExport(format!(
+                "goop material texture index {texture_index} is out of bounds"
+            )));
+        }
+        retained.insert(usize::from(texture_index));
+    }
+
+    let mut remap = vec![None; textures.len()];
+    for (new_index, old_index) in retained.iter().copied().enumerate() {
+        remap[old_index] = Some(u16::try_from(new_index).map_err(|_| {
+            SceneError::StageExport("goop texture remap exceeds J3D limits".to_string())
+        })?);
+    }
+    let original = std::mem::take(textures);
+    *textures = original
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, texture)| remap[index].is_some().then_some(texture))
+        .collect();
+
+    let texture_numbers = materials
+        .tables
+        .iter_mut()
+        .find(|table| table.kind == J3dMaterialTableKind::TextureNumber)
+        .expect("texture-number table was found above");
+    let J3dScalarArray::Unsigned16(texture_numbers) = &mut texture_numbers.allocation else {
+        unreachable!("texture-number table kind was validated above");
+    };
+    for texture_index in texture_numbers {
+        if *texture_index == u16::MAX {
+            continue;
+        }
+        *texture_index = remap
+            .get(usize::from(*texture_index))
+            .copied()
+            .flatten()
+            .unwrap_or(u16::MAX);
     }
     Ok(())
 }
@@ -1368,6 +2253,54 @@ fn runtime_depth_matches_surface(runtime: &YmpLayer, x: usize, y: usize, surface
         && encoded <= f32::from(depth) + FLOOR_RUNTIME_DEPTH_TOLERANCE
 }
 
+fn render_polygon_matches_surface_component(
+    polygon: &[[f32; 3]],
+    component: &[GoopTerrainTriangle],
+) -> bool {
+    const RENDER_COLLISION_Y_TOLERANCE: f32 = 8.0;
+    if polygon.is_empty() {
+        return false;
+    }
+    let centroid = polygon.iter().fold([0.0; 3], |mut centroid, vertex| {
+        for axis in 0..3 {
+            centroid[axis] += vertex[axis] / polygon.len() as f32;
+        }
+        centroid
+    });
+    if let Some(distance) = nearest_surface_distance(component, centroid) {
+        return distance <= RENDER_COLLISION_Y_TOLERANCE;
+    }
+    polygon
+        .iter()
+        .copied()
+        .chain(
+            polygon
+                .iter()
+                .copied()
+                .zip(polygon.iter().copied().cycle().skip(1))
+                .take(polygon.len())
+                .map(|(left, right)| {
+                    [
+                        (left[0] + right[0]) * 0.5,
+                        (left[1] + right[1]) * 0.5,
+                        (left[2] + right[2]) * 0.5,
+                    ]
+                }),
+        )
+        .filter_map(|sample| nearest_surface_distance(component, sample))
+        .any(|distance| distance <= RENDER_COLLISION_Y_TOLERANCE)
+}
+
+fn nearest_surface_distance(component: &[GoopTerrainTriangle], sample: [f32; 3]) -> Option<f32> {
+    component
+        .iter()
+        .filter_map(|triangle| {
+            triangle_height_at(triangle.vertices, sample[0], sample[2])
+                .map(|height| (height - sample[1]).abs())
+        })
+        .min_by(f32::total_cmp)
+}
+
 fn polygon_projected_area_twice(polygon: &[[f32; 3]]) -> f32 {
     if polygon.len() < 3 {
         return 0.0;
@@ -1535,12 +2468,13 @@ impl StageDocument {
                 };
                 let plane = GoopPlane::from_runtime_code(runtime.flags)
                     .expect("all runtime plane codes have a lossless representation");
+                let behavior = GoopBehavior::from_runtime_code(runtime.layer_type);
                 layers.push(GoopLayerAuthoring {
                     id: format!("goop-layer-{index:02}"),
                     runtime_index: index,
                     origin: GoopLayerOrigin::Imported,
                     plane,
-                    behavior: GoopBehavior::from_runtime_code(runtime.layer_type),
+                    behavior,
                     visible: true,
                     region: GoopRegion {
                         min_x: runtime.min_x,
@@ -1551,15 +2485,24 @@ impl StageDocument {
                     runtime,
                     bitmap,
                     generated_model: None,
-                    style_source: None,
+                    style_source: Some(GoopStyleSource {
+                        stage_id: self.stage_id.clone(),
+                        layer_index: index,
+                        display_name: format!("{} / {stem}", self.stage_id),
+                        behavior_code: behavior.runtime_code(),
+                        forced_incompatible: false,
+                        resource_stem: stem.clone(),
+                    }),
                     resource_stem: stem,
                     metadata_dirty: false,
+                    surface_anchor: None,
                 });
             }
             self.goop_authoring = Some(GoopAuthoringDocument {
                 format_version: GOOP_AUTHORING_FORMAT_VERSION,
                 layers,
                 terrain_fingerprint: 0,
+                stage_archive_resident_bytes: 0,
                 stale: false,
             });
         }
@@ -1568,10 +2511,10 @@ impl StageDocument {
             .as_mut()
             .expect("goop authoring inserted");
         if authoring.format_version < GOOP_AUTHORING_FORMAT_VERSION {
-            // Earlier generators used collision geometry for the visible BMD;
-            // those meshes can be culled, displaced, or projected onto walls.
-            // Mark every older generated layer for the normal template-backed
-            // rebuild, which preserves/reprojects its authored mask.
+            // Older generators may have stale material payload or may project
+            // one layer onto multiple render floors inside Sunshine's broad
+            // depth window. Rebuild through the current anchored,
+            // template-backed path while preserving/reprojecting the mask.
             authoring.stale |= authoring
                 .layers
                 .iter()
@@ -1588,9 +2531,18 @@ impl StageDocument {
     }
 
     pub fn compile_goop_authoring(&mut self) -> Result<()> {
+        self.ensure_goop_stage_heap_baseline()?;
         let Some(authoring) = self.goop_authoring.clone() else {
             return Ok(());
         };
+        let capacity = goop_runtime_layer_capacity(&self.stage_id);
+        if authoring.layers.len() > capacity {
+            return Err(SceneError::StageExport(format!(
+                "{} supports at most {capacity} runtime goop layers, got {}",
+                self.stage_id,
+                authoring.layers.len()
+            )));
+        }
         let compilable = authoring.for_resource_compilation();
         compilable.validate()?;
         if compilable
@@ -1699,6 +2651,33 @@ fn pollution_stem(index: usize, stage_id: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn stage_heap_baseline_uses_yaz0_decompressed_size() {
+        let path = std::env::temp_dir().join(format!(
+            "graffito-goop-heap-estimate-{}.szs",
+            std::process::id()
+        ));
+        let mut bytes = b"Yaz0".to_vec();
+        bytes.extend_from_slice(&0x0064_3210u32.to_be_bytes());
+        bytes.extend_from_slice(&[0; 24]);
+        std::fs::write(&path, bytes).unwrap();
+        let result = resident_stage_archive_bytes(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(result.unwrap(), 0x0064_3210);
+    }
+
+    #[test]
+    fn stage_heap_baseline_uses_uncompressed_file_size() {
+        let path = std::env::temp_dir().join(format!(
+            "graffito-goop-heap-estimate-{}.arc",
+            std::process::id()
+        ));
+        std::fs::write(&path, vec![0; 1234]).unwrap();
+        let result = resident_stage_archive_bytes(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(result.unwrap(), 1234);
+    }
+
     fn flat(size: f32, height: f32) -> Vec<GoopTerrainTriangle> {
         vec![
             GoopTerrainTriangle {
@@ -1797,6 +2776,267 @@ mod tests {
         }
     }
 
+    fn authored_layer(
+        id: &str,
+        region: GoopRegion,
+        width_log2: u16,
+        height_log2: u16,
+        vertical_offset: f32,
+        depth: u8,
+    ) -> GoopLayerAuthoring {
+        let width = 1u16 << width_log2;
+        let height = 1u16 << height_log2;
+        GoopLayerAuthoring {
+            id: id.to_string(),
+            runtime_index: 0,
+            origin: GoopLayerOrigin::Generated,
+            plane: GoopPlane::Floor,
+            behavior: GoopBehavior::Normal,
+            visible: true,
+            region,
+            runtime: floor_runtime(region, width_log2, height_log2, vertical_offset, depth),
+            bitmap: Some(
+                BmpFile::new_pollution_mask(
+                    width,
+                    height,
+                    vec![0; usize::from(width) * usize::from(height)],
+                )
+                .unwrap(),
+            ),
+            generated_model: None,
+            style_source: None,
+            resource_stem: id.to_string(),
+            metadata_dirty: false,
+            surface_anchor: None,
+        }
+    }
+
+    #[test]
+    fn automatic_regions_use_balanced_retail_sized_pages() {
+        let bounds = GoopPaintBounds::around([100.0, 0.0, 200.0], 200.0);
+        let (region, width_log2, height_log2) =
+            automatic_goop_region(bounds, GOOP_CELL_SIZE).unwrap();
+        assert_eq!((1usize << width_log2, 1usize << height_log2), (256, 256));
+        assert!(region.contains(100.0, 200.0));
+        assert_eq!(region.min_x % GOOP_CELL_SIZE, 0.0);
+        assert_eq!(region.min_z % GOOP_CELL_SIZE, 0.0);
+    }
+
+    #[test]
+    fn automatic_region_repositions_to_avoid_an_existing_rectangle() {
+        let bounds = GoopPaintBounds::around([0.0, 0.0, 0.0], 20.0);
+        let (preferred, _, _) = automatic_goop_region(bounds, 40.0).unwrap();
+        let blocker = GoopRegion {
+            min_x: preferred.min_x,
+            min_z: preferred.min_z,
+            max_x: -1000.0,
+            max_z: preferred.max_z,
+        };
+        let positioned =
+            position_goop_region_avoiding(preferred, bounds, 40.0, [0.0, 0.0], &[blocker]).unwrap();
+        assert!(positioned.min_x >= -1000.0);
+        assert!(positioned.contains(0.0, 0.0));
+        assert!(!positioned.overlaps(blocker));
+    }
+
+    #[test]
+    fn balanced_growth_expands_one_axis_but_not_a_corner() {
+        assert!(balanced_goop_expansion((256, 256), (512, 256), (256, 256)));
+        assert!(!balanced_goop_expansion((256, 256), (512, 512), (256, 256)));
+    }
+
+    #[test]
+    fn mask_reprojection_preserves_exact_cells_on_the_same_lattice() {
+        let old_region = GoopRegion {
+            min_x: 0.0,
+            min_z: 0.0,
+            max_x: 320.0,
+            max_z: 160.0,
+        };
+        let mut old = authored_layer("old", old_region, 3, 2, -40.0, 1);
+        let mut old_mask = old.mask().unwrap();
+        old_mask[9] = 173;
+        old.set_mask(&old_mask).unwrap();
+        let new_region = GoopRegion {
+            min_x: -320.0,
+            min_z: 0.0,
+            max_x: 320.0,
+            max_z: 160.0,
+        };
+        let new = authored_layer("new", new_region, 4, 2, -40.0, 1);
+        let mask = reproject_goop_mask(&old, &new).unwrap();
+        assert_eq!(mask[25], 173);
+        assert_eq!(mask.iter().filter(|value| **value != 0).count(), 1);
+    }
+
+    #[test]
+    fn surface_anchor_selects_the_lower_stacked_floor() {
+        let mut terrain = flat_rectangle(0.0, 0.0, 320.0, 160.0, 0.0);
+        terrain.extend(flat_rectangle(0.0, 0.0, 320.0, 160.0, 400.0));
+        let region = GoopRegion {
+            min_x: 0.0,
+            min_z: 0.0,
+            max_x: 320.0,
+            max_z: 160.0,
+        };
+        let (lower_offset, lower_depth) = generate_floor_depth_map_for_surface(
+            &terrain,
+            region,
+            3,
+            2,
+            40.0,
+            Some(GoopSurfaceAnchor {
+                world: [40.0, 0.0, 40.0],
+            }),
+        )
+        .unwrap();
+        let (upper_offset, upper_depth) = generate_floor_depth_map_for_surface(
+            &terrain,
+            region,
+            3,
+            2,
+            40.0,
+            Some(GoopSurfaceAnchor {
+                world: [40.0, 400.0, 40.0],
+            }),
+        )
+        .unwrap();
+        assert_eq!(lower_offset + f32::from(lower_depth[0]) * 40.0, 0.0);
+        assert_eq!(upper_offset + f32::from(upper_depth[0]) * 40.0, 400.0);
+    }
+
+    #[test]
+    fn stacked_same_behavior_layers_overlap_only_when_depth_windows_are_disjoint() {
+        let region = GoopRegion {
+            min_x: 0.0,
+            min_z: 0.0,
+            max_x: 320.0,
+            max_z: 160.0,
+        };
+        let lower = authored_layer("lower", region, 3, 2, -40.0, 1);
+        let mut upper = authored_layer("upper", region, 3, 2, 360.0, 1);
+        upper.resource_stem = lower.resource_stem.clone();
+        assert!(goop_layers_can_overlap(&lower, &upper));
+        let mut conflicting = authored_layer("conflicting", region, 3, 2, 0.0, 1);
+        conflicting.resource_stem = lower.resource_stem.clone();
+        assert!(!goop_layers_can_overlap(&lower, &conflicting));
+
+        let mut different_visual_source = upper.clone();
+        different_visual_source.resource_stem = "different-brown-resource".to_string();
+        different_visual_source.style_source = Some(GoopStyleSource {
+            stage_id: "bianco0".to_string(),
+            layer_index: 2,
+            display_name: "bianco0 / pollution02".to_string(),
+            behavior_code: GoopBehavior::Normal.runtime_code(),
+            forced_incompatible: false,
+            resource_stem: "pollution02".to_string(),
+        });
+        assert!(goop_layers_can_overlap(&lower, &different_visual_source));
+
+        different_visual_source.behavior = GoopBehavior::Slippery;
+        assert!(!goop_layers_can_overlap(&lower, &different_visual_source));
+    }
+
+    #[test]
+    fn compatible_sparse_page_fills_the_gap_between_generated_regions() {
+        let mut candidate = authored_layer(
+            "candidate",
+            GoopRegion {
+                min_x: -4560.0,
+                min_z: -600.0,
+                max_x: 5680.0,
+                max_z: 9640.0,
+            },
+            8,
+            8,
+            80.0,
+            0,
+        );
+        let mut neighbor = authored_layer(
+            "neighbor",
+            GoopRegion {
+                min_x: -3280.0,
+                min_z: -600.0,
+                max_x: 6960.0,
+                max_z: 9640.0,
+            },
+            8,
+            8,
+            80.0,
+            0,
+        );
+        candidate.resource_stem = "shared-style".to_string();
+        neighbor.resource_stem = candidate.resource_stem.clone();
+
+        let result =
+            carve_compatible_goop_overlap_depths(&mut candidate, &[neighbor.clone()], None);
+        let invalid = candidate
+            .runtime
+            .depth_map
+            .iter()
+            .filter(|depth| **depth == 0xff)
+            .count();
+        assert!(result.is_ok(), "{result:?}; invalid cells: {invalid}");
+        let carved = result.unwrap();
+
+        assert_eq!(carved, 224 * 256);
+        assert_ne!(candidate.runtime.depth_at(16, 128).unwrap(), 0xff);
+        assert_eq!(candidate.runtime.depth_at(64, 128).unwrap(), 0xff);
+        assert!(goop_layers_can_overlap(&candidate, &neighbor));
+    }
+
+    #[test]
+    fn overlap_carving_checks_both_offset_cell_lattices() {
+        let mut candidate = authored_layer(
+            "candidate",
+            GoopRegion {
+                min_x: 20.0,
+                min_z: 0.0,
+                max_x: 340.0,
+                max_z: 160.0,
+            },
+            3,
+            2,
+            0.0,
+            0xff,
+        );
+        let mut existing = authored_layer(
+            "existing",
+            GoopRegion {
+                min_x: 0.0,
+                min_z: 0.0,
+                max_x: 320.0,
+                max_z: 160.0,
+            },
+            3,
+            2,
+            0.0,
+            0xff,
+        );
+        candidate.resource_stem = "shared-style".to_string();
+        existing.resource_stem = candidate.resource_stem.clone();
+        candidate.runtime.set_depth(0, 0, 1).unwrap();
+        existing.runtime.set_depth(0, 0, 1).unwrap();
+
+        assert!(overlap_depths_are_disjoint(&candidate, &existing));
+        assert!(!overlap_depths_are_disjoint(&existing, &candidate));
+
+        assert_eq!(
+            carve_compatible_goop_overlap_depths(&mut candidate, &[existing.clone()], None)
+                .unwrap(),
+            1
+        );
+        assert_eq!(candidate.runtime.depth_at(0, 0).unwrap(), 0xff);
+        assert!(goop_layers_can_overlap(&candidate, &existing));
+    }
+
+    #[test]
+    fn mare_uses_the_runtime_nine_name_table() {
+        assert_eq!(goop_runtime_layer_capacity("mare0"), 9);
+        assert_eq!(goop_runtime_layer_capacity("mareUndersea"), 9);
+        assert_eq!(goop_runtime_layer_capacity("bianco0"), 20);
+    }
+
     #[test]
     fn paint_stroke_compiles_only_its_bitmap_without_serializing_the_overlay() {
         let region = GoopRegion {
@@ -1819,6 +3059,7 @@ mod tests {
             style_source: None,
             resource_stem: "pollution00".to_string(),
             metadata_dirty: false,
+            surface_anchor: None,
         };
         let mut painted = vec![0; 32];
         painted[11] = 192;
@@ -1864,6 +3105,7 @@ mod tests {
             format_version: GOOP_AUTHORING_FORMAT_VERSION - 1,
             layers: Vec::new(),
             terrain_fingerprint: 123,
+            stage_archive_resident_bytes: 0,
             stale: true,
         };
         assert!(authoring.validate().is_err());
@@ -2286,6 +3528,9 @@ mod tests {
         unrelated_vertices[2].tex_coords[0] = Some([0.0, 200.0]);
         let mut unrelated_material = material.clone();
         unrelated_material.name = "unrelated-material-one".to_string();
+        unrelated_material.texture_numbers[0] = Some(3);
+        unrelated_material.texture_numbers[1] = Some(4);
+        unrelated_material.texture_numbers[2] = Some(5);
         let template = compile_static_bmd3(&StaticModel {
             root_joint_name: "template".to_string(),
             meshes: vec![
@@ -2307,6 +3552,9 @@ mod tests {
                 encode_texture("mask"),
                 encode_texture("detail"),
                 encode_texture("detail-two"),
+                encode_texture("orphan-mask"),
+                encode_texture("orphan-detail"),
+                encode_texture("orphan-detail-two"),
             ],
         })
         .unwrap();
@@ -2352,6 +3600,17 @@ mod tests {
         assert_eq!(material.tex_gens[0].matrix, 60);
         assert_eq!(material.texture_indices[1], Some(1));
         assert_eq!(material.texture_indices[2], Some(2));
+        assert_eq!(
+            generated
+                .sections
+                .iter()
+                .find_map(|section| match &section.data {
+                    J3dRebuildSectionData::Textures(textures) =>
+                        Some(usize::from(textures.texture_count)),
+                    _ => None,
+                }),
+            Some(3)
+        );
         assert_eq!(material.tex_gens[1].source, 5);
         assert_eq!(material.tex_gens[2].source, 6);
         for slot in [1, 2] {
@@ -2434,5 +3693,81 @@ mod tests {
         assert!(!runtime_safe_surface_polygons(upper, &runtime)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn anchored_pollution_model_excludes_a_lower_render_floor_within_the_depth_window() {
+        let texture = GxEncodedTexture::encode_rgba(
+            "retail_goop",
+            &RgbaImage {
+                width: 8,
+                height: 4,
+                pixels: vec![0; 8 * 4 * 4],
+            },
+            GxTextureEncodeOptions {
+                encoding: GxTextureEncoding::Exact(GxTextureFormat::I8),
+                ..GxTextureEncodeOptions::default()
+            },
+        )
+        .unwrap();
+        let template = compile_static_bmd3(&StaticModel {
+            root_joint_name: "template".to_string(),
+            meshes: vec![StaticModelMesh {
+                name: "template".to_string(),
+                material_index: 0,
+                vertices: vec![
+                    StaticModelVertex::new([0.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+                    StaticModelVertex::new([320.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+                    StaticModelVertex::new([0.0, 0.0, 160.0], [0.0, 1.0, 0.0]),
+                ],
+                triangles: vec![[0, 1, 2]],
+            }],
+            materials: vec![mask_material()],
+            textures: vec![texture],
+        })
+        .unwrap();
+        let region = GoopRegion {
+            min_x: 0.0,
+            min_z: 0.0,
+            max_x: 320.0,
+            max_z: 160.0,
+        };
+        let mut collision = flat_rectangle(0.0, 0.0, 320.0, 160.0, 0.0);
+        collision.extend(flat_rectangle(0.0, 0.0, 320.0, 160.0, 60.0));
+        let anchor = GoopSurfaceAnchor {
+            world: [80.0, 60.0, 80.0],
+        };
+        let (vertical_offset, depth_map) =
+            generate_floor_depth_map_for_surface(&collision, region, 3, 2, 40.0, Some(anchor))
+                .unwrap();
+        let mut runtime = floor_runtime(region, 3, 2, vertical_offset, 0xff);
+        runtime.depth_map = depth_map;
+        let render = flat_rectangle(0.0, 0.0, 320.0, 160.0, 0.0)
+            .into_iter()
+            .chain(flat_rectangle(0.0, 0.0, 320.0, 160.0, 60.0))
+            .map(|triangle| GoopRenderTriangle {
+                vertices: triangle.vertices,
+                normals: Some([[0.0, 1.0, 0.0]; 3]),
+            })
+            .collect::<Vec<_>>();
+        assert!(!runtime_safe_surface_polygons(render[0].vertices, &runtime)
+            .unwrap()
+            .is_empty());
+
+        let generated = generate_floor_pollution_model_for_surface(
+            &template, &render, &collision, anchor, &runtime, false,
+        )
+        .unwrap();
+        let preview = J3dFile::parse(generated.to_bytes().unwrap())
+            .unwrap()
+            .geometry_preview()
+            .unwrap();
+        assert!(!preview.triangles.is_empty());
+        assert!(preview.triangles.iter().all(|triangle| {
+            triangle
+                .vertices
+                .iter()
+                .all(|vertex| (vertex[1] - 62.0).abs() < 0.001)
+        }));
     }
 }
