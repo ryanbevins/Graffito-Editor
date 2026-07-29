@@ -1297,8 +1297,29 @@ impl SmsEditorApp {
         }
         ui.separator();
 
+        // A pick made outside this panel has to be surfaced here: expand its
+        // ancestors and scroll to it. The request survives across frames
+        // because a group that was collapsed does not render its children
+        // until the expand animation has started.
+        const REVEAL_FRAME_BUDGET: u8 = 16;
+        if self.outliner_observed_selection != selected_id {
+            self.outliner_observed_selection = selected_id.clone();
+            self.outliner_reveal_pending = selected_id.clone().map(|id| (id, REVEAL_FRAME_BUDGET));
+        }
+        let reveal_id = self
+            .outliner_reveal_pending
+            .as_ref()
+            .map(|(id, _)| id.clone());
+        let render = OutlinerRender {
+            selected_id: selected_id.as_deref(),
+            selected_world_member,
+            force_open: !self.outliner_filter.trim().is_empty(),
+            reveal_id: reveal_id.as_deref(),
+        };
+
         let mut clicked_selection = None;
         let mut clicked_model_instance = None;
+        let mut revealed = reveal_id.is_none();
         let model_instances = self
             .model_instances
             .iter()
@@ -1337,13 +1358,9 @@ impl SmsEditorApp {
                 });
                 return;
             };
-            clicked_selection = show_outliner_tree(
-                ui,
-                tree,
-                selected_id.as_deref(),
-                selected_world_member,
-                !self.outliner_filter.trim().is_empty(),
-            );
+            let outliner = show_outliner_tree(ui, tree, &render);
+            clicked_selection = outliner.clicked;
+            revealed |= outliner.revealed;
             if tree.visible_objects == 0 {
                 ui.add_space(16.0);
                 ui.vertical_centered(|ui| {
@@ -1352,6 +1369,19 @@ impl SmsEditorApp {
                 });
             }
         });
+        if revealed {
+            self.outliner_reveal_pending = None;
+        } else if let Some((_, budget)) = self.outliner_reveal_pending.as_mut() {
+            // The node was still inside a group that had not started opening.
+            // Ask for another frame so the animation can render it, but give
+            // up rather than scroll at the user indefinitely.
+            *budget -= 1;
+            if *budget == 0 {
+                self.outliner_reveal_pending = None;
+            } else {
+                ui.ctx().request_repaint();
+            }
+        }
         if clicked_selection.is_some() || clicked_model_instance.is_some() {
             self.content_browser.inspector_active = false;
         }
@@ -1363,6 +1393,11 @@ impl SmsEditorApp {
             match selection {
                 OutlinerSelection::Object(id) => {
                     self.selected_object_id = Some(id);
+                    // Clicking a row already puts it on screen. Revealing it
+                    // again would scroll the list out from under the pointer
+                    // as the user works down the tree.
+                    self.outliner_observed_selection = self.selected_object_id.clone();
+                    self.outliner_reveal_pending = None;
                     self.selected_world_member = None;
                 }
                 OutlinerSelection::WorldMember(member) => {

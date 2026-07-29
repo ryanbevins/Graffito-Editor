@@ -50,6 +50,14 @@ impl OutlinerNode {
                 .sum::<usize>()
     }
 
+    fn contains_object(&self, object_id: &str) -> bool {
+        self.object_id.as_deref() == Some(object_id)
+            || self
+                .children
+                .iter()
+                .any(|child| child.contains_object(object_id))
+    }
+
     fn filtered(mut self, needle: &str) -> Option<Self> {
         if needle.is_empty() || self.search_text.contains(needle) {
             return Some(self);
@@ -416,43 +424,63 @@ fn normalized_raw_path(path: &[u8]) -> String {
     String::from_utf8_lossy(path).replace('\\', "/")
 }
 
+/// Inputs for one outliner render pass.
+pub(super) struct OutlinerRender<'a> {
+    pub(super) selected_id: Option<&'a str>,
+    pub(super) selected_world_member: Option<WorldHierarchyMember>,
+    pub(super) force_open: bool,
+    /// Object to expand ancestors for and scroll into view. Set for the frames
+    /// following a selection change so a pick made in the viewport surfaces
+    /// here, then cleared so it stops fighting manual collapsing.
+    pub(super) reveal_id: Option<&'a str>,
+}
+
+impl OutlinerRender<'_> {
+    fn reveals(&self, node: &OutlinerNode) -> bool {
+        self.reveal_id
+            .is_some_and(|object_id| node.contains_object(object_id))
+    }
+}
+
+#[derive(Default)]
+pub(super) struct OutlinerResponse {
+    pub(super) clicked: Option<OutlinerSelection>,
+    /// Whether the reveal target was reached, so the caller can stop asking.
+    pub(super) revealed: bool,
+}
+
 pub(super) fn show_outliner_tree(
     ui: &mut egui::Ui,
     tree: &OutlinerTree,
-    selected_id: Option<&str>,
-    selected_world_member: Option<WorldHierarchyMember>,
-    force_open: bool,
-) -> Option<OutlinerSelection> {
-    let mut clicked = None;
+    render: &OutlinerRender<'_>,
+) -> OutlinerResponse {
+    let mut response = OutlinerResponse {
+        clicked: None,
+        // A target the tree does not hold, because a filter hid it or it was
+        // deleted, is already as revealed as it can get.
+        revealed: render
+            .reveal_id
+            .is_none_or(|id| !tree.roots.iter().any(|root| root.contains_object(id))),
+    };
     for root in &tree.roots {
-        show_outliner_node(
-            ui,
-            root,
-            selected_id,
-            selected_world_member,
-            force_open,
-            0,
-            &mut clicked,
-        );
+        show_outliner_node(ui, root, render, 0, &mut response);
     }
-    clicked
+    response
 }
 
 fn show_outliner_node(
     ui: &mut egui::Ui,
     node: &OutlinerNode,
-    selected_id: Option<&str>,
-    selected_world_member: Option<WorldHierarchyMember>,
-    force_open: bool,
+    render: &OutlinerRender<'_>,
     depth: usize,
-    clicked: &mut Option<OutlinerSelection>,
+    out: &mut OutlinerResponse,
 ) {
     if node.kind == OutlinerNodeKind::Object {
-        show_object_node(ui, node, selected_id, force_open, depth, clicked);
+        show_object_node(ui, node, render, depth, out);
         return;
     }
     if node.kind == OutlinerNodeKind::StageMember {
-        show_stage_member_node(ui, node, selected_world_member, clicked);
+        show_stage_member_node(ui, node, render.selected_world_member, &mut out.clicked);
         return;
     }
 
@@ -470,19 +498,11 @@ fn show_outliner_node(
     let response = egui::CollapsingHeader::new(title)
         .id_salt(&node.key)
         .default_open(depth < 2)
-        .open(force_open.then_some(true))
+        .open((render.force_open || render.reveals(node)).then_some(true))
         .show_background(true)
         .show(ui, |ui| {
             for child in &node.children {
-                show_outliner_node(
-                    ui,
-                    child,
-                    selected_id,
-                    selected_world_member,
-                    force_open,
-                    depth + 1,
-                    clicked,
-                );
+                show_outliner_node(ui, child, render, depth + 1, out);
             }
         });
     response.header_response.on_hover_text(&node.detail);
@@ -523,12 +543,13 @@ fn show_stage_member_node(
 fn show_object_node(
     ui: &mut egui::Ui,
     node: &OutlinerNode,
-    selected_id: Option<&str>,
-    force_open: bool,
+    render: &OutlinerRender<'_>,
     depth: usize,
-    clicked: &mut Option<OutlinerSelection>,
+    out: &mut OutlinerResponse,
 ) {
-    let selected = node.object_id.as_deref() == selected_id;
+    let selected = node.object_id.as_deref() == render.selected_id;
+    let is_reveal_target =
+        render.reveal_id.is_some() && node.object_id.as_deref() == render.reveal_id;
     let label = format!("●  {}\n    {}", node.label, node.detail);
     if node.children.is_empty() {
         let response = ui
@@ -537,8 +558,12 @@ fn show_object_node(
                 egui::Button::selectable(selected, label),
             )
             .on_hover_text(format!("{}\n{}", node.detail, node.key));
+        if is_reveal_target {
+            response.scroll_to_me(None);
+            out.revealed = true;
+        }
         if response.clicked() {
-            *clicked = node.object_id.clone().map(OutlinerSelection::Object);
+            out.clicked = node.object_id.clone().map(OutlinerSelection::Object);
         }
         return;
     }
@@ -546,7 +571,7 @@ fn show_object_node(
     let id = ui.make_persistent_id(("outliner-related", &node.key));
     let mut header =
         egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, depth < 2);
-    if force_open {
+    if render.force_open || render.reveals(node) {
         header.set_open(true);
     }
     let (_toggle, header, _body) = header
@@ -566,11 +591,15 @@ fn show_object_node(
         })
         .body(|ui| {
             for child in &node.children {
-                show_outliner_node(ui, child, selected_id, None, force_open, depth + 1, clicked);
+                show_outliner_node(ui, child, render, depth + 1, out);
             }
         });
+    if is_reveal_target {
+        header.inner.scroll_to_me(None);
+        out.revealed = true;
+    }
     if header.inner.clicked() {
-        *clicked = node.object_id.clone().map(OutlinerSelection::Object);
+        out.clicked = node.object_id.clone().map(OutlinerSelection::Object);
     }
     header.response.on_hover_text(format!(
         "{}\nOwns {} related object(s)",
@@ -609,6 +638,43 @@ mod tests {
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         }
+    }
+
+    #[test]
+    fn nodes_report_whether_a_subtree_holds_an_object() {
+        let mut manager = SceneObject::new("manager", "HamuKuriManager");
+        manager.transform.translation = [0.0, 0.0, 0.0];
+        let mut actor = SceneObject::new("actor", "HamuKuri");
+        actor.transform.translation = [10.0, 0.0, 0.0];
+        let mut document = document(vec![manager, actor]);
+        document.actor_previews.insert(
+            "factory:HamuKuri".to_string(),
+            ActorPreview {
+                model_path: "/scene/hamukuri/hamukuri.bmd".to_string(),
+                load_flags: 0,
+                manager_factory: "HamuKuriManager".to_string(),
+                runtime_uniform_scale: None,
+            },
+        );
+        let tree = build_outliner_tree(&document, "", "Game default");
+        let stage = &tree.roots[0];
+
+        // The stage root owns every object, so revealing a nested actor has to
+        // open each ancestor on the way down, not just the actor's own parent.
+        assert!(stage.contains_object("actor"));
+        let manager_node = find_object(&tree.roots, "manager").expect("manager node");
+        assert!(manager_node.contains_object("actor"));
+        assert!(manager_node.contains_object("manager"));
+        assert!(!manager_node.contains_object("missing"));
+    }
+
+    #[test]
+    fn a_reveal_target_the_tree_does_not_hold_counts_as_revealed() {
+        // A filter can hide the selection. Without this the caller would keep
+        // requesting repaints forever waiting for a node that never renders.
+        let tree = build_outliner_tree(&document(vec![SceneObject::new("coin", "Coin")]), "", "x");
+        assert!(!tree.roots.iter().any(|root| root.contains_object("ghost")));
+        assert!(tree.roots.iter().any(|root| root.contains_object("coin")));
     }
 
     fn find_object<'a>(nodes: &'a [OutlinerNode], id: &str) -> Option<&'a OutlinerNode> {

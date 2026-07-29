@@ -1168,6 +1168,12 @@ struct SmsEditorApp {
     object_clipboard: Option<ObjectClipboard>,
     selected_world_member: Option<WorldHierarchyMember>,
     active_placement: Option<ActivePlacement>,
+    /// Selection the outliner last observed, used to notice a pick made
+    /// elsewhere (the viewport, undo, startup focus) and reveal it.
+    outliner_observed_selection: Option<String>,
+    /// Object the outliner still needs to expand to and scroll into view, with
+    /// a frame budget so a target that never renders cannot pin the scroll.
+    outliner_reveal_pending: Option<(String, u8)>,
     object_filter: String,
     scene_filter: String,
     skybox_filter: String,
@@ -1438,6 +1444,8 @@ impl Default for SmsEditorApp {
             object_clipboard: None,
             selected_world_member: None,
             active_placement: None,
+            outliner_observed_selection: None,
+            outliner_reveal_pending: None,
             object_filter: String::new(),
             scene_filter: String::new(),
             skybox_filter: String::new(),
