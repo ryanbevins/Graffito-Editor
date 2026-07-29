@@ -129,9 +129,19 @@ impl SmsEditorApp {
         ));
         ui.separator();
 
-        if self.selected_route_controls.len() == 2
-            && ui.button("Connect Selected (Bidirectional)").clicked()
-        {
+        // Kept visible when it cannot be used, so the two-point requirement is
+        // discoverable rather than the button simply not existing.
+        let connect_clicked = ui
+            .add_enabled(
+                self.selected_route_controls.len() == 2,
+                egui::Button::new("Connect Selected (Bidirectional)"),
+            )
+            .on_disabled_hover_text(
+                "Select exactly two control points to link them. Shift-click a point in the \
+                 viewport to add it to the selection.",
+            )
+            .clicked();
+        if connect_clicked {
             let endpoints = self
                 .selected_route_controls
                 .iter()
@@ -148,6 +158,64 @@ impl SmsEditorApp {
                 Ok(())
             });
         }
+        // Ctrl-clicking the viewport also extends a route, but nothing said so,
+        // which left a custom graph stuck at the points it was created with.
+        let anchor = self
+            .selected_route_controls
+            .iter()
+            .next()
+            .and_then(|id| graph.control(id))
+            .map(|control| control.node.position);
+        if ui
+            .button("Add Control Point")
+            .on_hover_text(if anchor.is_some() {
+                "Add a control point linked to the selected one"
+            } else {
+                "Add an unlinked control point at the camera focus"
+            })
+            .clicked()
+        {
+            const CONTROL_SPACING: i16 = 300;
+            let position = anchor.map_or_else(
+                || {
+                    let focus = self.renderer.camera().focus;
+                    std::array::from_fn(|axis| {
+                        focus[axis]
+                            .round()
+                            .clamp(f32::from(i16::MIN), f32::from(i16::MAX))
+                            as i16
+                    })
+                },
+                |mut position| {
+                    position[0] = position[0].saturating_add(CONTROL_SPACING);
+                    position
+                },
+            );
+            let link_from = self.selected_route_controls.iter().next().cloned();
+            let graph_id = graph_id.clone();
+            let mut new_id = None;
+            self.apply_route_edit("Added route control point", |document| {
+                let graph = document
+                    .ensure_route_authoring()?
+                    .graph_mut(&graph_id)
+                    .ok_or_else(|| {
+                        SceneError::StageExport("active route disappeared".to_string())
+                    })?;
+                let id = graph.add_control(position);
+                if let Some(from) = &link_from {
+                    graph
+                        .connect_bidirectional(from, &id)
+                        .map_err(|error| SceneError::StageExport(error.to_string()))?;
+                }
+                new_id = Some(id);
+                Ok(())
+            });
+            if let Some(id) = new_id {
+                self.selected_route_controls.clear();
+                self.selected_route_controls.insert(id);
+            }
+        }
+
         if let Some(control_id) = self.selected_route_controls.iter().next().cloned() {
             if let Some(control) = graph.control(&control_id) {
                 ui.strong("Control Point");
@@ -177,6 +245,41 @@ impl SmsEditorApp {
                         Ok(())
                     });
                 }
+                ui.separator();
+                ui.small("Connections");
+                let connections = graph
+                    .links
+                    .iter()
+                    .filter(|link| link.from == control_id || link.to == control_id)
+                    .collect::<Vec<_>>();
+                if connections.is_empty() {
+                    ui.small("None yet. Add a control point, or select two and connect them.");
+                }
+                for link in connections {
+                    let other = if link.from == control_id {
+                        &link.to
+                    } else {
+                        &link.from
+                    };
+                    let arrow = match (link.forward.is_some(), link.reverse.is_some()) {
+                        (true, true) => "<->",
+                        (true, false) => "->",
+                        (false, true) => "<-",
+                        (false, false) => "--",
+                    };
+                    if ui
+                        .selectable_label(
+                            self.selected_route_link.as_deref() == Some(link.id.as_str()),
+                            format!("{arrow}  {other}"),
+                        )
+                        .on_hover_text("Select this connection to reverse, split or delete it")
+                        .clicked()
+                    {
+                        self.selected_route_link = Some(link.id.clone());
+                    }
+                }
+                ui.separator();
+
                 if ui.button("Delete Control Point").clicked() {
                     let graph_id = graph_id.clone();
                     self.apply_route_edit("Deleted route control point", move |document| {
