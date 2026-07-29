@@ -461,6 +461,10 @@ impl SmsEditorApp {
             self.mark_viewport_interaction(ui);
         }
 
+        if self.handle_grab_input(ui, rect, response) {
+            self.mark_viewport_interaction(ui);
+        }
+
         if self.handle_viewport_keyboard_fly(ui, fly_navigation_active) {
             self.mark_viewport_interaction(ui);
         }
@@ -1167,6 +1171,226 @@ impl SmsEditorApp {
         self.camera_focus_animation = None;
     }
 
+    /// Blender-style modal grab. Returns whether it consumed anything.
+    ///
+    /// `G` starts moving the selection with the pointer, `X`/`Y`/`Z` constrain
+    /// it to a world axis and toggle off when pressed again, a click or Enter
+    /// commits, and Escape or right-click puts it back. `Alt+G` snaps the
+    /// selection to the origin outright. Placed objects and authored model
+    /// instances are both grabbable; they differ only in how the edit lands.
+    fn handle_grab_input(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        response: &egui::Response,
+    ) -> bool {
+        let (grab_pressed, alt, escape, enter, axis_key) = ui.input(|input| {
+            (
+                input.key_pressed(egui::Key::G),
+                input.modifiers.alt,
+                input.key_pressed(egui::Key::Escape),
+                input.key_pressed(egui::Key::Enter),
+                [
+                    (egui::Key::X, GizmoAxis::X),
+                    (egui::Key::Y, GizmoAxis::Y),
+                    (egui::Key::Z, GizmoAxis::Z),
+                ]
+                .into_iter()
+                .find(|(key, _)| input.key_pressed(*key))
+                .map(|(_, axis)| axis),
+            )
+        });
+
+        if self.grab_drag.is_none() {
+            if !response.hovered() || !grab_pressed || self.tool == EditorTool::Goop {
+                return false;
+            }
+            // An authored instance wins when one is selected, matching how the
+            // viewport click path prefers instances over placed objects.
+            let (target, start_transform) =
+                if let Some(transform) = self.selected_instance_transform() {
+                    (GrabTarget::ModelInstance, transform)
+                } else if let Some(object) = self.selected_object() {
+                    (GrabTarget::Object, object.transform)
+                } else {
+                    return false;
+                };
+
+            if alt {
+                // Snap home. A discrete edit, so it lands immediately.
+                let mut transform = start_transform;
+                transform.translation = [0.0; 3];
+                self.apply_grab_commit(target, start_transform, transform, "Moved to origin");
+                return true;
+            }
+
+            let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) else {
+                return false;
+            };
+            let world_units_per_pixel = self
+                .gizmo_geometry(rect, start_transform.translation)
+                .map_or(1.0, |geometry| geometry.world_units_per_pixel);
+            if target == GrabTarget::Object {
+                // Instances record their own undo when the drag lands.
+                self.begin_undo_transaction();
+            }
+            self.grab_drag = Some(GrabDrag {
+                target,
+                start_transform,
+                start_pointer: pointer,
+                axis: None,
+                world_units_per_pixel,
+            });
+            return true;
+        }
+
+        let Some(mut drag) = self.grab_drag else {
+            return false;
+        };
+
+        // Pressing the active axis again releases the constraint, matching
+        // Blender, so a mistaken lock does not need cancelling outright.
+        if let Some(axis) = axis_key {
+            drag.axis = (drag.axis != Some(axis)).then_some(axis);
+            self.grab_drag = Some(drag);
+        }
+
+        if escape || response.secondary_clicked() {
+            self.revert_grab(drag);
+            self.grab_drag = None;
+            return true;
+        }
+
+        let moved = ui
+            .input(|input| input.pointer.interact_pos())
+            .map(|pointer| self.grab_transform(rect, drag, pointer));
+        if let Some(transform) = moved {
+            self.preview_grab(drag.target, transform);
+        }
+
+        if enter || response.clicked() {
+            let end = moved.unwrap_or(drag.start_transform);
+            self.apply_grab_commit(drag.target, drag.start_transform, end, "Moved object");
+            self.grab_drag = None;
+        }
+        true
+    }
+
+    /// Live feedback while dragging, without touching undo.
+    fn preview_grab(&mut self, target: GrabTarget, transform: Transform) {
+        match target {
+            GrabTarget::Object => self.update_selected_transform(transform),
+            GrabTarget::ModelInstance => self.preview_selected_instance_transform(transform),
+        }
+    }
+
+    fn revert_grab(&mut self, drag: GrabDrag) {
+        match drag.target {
+            GrabTarget::Object => {
+                self.update_selected_transform(drag.start_transform);
+                // Back where it began, so the transaction records no delta.
+                self.commit_undo_transaction("Moved object");
+            }
+            GrabTarget::ModelInstance => {
+                self.preview_selected_instance_transform(drag.start_transform)
+            }
+        }
+    }
+
+    fn apply_grab_commit(
+        &mut self,
+        target: GrabTarget,
+        start: Transform,
+        end: Transform,
+        label: &str,
+    ) {
+        match target {
+            GrabTarget::Object => {
+                if self.grab_drag.is_none() {
+                    // Alt+G never opened a transaction.
+                    self.begin_undo_transaction();
+                }
+                self.update_selected_transform(end);
+                self.commit_undo_transaction(label);
+            }
+            // Routes through the instance update path, which owns the undo
+            // record, the save, and the goop re-check for moved terrain.
+            GrabTarget::ModelInstance => self.commit_selected_instance_transform(start, end),
+        }
+    }
+
+    fn grab_transform(&self, rect: egui::Rect, drag: GrabDrag, pointer: egui::Pos2) -> Transform {
+        let mut transform = drag.start_transform;
+        let delta = pointer - drag.start_pointer;
+        match drag.axis {
+            Some(axis) => {
+                let direction = self
+                    .gizmo_geometry(rect, drag.start_transform.translation)
+                    .map_or(egui::Vec2::ZERO, |geometry| {
+                        geometry.axes[axis.index()].direction
+                    });
+                let pixels = delta.x * direction.x + delta.y * direction.y;
+                let index = axis.index();
+                let mut value =
+                    drag.start_transform.translation[index] + pixels * drag.world_units_per_pixel;
+                if self.snap_enabled && self.snap_translation > f32::EPSILON {
+                    value = snap_value(value, self.snap_translation);
+                }
+                transform.translation[index] = value;
+            }
+            None => {
+                // Unconstrained grab slides across the camera plane.
+                let frame = self.camera_frame();
+                let world = vec3_add(
+                    vec3_scale(frame.right, delta.x * drag.world_units_per_pixel),
+                    vec3_scale(frame.up, -delta.y * drag.world_units_per_pixel),
+                );
+                transform.translation = vec3_add(drag.start_transform.translation, world);
+                if self.snap_enabled && self.snap_translation > f32::EPSILON {
+                    for value in &mut transform.translation {
+                        *value = snap_value(*value, self.snap_translation);
+                    }
+                }
+            }
+        }
+        transform
+    }
+
+    /// Draws the constraint guide through the grabbed item, in the same axis
+    /// colours the transform gizmo uses.
+    fn paint_grab_axis_guide(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let Some(drag) = self.grab_drag else {
+            return;
+        };
+        let Some(axis) = drag.axis else {
+            return;
+        };
+        let origin = match drag.target {
+            GrabTarget::Object => self
+                .selected_object()
+                .map(|object| object.transform.translation),
+            GrabTarget::ModelInstance => self
+                .selected_instance_transform()
+                .map(|transform| transform.translation),
+        };
+        let Some(origin) = origin else {
+            return;
+        };
+        // Long enough to read as an infinite constraint line at any zoom.
+        let reach = (self.renderer.camera().distance * 40.0).max(100_000.0);
+        let offset = vec3_scale(axis.world_direction(), reach);
+        let projection = self.camera_projection(rect);
+        let Some([start, end]) = projection
+            .project_world_segment_to_screen(vec3_sub(origin, offset), vec3_add(origin, offset))
+        else {
+            return;
+        };
+        painter.line_segment(
+            [start, end],
+            egui::Stroke::new(1.4, gizmo_axis_color(axis, false)),
+        );
+    }
+
     /// Glides the camera onto the world origin grid.
     ///
     /// Pitch is forced downward only when the camera is level or looking up,
@@ -1399,6 +1623,7 @@ impl SmsEditorApp {
         if self.renderer.config().show_grid && !grid_is_depth_rendered {
             self.paint_grid(painter, rect);
         }
+        self.paint_grab_axis_guide(painter, rect);
         self.paint_model_instances(painter, rect);
         self.paint_routes(painter, rect);
         self.paint_audio_helpers(painter, rect);

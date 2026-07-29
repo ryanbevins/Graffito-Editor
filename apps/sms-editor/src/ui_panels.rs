@@ -184,14 +184,6 @@ impl SmsEditorApp {
                     self.show_project_settings = true;
                 }
                 ui.separator();
-                if ui
-                    .selectable_label(self.tool == EditorTool::Goop, "Goop Tool    G")
-                    .on_hover_text("Paint and edit goop surfaces")
-                    .clicked()
-                {
-                    ui.close();
-                    self.tool = EditorTool::Goop;
-                }
                 ui.menu_button("Routes", |ui| {
                     let mut route_mode = self.route_mode;
                     if ui.checkbox(&mut route_mode, "Edit Routes").changed() {
@@ -261,6 +253,24 @@ impl SmsEditorApp {
                     } else if self.bottom_tab == BottomTab::Console {
                         self.bottom_tab = BottomTab::Content;
                     }
+                }
+            });
+
+            ui.menu_button("Tools", |ui| {
+                let goop_active = self.tool == EditorTool::Goop;
+                if ui
+                    .selectable_label(goop_active, "Goop Tool")
+                    .on_hover_text(if goop_active {
+                        "Leave the goop tool"
+                    } else {
+                        "Paint and edit goop surfaces"
+                    })
+                    .clicked()
+                {
+                    ui.close();
+                    // Same toggle rule as the viewport toolbar: picking the
+                    // active tool again drops back to Select.
+                    self.tool = self.tool.after_toolbar_click(EditorTool::Goop);
                 }
             });
 
@@ -2601,7 +2611,7 @@ fn tool_shortcut(tool: EditorTool) -> &'static str {
         EditorTool::Move => "W",
         EditorTool::Rotate => "E",
         EditorTool::Scale => "R",
-        EditorTool::Goop => "G",
+        EditorTool::Goop => "Tools menu",
         EditorTool::Place => "Content Browser",
     }
 }

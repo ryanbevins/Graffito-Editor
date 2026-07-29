@@ -168,6 +168,26 @@ impl GizmoAxis {
     }
 }
 
+/// What a grab is moving. Authored instances keep their own undo stack and
+/// save path, so they cannot share the scene-object transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrabTarget {
+    Object,
+    ModelInstance,
+}
+
+/// A Blender-style modal grab: `G` starts it, `X`/`Y`/`Z` constrain it to a
+/// world axis, a click or Enter commits, Escape or right-click reverts.
+#[derive(Debug, Clone, Copy)]
+struct GrabDrag {
+    target: GrabTarget,
+    start_transform: Transform,
+    start_pointer: egui::Pos2,
+    /// `None` moves in the camera plane, as Blender's unconstrained grab does.
+    axis: Option<GizmoAxis>,
+    world_units_per_pixel: f32,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct GizmoDrag {
     axis: GizmoAxis,
@@ -276,7 +296,10 @@ impl EditorTool {
     }
 
     fn after_keyboard_shortcut(self, key: egui::Key) -> Self {
-        if self == Self::Goop && key != egui::Key::G {
+        // Goop is reached from the Tools menu now. `G` starts a viewport grab,
+        // so it can no longer double as a tool switch, and Goop keeps owning
+        // the keyboard while it is active so a grab cannot fire mid-paint.
+        if self == Self::Goop {
             return self;
         }
 
@@ -285,7 +308,6 @@ impl EditorTool {
             egui::Key::W => Self::Move,
             egui::Key::E => Self::Rotate,
             egui::Key::R => Self::Scale,
-            egui::Key::G => Self::Goop,
             _ => self,
         }
     }
@@ -1321,6 +1343,7 @@ struct SmsEditorApp {
     camera_state_changed_at: Instant,
     hovered_gizmo_axis: Option<GizmoAxis>,
     gizmo_drag: Option<GizmoDrag>,
+    grab_drag: Option<GrabDrag>,
     next_object_serial: u32,
     saved_objects: Vec<SceneObject>,
     saved_lighting: StageLighting,
@@ -1585,6 +1608,7 @@ impl Default for SmsEditorApp {
             camera_state_changed_at: Instant::now(),
             hovered_gizmo_axis: None,
             gizmo_drag: None,
+            grab_drag: None,
             next_object_serial: 1,
             saved_objects: Vec::new(),
             saved_lighting: StageLighting::default(),
@@ -1684,9 +1708,6 @@ impl SmsEditorApp {
         }
         if ctx.input(|i| i.key_pressed(egui::Key::R)) {
             self.tool = self.tool.after_keyboard_shortcut(egui::Key::R);
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::G)) {
-            self.tool = self.tool.after_keyboard_shortcut(egui::Key::G);
         }
     }
 }

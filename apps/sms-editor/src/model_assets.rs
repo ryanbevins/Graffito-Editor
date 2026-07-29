@@ -1299,10 +1299,62 @@ impl SmsEditorApp {
             if previous_loader != updated_loader {
                 self.rebuild_model_preview_cache();
             } else {
+                // Moving an instance leaves its loader flags alone, so this is
+                // the branch a transform edit lands in. Goop is baked against
+                // the final terrain, so it has to be re-checked here or it
+                // stays behind at the geometry's old position.
+                self.refresh_goop_stale_from_final_terrain();
                 self.rebuild_gpu_viewport_scene();
                 self.clear_viewport_preview_cache();
             }
         }
+    }
+
+    /// Transform of the selected authored instance, if there is one.
+    pub(super) fn selected_instance_transform(&self) -> Option<Transform> {
+        self.selected_model_instance()
+            .map(|instance| matrix_to_transform(instance.placement.transform))
+    }
+
+    /// Writes a transform straight onto the selected instance for live drag
+    /// feedback, with no undo record and no save. Pair with
+    /// [`Self::commit_selected_instance_transform`] to land the edit.
+    pub(super) fn preview_selected_instance_transform(&mut self, transform: Transform) {
+        let Some(id) = self.selected_model_instance_id else {
+            return;
+        };
+        let Some(index) = self
+            .model_instances
+            .iter()
+            .position(|instance| instance.placement.instance_id == id)
+        else {
+            return;
+        };
+        self.model_instances[index].placement.transform = transform_to_matrix(transform);
+        self.sync_authored_model_instance_preview();
+        self.rebuild_gpu_viewport_scene();
+    }
+
+    /// Lands a dragged instance as a single undo step.
+    ///
+    /// The live preview has already moved the instance, so it is put back
+    /// first and the edit replayed through the normal update path, which owns
+    /// the undo record, the save and the goop re-check.
+    pub(super) fn commit_selected_instance_transform(&mut self, start: Transform, end: Transform) {
+        let Some(id) = self.selected_model_instance_id else {
+            return;
+        };
+        let Some(index) = self
+            .model_instances
+            .iter()
+            .position(|instance| instance.placement.instance_id == id)
+        else {
+            return;
+        };
+        self.model_instances[index].placement.transform = transform_to_matrix(start);
+        let mut updated = self.model_instances[index].clone();
+        updated.placement.transform = transform_to_matrix(end);
+        self.update_selected_model_instance(updated);
     }
 
     pub(super) fn delete_selected_model_instance(&mut self) -> bool {
@@ -4299,7 +4351,7 @@ fn transformed_bounds_corners(instance: &EditorModelInstance) -> [[f32; 3]; 8] {
     })
 }
 
-fn transform_to_matrix(transform: Transform) -> [[f32; 4]; 4] {
+pub(super) fn transform_to_matrix(transform: Transform) -> [[f32; 4]; 4] {
     let origin = transform.translation;
     let linear_transform = Transform {
         translation: [0.0; 3],
@@ -4318,7 +4370,7 @@ fn transform_to_matrix(transform: Transform) -> [[f32; 4]; 4] {
     ]
 }
 
-fn matrix_to_transform(matrix: [[f32; 4]; 4]) -> Transform {
+pub(super) fn matrix_to_transform(matrix: [[f32; 4]; 4]) -> Transform {
     let mut scale = [0.0; 3];
     for column in 0..3 {
         scale[column] =
