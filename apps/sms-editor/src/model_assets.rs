@@ -1333,8 +1333,11 @@ impl SmsEditorApp {
             return;
         };
         self.model_instances[index].placement.transform = transform_to_matrix(transform);
-        self.sync_authored_model_instance_preview();
-        self.rebuild_gpu_viewport_scene();
+        // Deliberately no preview re-sync here. Re-baking the instance's world
+        // vertices every frame tore the geometry down and rebuilt it while the
+        // pointer moved, which read as flicker. The outlined bounds follow the
+        // transform on their own, so a drag shows the box moving and the mesh
+        // catches up when the edit lands.
     }
 
     /// Lands a dragged instance as a single undo step.
@@ -1453,10 +1456,20 @@ impl SmsEditorApp {
         // Prefer the mesh, matching how placed world objects are picked. The
         // origin radius alone only selected an instance when the part of the
         // model under the cursor happened to sit near its origin.
-        if let Some(hit) = self.model_instance_mesh_hit_at_screen_position(rect, position) {
-            return Some(hit);
-        }
+        self.model_instance_mesh_hit_at_screen_position(rect, position)
+            .or_else(|| self.model_instance_bounds_hit_at_screen_position(rect, position))
+    }
 
+    /// Coarse hit test against the bounding box the viewport outlines.
+    ///
+    /// Kept separate from the mesh test because the box encloses everything
+    /// standing on the model, so callers that can also hit a placed object
+    /// need to rank this below one.
+    pub(super) fn model_instance_bounds_hit_at_screen_position(
+        &self,
+        rect: egui::Rect,
+        position: egui::Pos2,
+    ) -> Option<uuid::Uuid> {
         // Falling back to the drawn bounding box. The mesh test only works
         // once an instance's geometry is in the stage preview, which needs a
         // cached asset preview, and the old origin-radius fallback only
@@ -1469,20 +1482,43 @@ impl SmsEditorApp {
             .iter()
             .filter(|instance| instance.stage_id.eq_ignore_ascii_case(&self.stage_id))
             .filter_map(|instance| {
+                let corners = transformed_bounds_corners(instance);
                 let mut minimum = egui::Pos2::new(f32::INFINITY, f32::INFINITY);
                 let mut maximum = egui::Pos2::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
-                let mut nearest = f32::INFINITY;
-                for corner in transformed_bounds_corners(instance) {
-                    let (screen, depth) = projection.project_world_to_screen(corner)?;
-                    minimum = minimum.min(screen);
-                    maximum = maximum.max(screen);
-                    nearest = nearest.min(depth);
+                let mut visible = false;
+                // Clip each edge to the near plane rather than projecting the
+                // corners outright. A corner behind the camera has no screen
+                // position, so requiring all eight meant a large model became
+                // unpickable as soon as it was close enough to straddle the
+                // near plane, which is exactly when it fills the viewport.
+                for [a, b] in MODEL_INSTANCE_BOX_EDGES {
+                    let Some([start, end]) =
+                        projection.project_world_segment_to_screen(corners[a], corners[b])
+                    else {
+                        continue;
+                    };
+                    minimum = minimum.min(start).min(end);
+                    maximum = maximum.max(start).max(end);
+                    visible = true;
+                }
+                if !visible {
+                    return None;
                 }
                 // A degenerate or edge-on box still deserves a grab margin.
                 let bounds = egui::Rect::from_min_max(minimum, maximum).expand(4.0);
-                bounds
-                    .contains(position)
-                    .then_some((nearest, instance.placement.instance_id))
+                if !bounds.contains(position) {
+                    return None;
+                }
+                // Depth of the box centre orders overlapping instances. A
+                // centre behind the near plane means the camera is inside the
+                // box, which should sort ahead of everything else.
+                let centre = std::array::from_fn(|axis| {
+                    corners.iter().map(|corner| corner[axis]).sum::<f32>() / corners.len() as f32
+                });
+                let depth = projection
+                    .project_world_to_screen(centre)
+                    .map_or(0.0, |(_, depth)| depth);
+                Some((depth, instance.placement.instance_id))
             })
             .min_by(|left, right| left.0.total_cmp(&right.0))
             .map(|(_, id)| id)
@@ -1492,7 +1528,7 @@ impl SmsEditorApp {
     ///
     /// Instances without cached preview geometry are absent from
     /// `instance_model_indices`, so they fall back to the origin radius.
-    fn model_instance_mesh_hit_at_screen_position(
+    pub(super) fn model_instance_mesh_hit_at_screen_position(
         &self,
         rect: egui::Rect,
         position: egui::Pos2,
@@ -1556,21 +1592,7 @@ impl SmsEditorApp {
                 egui::Color32::from_rgb(90, 188, 242)
             };
             let corners = transformed_bounds_corners(instance);
-            const EDGES: [[usize; 2]; 12] = [
-                [0, 1],
-                [0, 2],
-                [0, 4],
-                [1, 3],
-                [1, 5],
-                [2, 3],
-                [2, 6],
-                [3, 7],
-                [4, 5],
-                [4, 6],
-                [5, 7],
-                [6, 7],
-            ];
-            for [a, b] in EDGES {
+            for [a, b] in MODEL_INSTANCE_BOX_EDGES {
                 if let (Some((a, _)), Some((b, _))) = (
                     projection.project_world_to_screen(corners[a]),
                     projection.project_world_to_screen(corners[b]),
@@ -4359,6 +4381,23 @@ fn transformed_bounds_corners(instance: &EditorModelInstance) -> [[f32; 3]; 8] {
         transform_instance_point(local, transform)
     })
 }
+
+/// Edges of a model instance's bounding box, as index pairs into
+/// [`transformed_bounds_corners`].
+const MODEL_INSTANCE_BOX_EDGES: [[usize; 2]; 12] = [
+    [0, 1],
+    [0, 2],
+    [0, 4],
+    [1, 3],
+    [1, 5],
+    [2, 3],
+    [2, 6],
+    [3, 7],
+    [4, 5],
+    [4, 6],
+    [5, 7],
+    [6, 7],
+];
 
 pub(super) fn transform_to_matrix(transform: Transform) -> [[f32; 4]; 4] {
     let origin = transform.translation;

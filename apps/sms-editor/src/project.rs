@@ -217,6 +217,10 @@ fn default_camera_speed() -> f32 {
 
 /// Stage-sized default for projects saved before the navigation distance was
 /// stored, matching `reset_camera`.
+fn default_stage_geometry_clickable() -> bool {
+    true
+}
+
 fn default_navigation_distance() -> f32 {
     7000.0
 }
@@ -244,6 +248,13 @@ pub(super) struct SmsProjectFile {
     pub(super) sound_assignments: BTreeMap<String, ProjectSoundAssignment>,
     #[serde(default)]
     pub(super) launch: ProjectLaunchConfiguration,
+    /// Whether authored stage geometry answers viewport clicks.
+    ///
+    /// A stage model is usually the backdrop everything else stands on, so
+    /// picking it is often in the way rather than useful. Defaults to on so
+    /// existing projects behave as before.
+    #[serde(default = "default_stage_geometry_clickable")]
+    pub(super) stage_geometry_clickable: bool,
 }
 
 #[derive(Deserialize)]
@@ -320,6 +331,7 @@ impl LegacySmsProjectFileV1 {
             stage_music,
             sound_assignments: self.sound_assignments,
             launch: self.launch,
+            stage_geometry_clickable: default_stage_geometry_clickable(),
         }
     }
 }
@@ -346,6 +358,7 @@ impl SmsProjectFile {
             stage_music: BTreeMap::new(),
             sound_assignments: BTreeMap::new(),
             launch: ProjectLaunchConfiguration::default(),
+            stage_geometry_clickable: default_stage_geometry_clickable(),
         }
     }
 

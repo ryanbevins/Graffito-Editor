@@ -1287,6 +1287,8 @@ struct SmsEditorApp {
     show_fps: bool,
     applied_window_title: String,
     snap_enabled: bool,
+    /// Keeps a moved item from sinking through the geometry under it.
+    content_aware_snap: bool,
     snap_translation: f32,
     snap_rotation: f32,
     snap_scale: f32,
@@ -1560,6 +1562,7 @@ impl Default for SmsEditorApp {
             show_fps: false,
             applied_window_title: String::new(),
             snap_enabled: true,
+            content_aware_snap: false,
             snap_translation: 50.0,
             snap_rotation: 15.0,
             snap_scale: 0.1,

@@ -352,7 +352,7 @@ impl SmsEditorApp {
             }
 
             ui.separator();
-            if ui
+            let snapping = ui
                 .selectable_label(
                     self.snap_enabled,
                     if self.snap_enabled {
@@ -361,11 +361,20 @@ impl SmsEditorApp {
                         "Snapping Off"
                     },
                 )
-                .on_hover_text("Enable or disable transform snapping")
-                .clicked()
-            {
+                .on_hover_text("Enable or disable transform snapping. Right-click for more");
+            if snapping.clicked() {
                 self.snap_enabled = !self.snap_enabled;
             }
+            // Written back after the menu closes over `ui`.
+            let mut content_aware = self.content_aware_snap;
+            snapping.context_menu(|ui| {
+                ui.checkbox(&mut content_aware, "Content aware snap")
+                    .on_hover_text(
+                        "Let moved items ride over the geometry beneath them instead of \
+                         sinking through it",
+                    );
+            });
+            self.content_aware_snap = content_aware;
             ui.add_enabled_ui(self.snap_enabled, |ui| {
                 ui.add(
                     egui::DragValue::new(&mut self.snap_translation)
@@ -594,6 +603,23 @@ impl SmsEditorApp {
         }
         if save_name {
             self.persist_project_settings(true);
+        }
+
+        if self.current_project.is_some() {
+            let mut clickable = self.stage_geometry_clickable();
+            if ui
+                .checkbox(&mut clickable, "Stage glb/bmd clickable in viewport")
+                .on_hover_text(
+                    "Let authored stage models answer viewport clicks. Turn this off to click \
+                     straight through the stage to the actors standing on it.",
+                )
+                .changed()
+            {
+                if let Some(project) = self.current_project.as_mut() {
+                    project.descriptor.stage_geometry_clickable = clickable;
+                }
+                self.persist_project_settings(false);
+            }
         }
 
         ui.add_space(8.0);

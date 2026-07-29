@@ -147,6 +147,23 @@ fn preview_triangle_writes_opaque_depth(
     ) && !preview_triangle_is_translucent(preview, triangle)
 }
 
+/// Height of `triangle` directly above or below `(x, z)`, if it covers that
+/// column. Barycentric in the XZ plane, so vertical faces simply miss.
+pub(super) fn triangle_height_at_xz(vertices: [[f32; 3]; 3], x: f32, z: f32) -> Option<f32> {
+    let [a, b, c] = vertices;
+    let area = (b[0] - a[0]) * (c[2] - a[2]) - (c[0] - a[0]) * (b[2] - a[2]);
+    if area.abs() < f32::EPSILON {
+        return None;
+    }
+    let u = ((b[0] - x) * (c[2] - z) - (c[0] - x) * (b[2] - z)) / area;
+    let v = ((c[0] - x) * (a[2] - z) - (a[0] - x) * (c[2] - z)) / area;
+    let w = 1.0 - u - v;
+    let inside = (-1e-4..=1.0 + 1e-4).contains(&u)
+        && (-1e-4..=1.0 + 1e-4).contains(&v)
+        && (-1e-4..=1.0 + 1e-4).contains(&w);
+    inside.then(|| a[1] * u + b[1] * v + c[1] * w)
+}
+
 fn preview_triangle_is_placement_surface(triangle: &PreviewTriangle) -> bool {
     matches!(
         triangle.render_layer,
@@ -461,8 +478,13 @@ impl SmsEditorApp {
             self.mark_viewport_interaction(ui);
         }
 
+        // A grab owns the viewport while it runs. Returning here keeps the
+        // click that commits it from falling through to the selection code,
+        // which would otherwise re-pick whatever sits under the pointer and
+        // drop the selection the grab was just moving.
         if self.handle_grab_input(ui, rect, response) {
             self.mark_viewport_interaction(ui);
+            return;
         }
 
         if self.handle_viewport_keyboard_fly(ui, fly_navigation_active) {
@@ -505,11 +527,26 @@ impl SmsEditorApp {
         if response.clicked() && self.hovered_gizmo_axis.is_none() && !gizmo_using_pointer {
             self.content_browser.inspector_active = false;
             if let Some(pos) = response.interact_pointer_pos() {
-                let model_instance_id = self.model_instance_at_screen_position(rect, pos);
-                let object_id = model_instance_id
-                    .is_none()
-                    .then(|| self.object_at_screen_position(rect, pos))
+                // A precise mesh hit on an authored instance wins outright.
+                // Its bounding box does not: the box encloses everything
+                // standing on the model, so clicking an actor sat on top of a
+                // large glb would otherwise select the glb underneath it.
+                let hit_object = self.object_at_screen_position(rect, pos);
+                let model_instance_id = self
+                    .stage_geometry_clickable()
+                    .then(|| {
+                        self.model_instance_mesh_hit_at_screen_position(rect, pos)
+                            .or_else(|| {
+                                hit_object
+                                    .is_none()
+                                    .then(|| {
+                                        self.model_instance_bounds_hit_at_screen_position(rect, pos)
+                                    })
+                                    .flatten()
+                            })
+                    })
                     .flatten();
+                let object_id = model_instance_id.is_none().then_some(hit_object).flatten();
                 let leaving_helper_for_world_selection = self.selected_audio_helper_id.is_some()
                     && (model_instance_id.is_some() || object_id.is_some());
                 if !leaving_helper_for_world_selection
@@ -658,6 +695,14 @@ impl SmsEditorApp {
                     self.snap_rotation,
                     self.snap_scale,
                 );
+                // Dragging the gizmo moves an item just as a grab does, so it
+                // has to respect the same floor. Rotate and scale leave the
+                // translation alone, so the clamp only applies to a move.
+                let transform = if drag.tool == EditorTool::Move {
+                    self.apply_content_aware_floor(drag.start_transform, transform)
+                } else {
+                    transform
+                };
                 if self.route_undo_transaction.is_some() {
                     self.update_selected_route_control_position(transform.translation);
                 } else {
@@ -1319,6 +1364,34 @@ impl SmsEditorApp {
         }
     }
 
+    /// Highest placement surface under `(x, z)` that sits at or below
+    /// `ceiling`.
+    ///
+    /// `ceiling` is the height the grab started from, so an item keeps to the
+    /// floor it was already above rather than catching on a roof it was under.
+    fn ground_height_below(
+        &self,
+        x: f32,
+        z: f32,
+        ceiling: f32,
+        ignore_model: Option<usize>,
+    ) -> Option<f32> {
+        let preview = self.model_preview.as_ref()?;
+        let mut best = f32::NEG_INFINITY;
+        for triangle in preview.triangles.iter().filter(|triangle| {
+            preview_triangle_is_placement_surface(triangle)
+                && ignore_model.is_none_or(|model| triangle.model_index != model)
+        }) {
+            let Some(height) = triangle_height_at_xz(triangle.vertices, x, z) else {
+                continue;
+            };
+            if height <= ceiling && height > best {
+                best = height;
+            }
+        }
+        best.is_finite().then_some(best)
+    }
+
     fn grab_transform(&self, rect: egui::Rect, drag: GrabDrag, pointer: egui::Pos2) -> Transform {
         let mut transform = drag.start_transform;
         let delta = pointer - drag.start_pointer;
@@ -1352,6 +1425,51 @@ impl SmsEditorApp {
                     }
                 }
             }
+        }
+        self.apply_content_aware_floor(drag.start_transform, transform)
+    }
+
+    /// Preview model index of the current selection, so a move can exclude the
+    /// item's own geometry from tests against the scene.
+    fn selected_model_index(&self) -> Option<usize> {
+        let preview = self.model_preview.as_ref()?;
+        if let Some(id) = self.selected_model_instance_id {
+            return preview.instance_model_indices.get(&id).copied();
+        }
+        let object_id = self.selected_object_id.as_deref()?;
+        preview.object_model_indices.get(object_id).copied()
+    }
+
+    /// Stops a moved item dropping through the geometry it was standing over.
+    ///
+    /// Not a magnet: the item moves freely and is only prevented from sinking
+    /// below the surface under it, so it rides along instead of snapping onto
+    /// it.
+    ///
+    /// The ceiling follows the item's live height rather than where the drag
+    /// began. Anchoring it to the start meant moving onto ground higher than
+    /// that start dropped the constraint entirely, and it re-engaged a frame
+    /// later once the column changed again, which read as the item fighting
+    /// its own position. Tracking the live height instead lets it climb a step
+    /// at a time, and keeps the allowance too small to catch a distant roof.
+    fn apply_content_aware_floor(&self, start: Transform, mut transform: Transform) -> Transform {
+        if !self.content_aware_snap {
+            return transform;
+        }
+        const STEP_ALLOWANCE: f32 = 200.0;
+        // Both inputs, never the clamped output. Feeding the result back in
+        // let each frame raise the ceiling for the next one, so the item
+        // ratcheted upwards on its own.
+        let reference = transform.translation[1].max(start.translation[1]);
+        // Skipping its own mesh: the item's geometry is a placement surface
+        // like any other, so without this it stands on itself and climbs.
+        if let Some(ground) = self.ground_height_below(
+            transform.translation[0],
+            transform.translation[2],
+            reference + STEP_ALLOWANCE,
+            self.selected_model_index(),
+        ) {
+            transform.translation[1] = transform.translation[1].max(ground);
         }
         transform
     }
@@ -1458,6 +1576,14 @@ impl SmsEditorApp {
         true
     }
 
+    /// Whether authored stage geometry answers viewport clicks. Sessions with
+    /// no project behave as if it is on.
+    pub(super) fn stage_geometry_clickable(&self) -> bool {
+        self.current_project
+            .as_ref()
+            .is_none_or(|project| project.descriptor.stage_geometry_clickable)
+    }
+
     /// Glides onto the object or model instance under `pos`. Returns false
     /// when the pointer is over bare terrain.
     pub(super) fn focus_camera_on_viewport_position(
@@ -1466,7 +1592,9 @@ impl SmsEditorApp {
         pos: egui::Pos2,
     ) -> bool {
         let target = self
-            .model_instance_at_screen_position(rect, pos)
+            .stage_geometry_clickable()
+            .then(|| self.model_instance_at_screen_position(rect, pos))
+            .flatten()
             .and_then(|id| self.model_instance_focus_target(id))
             .or_else(|| {
                 self.object_at_screen_position(rect, pos)

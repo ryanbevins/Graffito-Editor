@@ -5075,3 +5075,28 @@ fn goop_keeps_its_keys_while_active() {
         );
     }
 }
+
+#[test]
+fn triangle_height_lookup_covers_its_own_column() {
+    // Flat quad corner at y = 40 spanning the origin.
+    let flat = [[0.0, 40.0, 0.0], [100.0, 40.0, 0.0], [0.0, 40.0, 100.0]];
+    assert_eq!(
+        crate::viewport_ui::triangle_height_at_xz(flat, 10.0, 10.0),
+        Some(40.0)
+    );
+    // Outside the triangle, so nothing underfoot.
+    assert_eq!(
+        crate::viewport_ui::triangle_height_at_xz(flat, 90.0, 90.0),
+        None
+    );
+    // A ramp interpolates rather than picking a corner.
+    let ramp = [[0.0, 0.0, 0.0], [100.0, 100.0, 0.0], [0.0, 0.0, 100.0]];
+    let height = crate::viewport_ui::triangle_height_at_xz(ramp, 50.0, 10.0).expect("on the ramp");
+    assert!((height - 50.0).abs() < 0.001, "got {height}");
+    // A vertical face has no column to stand on.
+    let wall = [[0.0, 0.0, 0.0], [0.0, 100.0, 0.0], [0.0, 0.0, 100.0]];
+    assert_eq!(
+        crate::viewport_ui::triangle_height_at_xz(wall, 10.0, 10.0),
+        None
+    );
+}
