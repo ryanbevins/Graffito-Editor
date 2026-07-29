@@ -1403,10 +1403,20 @@ impl SmsEditorApp {
             return Some(hit);
         }
 
+        // The origin radius only covers instances with no preview mesh to test.
+        // Applying it to meshed instances too would let a click on bare terrain
+        // near an instance's origin select and frame it.
+        let meshed = self
+            .model_preview
+            .as_ref()
+            .map(|preview| &preview.instance_model_indices);
         let projection = self.camera_projection(rect);
         self.model_instances
             .iter()
             .filter(|instance| instance.stage_id.eq_ignore_ascii_case(&self.stage_id))
+            .filter(|instance| {
+                meshed.is_none_or(|meshed| !meshed.contains_key(&instance.placement.instance_id))
+            })
             .filter_map(|instance| {
                 let transform = matrix_to_transform(instance.placement.transform);
                 let (screen, depth) = projection.project_world_to_screen(transform.translation)?;

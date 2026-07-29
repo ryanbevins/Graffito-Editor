@@ -436,6 +436,7 @@ fn project_camera_state_restores_the_last_stage_view() {
             viewport_pan: [14.0, -9.0],
             viewport_zoom: 1.4,
             camera_speed: 0.5,
+            navigation_distance: 6_200.0,
         },
     );
     let mut app = SmsEditorApp {
@@ -4962,4 +4963,39 @@ fn preview_bounds_skip_every_non_world_space_layer() {
         );
     }
     assert!(preview_layer_is_world_space(PreviewRenderLayer::Main));
+}
+
+#[test]
+fn framing_bounds_ignore_billboards_and_effect_layers() {
+    // A Shine's glow and Petey's effects are billboards and particles. Their
+    // stored vertices are not world positions, so counting them inflated the
+    // framing box and the camera pulled back a long way from the model.
+    let mut solid = textured_blended_triangle();
+    solid.billboard = None;
+    solid.render_layer = PreviewRenderLayer::Main;
+    assert!(preview_triangle_frames_object(&solid));
+
+    let mut billboard = solid;
+    billboard.billboard = Some(J3dBillboard {
+        mode: sms_formats::J3dBillboardMode::Full,
+        center: [0.0, 0.0, 0.0],
+        axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        offsets: [[0.0; 3]; 3],
+        normals: None,
+    });
+    assert!(!preview_triangle_frames_object(&billboard));
+
+    for layer in [
+        PreviewRenderLayer::Particle,
+        PreviewRenderLayer::Heatwave,
+        PreviewRenderLayer::Sky,
+        PreviewRenderLayer::MirrorScene,
+    ] {
+        let mut effect = solid;
+        effect.render_layer = layer;
+        assert!(
+            !preview_triangle_frames_object(&effect),
+            "{layer:?} must not contribute to framing bounds"
+        );
+    }
 }

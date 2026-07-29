@@ -1243,8 +1243,7 @@ impl SmsEditorApp {
         let mut minimum = [f32::INFINITY; 3];
         let mut maximum = [f32::NEG_INFINITY; 3];
         for triangle in preview.triangles.iter().filter(|triangle| {
-            triangle.model_index == model_index
-                && preview_layer_is_world_space(triangle.render_layer)
+            triangle.model_index == model_index && preview_triangle_frames_object(triangle)
         }) {
             for vertex in triangle.vertices {
                 for axis in 0..3 {

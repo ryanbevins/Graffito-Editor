@@ -4988,6 +4988,18 @@ fn preview_layer_is_world_space(layer: PreviewRenderLayer) -> bool {
     )
 }
 
+/// Whether a triangle should contribute to the bounds used to frame an object.
+///
+/// Billboards are rebuilt from their centre against the live camera, so their
+/// stored vertices are not world positions, and effect layers are reprojected
+/// the same way. A Shine's glow or Petey's effects otherwise inflate the box
+/// far past the model and the camera frames from a huge distance.
+fn preview_triangle_frames_object(triangle: &PreviewTriangle) -> bool {
+    triangle.billboard.is_none()
+        && preview_layer_is_world_space(triangle.render_layer)
+        && !preview_render_layer_is_effect(triangle.render_layer)
+}
+
 fn preview_render_layer_is_effect(layer: PreviewRenderLayer) -> bool {
     matches!(
         layer,
