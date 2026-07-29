@@ -9,7 +9,24 @@ const GENERATED_ROUTE_NODE_RADIUS: f32 = 3.75;
 
 impl SmsEditorApp {
     pub(super) fn routes_hierarchy_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Routes");
+        // Route mode replaces the hierarchy entirely, and the only way out was
+        // the Edit menu checkbox that turned it on, which is easy to miss from
+        // in here.
+        ui.horizontal(|ui| {
+            ui.heading("Routes");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("Exit Routes")
+                    .on_hover_text("Leave route editing and return to the scene hierarchy")
+                    .clicked()
+                {
+                    self.set_route_mode(false);
+                }
+            });
+        });
+        if !self.route_mode {
+            return;
+        }
         ui.small("One graph is active for editing; all other graphs remain subdued context.");
         ui.separator();
 
