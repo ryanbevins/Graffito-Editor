@@ -403,11 +403,22 @@ pub(super) fn transform_normal(matrix: [[f32; 4]; 4], normal: [f32; 3]) -> [f32;
 /// Colour set 0 for a primitive, created opaque white when the mesh arrived
 /// without one. White is the identity for a vertex-lit surface, so an
 /// untouched model looks the same before and after the set exists.
-fn primitive_colors_mut(primitive: &mut sms_authoring::ModelPrimitive) -> &mut Vec<[f32; 4]> {
+/// Colour set 0 of a primitive, created from `base` if it does not have one.
+///
+/// `base` is the material's own diffuse. A mesh that shipped without vertex
+/// colours used to be seeded white, and because painting points the colour
+/// channel at the vertex array, that white immediately replaced the material
+/// colour on the surface -- so merely touching a mesh with any of these tools
+/// bleached it before a single stroke landed. Seeding from the diffuse means
+/// gaining a colour set changes nothing about how the model looks.
+fn primitive_colors_mut(
+    primitive: &mut sms_authoring::ModelPrimitive,
+    base: [f32; 4],
+) -> &mut Vec<[f32; 4]> {
     if !primitive.colors.iter().any(|set| set.set == 0) {
         primitive.colors.push(sms_authoring::ColorSet {
             set: 0,
-            values: vec![[1.0, 1.0, 1.0, 1.0]; primitive.positions.len()],
+            values: vec![base; primitive.positions.len()],
         });
     }
     let values = &mut primitive
@@ -418,8 +429,32 @@ fn primitive_colors_mut(primitive: &mut sms_authoring::ModelPrimitive) -> &mut V
         .values;
     // An imported set can be shorter than the position list if the source only
     // coloured part of the mesh.
-    values.resize(primitive.positions.len(), [1.0, 1.0, 1.0, 1.0]);
+    values.resize(primitive.positions.len(), base);
     values
+}
+
+/// The material diffuse each primitive of a document should fall back to.
+fn document_primitive_diffuse(document: &ModelAssetDocument) -> Vec<[f32; 4]> {
+    let materials = document
+        .materials
+        .iter()
+        .map(|material| material.source_base_color)
+        .collect::<Vec<_>>();
+    document
+        .meshes
+        .iter()
+        .flat_map(|mesh| &mesh.primitives)
+        .map(|primitive| {
+            primitive
+                .material
+                .and_then(|index| materials.get(index as usize))
+                .copied()
+                // No material at all is the textureless case. White is the
+                // only honest answer there, and it is also what the material
+                // this tool synthesises for such a mesh will carry.
+                .unwrap_or([1.0; 4])
+        })
+        .collect()
 }
 
 /// GX_SRC_VTX. `GXColorSrc` in the decomp is `{ GX_SRC_REG = 0, GX_SRC_VTX = 1 }`,
@@ -539,15 +574,19 @@ fn enable_vertex_colors(document: &mut ModelAssetDocument) {
     // factor into COLOR0 once so untouched vertices retain the imported tint
     // and alpha. Existing imported vertex colours are multiplied by the same
     // factor, matching their appearance before the source switch.
+    let diffuse = document_primitive_diffuse(document);
+    let mut primitive_index = 0usize;
     for mesh in &mut document.meshes {
         for primitive in &mut mesh.primitives {
+            let base = diffuse.get(primitive_index).copied().unwrap_or([1.0; 4]);
+            primitive_index += 1;
             let Some(factor) = primitive
                 .material
                 .and_then(|index| seed_colors.get(&index).copied())
             else {
                 continue;
             };
-            for color in primitive_colors_mut(primitive) {
+            for color in primitive_colors_mut(primitive, base) {
                 for channel in 0..4 {
                     color[channel] = (color[channel] * factor[channel]).clamp(0.0, 1.0);
                 }
@@ -1207,12 +1246,14 @@ impl SmsEditorApp {
         }
         for target in &mut targets {
             enable_vertex_colors(&mut target.document);
+            let diffuse = document_primitive_diffuse(&target.document);
             let world = Self::target_world_vertex_occurrences(target);
             let mut primitive_index = 0usize;
             for mesh in &mut target.document.meshes {
                 for primitive in &mut mesh.primitives {
                     let occurrences = &world[primitive_index];
-                    let colors = primitive_colors_mut(primitive);
+                    let base = diffuse.get(primitive_index).copied().unwrap_or([1.0; 4]);
+                    let colors = primitive_colors_mut(primitive, base);
                     for (index, color) in colors.iter_mut().enumerate() {
                         let vertices = occurrences
                             .iter()
@@ -1242,11 +1283,15 @@ impl SmsEditorApp {
             return;
         }
         for target in &mut targets {
+            let diffuse = document_primitive_diffuse(&target.document);
+            let mut primitive_index = 0usize;
             for mesh in &mut target.document.meshes {
                 for primitive in &mut mesh.primitives {
+                    let base = diffuse.get(primitive_index).copied().unwrap_or([1.0; 4]);
+                    primitive_index += 1;
                     let welds = weld_positions(&primitive.positions);
                     let adjacency = primitive_adjacency(&primitive.indices, &welds);
-                    let colors = primitive_colors_mut(primitive);
+                    let colors = primitive_colors_mut(primitive, base);
                     // Repeated passes spread the blend further than one pass
                     // at higher strength, which just overshoots.
                     for _ in 0..iterations {
@@ -1466,7 +1511,7 @@ impl SmsEditorApp {
                         .and_then(|index| diffuse.get(index as usize))
                         .copied()
                         .unwrap_or([1.0; 4]);
-                    for color in primitive_colors_mut(primitive) {
+                    for color in primitive_colors_mut(primitive, base) {
                         *color = [base[0], base[1], base[2], color[3]];
                     }
                 }
@@ -2039,7 +2084,7 @@ impl SmsEditorApp {
                             .unwrap_or([1.0; 4]);
                         let welds = weld_positions(&primitive.positions);
                         let adjacency = primitive_adjacency(&primitive.indices, &welds);
-                        let colors = primitive_colors_mut(primitive);
+                        let colors = primitive_colors_mut(primitive, base);
                         let smoothed = matches!(application.mode, VertexPaintMode::Smooth)
                             .then(|| smoothed_colors(colors, &welds, &adjacency, 1.0));
 
@@ -2293,7 +2338,7 @@ impl SmsEditorApp {
                         .and_then(|index| diffuse.get(index as usize))
                         .copied()
                         .unwrap_or([1.0; 4]);
-                    for color in primitive_colors_mut(primitive) {
+                    for color in primitive_colors_mut(primitive, base) {
                         settings.apply(color, [base[0], base[1], base[2]]);
                     }
                 }
