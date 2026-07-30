@@ -23,6 +23,9 @@ const SCENE_PATH: &[u8] = b"map/scene.bin";
 
 /// ナメクリマネージャー — the Gooble manager's JDrama object name, which is
 /// what `getManagerByName` resolves. The factory name is `NameKuriManager`.
+/// Production code no longer special-cases it — any manager in the scene can
+/// be flagged — so only the tests pin against it.
+#[cfg(test)]
 const GOOBLE_MANAGER_NAME: &str =
     "\u{30CA}\u{30E1}\u{30AF}\u{30EA}\u{30DE}\u{30CD}\u{30FC}\u{30B8}\u{30E3}\u{30FC}";
 /// 敵情報 — every retail StageEnemyInfo entry carries this object name.
@@ -34,8 +37,10 @@ const TABLES_ROOT_NAME: &str = "\u{30C7}\u{30FC}\u{30BF}\u{30C6}\u{30FC}\u{30D6}
 
 /// Bit 0x1 of `StageEnemyInfo::mFlags`: eligible for pollution generation.
 const SPAWN_FROM_GOOP_FLAG: i32 = 0x1;
-/// Retail weight on every bianco entry.
-const GOOBLE_SPAWN_WEIGHT: u32 = 100;
+/// Retail weight on every bianco entry; getMatchedInfo weights entries
+/// against each other, so with equal weights all flagged entries are equally
+/// likely.
+const SPAWN_WEIGHT: u32 = 100;
 
 fn jdrama_field(name: &str, value: sms_formats::JDramaFieldValue) -> sms_formats::JDramaField {
     sms_formats::JDramaField {
@@ -44,7 +49,7 @@ fn jdrama_field(name: &str, value: sms_formats::JDramaFieldValue) -> sms_formats
     }
 }
 
-fn gooble_enemy_info_record(flags: i32) -> sms_formats::JDramaRecord {
+fn enemy_info_record(manager: &str, flags: i32) -> sms_formats::JDramaRecord {
     sms_formats::JDramaRecord {
         type_name: "StageEnemyInfo".to_string(),
         name: ENEMY_INFO_NAME.to_string(),
@@ -52,13 +57,10 @@ fn gooble_enemy_info_record(flags: i32) -> sms_formats::JDramaRecord {
             fields: vec![
                 jdrama_field(
                     "manager_name",
-                    sms_formats::JDramaFieldValue::String(GOOBLE_MANAGER_NAME.to_string()),
+                    sms_formats::JDramaFieldValue::String(manager.to_string()),
                 ),
                 jdrama_field("flags", sms_formats::JDramaFieldValue::I32(flags)),
-                jdrama_field(
-                    "weight",
-                    sms_formats::JDramaFieldValue::U32(GOOBLE_SPAWN_WEIGHT),
-                ),
+                jdrama_field("weight", sms_formats::JDramaFieldValue::U32(SPAWN_WEIGHT)),
             ],
         },
     }
@@ -77,12 +79,11 @@ fn record_field<'a>(
         .map(|field| &field.value)
 }
 
-fn is_gooble_entry(record: &sms_formats::JDramaRecord) -> bool {
+fn entry_for_manager(record: &sms_formats::JDramaRecord, manager: &str) -> bool {
     record.type_name == "StageEnemyInfo"
         && matches!(
             record_field(record, "manager_name"),
-            Some(sms_formats::JDramaFieldValue::String(manager))
-                if manager == GOOBLE_MANAGER_NAME
+            Some(sms_formats::JDramaFieldValue::String(name)) if name == manager
         )
 }
 
@@ -158,9 +159,15 @@ fn record_at_mut<'a>(
 ///
 /// Pure so it can be tested without an archive. Returns false when nothing
 /// changed.
-fn apply_gooble_spawn_to_tables(tables: &mut sms_formats::JDramaDocument, enabled: bool) -> bool {
+fn apply_spawn_to_tables(
+    tables: &mut sms_formats::JDramaDocument,
+    manager: &str,
+    enabled: bool,
+) -> bool {
     let mut entry_path = Vec::new();
-    if find_record_path(&tables.root, &mut entry_path, &is_gooble_entry) {
+    if find_record_path(&tables.root, &mut entry_path, &|record| {
+        entry_for_manager(record, manager)
+    }) {
         let entry = record_at_mut(&mut tables.root, &entry_path).expect("path just found");
         if entry_spawns_from_goop(entry) == enabled {
             return false;
@@ -196,7 +203,7 @@ fn apply_gooble_spawn_to_tables(tables: &mut sms_formats::JDramaDocument, enable
     let sms_formats::JDramaRecordPayload::Group { children, .. } = &mut header.payload else {
         return false;
     };
-    children.push(gooble_enemy_info_record(SPAWN_FROM_GOOP_FLAG));
+    children.push(enemy_info_record(manager, SPAWN_FROM_GOOP_FLAG));
     true
 }
 
@@ -218,7 +225,34 @@ fn fresh_tables_document() -> sms_formats::JDramaDocument {
 
 impl SmsEditorApp {
     /// Whether the effective enemy table flags Goobles to generate from goop.
-    pub(super) fn gooble_spawn_enabled(&self) -> bool {
+    /// Enemy managers this stage could spawn from goop, derived from what is
+    /// actually in the scene.
+    ///
+    /// A placed enemy actor names its manager in its `manager_name` parameter,
+    /// and export inserts that manager alongside the actor; a retail-derived
+    /// stage additionally carries managers in its effective scene. Either way
+    /// the conductor can only spawn from managers that exist, so the list is
+    /// built from presence rather than from a registry of everything.
+    pub(super) fn goop_spawnable_entities(&self) -> Vec<(String, String)> {
+        let Some(document) = self.document.as_ref() else {
+            return Vec::new();
+        };
+        let mut entities: Vec<(String, String)> = Vec::new();
+        let mut seen = BTreeSet::new();
+        for object in &document.objects {
+            let Some(manager) = object.raw_param("manager_name") else {
+                continue;
+            };
+            if manager.is_empty() || !seen.insert(manager.to_string()) {
+                continue;
+            }
+            entities.push((object.factory_name.clone(), manager.to_string()));
+        }
+        entities
+    }
+
+    /// Whether the effective enemy table flags `manager` for goop spawning.
+    pub(super) fn manager_spawns_from_goop(&self, manager: &str) -> bool {
         let Some(document) = self.document.as_ref() else {
             return false;
         };
@@ -228,21 +262,20 @@ impl SmsEditorApp {
             return false;
         };
         any_record(&tables.root, &|record| {
-            is_gooble_entry(record) && entry_spawns_from_goop(record)
+            entry_for_manager(record, manager) && entry_spawns_from_goop(record)
         })
     }
 
-    /// Flips the spawn flag, creating the enemy table and the manager record
-    /// when the stage lacks them. One undo step.
-    pub(super) fn set_gooble_spawn(&mut self, enabled: bool) {
+    /// Flips a manager's spawn flag in the enemy table. One undo step.
+    pub(super) fn set_manager_spawns_from_goop(&mut self, manager: &str, enabled: bool) {
         let Some(document) = self.document.as_ref() else {
             return;
         };
         let before = document.archive_edits.clone();
 
-        if let Err(error) = self.apply_gooble_spawn(enabled) {
+        if let Err(error) = self.apply_manager_spawn(manager, enabled) {
             self.log
-                .push(format!("Could not update Gooble spawning: {error}"));
+                .push(format!("Could not update goop spawning: {error}"));
             return;
         }
 
@@ -274,19 +307,19 @@ impl SmsEditorApp {
         self.document_dirty = dirty;
         self.flush_document_change();
         self.log.push(match enabled {
-            true => "Goobles now spawn from painted goop.".to_string(),
-            false => "Goobles no longer spawn from goop.".to_string(),
+            true => format!("{manager} now spawns its enemies from painted goop."),
+            false => format!("{manager} no longer spawns from goop."),
         });
     }
 
-    fn apply_gooble_spawn(&mut self, enabled: bool) -> Result<(), String> {
+    fn apply_manager_spawn(&mut self, manager: &str, enabled: bool) -> Result<(), String> {
         let document = self
             .document
             .as_mut()
             .ok_or_else(|| "no stage is open".to_string())?;
 
-        // The flag, in tables.bin. Editing the effective document keeps any
-        // audio-cube edits already upserted into the same file.
+        // Editing the effective document keeps any audio-cube edits already
+        // upserted into the same file.
         let mut tables = match document
             .effective_resource_clone(TABLES_PATH)
             .map_err(|error| error.to_string())?
@@ -295,7 +328,7 @@ impl SmsEditorApp {
             Some(_) => return Err("map/tables.bin is not typed placement data".to_string()),
             None => fresh_tables_document(),
         };
-        if apply_gooble_spawn_to_tables(&mut tables, enabled) {
+        if apply_spawn_to_tables(&mut tables, manager, enabled) {
             document.archive_edits.upsert_resource(
                 TABLES_PATH.to_vec(),
                 StageResourceDocument::Placement(tables),
@@ -305,10 +338,8 @@ impl SmsEditorApp {
         // An earlier revision inserted a bare NameKuriManager record here. A
         // manager is not just a record: TObjManager::load resolves its
         // character archive by name and dereferences the result, so a manager
-        // without its resources crashes the stage on load. Placing the manager
-        // is the content browser's job, where the authoring template carries
-        // every resource the runtime touches. Strip any bare insert an earlier
-        // revision left behind, so an affected stage heals on the next toggle.
+        // without its resources crashes the stage on load. Strip any bare
+        // insert that revision left behind, so an affected stage heals.
         document.archive_edits.placement_inserts.retain(|insert| {
             !(insert.raw_resource_path == SCENE_PATH
                 && insert.record.type_name == "NameKuriManager"
@@ -320,53 +351,31 @@ impl SmsEditorApp {
         Ok(())
     }
 
-    /// Whether the effective scene carries the Gooble manager, from any
-    /// source: the base archive or a placed template.
-    pub(super) fn gooble_manager_present(&self) -> bool {
-        let Some(document) = self.document.as_ref() else {
-            return false;
-        };
-        let placed = document
-            .archive_edits
-            .placement_inserts
-            .iter()
-            .any(|insert| {
-                insert.raw_resource_path == SCENE_PATH
-                    && any_record(&insert.record, &|record| record.name == GOOBLE_MANAGER_NAME)
-            });
-        if placed {
-            return true;
-        }
-        let Ok(Some(StageResourceDocument::Placement(scene))) =
-            document.effective_resource_clone(SCENE_PATH)
-        else {
-            return false;
-        };
-        any_record(&scene.root, &|record| record.name == GOOBLE_MANAGER_NAME)
-    }
-
     /// The Spawning section of the goop inspector.
     pub(super) fn gooble_spawn_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
-        ui.strong("Spawning");
-        let mut enabled = self.gooble_spawn_enabled();
-        if ui
-            .checkbox(&mut enabled, "Spawn Goobles from goop")
-            .on_hover_text(
-                "Writes the retail enemy table: the conductor periodically picks a spot near \
-                 Mario and spawns a Gooble there if that spot is goop. The stage also needs \
-                 a NameKuri Manager placed from the content browser to supply the actors.",
-            )
-            .changed()
-        {
-            self.set_gooble_spawn(enabled);
-        }
-        if enabled && !self.gooble_manager_present() {
-            ui.colored_label(
-                egui::Color32::from_rgb(245, 180, 70),
-                "No NameKuri Manager in this stage: nothing will spawn. Place one from the \
-                 content browser (search \"namekuri\").",
+        ui.strong("Spawnable entities (TConductor)");
+        let entities = self.goop_spawnable_entities();
+        if entities.is_empty() {
+            ui.label(
+                "Place an enemy from the content browser first; whatever is in the scene can \
+                 be flagged to emerge from painted goop. Goobles are NameKuri.",
             );
+            return;
+        }
+        for (factory, manager) in entities {
+            let mut enabled = self.manager_spawns_from_goop(&manager);
+            if ui
+                .checkbox(&mut enabled, format!("{factory} \u{2014} {manager}"))
+                .on_hover_text(
+                    "Writes the retail enemy table: the conductor periodically picks a spot \
+                     near Mario and, if that spot is goop, relocates one of this manager's \
+                     enemies there.",
+                )
+                .changed()
+            {
+                self.set_manager_spawns_from_goop(&manager, enabled);
+            }
         }
     }
 }
@@ -380,17 +389,32 @@ mod tests {
     #[test]
     fn the_flag_round_trips_through_an_empty_table() {
         let mut tables = fresh_tables_document();
-        assert!(apply_gooble_spawn_to_tables(&mut tables, true));
+        assert!(apply_spawn_to_tables(
+            &mut tables,
+            GOOBLE_MANAGER_NAME,
+            true
+        ));
         assert!(any_record(&tables.root, &|record| {
-            is_gooble_entry(record) && entry_spawns_from_goop(record)
+            entry_for_manager(record, GOOBLE_MANAGER_NAME) && entry_spawns_from_goop(record)
         }));
         // Setting it again is a no-op, not a duplicate entry.
-        assert!(!apply_gooble_spawn_to_tables(&mut tables, true));
+        assert!(!apply_spawn_to_tables(
+            &mut tables,
+            GOOBLE_MANAGER_NAME,
+            true
+        ));
 
-        assert!(apply_gooble_spawn_to_tables(&mut tables, false));
-        assert!(any_record(&tables.root, &|record| is_gooble_entry(record)));
+        assert!(apply_spawn_to_tables(
+            &mut tables,
+            GOOBLE_MANAGER_NAME,
+            false
+        ));
+        assert!(any_record(&tables.root, &|record| entry_for_manager(
+            record,
+            GOOBLE_MANAGER_NAME
+        )));
         assert!(!any_record(&tables.root, &|record| {
-            is_gooble_entry(record) && entry_spawns_from_goop(record)
+            entry_for_manager(record, GOOBLE_MANAGER_NAME) && entry_spawns_from_goop(record)
         }));
 
         // The document must survive the encoder, or export would corrupt the
@@ -414,14 +438,18 @@ mod tests {
                 name: ENEMY_TABLE_NAME.to_string(),
                 payload: sms_formats::JDramaRecordPayload::Group {
                     fields: Vec::new(),
-                    children: vec![gooble_enemy_info_record(0)],
+                    children: vec![enemy_info_record(GOOBLE_MANAGER_NAME, 0)],
                 },
             });
         }
-        assert!(apply_gooble_spawn_to_tables(&mut tables, true));
+        assert!(apply_spawn_to_tables(
+            &mut tables,
+            GOOBLE_MANAGER_NAME,
+            true
+        ));
         let mut entries = 0;
         fn count(record: &sms_formats::JDramaRecord, entries: &mut usize) {
-            if is_gooble_entry(record) {
+            if entry_for_manager(record, GOOBLE_MANAGER_NAME) {
                 *entries += 1;
             }
             if let sms_formats::JDramaRecordPayload::Group { children, .. } = &record.payload {
