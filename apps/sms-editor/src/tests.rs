@@ -5238,6 +5238,8 @@ fn rotating_hue_holds_luminance_and_leaves_grey_alone() {
 
     for degrees in [-180.0, -90.0, -33.0, 0.0, 45.0, 120.0, 180.0] {
         settings.hue = degrees;
+        // Graded against a reference of 1.0, so these read as shaded and the
+        // rotation is mixed in at full strength.
 
         // Kept away from the edge of the gamut on purpose. A saturated colour
         // rotates to a negative channel, and clamping that back into range is

@@ -202,6 +202,15 @@ impl VertexPaintGradeSettings {
             (1.0 - lit / unshaded).clamp(0.0, 1.0)
         };
 
+        // Everything here grades the bake, not the model. A vertex the bake
+        // left alone is the surface's own colour, and exposure or hue has no
+        // business moving it: that is a texture edit wearing a grade's
+        // clothes. So the four tonal controls below are mixed back in by how
+        // shaded the vertex is, which is zero where nothing was baked. Shadow
+        // and tint further down already work this way by construction.
+        let scope = shading(color);
+        let original = *color;
+
         let exposure = self.exposure.exp2();
         for channel in color.iter_mut().take(3) {
             *channel *= exposure;
@@ -245,6 +254,12 @@ impl VertexPaintGradeSettings {
                             + HUE_SINE[channel][2] * color[2])
             });
             color[..3].copy_from_slice(&rotated);
+        }
+
+        // Mix the tonal work back in over the untouched colour, so an
+        // unshaded vertex comes out exactly as it went in.
+        for (channel, before) in color.iter_mut().take(3).zip(original.iter()) {
+            *channel = before + (*channel - before) * scope;
         }
 
         // Shadow after vibrance, before tint. The weight is how dark the
