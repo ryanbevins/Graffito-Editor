@@ -1087,7 +1087,7 @@ impl SmsEditorApp {
         self.clear_viewport_preview_cache();
     }
 
-    fn clear_viewport_drag_preview(&mut self) {
+    pub(super) fn clear_viewport_drag_preview(&mut self) {
         self.viewport_drag_preview_failed_key = None;
         let Some(state) = self.viewport_drag_preview.take() else {
             return;
@@ -3217,7 +3217,7 @@ impl SmsEditorApp {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                format!("Placing {text} — click to confirm"),
+                format!("Placing {text} — click to confirm, Esc to cancel"),
                 egui::FontId::proportional(13.0),
                 egui::Color32::from_rgb(215, 238, 231),
             );
