@@ -9,8 +9,7 @@ use sms_authoring::{AssetId, ModelAssetDocument, ModelInstanceExportMode, NodePu
 pub(super) enum VertexPaintMode {
     #[default]
     Brush,
-    /// Blends toward white rather than erasing to nothing: white is the
-    /// identity colour for a vertex-lit surface.
+    /// Blends back toward the primitive's material diffuse.
     Eraser,
     Smooth,
 }
@@ -196,9 +195,9 @@ impl VertexPaintGradeSettings {
     /// Grades the shading a bake left on a vertex.
     ///
     /// `neutral` is the vertex colour that means "unshaded", which the TEV
-    /// program decides: a textured material multiplies, so neutral is white
-    /// and the texture comes through as authored; an untextured one has the
-    /// vertex colour *as* the surface, so neutral is the material colour.
+    /// program decides. The importer supplies the glTF base-colour factor
+    /// through the material register for textured and untextured materials;
+    /// enabling vertex colours folds that authored factor into COLOR0.
     ///
     /// Everything works on `colour / neutral`, the shading factor, where 1 is
     /// clean and 0 is fully shadowed. That is the whole reason the controls
@@ -297,15 +296,17 @@ impl VertexPaintGradeSettings {
             }
         }
 
-        // Back to a colour. Clamping the factor is what stops any control
-        // brightening the surface past its clean state.
+        // Back to a colour. Clamp the factor itself, not only the reconstructed
+        // channel: a non-white clean colour multiplied by an over-range factor
+        // can otherwise become brighter than its authored clean state without
+        // reaching the absolute 1.0 channel clamp.
         for ((channel, clean), shading) in color
             .iter_mut()
             .take(3)
             .zip(neutral.iter())
             .zip(factor.iter())
         {
-            *channel = (clean * shading).clamp(0.0, 1.0);
+            *channel = (clean * shading.clamp(0.0, 1.0)).clamp(0.0, 1.0);
         }
     }
 }
@@ -433,9 +434,6 @@ pub(super) fn transform_normal(matrix: [[f32; 4]; 4], normal: [f32; 3]) -> [f32;
     vec3_normalize(transformed)
 }
 
-/// Colour set 0 for a primitive, created opaque white when the mesh arrived
-/// without one. White is the identity for a vertex-lit surface, so an
-/// untouched model looks the same before and after the set exists.
 /// Colour set 0 of a primitive, created from `base` if it does not have one.
 ///
 /// `base` is the material's own diffuse. A mesh that shipped without vertex
@@ -466,13 +464,26 @@ fn primitive_colors_mut(
     values
 }
 
-/// The vertex colour that means "unshaded", per primitive, as a luma level.
+/// Enables the vertex colour source before any caller creates or edits COLOR0.
+///
+/// The order matters for a primitive without COLOR0: enabling first seeds it
+/// with white and folds the GX material register into it exactly once. Creating
+/// it from the diffuse first would make the later fold apply that diffuse a
+/// second time.
+fn prepare_document_vertex_colors(document: &mut ModelAssetDocument) -> Vec<[f32; 4]> {
+    enable_vertex_colors(document);
+    document_primitive_diffuse(document)
+}
+
+/// The vertex colour that means "unshaded", per primitive.
 ///
 /// This is decided by the TEV program the importer writes, not by taste:
 ///
 /// - A textured material gets `out = RASC * TEXC`, so the vertex colour
-///   multiplies the texture. White leaves it alone and nothing above white
-///   exists, so neutral is 1.0 and the colour can only ever darken.
+///   multiplies the texture. The importer initially supplies the glTF
+///   base-colour factor through the material register, and enabling vertex
+///   colours folds that factor into COLOR0, so the clean vertex value remains
+///   that authored factor rather than necessarily being white.
 /// - An untextured material gets `out = RASC`, so the vertex colour is the
 ///   surface. Neutral is the material's own base colour, and white is not
 ///   neutral at all -- it is a white surface.
@@ -485,14 +496,12 @@ fn document_primitive_unshaded(document: &ModelAssetDocument) -> Vec<[f32; 3]> {
     let levels = document
         .materials
         .iter()
-        .map(|material| match material.base_color_texture.is_some() {
-            // A multiplier of white leaves the texture exactly as authored.
-            true => [1.0; 3],
-            false => [
+        .map(|material| {
+            [
                 material.source_base_color[0],
                 material.source_base_color[1],
                 material.source_base_color[2],
-            ],
+            ]
         })
         .collect::<Vec<_>>();
     document
@@ -531,6 +540,56 @@ fn document_primitive_diffuse(document: &ModelAssetDocument) -> Vec<[f32; 4]> {
                 .unwrap_or([1.0; 4])
         })
         .collect()
+}
+
+/// Adds an authored equivalent of the compiler's implicit default material and
+/// assigns it to every materialless primitive.
+///
+/// Material repairs need an actual document material to persist their state;
+/// changing only `document.materials` cannot affect the default material that
+/// compilation synthesises later.
+fn ensure_authored_default_material(document: &mut ModelAssetDocument) -> bool {
+    let needs_fallback = document
+        .meshes
+        .iter()
+        .flat_map(|mesh| &mesh.primitives)
+        .any(|primitive| primitive.material.is_none());
+    if !needs_fallback {
+        return false;
+    }
+
+    let mut fallback = vertex_color_material(&document.name);
+    fallback.gx.name = format!("{}_default_material", document.name);
+    fallback.vertex_color_set = None;
+    let fallback_index = document.materials.len() as u32;
+    document.materials.push(fallback);
+    for mesh in &mut document.meshes {
+        for primitive in &mut mesh.primitives {
+            if primitive.material.is_none() {
+                primitive.material = Some(fallback_index);
+            }
+        }
+    }
+    true
+}
+
+fn material_has_translucent_source(
+    document: &ModelAssetDocument,
+    material: &sms_authoring::ModelMaterial,
+) -> bool {
+    if material.source_base_color[3] < 0.999 {
+        return true;
+    }
+    material
+        .base_color_texture
+        .as_ref()
+        .and_then(|binding| document.textures.get(binding.texture as usize))
+        .is_some_and(|texture| {
+            texture
+                .rgba8
+                .chunks_exact(4)
+                .any(|pixel| pixel[3] < u8::MAX)
+        })
 }
 
 /// GX_SRC_VTX. `GXColorSrc` in the decomp is `{ GX_SRC_REG = 0, GX_SRC_VTX = 1 }`,
@@ -1212,6 +1271,7 @@ impl SmsEditorApp {
             ));
             return SnapshotApplyResult::Failed;
         }
+        self.vertex_paint_double_sided = None;
         self.force_refresh_model_catalog();
         self.rebuild_model_preview_cache();
         self.log
@@ -1322,8 +1382,7 @@ impl SmsEditorApp {
             return;
         }
         for target in &mut targets {
-            enable_vertex_colors(&mut target.document);
-            let diffuse = document_primitive_diffuse(&target.document);
+            let diffuse = prepare_document_vertex_colors(&mut target.document);
             let world = Self::target_world_vertex_occurrences(target);
             let mut primitive_index = 0usize;
             for mesh in &mut target.document.meshes {
@@ -1360,7 +1419,7 @@ impl SmsEditorApp {
             return;
         }
         for target in &mut targets {
-            let diffuse = document_primitive_diffuse(&target.document);
+            let diffuse = prepare_document_vertex_colors(&mut target.document);
             let mut primitive_index = 0usize;
             for mesh in &mut target.document.meshes {
                 for primitive in &mut mesh.primitives {
@@ -1466,6 +1525,9 @@ impl SmsEditorApp {
         };
         let mut changed = 0usize;
         for target in &mut targets {
+            if ensure_authored_default_material(&mut target.document) {
+                changed += 1;
+            }
             for material in &mut target.document.materials {
                 if material.gx.cull_mode != wanted {
                     material.gx.cull_mode = wanted;
@@ -1510,8 +1572,8 @@ impl SmsEditorApp {
     /// and depth state, so the same asset looks right there and wrong once it
     /// bakes as terrain.
     ///
-    /// Materials whose base colour is genuinely translucent are left alone, so
-    /// this cannot quietly turn real glass into a wall.
+    /// Materials whose base-colour factor or texture is genuinely translucent
+    /// are left alone, so this cannot quietly turn real glass into a wall.
     pub(super) fn make_terrain_opaque(&mut self) {
         let mut targets = self.terrain_paint_targets_scoped(true);
         if targets.is_empty() {
@@ -1524,18 +1586,25 @@ impl SmsEditorApp {
         let mut changed = 0usize;
         let mut kept = 0usize;
         for target in &mut targets {
-            for material in &mut target.document.materials {
+            let translucent = target
+                .document
+                .materials
+                .iter()
+                .map(|material| material_has_translucent_source(&target.document, material))
+                .collect::<Vec<_>>();
+            for (material, translucent) in target.document.materials.iter_mut().zip(translucent) {
                 let blended = material.gx.blend_mode != sms_formats::GxBlendMode::default()
                     || material.gx.depth_mode.update_enabled == 0;
                 if !blended {
                     continue;
                 }
-                if material.source_base_color[3] < 0.999 {
+                if translucent {
                     kept += 1;
                     continue;
                 }
                 material.gx.blend_mode = sms_formats::GxBlendMode::default();
                 material.gx.depth_mode.update_enabled = 1;
+                material.gx.z_compare_location = 1;
                 material.source_alpha_mode = sms_authoring::ImportedAlphaMode::Opaque;
                 changed += 1;
             }
@@ -1575,12 +1644,7 @@ impl SmsEditorApp {
         // contributing; clearing to flat white therefore threw the model's
         // diffuse away along with the paint, and the mesh came back blank.
         for target in &mut targets {
-            let diffuse = target
-                .document
-                .materials
-                .iter()
-                .map(|material| material.source_base_color)
-                .collect::<Vec<_>>();
+            let diffuse = prepare_document_vertex_colors(&mut target.document);
             for mesh in &mut target.document.meshes {
                 for primitive in &mut mesh.primitives {
                     let base = primitive
@@ -2363,23 +2427,41 @@ impl SmsEditorApp {
         painter.add(egui::Shape::line(ring, egui::Stroke::new(2.0, color)));
     }
 
+    fn selected_vertex_paint_asset(&self) -> Option<AssetId> {
+        self.selected_model_instance()
+            .map(|instance| instance.placement.asset_id)
+    }
+
+    fn vertex_paint_grade_selection_changed(&self) -> bool {
+        self.vertex_paint_grade.as_ref().is_some_and(|grade| {
+            grade.baseline.first().map(|entry| entry.id) != self.selected_vertex_paint_asset()
+        })
+    }
+
+    /// Drops an open grade when the hierarchy selection moves and restores the
+    /// in-memory preview that belonged to the previous asset.
+    fn discard_vertex_paint_grade_for_selection_change(&mut self) -> bool {
+        if !self.vertex_paint_grade_selection_changed() {
+            return false;
+        }
+        self.vertex_paint_grade_settings = VertexPaintGradeSettings::default();
+        let Some(mut grade) = self.vertex_paint_grade.take() else {
+            return false;
+        };
+        for (target, baseline) in grade.targets.iter_mut().zip(grade.baseline.iter()) {
+            restore_paint_state(&mut target.document, baseline);
+        }
+        for target in &grade.targets {
+            self.cache_model_previews_for_document(target.id, &target.document);
+        }
+        self.refresh_authored_model_instance_preview_surfaces();
+        true
+    }
+
     /// Re-grades from the baseline and shows it, without touching the catalog.
     fn refresh_vertex_paint_grade(&mut self) {
+        self.discard_vertex_paint_grade_for_selection_change();
         let settings = self.vertex_paint_grade_settings;
-        let asset = self
-            .selected_model_instance()
-            .map(|instance| instance.placement.asset_id);
-
-        // A session belongs to the terrain it opened on. Grading whatever got
-        // selected later against a stale baseline would write one mesh's
-        // colours onto another.
-        if self
-            .vertex_paint_grade
-            .as_ref()
-            .is_some_and(|grade| grade.baseline.first().map(|entry| entry.id) != asset)
-        {
-            self.vertex_paint_grade = None;
-        }
         if self.vertex_paint_grade.is_none() {
             if settings.is_neutral() {
                 return;
@@ -2402,7 +2484,7 @@ impl SmsEditorApp {
         };
         for (target, baseline) in grade.targets.iter_mut().zip(grade.baseline.iter()) {
             restore_paint_state(&mut target.document, baseline);
-            let diffuse = document_primitive_diffuse(&target.document);
+            let diffuse = prepare_document_vertex_colors(&mut target.document);
             let neutral = document_primitive_unshaded(&target.document);
             let mut primitive_index = 0usize;
             for mesh in &mut target.document.meshes {
@@ -2423,11 +2505,17 @@ impl SmsEditorApp {
         for target in &grade.targets {
             self.cache_model_previews_for_document(target.id, &target.document);
         }
+        self.refresh_authored_model_instance_preview_surfaces();
         self.vertex_paint_grade = Some(grade);
     }
 
     /// Writes the grade to the catalog as one undo step.
     fn apply_vertex_paint_grade(&mut self) {
+        if self.discard_vertex_paint_grade_for_selection_change() {
+            self.log
+                .push("Cancelled the grade because the terrain selection changed.".to_string());
+            return;
+        }
         let Some(grade) = self.vertex_paint_grade.take() else {
             return;
         };
@@ -2449,9 +2537,11 @@ impl SmsEditorApp {
         for target in &grade.targets {
             self.cache_model_previews_for_document(target.id, &target.document);
         }
+        self.refresh_authored_model_instance_preview_surfaces();
     }
 
     pub(super) fn vertex_paint_panel(&mut self, ui: &mut egui::Ui) {
+        self.discard_vertex_paint_grade_for_selection_change();
         ui.heading("Vertex Paint");
         let terrain = self
             .model_instances
@@ -2690,6 +2780,28 @@ impl SmsEditorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sms_authoring::{GxTextureBinding, ModelMesh, ModelNode, ModelPrimitive, ModelTexture};
+
+    fn tinted_document(color: [f32; 4]) -> ModelAssetDocument {
+        let mut document = ModelAssetDocument::new("tinted");
+        let mut material = vertex_color_material("tinted");
+        material.source_base_color = color;
+        material.gx.material_colors[0] = Some(color.map(|value| (value * 255.0).round() as u8));
+        document.materials.push(material);
+        document.meshes.push(ModelMesh {
+            name: "tinted".to_string(),
+            primitives: vec![ModelPrimitive {
+                positions: vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                normals: vec![[0.0, 1.0, 0.0]; 3],
+                tangents: Vec::new(),
+                tex_coords: Vec::new(),
+                colors: Vec::new(),
+                indices: vec![0, 1, 2],
+                material: Some(0),
+            }],
+        });
+        document
+    }
 
     /// Switching a mesh to vertex colour must not change how it looks.
     ///
@@ -2702,23 +2814,7 @@ mod tests {
     #[test]
     fn enabling_vertex_colors_lands_on_the_material_colour_once() {
         let green = [0.05f32, 0.53, 0.05, 1.0];
-        let mut document = ModelAssetDocument::new("test");
-        let mut material = vertex_color_material("test");
-        material.source_base_color = green;
-        material.gx.material_colors[0] = Some(green.map(|value| (value * 255.0).round() as u8));
-        document.materials.push(material);
-        document.meshes.push(sms_authoring::ModelMesh {
-            name: "test".to_string(),
-            primitives: vec![sms_authoring::ModelPrimitive {
-                positions: vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
-                normals: vec![[0.0, 1.0, 0.0]; 3],
-                tangents: Vec::new(),
-                tex_coords: Vec::new(),
-                colors: Vec::new(),
-                indices: vec![0, 1, 2],
-                material: Some(0),
-            }],
-        });
+        let mut document = tinted_document(green);
 
         enable_vertex_colors(&mut document);
 
@@ -2737,7 +2833,105 @@ mod tests {
             }
         }
     }
-    use sms_authoring::{ModelMesh, ModelNode, ModelPrimitive};
+
+    #[test]
+    fn preparing_an_uncoloured_material_does_not_fold_its_diffuse_twice() {
+        let green = [0.05f32, 0.53, 0.05, 1.0];
+        let mut document = tinted_document(green);
+
+        let diffuse = prepare_document_vertex_colors(&mut document);
+        let colors = primitive_colors_mut(&mut document.meshes[0].primitives[0], diffuse[0]);
+        assert!(colors.iter().all(|color| {
+            color
+                .iter()
+                .zip(green.iter())
+                .all(|(actual, expected)| (actual - expected).abs() < 0.01)
+        }));
+
+        // The commit path enables colours again; it must stay idempotent.
+        enable_vertex_colors(&mut document);
+        assert!(document.meshes[0].primitives[0].colors[0]
+            .values
+            .iter()
+            .all(|color| {
+                color
+                    .iter()
+                    .zip(green.iter())
+                    .all(|(actual, expected)| (actual - expected).abs() < 0.01)
+            }));
+    }
+
+    #[test]
+    fn textured_material_uses_its_base_colour_factor_as_the_clean_level() {
+        let tint = [0.3f32, 0.6, 0.9, 1.0];
+        let mut document = tinted_document(tint);
+        document.materials[0].base_color_texture = Some(GxTextureBinding {
+            texture: 0,
+            tex_coord: 0,
+        });
+
+        assert_eq!(
+            document_primitive_unshaded(&document),
+            vec![[0.3, 0.6, 0.9]]
+        );
+    }
+
+    #[test]
+    fn grade_cannot_brighten_past_the_clean_surface() {
+        let neutral = [0.2f32, 0.4, 0.6];
+        let mut color = [0.1f32, 0.2, 0.3, 1.0];
+        let settings = VertexPaintGradeSettings {
+            exposure: 3.0,
+            ..VertexPaintGradeSettings::default()
+        };
+
+        settings.apply(&mut color, neutral);
+
+        for (channel, clean) in color.iter().take(3).zip(neutral) {
+            assert!(
+                *channel <= clean,
+                "grade brightened {channel} past clean level {clean}"
+            );
+        }
+    }
+
+    #[test]
+    fn authored_default_material_makes_materialless_culling_editable() {
+        let mut document = test_document();
+
+        assert!(ensure_authored_default_material(&mut document));
+        let index = document.meshes[0].primitives[0]
+            .material
+            .expect("materialless primitive was assigned the authored default");
+        document.materials[index as usize].gx.cull_mode = GX_CULL_NONE;
+
+        assert_eq!(
+            document.materials[index as usize].gx.cull_mode,
+            GX_CULL_NONE
+        );
+        assert!(!ensure_authored_default_material(&mut document));
+    }
+
+    #[test]
+    fn texture_alpha_keeps_a_blended_material_translucent() {
+        let mut document = tinted_document([1.0; 4]);
+        document.textures.push(ModelTexture {
+            name: "alpha".to_string(),
+            width: 1,
+            height: 1,
+            rgba8: vec![255, 255, 255, 128],
+            encode_options: Default::default(),
+        });
+        document.materials[0].base_color_texture = Some(GxTextureBinding {
+            texture: 0,
+            tex_coord: 0,
+        });
+
+        assert!(material_has_translucent_source(
+            &document,
+            &document.materials[0]
+        ));
+    }
 
     fn test_document() -> ModelAssetDocument {
         let mut document = ModelAssetDocument::new("terrain");
@@ -2996,6 +3190,35 @@ mod tests {
     }
 
     #[test]
+    fn changing_selection_discards_the_previous_assets_grade() {
+        let previous_asset = AssetId::new();
+        let selected_asset = AssetId::new();
+        let placement = sms_authoring::ModelInstancePlacement::new(selected_asset, "selected");
+        let selected_instance_id = placement.instance_id;
+        let mut app = SmsEditorApp {
+            model_instances: vec![EditorModelInstance {
+                stage_id: String::new(),
+                placement,
+                local_bounds: [[0.0; 3]; 2],
+            }],
+            selected_model_instance_id: Some(selected_instance_id),
+            vertex_paint_grade_settings: VertexPaintGradeSettings {
+                exposure: 1.0,
+                ..VertexPaintGradeSettings::default()
+            },
+            vertex_paint_grade: Some(VertexPaintGrade {
+                targets: Vec::new(),
+                baseline: vec![snapshot_paint_state(previous_asset, &test_document())],
+            }),
+            ..SmsEditorApp::default()
+        };
+
+        assert!(app.discard_vertex_paint_grade_for_selection_change());
+        assert!(app.vertex_paint_grade.is_none());
+        assert!(app.vertex_paint_grade_settings.is_neutral());
+    }
+
+    #[test]
     fn failed_undo_keeps_the_record_available() {
         let id = AssetId::new();
         let document = test_document();
@@ -3011,6 +3234,36 @@ mod tests {
         assert!(!app.undo_vertex_paint());
         assert_eq!(app.vertex_paint_undo_stack.len(), 1);
         assert!(app.vertex_paint_redo_stack.is_empty());
+    }
+
+    #[test]
+    fn successful_terrain_undo_invalidates_cached_culling_state() {
+        let temporary = tempfile::tempdir().unwrap();
+        let catalog =
+            sms_authoring::ModelAssetCatalog::open_content_root(temporary.path().join("Content"))
+                .unwrap();
+        let before = test_document();
+        let mut after = before.clone();
+        ensure_authored_default_material(&mut after);
+        after.materials[0].gx.cull_mode = GX_CULL_NONE;
+        let entry = catalog
+            .create_asset("terrain.smsmodel", &after)
+            .expect("create terrain asset");
+        let mut app = SmsEditorApp {
+            project_root: temporary.path().to_string_lossy().into_owned(),
+            vertex_paint_double_sided: Some((entry.id, true)),
+            ..SmsEditorApp::default()
+        };
+        app.vertex_paint_undo_stack
+            .push_back(VertexPaintUndoRecord {
+                label: "made terrain double sided".to_string(),
+                before: vec![snapshot_paint_state(entry.id, &before)],
+                after: vec![snapshot_paint_state(entry.id, &after)],
+            });
+
+        assert!(app.undo_vertex_paint());
+        assert!(app.vertex_paint_double_sided.is_none());
+        assert_eq!(catalog.load_asset(entry.id).unwrap(), before);
     }
 
     #[test]
