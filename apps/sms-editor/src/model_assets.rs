@@ -475,14 +475,14 @@ impl SmsEditorApp {
         (!root.is_empty()).then(|| PathBuf::from(root).join("Content"))
     }
 
-    fn model_catalog(&self) -> Result<ModelAssetCatalog, String> {
+    pub(super) fn model_catalog(&self) -> Result<ModelAssetCatalog, String> {
         let root = self
             .model_content_root()
             .ok_or_else(|| "Project data root is not configured".to_string())?;
         ModelAssetCatalog::open_content_root(root).map_err(|error| error.to_string())
     }
 
-    fn content_catalog_mutation_allowed(&mut self, action: &str) -> bool {
+    pub(super) fn content_catalog_mutation_allowed(&mut self, action: &str) -> bool {
         if self.background_receiver.is_none() {
             return true;
         }

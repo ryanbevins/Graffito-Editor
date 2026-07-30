@@ -519,6 +519,11 @@ impl SmsEditorApp {
             }
         }
 
+        if self.handle_vertex_paint_input(ui, rect, response) {
+            self.mark_viewport_interaction(ui);
+            return;
+        }
+
         if self.handle_goop_viewport_input(ui, rect, response) {
             self.mark_viewport_interaction(ui);
             return;
@@ -1751,6 +1756,7 @@ impl SmsEditorApp {
         if self.renderer.config().show_grid && !grid_is_depth_rendered {
             self.paint_grid(painter, rect);
         }
+        self.paint_vertex_paint_overlay(painter, rect);
         self.paint_grab_axis_guide(painter, rect);
         self.paint_model_instances(painter, rect);
         self.paint_routes(painter, rect);
@@ -3337,7 +3343,7 @@ pub(super) fn transform_from_gizmo_drag(
             transform.scale[axis] = value.max(0.001);
         }
         // These tools raise no gizmo, so they never open a drag to resolve.
-        EditorTool::Select | EditorTool::Goop | EditorTool::Place => {}
+        EditorTool::Select | EditorTool::VertexPaint | EditorTool::Goop | EditorTool::Place => {}
     }
     transform
 }

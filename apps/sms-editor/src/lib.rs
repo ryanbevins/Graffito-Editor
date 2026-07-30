@@ -63,6 +63,7 @@ mod scene_labels;
 mod skybox_library;
 mod stage_creation;
 mod ui_panels;
+mod vertex_paint;
 mod viewport_ui;
 
 use active_placement::*;
@@ -83,6 +84,7 @@ use project_ui::{path_display_row, NewProjectDraft};
 use scene_labels::*;
 use skybox_library::*;
 use stage_creation::{insert_authored_scene_archive, NewStageDraft};
+use vertex_paint::*;
 
 const VIEWPORT_NEAR_CLIP: f32 = 8.0;
 const FULL_DELFINO_PROGRESSION: f32 = 1.0;
@@ -123,6 +125,8 @@ pub fn run() -> eframe::Result<()> {
 enum EditorTool {
     /// Selection only: picks and highlights without raising a transform gizmo.
     Select,
+    /// Paints per-vertex colour into the stage terrain assets.
+    VertexPaint,
     Move,
     Rotate,
     Scale,
@@ -277,6 +281,7 @@ impl EditorTool {
     fn label(self) -> &'static str {
         match self {
             Self::Select => "Select",
+            Self::VertexPaint => "Vertex Paint",
             Self::Move => "Move",
             Self::Rotate => "Rotate",
             Self::Scale => "Scale",
@@ -1287,6 +1292,19 @@ struct SmsEditorApp {
     show_fps: bool,
     applied_window_title: String,
     snap_enabled: bool,
+    vertex_paint_mode: VertexPaintMode,
+    vertex_paint_color: [f32; 3],
+    vertex_paint_radius: f32,
+    vertex_paint_strength: f32,
+    vertex_paint_sun_yaw: f32,
+    vertex_paint_sun_pitch: f32,
+    vertex_paint_sun_softness: f32,
+    vertex_paint_sun_shadow: f32,
+    vertex_paint_dirt: f32,
+    vertex_paint_stroke: Vec<[f32; 3]>,
+    vertex_paint_cursor: Option<[f32; 3]>,
+    /// Stage whose terrain has been given vertex-colour materials.
+    vertex_paint_prepared: Option<String>,
     /// Keeps a moved item from sinking through the geometry under it.
     content_aware_snap: bool,
     snap_translation: f32,
@@ -1562,6 +1580,18 @@ impl Default for SmsEditorApp {
             show_fps: false,
             applied_window_title: String::new(),
             snap_enabled: true,
+            vertex_paint_mode: VertexPaintMode::default(),
+            vertex_paint_color: [1.0, 0.25, 0.25],
+            vertex_paint_radius: 28.0,
+            vertex_paint_strength: 0.75,
+            vertex_paint_sun_yaw: 34.0,
+            vertex_paint_sun_pitch: 46.0,
+            vertex_paint_sun_softness: 0.5,
+            vertex_paint_sun_shadow: 0.6,
+            vertex_paint_dirt: 0.6,
+            vertex_paint_stroke: Vec::new(),
+            vertex_paint_cursor: None,
+            vertex_paint_prepared: None,
             content_aware_snap: false,
             snap_translation: 50.0,
             snap_rotation: 15.0,

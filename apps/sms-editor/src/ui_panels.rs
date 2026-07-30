@@ -273,6 +273,16 @@ impl SmsEditorApp {
                     self.tool = self.tool.after_toolbar_click(EditorTool::Goop);
                 }
 
+                let vertex_active = self.tool == EditorTool::VertexPaint;
+                if ui
+                    .selectable_label(vertex_active, "Vertex Paint Tool")
+                    .on_hover_text("Paint per-vertex colour across the stage terrain")
+                    .clicked()
+                {
+                    ui.close();
+                    self.tool = self.tool.after_toolbar_click(EditorTool::VertexPaint);
+                }
+
                 ui.separator();
                 // Placeholders for tools that do not exist yet. Deliberately
                 // disabled rather than inert-but-clickable, so the menu cannot
@@ -282,7 +292,6 @@ impl SmsEditorApp {
                         "Route Tool",
                         "Not implemented yet. Routes are edited from the Edit menu.",
                     ),
-                    ("Vertex Color Tool", "Not implemented yet."),
                     ("Sound Instance Tool", "Not implemented yet."),
                     ("Camera Tool", "Not implemented yet."),
                 ] {
@@ -1426,6 +1435,10 @@ impl SmsEditorApp {
     }
 
     pub(super) fn inspector_panel(&mut self, ui: &mut egui::Ui) {
+        if self.tool == EditorTool::VertexPaint {
+            self.vertex_paint_panel(ui);
+            return;
+        }
         if self.tool == EditorTool::Goop {
             self.goop_inspector_panel(ui);
             return;
@@ -2651,6 +2664,7 @@ fn is_palette_service_type(type_name: &str) -> bool {
 fn tool_shortcut(tool: EditorTool) -> &'static str {
     match tool {
         EditorTool::Select => "Q",
+        EditorTool::VertexPaint => "Tools menu",
         EditorTool::Move => "W",
         EditorTool::Rotate => "E",
         EditorTool::Scale => "R",
