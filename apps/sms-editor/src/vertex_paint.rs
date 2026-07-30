@@ -194,9 +194,9 @@ impl VertexPaintGradeSettings {
     /// takes the full shadow tint and the grade bleeds across the whole model.
     /// Measured against the diffuse, a vertex sitting at its material colour
     /// is unshaded whatever that colour is.
-    pub(super) fn apply(self, color: &mut [f32; 4], base: [f32; 3]) {
+    pub(super) fn apply(self, color: &mut [f32; 4], unshaded: f32) {
         let luma = |value: [f32; 3]| 0.299 * value[0] + 0.587 * value[1] + 0.114 * value[2];
-        let unshaded = luma(base).max(1e-3);
+        let unshaded = unshaded.max(1e-3);
         let shading = |value: &[f32; 4]| {
             let lit = luma([value[0], value[1], value[2]]);
             (1.0 - lit / unshaded).clamp(0.0, 1.0)
@@ -251,12 +251,28 @@ impl VertexPaintGradeSettings {
         // vertex is, so an occlusion bake can be deepened or lifted without
         // dragging the lit surfaces with it.
         if self.shadow != 0.0 {
-            let weight = shading(color);
-            for channel in color.iter_mut().take(3) {
-                *channel = match self.shadow > 0.0 {
-                    true => *channel * (1.0 - self.shadow * weight),
-                    false => *channel + (1.0 - *channel) * (-self.shadow) * weight,
-                };
+            match self.shadow > 0.0 {
+                true => {
+                    let weight = shading(color);
+                    for channel in color.iter_mut().take(3) {
+                        *channel *= 1.0 - self.shadow * weight;
+                    }
+                }
+                false => {
+                    // Lifting scales the colour back up toward the unshaded
+                    // level, keeping its hue. Blending toward white instead
+                    // washes the colour out on the way, which is not relieving
+                    // a shadow, and at -1 it would leave a lit green surface
+                    // white rather than green.
+                    let lit = luma([color[0], color[1], color[2]]);
+                    if lit > 1e-4 && lit < unshaded {
+                        let target = lit + (unshaded - lit) * -self.shadow;
+                        let scale = target / lit;
+                        for channel in color.iter_mut().take(3) {
+                            *channel *= scale;
+                        }
+                    }
+                }
             }
         }
 
@@ -2325,21 +2341,27 @@ impl SmsEditorApp {
         };
         for (target, baseline) in grade.targets.iter_mut().zip(grade.baseline.iter()) {
             restore_paint_state(&mut target.document, baseline);
-            let diffuse = target
-                .document
-                .materials
-                .iter()
-                .map(|material| material.source_base_color)
-                .collect::<Vec<_>>();
+            let diffuse = document_primitive_diffuse(&target.document);
+            let mut primitive_index = 0usize;
             for mesh in &mut target.document.meshes {
                 for primitive in &mut mesh.primitives {
-                    let base = primitive
-                        .material
-                        .and_then(|index| diffuse.get(index as usize))
-                        .copied()
-                        .unwrap_or([1.0; 4]);
-                    for color in primitive_colors_mut(primitive, base) {
-                        settings.apply(color, [base[0], base[1], base[2]]);
+                    let base = diffuse.get(primitive_index).copied().unwrap_or([1.0; 4]);
+                    primitive_index += 1;
+                    let colors = primitive_colors_mut(primitive, base);
+                    // The unshaded level comes from the mesh, not the
+                    // material. A material's base colour is often plain white
+                    // with the real colour living in a texture, and measuring
+                    // shade against white makes every mid-bright surface read
+                    // as half shadowed -- which is how a lit green wall ended
+                    // up being lifted and tinted along with the shadows. The
+                    // brightest vertex a primitive already has is the one the
+                    // bake left unshaded, so that is the reference.
+                    let unshaded = colors
+                        .iter()
+                        .map(|color| 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2])
+                        .fold(0.0f32, f32::max);
+                    for color in colors.iter_mut() {
+                        settings.apply(color, unshaded);
                     }
                 }
             }
