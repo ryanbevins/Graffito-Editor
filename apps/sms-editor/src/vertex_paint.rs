@@ -1356,6 +1356,70 @@ impl SmsEditorApp {
         });
     }
 
+    /// Turns blended terrain materials back into opaque ones.
+    ///
+    /// A glTF exporter will mark a material `BLEND` for having any alpha
+    /// plumbing at all, whether or not anything is actually transparent, and
+    /// the importer maps that faithfully: blending on and depth writes off.
+    /// Terrain then stops occluding itself and the stage looks like its faces
+    /// are missing, because you are seeing through them rather than at them.
+    ///
+    /// The separate-object path hides this. Its loader flags derive
+    /// pixel-engine state from material mode and overwrite the stored blend
+    /// and depth state, so the same asset looks right there and wrong once it
+    /// bakes as terrain.
+    ///
+    /// Materials whose base colour is genuinely translucent are left alone, so
+    /// this cannot quietly turn real glass into a wall.
+    pub(super) fn make_terrain_opaque(&mut self) {
+        let mut targets = self.terrain_paint_targets_scoped(true);
+        if targets.is_empty() {
+            self.log.push(
+                "Select a terrain instance in the hierarchy before changing its blending."
+                    .to_string(),
+            );
+            return;
+        }
+        let mut changed = 0usize;
+        let mut kept = 0usize;
+        for target in &mut targets {
+            for material in &mut target.document.materials {
+                let blended = material.gx.blend_mode != sms_formats::GxBlendMode::default()
+                    || material.gx.depth_mode.update_enabled == 0;
+                if !blended {
+                    continue;
+                }
+                if material.source_base_color[3] < 0.999 {
+                    kept += 1;
+                    continue;
+                }
+                material.gx.blend_mode = sms_formats::GxBlendMode::default();
+                material.gx.depth_mode.update_enabled = 1;
+                material.source_alpha_mode = sms_authoring::ImportedAlphaMode::Opaque;
+                changed += 1;
+            }
+        }
+
+        if changed == 0 {
+            self.log.push(match kept {
+                0 => "That terrain is already opaque.".to_string(),
+                _ => format!(
+                    "Left {kept} translucent material(s) alone; nothing else on that terrain                      was blended."
+                ),
+            });
+            return;
+        }
+        self.commit_terrain_targets(targets, "Made terrain opaque", false);
+        let mut message =
+            format!("{changed} material(s) now write depth again, so the terrain occludes itself.");
+        if kept > 0 {
+            message.push_str(&format!(
+                " Left {kept} alone for having a genuinely translucent base colour."
+            ));
+        }
+        self.log.push(message);
+    }
+
     pub(super) fn clear_terrain_vertex_colors(&mut self) {
         let mut targets = self.terrain_paint_targets_scoped(true);
         if targets.is_empty() {
@@ -2307,6 +2371,15 @@ impl SmsEditorApp {
                 .clicked()
             {
                 self.smooth_terrain_vertex_colors();
+            }
+            if ui
+                .button("Make Opaque")
+                .on_hover_text(
+                    "Clear blending and re-enable depth writes, so terrain stops showing                      through itself",
+                )
+                .clicked()
+            {
+                self.make_terrain_opaque();
             }
             if ui
                 .button("Fix Facing")
