@@ -9,7 +9,24 @@ const GENERATED_ROUTE_NODE_RADIUS: f32 = 3.75;
 
 impl SmsEditorApp {
     pub(super) fn routes_hierarchy_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Routes");
+        // Route mode replaces the hierarchy entirely, and the only way out was
+        // the Edit menu checkbox that turned it on, which is easy to miss from
+        // in here.
+        ui.horizontal(|ui| {
+            ui.heading("Routes");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("Exit Routes")
+                    .on_hover_text("Leave route editing and return to the scene hierarchy")
+                    .clicked()
+                {
+                    self.set_route_mode(false);
+                }
+            });
+        });
+        if !self.route_mode {
+            return;
+        }
         ui.small("One graph is active for editing; all other graphs remain subdued context.");
         ui.separator();
 
@@ -65,6 +82,18 @@ impl SmsEditorApp {
                 }
             }
         });
+    }
+
+    /// Label for a control point: the number the viewport draws beside it.
+    ///
+    /// Raw ids like `g0000:n0004` say nothing about which point on screen they
+    /// are, so the panel uses the same 1-based numbering the viewport paints.
+    fn route_control_label(graph: &sms_scene::RouteGraph, id: &str) -> String {
+        graph
+            .controls
+            .iter()
+            .position(|control| control.id == id)
+            .map_or_else(|| id.to_string(), |index| (index + 1).to_string())
     }
 
     pub(super) fn route_inspector_panel(&mut self, ui: &mut egui::Ui) -> bool {
@@ -129,9 +158,19 @@ impl SmsEditorApp {
         ));
         ui.separator();
 
-        if self.selected_route_controls.len() == 2
-            && ui.button("Connect Selected (Bidirectional)").clicked()
-        {
+        // Kept visible when it cannot be used, so the two-point requirement is
+        // discoverable rather than the button simply not existing.
+        let connect_clicked = ui
+            .add_enabled(
+                self.selected_route_controls.len() == 2,
+                egui::Button::new("Connect Selected (Bidirectional)"),
+            )
+            .on_disabled_hover_text(
+                "Select exactly two control points to link them. Shift-click a point in the \
+                 viewport to add it to the selection.",
+            )
+            .clicked();
+        if connect_clicked {
             let endpoints = self
                 .selected_route_controls
                 .iter()
@@ -148,9 +187,70 @@ impl SmsEditorApp {
                 Ok(())
             });
         }
+        // Ctrl-clicking the viewport also extends a route, but nothing said so,
+        // which left a custom graph stuck at the points it was created with.
+        let anchor = self
+            .selected_route_controls
+            .iter()
+            .next()
+            .and_then(|id| graph.control(id))
+            .map(|control| control.node.position);
+        if ui
+            .button("Add Control Point")
+            .on_hover_text(if anchor.is_some() {
+                "Add a control point linked to the selected one"
+            } else {
+                "Add an unlinked control point at the camera focus"
+            })
+            .clicked()
+        {
+            const CONTROL_SPACING: i16 = 300;
+            let position = anchor.map_or_else(
+                || {
+                    let focus = self.renderer.camera().focus;
+                    std::array::from_fn(|axis| {
+                        focus[axis]
+                            .round()
+                            .clamp(f32::from(i16::MIN), f32::from(i16::MAX))
+                            as i16
+                    })
+                },
+                |mut position| {
+                    position[0] = position[0].saturating_add(CONTROL_SPACING);
+                    position
+                },
+            );
+            let link_from = self.selected_route_controls.iter().next().cloned();
+            let graph_id = graph_id.clone();
+            let mut new_id = None;
+            self.apply_route_edit("Added route control point", |document| {
+                let graph = document
+                    .ensure_route_authoring()?
+                    .graph_mut(&graph_id)
+                    .ok_or_else(|| {
+                        SceneError::StageExport("active route disappeared".to_string())
+                    })?;
+                let id = graph.add_control(position);
+                if let Some(from) = &link_from {
+                    graph
+                        .connect_bidirectional(from, &id)
+                        .map_err(|error| SceneError::StageExport(error.to_string()))?;
+                }
+                new_id = Some(id);
+                Ok(())
+            });
+            if let Some(id) = new_id {
+                self.selected_route_controls.clear();
+                self.selected_route_controls.insert(id);
+            }
+        }
+
         if let Some(control_id) = self.selected_route_controls.iter().next().cloned() {
             if let Some(control) = graph.control(&control_id) {
-                ui.strong("Control Point");
+                ui.strong(format!(
+                    "Control Point {}",
+                    Self::route_control_label(&graph, &control_id)
+                ));
                 let mut position = control.node.position;
                 let mut changed = false;
                 ui.horizontal(|ui| {
@@ -177,6 +277,43 @@ impl SmsEditorApp {
                         Ok(())
                     });
                 }
+                ui.separator();
+                ui.small("Connections");
+                let connections = graph
+                    .links
+                    .iter()
+                    .filter(|link| link.from == control_id || link.to == control_id)
+                    .collect::<Vec<_>>();
+                if connections.is_empty() {
+                    ui.small("None yet. Add a control point, or select two and connect them.");
+                }
+                for link in connections {
+                    let other = if link.from == control_id {
+                        &link.to
+                    } else {
+                        &link.from
+                    };
+                    let arrow = match (link.forward.is_some(), link.reverse.is_some()) {
+                        (true, true) => "<->",
+                        (true, false) => "->",
+                        (false, true) => "<-",
+                        (false, false) => "--",
+                    };
+                    if ui
+                        .selectable_label(
+                            self.selected_route_link.as_deref() == Some(link.id.as_str()),
+                            format!("{arrow}  {}", Self::route_control_label(&graph, other)),
+                        )
+                        .on_hover_text(format!(
+                            "Connection to {other}. Select it to reverse, split or delete it"
+                        ))
+                        .clicked()
+                    {
+                        self.selected_route_link = Some(link.id.clone());
+                    }
+                }
+                ui.separator();
+
                 if ui.button("Delete Control Point").clicked() {
                     let graph_id = graph_id.clone();
                     self.apply_route_edit("Deleted route control point", move |document| {
@@ -198,7 +335,11 @@ impl SmsEditorApp {
             if let Some(link) = graph.links.iter().find(|link| link.id == link_id) {
                 ui.separator();
                 ui.strong("Connection");
-                ui.small(format!("{} -> {}", link.from, link.to));
+                ui.small(format!(
+                    "{} -> {}",
+                    Self::route_control_label(&graph, &link.from),
+                    Self::route_control_label(&graph, &link.to)
+                ));
                 let forward = link.forward.is_some();
                 let reverse = link.reverse.is_some();
                 ui.horizontal(|ui| {
