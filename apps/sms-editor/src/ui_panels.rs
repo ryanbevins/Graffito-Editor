@@ -1681,6 +1681,22 @@ impl SmsEditorApp {
                 }
             }
 
+            if let Some(sms_scene::PlacementBinding::Authored(placement)) = &object.placement {
+                if object.raw_param("manager_name").is_some() {
+                    ui.separator();
+                    let mut pool_only = placement.pool_only;
+                    if ui
+                        .checkbox(&mut pool_only, "Pool only (no placed instance)")
+                        .on_hover_text(
+                            "Export the manager and its resources without this actor record.                              The conductor fills the manager's pool at load, so goop spawning                              still works and nothing stands in the world.",
+                        )
+                        .changed()
+                    {
+                        self.set_selected_object_pool_only(pool_only);
+                    }
+                }
+            }
+
             ui.separator();
             ui.heading("Params");
             let editable_parameters = self

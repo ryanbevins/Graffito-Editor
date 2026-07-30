@@ -5919,6 +5919,7 @@ mod tests {
                 )
                 .unwrap(),
                 dependencies: Vec::new(),
+                pool_only: false,
             },
         ));
         object
