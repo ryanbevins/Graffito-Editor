@@ -1169,7 +1169,6 @@ pub(super) fn primitive_cavity(
         })
         .collect();
 
-    let bias = bias.clamp(0.0, 1.0);
     let mut sums: BTreeMap<usize, (f32, f32)> = BTreeMap::new();
     for (origin, a, b, angle) in &corners {
         let weld = welds[*origin];
@@ -1193,17 +1192,7 @@ pub(super) fn primitive_cavity(
     let cavity: BTreeMap<usize, f32> = sums
         .into_iter()
         .filter(|(_, (_, weight))| *weight > f32::EPSILON)
-        .map(|(weld, (sum, weight))| {
-            let concavity = (sum / weight).clamp(0.0, 1.0);
-            // Direction bias: at 0 every crease dirties equally, at 1 only the
-            // ones facing the chosen direction do. Half lambert so it fades in
-            // rather than cutting off along a hard terminator.
-            let facing = normals
-                .get(&weld)
-                .map(|normal| vec3_dot(*normal, direction) * 0.5 + 0.5)
-                .unwrap_or(1.0);
-            (weld, concavity * (1.0 - bias + bias * facing))
-        })
+        .map(|(weld, (sum, weight))| (weld, (sum / weight).clamp(0.0, 1.0)))
         .collect();
 
     // One relaxation pass, so dirt grades into surrounding faces instead of
@@ -1224,9 +1213,36 @@ pub(super) fn primitive_cavity(
         })
         .collect();
 
+    // Rescaled to fill 0..1. The raw term is a mean of dot products over every
+    // neighbour, including the coplanar ones, so even a right-angle fold only
+    // reaches about 0.1 and the Dirty slider looks like it does nothing. Since
+    // it never spans its own range, grade it against the sharpest crease the
+    // mesh actually has.
+    let peak = relaxed.values().copied().fold(0.0f32, f32::max);
+    // Below this there is no crease to speak of, only the noise a flat surface
+    // makes at its border, and stretching that to full black would be a lie.
+    let graded: BTreeMap<usize, f32> = match peak > 0.004 {
+        true => relaxed
+            .into_iter()
+            .map(|(weld, value)| (weld, (value / peak).clamp(0.0, 1.0)))
+            .collect(),
+        false => BTreeMap::new(),
+    };
+
+    let bias = bias.clamp(0.0, 1.0);
     welds
         .iter()
-        .map(|weld| relaxed.get(weld).copied().unwrap_or(0.0))
+        .map(|weld| {
+            let value = graded.get(weld).copied().unwrap_or(0.0);
+            // Direction: at 0 every crease dirties alike, at 1 only the ones
+            // facing the chosen angle do. Half lambert, so it fades in instead
+            // of cutting off along a hard terminator.
+            let facing = normals
+                .get(weld)
+                .map(|normal| vec3_dot(*normal, direction) * 0.5 + 0.5)
+                .unwrap_or(1.0);
+            value * (1.0 - bias + bias * facing)
+        })
         .collect()
 }
 

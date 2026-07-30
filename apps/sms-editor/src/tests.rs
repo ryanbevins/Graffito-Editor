@@ -5172,3 +5172,74 @@ fn cavity_does_not_lean_along_the_triangulation() {
         "the four sides of a symmetric pit must dirty alike: {ring:?}"
     );
 }
+
+/// Prints the cavity bake for a real asset. Local diagnostic, run on demand:
+/// `GRAFFITO_PROBE_CONTENT=<content dir> GRAFFITO_PROBE_ASSET=ramp3 cargo test
+/// probe_cavity -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_cavity_on_a_real_asset() {
+    let Ok(content) = std::env::var("GRAFFITO_PROBE_CONTENT") else {
+        return;
+    };
+    let wanted = std::env::var("GRAFFITO_PROBE_ASSET").unwrap_or_default();
+    let catalog = sms_authoring::ModelAssetCatalog::open_content_root(&content).expect("content");
+    let entries = catalog.scan().expect("scan").assets;
+    let entry = entries
+        .iter()
+        .find(|entry| entry.name.eq_ignore_ascii_case(&wanted))
+        .expect("asset");
+    let document = catalog.load_asset(entry.id).expect("document");
+    println!("asset {} meshes {}", entry.name, document.meshes.len());
+    for (mesh_index, mesh) in document.meshes.iter().enumerate() {
+        for (primitive_index, primitive) in mesh.primitives.iter().enumerate() {
+            let world = primitive
+                .positions
+                .iter()
+                .enumerate()
+                .map(|(index, position)| crate::vertex_paint::WorldVertex {
+                    position: *position,
+                    normal: primitive
+                        .normals
+                        .get(index)
+                        .copied()
+                        .unwrap_or([0.0, 1.0, 0.0]),
+                })
+                .collect::<Vec<_>>();
+            for (label, direction, bias) in [
+                ("none", [0.0, 1.0, 0.0], 0.0),
+                ("down", [0.0, -1.0, 0.0], 1.0),
+                ("up", [0.0, 1.0, 0.0], 1.0),
+                ("+x", [1.0, 0.0, 0.0], 1.0),
+                ("-x", [-1.0, 0.0, 0.0], 1.0),
+            ] {
+                let cavity =
+                    crate::vertex_paint::primitive_cavity(primitive, &world, direction, bias);
+                let nonzero = cavity.iter().filter(|value| **value > 0.001).count();
+                let high = cavity.iter().copied().fold(0.0f32, f32::max);
+                let sum: f32 = cavity.iter().sum();
+                println!(
+                    "  mesh {mesh_index} prim {primitive_index} verts {} tris {} | {label:>4}: \
+                     nonzero {nonzero} max {high:.4} mean {:.4}",
+                    primitive.positions.len(),
+                    primitive.indices.len() / 3,
+                    sum / cavity.len().max(1) as f32
+                );
+            }
+            let cavity =
+                crate::vertex_paint::primitive_cavity(primitive, &world, [0.0, 1.0, 0.0], 0.0);
+            for (index, value) in cavity.iter().enumerate().take(60) {
+                println!(
+                    "    v{index:>3} pos {:>9.1} {:>9.1} {:>9.1}  n {:>6.2} {:>6.2} {:>6.2}  \
+                     cavity {value:.4}",
+                    primitive.positions[index][0],
+                    primitive.positions[index][1],
+                    primitive.positions[index][2],
+                    primitive.normals.get(index).map_or(0.0, |n| n[0]),
+                    primitive.normals.get(index).map_or(0.0, |n| n[1]),
+                    primitive.normals.get(index).map_or(0.0, |n| n[2]),
+                );
+            }
+        }
+    }
+}
