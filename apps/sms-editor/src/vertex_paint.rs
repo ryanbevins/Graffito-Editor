@@ -248,8 +248,16 @@ impl VertexPaintGradeSettings {
             }
         }
 
-        for (channel, tint) in color.iter_mut().take(3).zip(self.tint.iter()) {
-            *channel += (tint - *channel) * self.tint_amount;
+        // Tint rides the dark end only. Tinting everything is a colour cast
+        // over the whole mesh, which is what a brush stroke is for; what a
+        // grade is wanted for is warming or cooling the shadows an occlusion
+        // bake laid down, leaving the lit surfaces where they are.
+        if self.tint_amount != 0.0 {
+            let luma = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2];
+            let weight = (1.0 - luma).clamp(0.0, 1.0) * self.tint_amount;
+            for (channel, tint) in color.iter_mut().take(3).zip(self.tint.iter()) {
+                *channel += (tint - *channel) * weight;
+            }
         }
 
         for channel in color.iter_mut().take(3) {
@@ -1991,6 +1999,17 @@ impl SmsEditorApp {
     ) {
         for target in targets {
             let world = Self::target_world_vertex_occurrences(target);
+            // Erasing goes back to the material's own diffuse, the same place
+            // Clear Paint goes. Painting points the colour channel at the
+            // vertex array, so the material register stops reaching the
+            // surface: white in that array is not "no paint", it is a white
+            // surface, and erasing to it bleached the model.
+            let diffuse = target
+                .document
+                .materials
+                .iter()
+                .map(|material| material.source_base_color)
+                .collect::<Vec<_>>();
             // Apply the fixed-distance dabs in order. Grouping them by UI
             // frame would change repeated brush blends, and smoothing would
             // sample a different intermediate neighbourhood.
@@ -2002,6 +2021,11 @@ impl SmsEditorApp {
                             continue;
                         };
                         primitive_index += 1;
+                        let base = primitive
+                            .material
+                            .and_then(|index| diffuse.get(index as usize))
+                            .copied()
+                            .unwrap_or([1.0; 4]);
                         let welds = weld_positions(&primitive.positions);
                         let adjacency = primitive_adjacency(&primitive.indices, &welds);
                         let colors = primitive_colors_mut(primitive);
@@ -2034,12 +2058,9 @@ impl SmsEditorApp {
                             if amount <= f32::EPSILON {
                                 continue;
                             }
-                            // White is the identity for a vertex-lit surface,
-                            // so erasing blends back toward it rather than to
-                            // black.
                             let goal = match application.mode {
                                 VertexPaintMode::Brush => application.color,
-                                VertexPaintMode::Eraser => [1.0, 1.0, 1.0],
+                                VertexPaintMode::Eraser => [base[0], base[1], base[2]],
                                 VertexPaintMode::Smooth => smoothed
                                     .as_ref()
                                     .and_then(|set| set.get(index))
@@ -2474,7 +2495,7 @@ impl SmsEditorApp {
             changed |= ui
                 .add(
                     egui::Slider::new(&mut self.vertex_paint_grade_settings.tint_amount, 0.0..=1.0)
-                        .text("Tint"),
+                        .text("Shadow tint"),
                 )
                 .changed();
         });
