@@ -5101,188 +5101,21 @@ fn triangle_height_lookup_covers_its_own_column() {
     );
 }
 
-/// A grid with a symmetric pit dirties symmetrically, whichever way it was cut.
-///
-/// Every quad here is split along the same diagonal, so each vertex has
-/// neighbours on that diagonal and none on the other. Averaging edges equally
-/// leans the bake along it, which is what made the dirt come out tilted on a
-/// mesh whose geometry has no tilt in it at all.
 #[test]
-fn cavity_does_not_lean_along_the_triangulation() {
-    const SIDE: usize = 5;
-    const STEP: f32 = 100.0;
-    let index_of = |x: usize, z: usize| (z * SIDE + x) as u32;
-
-    let mut positions = Vec::new();
-    for z in 0..SIDE {
-        for x in 0..SIDE {
-            // A pit at the centre: symmetric under a quarter turn.
-            let centre = x == SIDE / 2 && z == SIDE / 2;
-            positions.push([
-                x as f32 * STEP,
-                if centre { -60.0 } else { 0.0 },
-                z as f32 * STEP,
-            ]);
-        }
-    }
-    let mut indices = Vec::new();
-    for z in 0..SIDE - 1 {
-        for x in 0..SIDE - 1 {
-            indices.extend([
-                index_of(x, z),
-                index_of(x + 1, z + 1),
-                index_of(x + 1, z),
-                index_of(x, z),
-                index_of(x, z + 1),
-                index_of(x + 1, z + 1),
-            ]);
-        }
-    }
-
-    let primitive = sms_authoring::ModelPrimitive {
-        positions: positions.clone(),
-        normals: vec![[0.0, 1.0, 0.0]; positions.len()],
-        tangents: Vec::new(),
-        tex_coords: Vec::new(),
-        colors: Vec::new(),
-        indices,
-        material: None,
+fn escape_leaves_placement_mode() {
+    let mut app = SmsEditorApp {
+        tool: EditorTool::Place,
+        active_placement: Some(ActivePlacement::Object {
+            factory_name: "Amenbo".to_string(),
+        }),
+        ..SmsEditorApp::default()
     };
-    let world = positions
-        .iter()
-        .map(|position| crate::vertex_paint::WorldVertex {
-            position: *position,
-            normal: [0.0, 1.0, 0.0],
-        })
-        .collect::<Vec<_>>();
 
-    let cavity =
-        crate::vertex_paint::primitive_cavity(&primitive, &world, [0.0, 1.0, 0.0], 0.0, 2, 0.0);
-    let middle = SIDE / 2;
-    let ring = [
-        cavity[middle * SIDE + middle - 1],
-        cavity[middle * SIDE + middle + 1],
-        cavity[(middle - 1) * SIDE + middle],
-        cavity[(middle + 1) * SIDE + middle],
-    ];
-    let high = ring.iter().copied().fold(f32::MIN, f32::max);
-    let low = ring.iter().copied().fold(f32::MAX, f32::min);
-    assert!(high > 0.0, "the pit has to dirty something: {ring:?}");
-    assert!(
-        (high - low) / high < 0.05,
-        "the four sides of a symmetric pit must dirty alike: {ring:?}"
-    );
-}
+    assert!(app.cancel_active_placement());
+    assert!(app.active_placement.is_none());
+    // Place is a mode, so leaving it has to land somewhere usable.
+    assert_eq!(app.tool, EditorTool::Select);
 
-/// Prints the cavity bake for a real asset. Local diagnostic, run on demand:
-/// `GRAFFITO_PROBE_CONTENT=<content dir> GRAFFITO_PROBE_ASSET=ramp3 cargo test
-/// probe_cavity -- --ignored --nocapture`
-#[test]
-#[ignore]
-fn probe_cavity_on_a_real_asset() {
-    let Ok(content) = std::env::var("GRAFFITO_PROBE_CONTENT") else {
-        return;
-    };
-    let wanted = std::env::var("GRAFFITO_PROBE_ASSET").unwrap_or_default();
-    let catalog = sms_authoring::ModelAssetCatalog::open_content_root(&content).expect("content");
-    let entries = catalog.scan().expect("scan").assets;
-    let entry = entries
-        .iter()
-        .find(|entry| entry.name.eq_ignore_ascii_case(&wanted))
-        .expect("asset");
-    let document = catalog.load_asset(entry.id).expect("document");
-    println!("asset {} meshes {}", entry.name, document.meshes.len());
-    for (mesh_index, mesh) in document.meshes.iter().enumerate() {
-        for (primitive_index, primitive) in mesh.primitives.iter().enumerate() {
-            let world = primitive
-                .positions
-                .iter()
-                .enumerate()
-                .map(|(index, position)| crate::vertex_paint::WorldVertex {
-                    position: *position,
-                    normal: primitive
-                        .normals
-                        .get(index)
-                        .copied()
-                        .unwrap_or([0.0, 1.0, 0.0]),
-                })
-                .collect::<Vec<_>>();
-            for (label, direction, bias) in [
-                ("none", [0.0, 1.0, 0.0], 0.0),
-                ("down", [0.0, -1.0, 0.0], 1.0),
-                ("up", [0.0, 1.0, 0.0], 1.0),
-                ("+x", [1.0, 0.0, 0.0], 1.0),
-                ("-x", [-1.0, 0.0, 0.0], 1.0),
-            ] {
-                let cavity = crate::vertex_paint::primitive_cavity(
-                    primitive, &world, direction, bias, 2, 0.0,
-                );
-                let nonzero = cavity.iter().filter(|value| **value > 0.001).count();
-                let high = cavity.iter().copied().fold(0.0f32, f32::max);
-                let sum: f32 = cavity.iter().sum();
-                println!(
-                    "  mesh {mesh_index} prim {primitive_index} verts {} tris {} | {label:>4}: \
-                     nonzero {nonzero} max {high:.4} mean {:.4}",
-                    primitive.positions.len(),
-                    primitive.indices.len() / 3,
-                    sum / cavity.len().max(1) as f32
-                );
-            }
-            let cavity = crate::vertex_paint::primitive_cavity(
-                primitive,
-                &world,
-                [0.0, 1.0, 0.0],
-                0.0,
-                12,
-                1.0,
-            );
-            let mut buckets = [0usize; 10];
-            for value in &cavity {
-                buckets[((value * 9.999) as usize).min(9)] += 1;
-            }
-            let mut sorted = cavity.clone();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            println!("    histogram in tenths: {buckets:?}");
-            println!(
-                "    min {:.3} p25 {:.3} median {:.3} p75 {:.3} max {:.3}",
-                sorted[0],
-                sorted[sorted.len() / 4],
-                sorted[sorted.len() / 2],
-                sorted[sorted.len() * 3 / 4],
-                sorted[sorted.len() - 1]
-            );
-            let mid = primitive
-                .positions
-                .iter()
-                .map(|position| position[0])
-                .sum::<f32>()
-                / primitive.positions.len() as f32;
-            for (label, keep) in [("x<mid", true), ("x>mid", false)] {
-                let side = cavity
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| (primitive.positions[*index][0] < mid) == keep)
-                    .map(|(_, value)| *value)
-                    .collect::<Vec<_>>();
-                println!(
-                    "    {label}: n {} mean {:.3} max {:.3}",
-                    side.len(),
-                    side.iter().sum::<f32>() / side.len().max(1) as f32,
-                    side.iter().copied().fold(0.0f32, f32::max)
-                );
-            }
-            for (index, value) in cavity.iter().enumerate().take(0) {
-                println!(
-                    "    v{index:>3} pos {:>9.1} {:>9.1} {:>9.1}  n {:>6.2} {:>6.2} {:>6.2}  \
-                     cavity {value:.4}",
-                    primitive.positions[index][0],
-                    primitive.positions[index][1],
-                    primitive.positions[index][2],
-                    primitive.normals.get(index).map_or(0.0, |n| n[0]),
-                    primitive.normals.get(index).map_or(0.0, |n| n[1]),
-                    primitive.normals.get(index).map_or(0.0, |n| n[2]),
-                );
-            }
-        }
-    }
+    // Nothing to cancel, so Escape stays available to whatever else wants it.
+    assert!(!app.cancel_active_placement());
 }

@@ -39,6 +39,7 @@ use sms_schema::{
 mod active_placement;
 mod audio_helpers;
 mod audio_preview;
+mod boolean_cut;
 mod browser_settings;
 mod camera;
 mod content_browser;
@@ -127,6 +128,8 @@ enum EditorTool {
     Select,
     /// Paints per-vertex colour into the stage terrain assets.
     VertexPaint,
+    /// Cuts stage terrain along where another mesh crosses it.
+    Boolean,
     Move,
     Rotate,
     Scale,
@@ -282,6 +285,7 @@ impl EditorTool {
         match self {
             Self::Select => "Select",
             Self::VertexPaint => "Vertex Paint",
+            Self::Boolean => "Boolean Cut",
             Self::Move => "Move",
             Self::Rotate => "Rotate",
             Self::Scale => "Scale",
@@ -1300,16 +1304,10 @@ struct SmsEditorApp {
     vertex_paint_sun_pitch: f32,
     vertex_paint_sun_softness: f32,
     vertex_paint_sun_shadow: f32,
-    vertex_paint_dirt: f32,
-    vertex_paint_dirt_ramp: f32,
-    vertex_paint_dirt_bias: f32,
-    vertex_paint_dirt_spread: u32,
-    vertex_paint_dirt_even: f32,
     vertex_paint_ao_strength: f32,
     vertex_paint_ao_distance: f32,
     vertex_paint_ao_rays: u32,
-    vertex_paint_dirt_yaw: f32,
-    vertex_paint_dirt_pitch: f32,
+    boolean_cutter: Option<sms_authoring::AssetId>,
     vertex_paint_smooth_iterations: u32,
     vertex_paint_sun_smooth_normals: bool,
     vertex_paint_ramp_axis: usize,
@@ -1614,16 +1612,10 @@ impl Default for SmsEditorApp {
             vertex_paint_sun_pitch: 46.0,
             vertex_paint_sun_softness: 0.5,
             vertex_paint_sun_shadow: 0.6,
-            vertex_paint_dirt: 0.6,
-            vertex_paint_dirt_ramp: 1.0,
-            vertex_paint_dirt_bias: 0.0,
-            vertex_paint_dirt_spread: 2,
-            vertex_paint_dirt_even: 0.5,
             vertex_paint_ao_strength: 0.7,
             vertex_paint_ao_distance: 400.0,
             vertex_paint_ao_rays: 64,
-            vertex_paint_dirt_yaw: 0.0,
-            vertex_paint_dirt_pitch: -90.0,
+            boolean_cutter: None,
             vertex_paint_smooth_iterations: 1,
             vertex_paint_sun_smooth_normals: true,
             vertex_paint_ramp_axis: 1,

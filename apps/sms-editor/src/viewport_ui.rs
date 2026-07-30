@@ -3343,7 +3343,11 @@ pub(super) fn transform_from_gizmo_drag(
             transform.scale[axis] = value.max(0.001);
         }
         // These tools raise no gizmo, so they never open a drag to resolve.
-        EditorTool::Select | EditorTool::VertexPaint | EditorTool::Goop | EditorTool::Place => {}
+        EditorTool::Select
+        | EditorTool::VertexPaint
+        | EditorTool::Boolean
+        | EditorTool::Goop
+        | EditorTool::Place => {}
     }
     transform
 }

@@ -91,11 +91,11 @@ pub(super) struct VertexPaintLiveStroke {
 /// A terrain asset opened for painting, with the world transform of every
 /// instance that uses it.
 pub(super) struct PaintTarget {
-    id: AssetId,
-    document: ModelAssetDocument,
+    pub(super) id: AssetId,
+    pub(super) document: ModelAssetDocument,
     /// One asset can be placed several times; a stroke has to consider each
     /// placement, and every placement writes back to the same vertices.
-    transforms: Vec<[[f32; 4]; 4]>,
+    pub(super) transforms: Vec<[[f32; 4]; 4]>,
     /// State as loaded, so the commit can record an undo step without a second
     /// read from disk.
     baseline: VertexPaintSnapshot,
@@ -107,7 +107,7 @@ pub(super) struct WorldVertex {
     pub(super) normal: [f32; 3],
 }
 
-fn transform_point(matrix: [[f32; 4]; 4], point: [f32; 3]) -> [f32; 3] {
+pub(super) fn transform_point(matrix: [[f32; 4]; 4], point: [f32; 3]) -> [f32; 3] {
     std::array::from_fn(|row| {
         matrix[0][row] * point[0]
             + matrix[1][row] * point[1]
@@ -320,8 +320,49 @@ const IDENTITY_MATRIX: [[f32; 4]; 4] = [
     [0.0, 0.0, 0.0, 1.0],
 ];
 
+/// Inverse of an affine transform, or nothing if it is degenerate.
+///
+/// Cutting runs in the target mesh's own space so split positions can be
+/// written straight back into the primitive, which means carrying the cutter
+/// the other way through this.
+pub(super) fn invert_affine(matrix: [[f32; 4]; 4]) -> Option<[[f32; 4]; 4]> {
+    // Column major: matrix[column][row].
+    let linear = |row: usize, column: usize| matrix[column][row];
+    let determinant = linear(0, 0) * (linear(1, 1) * linear(2, 2) - linear(1, 2) * linear(2, 1))
+        - linear(0, 1) * (linear(1, 0) * linear(2, 2) - linear(1, 2) * linear(2, 0))
+        + linear(0, 2) * (linear(1, 0) * linear(2, 1) - linear(1, 1) * linear(2, 0));
+    if determinant.abs() <= 1e-12 {
+        return None;
+    }
+    let inverse = 1.0 / determinant;
+    let cofactor = |row: usize, column: usize| {
+        let rows = [(row + 1) % 3, (row + 2) % 3];
+        let columns = [(column + 1) % 3, (column + 2) % 3];
+        (linear(rows[0], columns[0]) * linear(rows[1], columns[1])
+            - linear(rows[0], columns[1]) * linear(rows[1], columns[0]))
+            * inverse
+    };
+    // Transposed cofactors give the inverse of the linear part.
+    let mut result: [[f32; 4]; 4] = std::array::from_fn(|column| {
+        std::array::from_fn(|row| match (row < 3, column < 3) {
+            (true, true) => cofactor(column, row),
+            _ => 0.0,
+        })
+    });
+    let translation: [f32; 3] = std::array::from_fn(|axis| matrix[3][axis]);
+    result[3] = std::array::from_fn(|row| match row < 3 {
+        true => {
+            -(result[0][row] * translation[0]
+                + result[1][row] * translation[1]
+                + result[2][row] * translation[2])
+        }
+        false => 1.0,
+    });
+    Some(result)
+}
+
 /// Column-major 4x4 multiply, `a` applied after `b`.
-fn multiply_matrix(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+pub(super) fn multiply_matrix(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     std::array::from_fn(|column| {
         std::array::from_fn(|row| {
             (0..4)
@@ -337,7 +378,7 @@ fn multiply_matrix(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
 /// primitive positions are not where the mesh is drawn. Screen-space painting
 /// projects vertices, and skipping this put every projected vertex somewhere
 /// the mesh is not.
-fn mesh_node_transforms(document: &ModelAssetDocument) -> BTreeMap<u32, [[f32; 4]; 4]> {
+pub(super) fn mesh_node_transforms(document: &ModelAssetDocument) -> BTreeMap<u32, [[f32; 4]; 4]> {
     const IDENTITY: [[f32; 4]; 4] = [
         [1.0, 0.0, 0.0, 0.0],
         [0.0, 1.0, 0.0, 0.0],
@@ -454,7 +495,7 @@ impl SmsEditorApp {
     /// unscoped operation aimed at a ramp also rewrites the floor beneath it.
     /// Only preparing a stage on tool open leaves it false, since that has to
     /// reach every asset before anything is selected.
-    fn terrain_paint_targets_scoped(&self, selection_only: bool) -> Vec<PaintTarget> {
+    pub(super) fn terrain_paint_targets_scoped(&self, selection_only: bool) -> Vec<PaintTarget> {
         let Some(catalog) = self.model_catalog().ok() else {
             return Vec::new();
         };
@@ -670,7 +711,7 @@ impl SmsEditorApp {
     }
 
     /// Writes every modified target back to the catalog.
-    fn commit_paint_targets(&mut self, targets: Vec<PaintTarget>, label: &str) {
+    pub(super) fn commit_paint_targets(&mut self, targets: Vec<PaintTarget>, label: &str) {
         if targets.is_empty() {
             return;
         }
@@ -871,69 +912,6 @@ impl SmsEditorApp {
                 }
             },
         );
-    }
-
-    /// Concavity at a welded position is the mean, over its edge neighbours, of
-    /// the dot between the direction to that neighbour and the vertex normal.
-    /// Positive means neighbours sit above the tangent plane, which is a crease
-    /// ambient light cannot reach; convex and flat areas stay untouched.
-    pub(super) fn bake_terrain_dirt(&mut self) {
-        let amount = self.vertex_paint_dirt.clamp(0.0, 1.0);
-        let ramp = self.vertex_paint_dirt_ramp.clamp(0.25, 4.0);
-        let (yaw, pitch) = (
-            self.vertex_paint_dirt_yaw.to_radians(),
-            self.vertex_paint_dirt_pitch.to_radians(),
-        );
-        let direction = [
-            pitch.cos() * yaw.sin(),
-            pitch.sin(),
-            pitch.cos() * yaw.cos(),
-        ];
-        let bias = self.vertex_paint_dirt_bias.clamp(0.0, 1.0);
-        let spread = self.vertex_paint_dirt_spread;
-        let even = self.vertex_paint_dirt_even.clamp(0.0, 1.0);
-        let mut targets = self.terrain_paint_targets_scoped(true);
-        if targets.is_empty() {
-            self.log.push(
-                "No terrain to paint: set a model instance to 'Bake as map terrain' first."
-                    .to_string(),
-            );
-            return;
-        }
-        for target in &mut targets {
-            let world = Self::target_world_vertices(target);
-            let mut primitive_index = 0usize;
-            for mesh in &mut target.document.meshes {
-                for primitive in &mut mesh.primitives {
-                    let dirt = primitive_cavity(
-                        primitive,
-                        &world[primitive_index],
-                        direction,
-                        bias,
-                        spread,
-                        even,
-                    );
-                    primitive_index += 1;
-                    let colors = primitive_colors_mut(primitive);
-                    for (index, color) in colors.iter_mut().enumerate() {
-                        // The ramp is a contrast curve on the cavity factor:
-                        // above 1 the dirt tightens into the deepest creases,
-                        // below 1 it spreads across the shallower ones.
-                        let cavity = dirt
-                            .get(index)
-                            .copied()
-                            .unwrap_or(0.0)
-                            .clamp(0.0, 1.0)
-                            .powf(ramp);
-                        let shade = 1.0 - cavity * amount;
-                        for channel in color.iter_mut().take(3) {
-                            *channel = (*channel * shade).clamp(0.0, 1.0);
-                        }
-                    }
-                }
-            }
-        }
-        self.commit_paint_targets(targets, "Baked cavity dirt into vertex paint");
     }
 
     /// Subdivides the selected terrain instance, or all of it when nothing is
@@ -1249,229 +1227,6 @@ fn smoothed_colors(
                 .copied()
                 .unwrap_or([color[0], color[1], color[2]]);
             [rgb[0], rgb[1], rgb[2], color[3]]
-        })
-        .collect()
-}
-
-/// Per-vertex cavity factor in 0..1, where 1 is a deep crease.
-pub(super) fn primitive_cavity(
-    primitive: &sms_authoring::ModelPrimitive,
-    world: &[WorldVertex],
-    direction: [f32; 3],
-    bias: f32,
-    spread: u32,
-    even: f32,
-) -> Vec<f32> {
-    // World space, because a non-uniform scale on the node or the placement
-    // would otherwise skew the result along an axis.
-    let positions = world
-        .iter()
-        .map(|vertex| vertex.position)
-        .collect::<Vec<_>>();
-    let welds = weld_positions(&positions);
-    let adjacency = primitive_adjacency(&primitive.indices, &welds);
-
-    // Angle weighted, not one equal share per edge. A grid triangulated along a
-    // single diagonal gives every vertex neighbours on that diagonal and none
-    // on the other, so weighting edges equally leans the whole bake along it.
-    // That is the tilt: it is in the triangulation, not the transform.
-    // Weighting by the corner angle each edge subtends makes the sampling even
-    // no matter how the surface was cut up.
-    let corner_angle = |origin: [f32; 3], a: [f32; 3], b: [f32; 3]| -> f32 {
-        let u = vec3_sub(a, origin);
-        let v = vec3_sub(b, origin);
-        let (lu, lv) = (vec3_dot(u, u).sqrt(), vec3_dot(v, v).sqrt());
-        if lu <= f32::EPSILON || lv <= f32::EPSILON {
-            return 0.0;
-        }
-        (vec3_dot(u, v) / (lu * lv)).clamp(-1.0, 1.0).acos()
-    };
-
-    let triangles = primitive.indices.chunks_exact(3).filter_map(|triangle| {
-        let indices = [
-            triangle[0] as usize,
-            triangle[1] as usize,
-            triangle[2] as usize,
-        ];
-        indices
-            .iter()
-            .all(|index| *index < positions.len() && *index < welds.len())
-            .then_some(indices)
-    });
-    let corners = triangles
-        .flat_map(|indices| {
-            (0..3).map(move |corner| {
-                (
-                    indices[corner],
-                    indices[(corner + 1) % 3],
-                    indices[(corner + 2) % 3],
-                )
-            })
-        })
-        .filter_map(|(origin, a, b)| {
-            let angle = corner_angle(positions[origin], positions[a], positions[b]);
-            (angle > f32::EPSILON).then_some((origin, a, b, angle))
-        })
-        .collect::<Vec<_>>();
-
-    // Normals get the same weighting, so a long thin triangle does not shout
-    // over a compact one that covers more of the surface around the vertex.
-    let mut normals: BTreeMap<usize, [f32; 3]> = BTreeMap::new();
-    for (origin, _, _, angle) in &corners {
-        let normal = world
-            .get(*origin)
-            .map(|vertex| vertex.normal)
-            .unwrap_or([0.0, 1.0, 0.0]);
-        let entry = normals.entry(welds[*origin]).or_insert([0.0; 3]);
-        for axis in 0..3 {
-            entry[axis] += normal[axis] * angle;
-        }
-    }
-    let normals: BTreeMap<usize, [f32; 3]> = normals
-        .into_iter()
-        .filter_map(|(weld, normal)| {
-            let length = vec3_dot(normal, normal).sqrt();
-            (length > f32::EPSILON).then(|| (weld, vec3_scale(normal, 1.0 / length)))
-        })
-        .collect();
-
-    let mut sums: BTreeMap<usize, (f32, f32)> = BTreeMap::new();
-    for (origin, a, b, angle) in &corners {
-        let weld = welds[*origin];
-        let Some(normal) = normals.get(&weld) else {
-            continue;
-        };
-        // The corner's weight is split between the two edges leaving it.
-        let weight = angle * 0.5;
-        for neighbour in [a, b] {
-            let delta = vec3_sub(positions[*neighbour], positions[*origin]);
-            let distance = vec3_dot(delta, delta).sqrt();
-            if distance <= f32::EPSILON {
-                continue;
-            }
-            let entry = sums.entry(weld).or_insert((0.0, 0.0));
-            entry.0 += vec3_dot(vec3_scale(delta, 1.0 / distance), *normal) * weight;
-            entry.1 += weight;
-        }
-    }
-
-    let cavity: BTreeMap<usize, f32> = sums
-        .into_iter()
-        .filter(|(_, (_, weight))| *weight > f32::EPSILON)
-        .map(|(weld, (sum, weight))| (weld, (sum / weight).clamp(0.0, 1.0)))
-        .collect();
-
-    // One relaxation pass, so dirt grades into surrounding faces instead of
-    // hugging single vertices.
-    let relaxed: BTreeMap<usize, f32> = cavity
-        .iter()
-        .map(|(position, value)| {
-            let Some(neighbours) = adjacency.get(position) else {
-                return (*position, *value);
-            };
-            let mut sum = *value;
-            let mut count = 1usize;
-            for neighbour in neighbours {
-                sum += cavity.get(neighbour).copied().unwrap_or(0.0);
-                count += 1;
-            }
-            (*position, sum / count as f32)
-        })
-        .collect();
-
-    // Rescaled to fill 0..1. The raw term is a mean of dot products over every
-    // neighbour, including the coplanar ones, so even a right-angle fold only
-    // reaches about 0.1 and the Dirty slider looks like it does nothing. Since
-    // it never spans its own range, grade it against the sharpest crease the
-    // mesh actually has.
-    // A high percentile rather than the maximum. One freak vertex -- the apex
-    // of a fold, a spike where two edges nearly meet -- would otherwise set the
-    // scale for the whole mesh and squash every other crease toward nothing,
-    // which reads as one side of a ramp dirtying and the other staying clean.
-    let mut ordered = relaxed
-        .values()
-        .copied()
-        .filter(|value| *value > 0.0)
-        .collect::<Vec<_>>();
-    ordered.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let peak = ordered
-        .get(ordered.len().saturating_sub(1).min(ordered.len() * 9 / 10))
-        .copied()
-        .unwrap_or(0.0);
-    // Below this there is no crease to speak of, only the noise a flat surface
-    // makes at its border, and stretching that to full black would be a lie.
-    let graded: BTreeMap<usize, f32> = match peak > 0.004 {
-        true => relaxed
-            .into_iter()
-            .map(|(weld, value)| (weld, (value / peak).clamp(0.0, 1.0)))
-            .collect(),
-        false => BTreeMap::new(),
-    };
-
-    // Even grades a vertex by where it ranks among the rest rather than by how
-    // deep its crease measures. Two folds on one model are rarely equally
-    // sharp -- on this ramp the arms measure mean 0.38 and 0.61 -- and depth
-    // grading is honest about that, which reads as one side taking all the
-    // dirt. Ranking spends the full range across the mesh instead of leaving
-    // most of it on whichever fold happens to be sharpest.
-    //
-    // Grading against a local neighbourhood would even the two folds properly,
-    // but terrain this coarse has no locality to work with: four graph steps
-    // reach the whole 76 vertex ramp, so every local peak is the global one.
-    // That wants more vertices, not a different formula.
-    let even = even.clamp(0.0, 1.0);
-    let graded: BTreeMap<usize, f32> = match even > 0.0 {
-        false => graded,
-        true => {
-            let mut ordered = graded
-                .iter()
-                .map(|(weld, value)| (*value, *weld))
-                .collect::<Vec<_>>();
-            ordered.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-            let last = ordered.len().saturating_sub(1).max(1) as f32;
-            ordered
-                .iter()
-                .enumerate()
-                .map(|(rank, (value, weld))| (*weld, value + (rank as f32 / last - value) * even))
-                .collect()
-        }
-    };
-
-    // Spread walks the dirt outward from the creases it was measured on.
-    // Concavity only exists at a fold, so on coarse terrain it lands on a
-    // handful of vertices and stops; the surrounding faces are flat and score
-    // nothing however strong the bake is. Each pass lets a vertex take a
-    // fraction of its dirtiest neighbour, so the dirt reaches across the
-    // surface instead of clinging to the edge that produced it.
-    let mut graded = graded;
-    for _ in 0..spread.min(12) {
-        graded = graded
-            .iter()
-            .map(|(weld, value)| {
-                let reached = adjacency
-                    .get(weld)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|neighbour| graded.get(neighbour))
-                    .fold(0.0f32, |highest, neighbour| highest.max(*neighbour));
-                (*weld, value.max(reached * 0.72))
-            })
-            .collect();
-    }
-
-    let bias = bias.clamp(0.0, 1.0);
-    welds
-        .iter()
-        .map(|weld| {
-            let value = graded.get(weld).copied().unwrap_or(0.0);
-            // Direction: at 0 every crease dirties alike, at 1 only the ones
-            // facing the chosen angle do. Half lambert, so it fades in instead
-            // of cutting off along a hard terminator.
-            let facing = normals
-                .get(weld)
-                .map(|normal| vec3_dot(*normal, direction) * 0.5 + 0.5)
-                .unwrap_or(1.0);
-            value * (1.0 - bias + bias * facing)
         })
         .collect()
 }
@@ -1906,37 +1661,6 @@ impl SmsEditorApp {
             .clicked()
         {
             self.bake_terrain_occlusion();
-        }
-
-        ui.separator();
-        ui.strong("Dirty (cavity AO)");
-        ui.add(egui::Slider::new(&mut self.vertex_paint_dirt, 0.0..=1.0).text("Dirty"));
-        ui.add(
-            egui::Slider::new(&mut self.vertex_paint_dirt_ramp, 0.25..=4.0)
-                .logarithmic(true)
-                .text("Ramp"),
-        )
-        .on_hover_text("Above 1 tightens dirt into deep creases; below 1 spreads it wider");
-        ui.add(egui::Slider::new(&mut self.vertex_paint_dirt_even, 0.0..=1.0).text("Even"))
-            .on_hover_text(
-                "Grade creases by rank instead of depth, so a shallow fold dirties as much as a                  sharp one",
-            );
-        ui.add(egui::Slider::new(&mut self.vertex_paint_dirt_spread, 0..=12).text("Spread"))
-            .on_hover_text("How far the dirt travels out from the creases it was measured on");
-        ui.add(egui::Slider::new(&mut self.vertex_paint_dirt_bias, 0.0..=1.0).text("Direction"))
-            .on_hover_text("0 dirties every crease equally; 1 only those facing the angle below");
-        ui.add_enabled_ui(self.vertex_paint_dirt_bias > 0.0, |ui| {
-            ui.add(egui::Slider::new(&mut self.vertex_paint_dirt_yaw, -180.0..=180.0).text("Yaw"));
-            ui.add(
-                egui::Slider::new(&mut self.vertex_paint_dirt_pitch, -90.0..=90.0).text("Pitch"),
-            );
-        });
-        if ui
-            .button("Bake Dirt")
-            .on_hover_text("Darken creases and inner edges")
-            .clicked()
-        {
-            self.bake_terrain_dirt();
         }
 
         ui.separator();

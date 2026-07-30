@@ -283,6 +283,16 @@ impl SmsEditorApp {
                     self.tool = self.tool.after_toolbar_click(EditorTool::VertexPaint);
                 }
 
+                let boolean_active = self.tool == EditorTool::Boolean;
+                if ui
+                    .selectable_label(boolean_active, "Boolean Cut Tool")
+                    .on_hover_text("Cut terrain along where another mesh crosses it")
+                    .clicked()
+                {
+                    ui.close();
+                    self.tool = self.tool.after_toolbar_click(EditorTool::Boolean);
+                }
+
                 ui.separator();
                 // Placeholders for tools that do not exist yet. Deliberately
                 // disabled rather than inert-but-clickable, so the menu cannot
@@ -1437,6 +1447,10 @@ impl SmsEditorApp {
     pub(super) fn inspector_panel(&mut self, ui: &mut egui::Ui) {
         if self.tool == EditorTool::VertexPaint {
             self.vertex_paint_panel(ui);
+            return;
+        }
+        if self.tool == EditorTool::Boolean {
+            self.boolean_cut_panel(ui);
             return;
         }
         if self.tool == EditorTool::Goop {
@@ -2664,7 +2678,7 @@ fn is_palette_service_type(type_name: &str) -> bool {
 fn tool_shortcut(tool: EditorTool) -> &'static str {
     match tool {
         EditorTool::Select => "Q",
-        EditorTool::VertexPaint => "Tools menu",
+        EditorTool::VertexPaint | EditorTool::Boolean => "Tools menu",
         EditorTool::Move => "W",
         EditorTool::Rotate => "E",
         EditorTool::Scale => "R",
