@@ -467,6 +467,10 @@ pub(super) struct PreparedModelImport {
     pub(super) relative_path: PathBuf,
     pub(super) source_path: PathBuf,
     pub(super) document: ModelAssetDocument,
+    /// Set when the import overwrites an existing asset rather than creating
+    /// one. Keeping the id is the point: every placement already refers to it,
+    /// so they all follow the swap without being touched.
+    pub(super) replaces: Option<AssetId>,
 }
 
 impl SmsEditorApp {
@@ -585,6 +589,7 @@ impl SmsEditorApp {
                     relative_path,
                     source_path: task_source,
                     document: imported.asset,
+                    replaces: None,
                 })
                 .map_err(|error| error.to_string());
             if !worker_cancel.load(Ordering::Acquire) {
@@ -596,6 +601,134 @@ impl SmsEditorApp {
             "Importing model '{}' in the background...",
             source_path.display()
         ));
+    }
+
+    /// Re-imports an existing asset from a different glTF or GLB.
+    ///
+    /// The asset keeps its id, path and display name, so every instance placed
+    /// from it in every stage picks up the new geometry without being relinked.
+    pub(super) fn begin_model_source_replacement(&mut self, id: AssetId) {
+        if !self.content_catalog_mutation_allowed("replace a model source") {
+            return;
+        }
+        if self.model_import_job.is_some() {
+            self.log
+                .push("A model import is already running.".to_string());
+            return;
+        }
+        let Some(entry) = self
+            .model_catalog_entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+        else {
+            self.log
+                .push("That model is no longer in the catalog.".to_string());
+            return;
+        };
+        let Some(source_path) = rfd::FileDialog::new()
+            .set_title(format!("Replace '{}' with", entry.name))
+            .add_filter("glTF model", &["gltf", "glb"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        let mut options = self.model_import_options.clone();
+        if let CollisionSource::SeparateFile {
+            options: collision_options,
+            ..
+        } = &mut options.collision
+        {
+            collision_options.coordinate_conversion = options.coordinate_conversion;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let task_source = source_path.clone();
+        let relative_path = entry.relative_path.clone();
+        std::thread::spawn(move || {
+            if worker_cancel.load(Ordering::Acquire) {
+                return;
+            }
+            let result = sms_authoring::import_model(&task_source, &options)
+                .map(|imported| PreparedModelImport {
+                    relative_path,
+                    source_path: task_source,
+                    document: imported.asset,
+                    replaces: Some(id),
+                })
+                .map_err(|error| error.to_string());
+            if !worker_cancel.load(Ordering::Acquire) {
+                let _ = sender.send(result);
+            }
+        });
+        self.model_import_job = Some(ModelImportJob { cancel, receiver });
+        self.log.push(format!(
+            "Replacing '{}' with '{}' in the background...",
+            entry.name,
+            source_path.display()
+        ));
+    }
+
+    fn commit_model_source_replacement(&mut self, id: AssetId, prepared: PreparedModelImport) {
+        if !self.content_catalog_mutation_allowed("commit the replaced model") {
+            return;
+        }
+        let catalog = match self.model_catalog() {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                self.log
+                    .push(format!("Model replacement was not committed: {error}"));
+                return;
+            }
+        };
+        let Some(entry) = self
+            .model_catalog_entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+        else {
+            self.log
+                .push("That model is no longer in the catalog.".to_string());
+            return;
+        };
+
+        // The name comes from the asset, not the file that was just picked, so
+        // a swap does not rename what the hierarchy and the browser show.
+        let mut document = prepared.document;
+        document.name = entry.name.clone();
+
+        match catalog.save_asset(id, &document) {
+            Ok(_) => {
+                self.model_asset_preview_cache
+                    .retain(|key, _| key.asset_id != id);
+                self.force_refresh_model_catalog();
+                if self.selected_model_asset == Some(id) {
+                    // Reload the open editor so it is not still showing the
+                    // geometry that was just overwritten.
+                    self.selected_model_document = Some(document.clone());
+                    self.saved_model_document = Some(document);
+                    self.asset_dirty = false;
+                    self.selected_model_material = 0;
+                    self.selected_model_texture = 0;
+                }
+                self.rebuild_model_preview_cache();
+                // New geometry under the same asset means any goop generated
+                // from the old terrain no longer matches it.
+                self.refresh_goop_stale_from_final_terrain();
+                self.rebuild_generated_goop_layers_if_stale();
+                self.log.push(format!(
+                    "Replaced '{}' from '{}'. Vertex colours and materials came from the new \
+                     file, so any paint on the old geometry is gone.",
+                    entry.name,
+                    prepared.source_path.display()
+                ));
+            }
+            Err(error) => self
+                .log
+                .push(format!("Model replacement could not be committed: {error}")),
+        }
     }
 
     pub(super) fn cancel_model_import(&mut self) {
@@ -618,7 +751,10 @@ impl SmsEditorApp {
         match result {
             Some(Ok(Ok(prepared))) => {
                 self.model_import_job = None;
-                self.commit_prepared_model_import(prepared);
+                match prepared.replaces {
+                    Some(id) => self.commit_model_source_replacement(id, prepared),
+                    None => self.commit_prepared_model_import(prepared),
+                }
             }
             Some(Ok(Err(error))) => {
                 self.model_import_job = None;

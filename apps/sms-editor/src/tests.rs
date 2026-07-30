@@ -5100,3 +5100,75 @@ fn triangle_height_lookup_covers_its_own_column() {
         None
     );
 }
+
+/// A grid with a symmetric pit dirties symmetrically, whichever way it was cut.
+///
+/// Every quad here is split along the same diagonal, so each vertex has
+/// neighbours on that diagonal and none on the other. Averaging edges equally
+/// leans the bake along it, which is what made the dirt come out tilted on a
+/// mesh whose geometry has no tilt in it at all.
+#[test]
+fn cavity_does_not_lean_along_the_triangulation() {
+    const SIDE: usize = 5;
+    const STEP: f32 = 100.0;
+    let index_of = |x: usize, z: usize| (z * SIDE + x) as u32;
+
+    let mut positions = Vec::new();
+    for z in 0..SIDE {
+        for x in 0..SIDE {
+            // A pit at the centre: symmetric under a quarter turn.
+            let centre = x == SIDE / 2 && z == SIDE / 2;
+            positions.push([
+                x as f32 * STEP,
+                if centre { -60.0 } else { 0.0 },
+                z as f32 * STEP,
+            ]);
+        }
+    }
+    let mut indices = Vec::new();
+    for z in 0..SIDE - 1 {
+        for x in 0..SIDE - 1 {
+            indices.extend([
+                index_of(x, z),
+                index_of(x + 1, z + 1),
+                index_of(x + 1, z),
+                index_of(x, z),
+                index_of(x, z + 1),
+                index_of(x + 1, z + 1),
+            ]);
+        }
+    }
+
+    let primitive = sms_authoring::ModelPrimitive {
+        positions: positions.clone(),
+        normals: vec![[0.0, 1.0, 0.0]; positions.len()],
+        tangents: Vec::new(),
+        tex_coords: Vec::new(),
+        colors: Vec::new(),
+        indices,
+        material: None,
+    };
+    let world = positions
+        .iter()
+        .map(|position| crate::vertex_paint::WorldVertex {
+            position: *position,
+            normal: [0.0, 1.0, 0.0],
+        })
+        .collect::<Vec<_>>();
+
+    let cavity = crate::vertex_paint::primitive_cavity(&primitive, &world, [0.0, 1.0, 0.0], 0.0);
+    let middle = SIDE / 2;
+    let ring = [
+        cavity[middle * SIDE + middle - 1],
+        cavity[middle * SIDE + middle + 1],
+        cavity[(middle - 1) * SIDE + middle],
+        cavity[(middle + 1) * SIDE + middle],
+    ];
+    let high = ring.iter().copied().fold(f32::MIN, f32::max);
+    let low = ring.iter().copied().fold(f32::MAX, f32::min);
+    assert!(high > 0.0, "the pit has to dirty something: {ring:?}");
+    assert!(
+        (high - low) / high < 0.05,
+        "the four sides of a symmetric pit must dirty alike: {ring:?}"
+    );
+}

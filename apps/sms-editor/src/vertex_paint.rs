@@ -90,9 +90,9 @@ struct PaintTarget {
 }
 
 /// One vertex of a target, resolved into world space.
-struct WorldVertex {
-    position: [f32; 3],
-    normal: [f32; 3],
+pub(super) struct WorldVertex {
+    pub(super) position: [f32; 3],
+    pub(super) normal: [f32; 3],
 }
 
 fn transform_point(matrix: [[f32; 4]; 4], point: [f32; 3]) -> [f32; 3] {
@@ -724,6 +724,16 @@ impl SmsEditorApp {
     pub(super) fn bake_terrain_dirt(&mut self) {
         let amount = self.vertex_paint_dirt.clamp(0.0, 1.0);
         let ramp = self.vertex_paint_dirt_ramp.clamp(0.05, 8.0);
+        let (yaw, pitch) = (
+            self.vertex_paint_dirt_yaw.to_radians(),
+            self.vertex_paint_dirt_pitch.to_radians(),
+        );
+        let direction = [
+            pitch.cos() * yaw.sin(),
+            pitch.sin(),
+            pitch.cos() * yaw.cos(),
+        ];
+        let bias = self.vertex_paint_dirt_bias.clamp(0.0, 1.0);
         let mut targets = self.terrain_paint_targets_scoped(true);
         if targets.is_empty() {
             self.log.push(
@@ -737,7 +747,8 @@ impl SmsEditorApp {
             let mut primitive_index = 0usize;
             for mesh in &mut target.document.meshes {
                 for primitive in &mut mesh.primitives {
-                    let dirt = primitive_cavity(primitive, &world[primitive_index]);
+                    let dirt =
+                        primitive_cavity(primitive, &world[primitive_index], direction, bias);
                     primitive_index += 1;
                     let colors = primitive_colors_mut(primitive);
                     for (index, color) in colors.iter_mut().enumerate() {
@@ -1079,55 +1090,121 @@ fn smoothed_colors(
 }
 
 /// Per-vertex cavity factor in 0..1, where 1 is a deep crease.
-fn primitive_cavity(primitive: &sms_authoring::ModelPrimitive, world: &[WorldVertex]) -> Vec<f32> {
-    // World space, not the raw local arrays. Concavity is a dot product so
-    // rotation does not matter, but any non-uniform scale on the node or the
-    // placement skews it along an axis, which reads as the dirt being tilted.
+pub(super) fn primitive_cavity(
+    primitive: &sms_authoring::ModelPrimitive,
+    world: &[WorldVertex],
+    direction: [f32; 3],
+    bias: f32,
+) -> Vec<f32> {
+    // World space, because a non-uniform scale on the node or the placement
+    // would otherwise skew the result along an axis.
     let positions = world
         .iter()
         .map(|vertex| vertex.position)
         .collect::<Vec<_>>();
     let welds = weld_positions(&positions);
     let adjacency = primitive_adjacency(&primitive.indices, &welds);
+
+    // Angle weighted, not one equal share per edge. A grid triangulated along a
+    // single diagonal gives every vertex neighbours on that diagonal and none
+    // on the other, so weighting edges equally leans the whole bake along it.
+    // That is the tilt: it is in the triangulation, not the transform.
+    // Weighting by the corner angle each edge subtends makes the sampling even
+    // no matter how the surface was cut up.
+    let corner_angle = |origin: [f32; 3], a: [f32; 3], b: [f32; 3]| -> f32 {
+        let u = vec3_sub(a, origin);
+        let v = vec3_sub(b, origin);
+        let (lu, lv) = (vec3_dot(u, u).sqrt(), vec3_dot(v, v).sqrt());
+        if lu <= f32::EPSILON || lv <= f32::EPSILON {
+            return 0.0;
+        }
+        (vec3_dot(u, v) / (lu * lv)).clamp(-1.0, 1.0).acos()
+    };
+
+    let triangles = primitive.indices.chunks_exact(3).filter_map(|triangle| {
+        let indices = [
+            triangle[0] as usize,
+            triangle[1] as usize,
+            triangle[2] as usize,
+        ];
+        indices
+            .iter()
+            .all(|index| *index < positions.len() && *index < welds.len())
+            .then_some(indices)
+    });
+    let corners = triangles
+        .flat_map(|indices| {
+            (0..3).map(move |corner| {
+                (
+                    indices[corner],
+                    indices[(corner + 1) % 3],
+                    indices[(corner + 2) % 3],
+                )
+            })
+        })
+        .filter_map(|(origin, a, b)| {
+            let angle = corner_angle(positions[origin], positions[a], positions[b]);
+            (angle > f32::EPSILON).then_some((origin, a, b, angle))
+        })
+        .collect::<Vec<_>>();
+
+    // Normals get the same weighting, so a long thin triangle does not shout
+    // over a compact one that covers more of the surface around the vertex.
     let mut normals: BTreeMap<usize, [f32; 3]> = BTreeMap::new();
-    for (index, weld) in welds.iter().enumerate() {
+    for (origin, _, _, angle) in &corners {
         let normal = world
-            .get(index)
+            .get(*origin)
             .map(|vertex| vertex.normal)
             .unwrap_or([0.0, 1.0, 0.0]);
-        let entry = normals.entry(*weld).or_insert([0.0; 3]);
+        let entry = normals.entry(welds[*origin]).or_insert([0.0; 3]);
         for axis in 0..3 {
-            entry[axis] += normal[axis];
+            entry[axis] += normal[axis] * angle;
         }
     }
+    let normals: BTreeMap<usize, [f32; 3]> = normals
+        .into_iter()
+        .filter_map(|(weld, normal)| {
+            let length = vec3_dot(normal, normal).sqrt();
+            (length > f32::EPSILON).then(|| (weld, vec3_scale(normal, 1.0 / length)))
+        })
+        .collect();
 
-    let mut cavity: BTreeMap<usize, f32> = BTreeMap::new();
-    for (position, neighbours) in &adjacency {
-        let normal = normals.get(position).copied().unwrap_or([0.0, 1.0, 0.0]);
-        let length = vec3_dot(normal, normal).sqrt();
-        if length <= f32::EPSILON {
+    let bias = bias.clamp(0.0, 1.0);
+    let mut sums: BTreeMap<usize, (f32, f32)> = BTreeMap::new();
+    for (origin, a, b, angle) in &corners {
+        let weld = welds[*origin];
+        let Some(normal) = normals.get(&weld) else {
             continue;
-        }
-        let normal = vec3_scale(normal, 1.0 / length);
-        let origin = positions[*position];
-        let mut concavity = 0.0f32;
-        let mut count = 0usize;
-        for neighbour in neighbours {
-            let Some(target) = positions.get(*neighbour) else {
-                continue;
-            };
-            let delta = vec3_sub(*target, origin);
+        };
+        // The corner's weight is split between the two edges leaving it.
+        let weight = angle * 0.5;
+        for neighbour in [a, b] {
+            let delta = vec3_sub(positions[*neighbour], positions[*origin]);
             let distance = vec3_dot(delta, delta).sqrt();
             if distance <= f32::EPSILON {
                 continue;
             }
-            concavity += vec3_dot(vec3_scale(delta, 1.0 / distance), normal);
-            count += 1;
-        }
-        if count > 0 {
-            cavity.insert(*position, (concavity / count as f32).clamp(0.0, 1.0));
+            let entry = sums.entry(weld).or_insert((0.0, 0.0));
+            entry.0 += vec3_dot(vec3_scale(delta, 1.0 / distance), *normal) * weight;
+            entry.1 += weight;
         }
     }
+
+    let cavity: BTreeMap<usize, f32> = sums
+        .into_iter()
+        .filter(|(_, (_, weight))| *weight > f32::EPSILON)
+        .map(|(weld, (sum, weight))| {
+            let concavity = (sum / weight).clamp(0.0, 1.0);
+            // Direction bias: at 0 every crease dirties equally, at 1 only the
+            // ones facing the chosen direction do. Half lambert so it fades in
+            // rather than cutting off along a hard terminator.
+            let facing = normals
+                .get(&weld)
+                .map(|normal| vec3_dot(*normal, direction) * 0.5 + 0.5)
+                .unwrap_or(1.0);
+            (weld, concavity * (1.0 - bias + bias * facing))
+        })
+        .collect();
 
     // One relaxation pass, so dirt grades into surrounding faces instead of
     // hugging single vertices.
@@ -1481,6 +1558,14 @@ impl SmsEditorApp {
                 .text("Ramp"),
         )
         .on_hover_text("Above 1 tightens dirt into deep creases; below 1 spreads it wider");
+        ui.add(egui::Slider::new(&mut self.vertex_paint_dirt_bias, 0.0..=1.0).text("Direction"))
+            .on_hover_text("0 dirties every crease equally; 1 only those facing the angle below");
+        ui.add_enabled_ui(self.vertex_paint_dirt_bias > 0.0, |ui| {
+            ui.add(egui::Slider::new(&mut self.vertex_paint_dirt_yaw, -180.0..=180.0).text("Yaw"));
+            ui.add(
+                egui::Slider::new(&mut self.vertex_paint_dirt_pitch, -90.0..=90.0).text("Pitch"),
+            );
+        });
         if ui
             .button("Bake Dirt")
             .on_hover_text("Darken creases and inner edges")
