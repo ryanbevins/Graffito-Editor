@@ -76,6 +76,63 @@ const HUE_SINE: [[f32; 3]; 3] = [
     [-(1.0 - HUE_LUMA[0]), HUE_LUMA[1], HUE_LUMA[2]],
 ];
 
+/// Rewinds triangles whose winding disagrees with their own vertex normals.
+///
+/// Returns how many were flipped and how many were judged.
+///
+/// A mesh can arrive wound against its normals. Nothing shows while it is drawn
+/// as an object, but map terrain is loaded with flags that leave back-face
+/// culling on, so the disagreeing faces drop out and the model reads as inside
+/// out. The normals are the intent -- they say which way the artist meant the
+/// surface to face -- so the winding is what gets corrected, and only on the
+/// triangles that actually disagree. A consistent mesh comes back untouched.
+///
+/// Local space is the right place for this. Compile reverses winding again for
+/// a mirrored placement and carries normals through the same transform, so
+/// agreement here survives into the baked model.
+pub(super) fn repair_document_winding(document: &mut ModelAssetDocument) -> (usize, usize) {
+    let mut flipped = 0usize;
+    let mut checked = 0usize;
+    for mesh in &mut document.meshes {
+        for primitive in &mut mesh.primitives {
+            let positions = primitive.positions.clone();
+            let normals = primitive.normals.clone();
+            for face in primitive.indices.chunks_exact_mut(3) {
+                let corners = [face[0] as usize, face[1] as usize, face[2] as usize];
+                let Some(corner_positions) = corners
+                    .iter()
+                    .map(|index| positions.get(*index).copied())
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    continue;
+                };
+                let geometric = vec3_cross(
+                    vec3_sub(corner_positions[1], corner_positions[0]),
+                    vec3_sub(corner_positions[2], corner_positions[0]),
+                );
+                // A sliver has no reliable facing, so leave it rather than
+                // flip it on rounding noise.
+                if vec3_dot(geometric, geometric) <= 1e-8 {
+                    continue;
+                }
+                let intended = corners
+                    .iter()
+                    .filter_map(|index| normals.get(*index))
+                    .fold([0.0f32; 3], |sum, normal| vec3_add(sum, *normal));
+                if vec3_dot(intended, intended) <= 1e-8 {
+                    continue;
+                }
+                checked += 1;
+                if vec3_dot(geometric, intended) < 0.0 {
+                    face.swap(1, 2);
+                    flipped += 1;
+                }
+            }
+        }
+    }
+    (flipped, checked)
+}
+
 /// A non-destructive grade over vertex colours.
 ///
 /// Held open while the sliders are being moved so every change re-grades the
@@ -350,6 +407,10 @@ fn primitive_colors_mut(primitive: &mut sms_authoring::ModelPrimitive) -> &mut V
 /// so a channel left on the default register source ignores the vertex colour
 /// array entirely.
 const GX_SRC_VTX: u8 = 1;
+
+/// `GX_CULL_NONE`. The importer writes 2, `GX_CULL_BACK`, for anything the
+/// source did not mark double sided.
+const GX_CULL_NONE: u32 = 0;
 
 /// An untextured material whose single TEV stage passes the rasterised colour
 /// straight through, matching what the importer builds for a textureless
@@ -1176,13 +1237,7 @@ impl SmsEditorApp {
     }
 
     /// Resets every terrain vertex to opaque white.
-    /// Rewinds triangles whose winding disagrees with their own vertex normals.
-    ///
-    /// A mesh can arrive with its faces wound against its normals, and baking
-    /// as terrain is where it shows: the surface is drawn from the other side
-    /// and reads as inside out. The normals are the intent, so the winding is
-    /// what gets corrected, and only on the triangles that actually disagree.
-    /// A mesh that is already consistent is left exactly as it was.
+    /// Rewinds terrain triangles that disagree with their own vertex normals.
     pub(super) fn repair_terrain_winding(&mut self) {
         let mut targets = self.terrain_paint_targets_scoped(true);
         if targets.is_empty() {
@@ -1194,48 +1249,15 @@ impl SmsEditorApp {
         let mut flipped = 0usize;
         let mut checked = 0usize;
         for target in &mut targets {
-            for mesh in &mut target.document.meshes {
-                for primitive in &mut mesh.primitives {
-                    let positions = primitive.positions.clone();
-                    let normals = primitive.normals.clone();
-                    for face in primitive.indices.chunks_exact_mut(3) {
-                        let corners = [face[0] as usize, face[1] as usize, face[2] as usize];
-                        let Some(corner_positions) = corners
-                            .iter()
-                            .map(|index| positions.get(*index).copied())
-                            .collect::<Option<Vec<_>>>()
-                        else {
-                            continue;
-                        };
-                        let geometric = vec3_cross(
-                            vec3_sub(corner_positions[1], corner_positions[0]),
-                            vec3_sub(corner_positions[2], corner_positions[0]),
-                        );
-                        // A sliver has no reliable facing, so leave it rather
-                        // than flip it on rounding noise.
-                        if vec3_dot(geometric, geometric) <= 1e-8 {
-                            continue;
-                        }
-                        let intended = corners
-                            .iter()
-                            .filter_map(|index| normals.get(*index))
-                            .fold([0.0f32; 3], |sum, normal| vec3_add(sum, *normal));
-                        if vec3_dot(intended, intended) <= 1e-8 {
-                            continue;
-                        }
-                        checked += 1;
-                        if vec3_dot(geometric, intended) < 0.0 {
-                            face.swap(1, 2);
-                            flipped += 1;
-                        }
-                    }
-                }
-            }
+            let (mesh_flipped, mesh_checked) = repair_document_winding(&mut target.document);
+            flipped += mesh_flipped;
+            checked += mesh_checked;
         }
 
         if flipped == 0 {
             self.log.push(format!(
-                "Winding already agrees with the normals across {checked} triangle(s); nothing                  to repair."
+                "Winding already agrees with the normals across {checked} triangle(s); nothing \
+                 to repair."
             ));
             return;
         }
@@ -1243,6 +1265,46 @@ impl SmsEditorApp {
         self.commit_terrain_targets(targets, "Repaired terrain winding", false);
         self.log.push(format!(
             "Rewound {flipped} of {checked} triangle(s) to face the way their normals point."
+        ));
+    }
+
+    /// Turns culling off for the selected terrain's materials.
+    ///
+    /// Baking as terrain is where a single-sided material starts costing you
+    /// faces: the same mesh drawn as a separate object keeps them, so the two
+    /// modes disagree and the terrain reads as inside out. Drawing both sides
+    /// makes them agree no matter which way any given triangle is wound, which
+    /// is the one repair that does not depend on trusting the normals.
+    ///
+    /// It is not free. Both sides of every triangle get rasterised, so reach
+    /// for `Fix Facing` first and keep this for meshes it cannot resolve.
+    pub(super) fn make_terrain_double_sided(&mut self) {
+        let mut targets = self.terrain_paint_targets_scoped(true);
+        if targets.is_empty() {
+            self.log.push(
+                "Select a terrain instance in the hierarchy before changing its culling."
+                    .to_string(),
+            );
+            return;
+        }
+        let mut changed = 0usize;
+        for target in &mut targets {
+            for material in &mut target.document.materials {
+                if material.gx.cull_mode != GX_CULL_NONE {
+                    material.gx.cull_mode = GX_CULL_NONE;
+                    material.source_double_sided = true;
+                    changed += 1;
+                }
+            }
+        }
+        if changed == 0 {
+            self.log
+                .push("That terrain already draws both sides.".to_string());
+            return;
+        }
+        self.commit_terrain_targets(targets, "Made terrain double sided", false);
+        self.log.push(format!(
+            "{changed} material(s) now draw both sides, so no face drops out of the terrain bake."
         ));
     }
 
@@ -2185,6 +2247,15 @@ impl SmsEditorApp {
                 .clicked()
             {
                 self.smooth_terrain_vertex_colors();
+            }
+            if ui
+                .button("Double-Sided")
+                .on_hover_text(
+                    "Draw both sides of the selected terrain, so no face can drop out of the                      bake. Costs fill rate; try Fix Facing first",
+                )
+                .clicked()
+            {
+                self.make_terrain_double_sided();
             }
             if ui
                 .button("Fix Facing")
