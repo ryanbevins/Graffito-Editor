@@ -282,7 +282,15 @@ impl VertexPaintGradeSettings {
         // bake laid down, leaving the lit surfaces where they are.
         if self.tint_amount != 0.0 {
             let weight = shading(color) * self.tint_amount;
-            for (channel, tint) in color.iter_mut().take(3).zip(self.tint.iter()) {
+            // The tint is matched to the vertex's own brightness before it is
+            // blended in, so it colours the shadow without lightening it.
+            // Blending toward the raw colour carries its brightness too: a
+            // white tint then pulled shadows toward white, which is relieving
+            // them rather than tinting them, and that is what Shadow is for.
+            let level = luma([color[0], color[1], color[2]]);
+            let strength = luma(self.tint).max(1e-3);
+            let matched: [f32; 3] = std::array::from_fn(|axis| self.tint[axis] * level / strength);
+            for (channel, tint) in color.iter_mut().take(3).zip(matched.iter()) {
                 *channel += (tint - *channel) * weight;
             }
         }
