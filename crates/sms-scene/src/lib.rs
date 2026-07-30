@@ -341,6 +341,11 @@ pub struct StageObjectLighting {
 }
 
 impl StageLighting {
+    pub fn player_lighting(&self) -> Option<StageObjectLighting> {
+        self.resolve_player_lighting()
+            .map(|(lighting, _used_ordinal_fallback)| lighting)
+    }
+
     pub fn object_lighting(&self) -> Option<StageObjectLighting> {
         self.resolve_object_lighting()
             .map(|(lighting, _used_ordinal_fallback)| lighting)
@@ -349,6 +354,41 @@ impl StageLighting {
     pub fn object_lighting_uses_ordinal_fallback(&self) -> bool {
         self.resolve_object_lighting()
             .is_some_and(|(_lighting, used_ordinal_fallback)| used_ordinal_fallback)
+    }
+
+    fn resolve_player_lighting(&self) -> Option<(StageObjectLighting, bool)> {
+        let player_primary = |name: &str| {
+            name.contains("プレイヤー")
+                && name.contains("太陽")
+                && !name.contains("サブ")
+                && !name.contains("スペキュラ")
+        };
+        let (light, light_fallback) = self
+            .lights
+            .iter()
+            .find(|light| light.name.as_deref().is_some_and(player_primary))
+            .map(|light| (light, false))
+            .or_else(|| self.lights.first().map(|light| (light, true)))?;
+        let (ambient, ambient_fallback) = self
+            .ambients
+            .iter()
+            .find(|ambient| {
+                ambient.name.as_deref().is_some_and(|name| {
+                    name.contains("プレイヤー")
+                        && name.contains("アンビエント")
+                        && !name.contains("サブ")
+                })
+            })
+            .map(|ambient| (ambient, false))
+            .or_else(|| self.ambients.first().map(|ambient| (ambient, true)))?;
+        Some((
+            StageObjectLighting {
+                position: light.position,
+                color: light.color,
+                ambient: ambient.color,
+            },
+            light_fallback || ambient_fallback,
+        ))
     }
 
     fn resolve_object_lighting(&self) -> Option<(StageObjectLighting, bool)> {
@@ -3585,6 +3625,43 @@ mod tests {
             })
         );
         assert!(!lighting.object_lighting_uses_ordinal_fallback());
+    }
+
+    #[test]
+    fn selects_primary_player_light_and_ambient_by_runtime_names() {
+        let lighting = StageLighting {
+            lights: vec![
+                JDramaLight {
+                    name: Some("太陽（オブジェクト）".to_string()),
+                    position: [9.0; 3],
+                    color: [10; 4],
+                },
+                JDramaLight {
+                    name: Some("太陽（プレイヤー）".to_string()),
+                    position: [1.0, 2.0, 3.0],
+                    color: [4, 5, 6, 255],
+                },
+            ],
+            ambients: vec![
+                JDramaAmbient {
+                    name: Some("太陽アンビエント（オブジェクト）".to_string()),
+                    color: [11; 4],
+                },
+                JDramaAmbient {
+                    name: Some("太陽アンビエント（プレイヤー）".to_string()),
+                    color: [7, 8, 9, 255],
+                },
+            ],
+        };
+
+        assert_eq!(
+            lighting.player_lighting(),
+            Some(StageObjectLighting {
+                position: [1.0, 2.0, 3.0],
+                color: [4, 5, 6, 255],
+                ambient: [7, 8, 9, 255],
+            })
+        );
     }
 
     #[test]

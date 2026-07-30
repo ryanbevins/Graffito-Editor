@@ -282,6 +282,9 @@ pub struct GpuViewportFrame {
     pub light_position: [f32; 3],
     pub light_color: [f32; 4],
     pub ambient_color: Option<[f32; 4]>,
+    pub object_light_position: [f32; 3],
+    pub object_light_color: [f32; 4],
+    pub object_ambient_color: Option<[f32; 4]>,
     pub show_grid: bool,
     pub death_barrier_y: Option<f32>,
 }
@@ -301,6 +304,9 @@ impl Default for GpuViewportFrame {
             light_position: [200_000.0, 500_000.0, 200_000.0],
             light_color: [1.0; 4],
             ambient_color: None,
+            object_light_position: [200_000.0, 500_000.0, 200_000.0],
+            object_light_color: [1.0; 4],
+            object_ambient_color: None,
             show_grid: false,
             death_barrier_y: None,
         }
@@ -563,6 +569,7 @@ impl GpuSceneData {
                 usize,
                 u8,
                 bool,
+                bool,
                 Option<usize>,
                 Option<usize>,
                 GpuPipelineKey,
@@ -572,8 +579,15 @@ impl GpuSceneData {
         let mut batches = Vec::<GpuBatchData>::new();
         let mut triangle_vertices = vec![None; preview.triangles.len()];
         let updateable_triangles = updateable_preview_triangles(preview);
+        let stage_object_lighting_model_indices = preview
+            .object_model_indices
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>();
 
         for (triangle_index, triangle) in preview.triangles.iter().enumerate() {
+            let uses_stage_object_lighting =
+                stage_object_lighting_model_indices.contains(&triangle.model_index);
             let material_index = triangle
                 .material_index
                 .filter(|index| *index < materials.len())
@@ -612,6 +626,7 @@ impl GpuSceneData {
                     triangle.packet_index,
                     material_index,
                     render_layer_id(triangle.render_layer),
+                    uses_stage_object_lighting,
                     mirror_visible,
                     mirror_slot,
                     mirror_actor_model_index,
@@ -624,6 +639,7 @@ impl GpuSceneData {
                         material_index,
                         packet_index: triangle.packet_index,
                         render_layer: triangle.render_layer,
+                        uses_stage_object_lighting,
                         mirror_visible,
                         mirror_slot,
                         mirror_actor_model_index,
@@ -714,18 +730,26 @@ impl GpuSceneData {
                 usize,
                 u8,
                 bool,
+                bool,
                 Option<usize>,
                 Option<usize>,
                 GpuPipelineKey,
             ),
             usize,
         >::new();
+        let stage_object_lighting_model_indices = preview
+            .object_model_indices
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>();
         self.triangle_vertices.resize(preview.triangles.len(), None);
 
         let triangle_start = triangle_range.start.min(preview.triangles.len());
         let triangle_end = triangle_range.end.min(preview.triangles.len());
         for triangle_index in triangle_start..triangle_end {
             let triangle = &preview.triangles[triangle_index];
+            let uses_stage_object_lighting =
+                stage_object_lighting_model_indices.contains(&triangle.model_index);
             let material_index = triangle
                 .material_index
                 .and_then(|index| material_indices.get(&index).copied())
@@ -765,6 +789,7 @@ impl GpuSceneData {
                     triangle.packet_index,
                     material_index,
                     render_layer_id(triangle.render_layer),
+                    uses_stage_object_lighting,
                     mirror_visible,
                     mirror_slot,
                     mirror_actor_model_index,
@@ -777,6 +802,7 @@ impl GpuSceneData {
                         material_index,
                         packet_index: triangle.packet_index,
                         render_layer: triangle.render_layer,
+                        uses_stage_object_lighting,
                         mirror_visible,
                         mirror_slot,
                         mirror_actor_model_index,
@@ -900,6 +926,14 @@ fn apply_batch_material_overrides(
     }) {
         material.uniform.texture_sizes[1] = texture_size_uniform(SMS_SCREEN_TEXTURE_SIZE);
     }
+    material.uniform.runtime_parameters[3] = if batches
+        .iter()
+        .any(|batch| batch.material_index == material_index && batch.uses_stage_object_lighting)
+    {
+        1.0
+    } else {
+        0.0
+    };
     material.runtime_wave = batches.iter().any(|batch| {
         batch.material_index == material_index && batch.render_layer == PreviewRenderLayer::WaveFoam
     });
@@ -2178,6 +2212,7 @@ struct GpuBatchData {
     material_index: usize,
     packet_index: usize,
     render_layer: PreviewRenderLayer,
+    uses_stage_object_lighting: bool,
     mirror_visible: bool,
     mirror_slot: Option<usize>,
     mirror_actor_model_index: Option<usize>,
@@ -2364,6 +2399,9 @@ struct GpuCameraUniform {
     light_position: [f32; 4],
     light_color: [f32; 4],
     ambient_color: [f32; 4],
+    object_light_position: [f32; 4],
+    object_light_color: [f32; 4],
+    object_ambient_color: [f32; 4],
     lighting_meta: [f32; 4],
     render_target_size: [f32; 4],
 }
@@ -2446,7 +2484,15 @@ impl GpuCameraUniform {
             light_position: vec4(frame.light_position, 0.0),
             light_color: frame.light_color,
             ambient_color: frame.ambient_color.unwrap_or([1.0; 4]),
-            lighting_meta: [f32::from(frame.ambient_color.is_some()), 0.0, 0.0, 0.0],
+            object_light_position: vec4(frame.object_light_position, 0.0),
+            object_light_color: frame.object_light_color,
+            object_ambient_color: frame.object_ambient_color.unwrap_or([1.0; 4]),
+            lighting_meta: [
+                f32::from(frame.ambient_color.is_some()),
+                f32::from(frame.object_ambient_color.is_some()),
+                0.0,
+                0.0,
+            ],
             render_target_size: [
                 render_width,
                 render_height,

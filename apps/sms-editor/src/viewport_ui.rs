@@ -2186,7 +2186,11 @@ impl SmsEditorApp {
         self.model_preview.as_ref()?;
         let frame = self.camera_frame();
         let focal = perspective_focal_length(rect, self.viewport_zoom);
-        let lighting = self
+        let player_lighting = self
+            .document
+            .as_ref()
+            .and_then(|document| document.lighting.player_lighting());
+        let object_lighting = self
             .document
             .as_ref()
             .and_then(|document| document.lighting.object_lighting());
@@ -2200,13 +2204,22 @@ impl SmsEditorApp {
             viewport_pan: [self.viewport_pan.x, self.viewport_pan.y],
             near: VIEWPORT_NEAR_CLIP,
             animation_seconds: self.animation_started_at.elapsed().as_secs_f32(),
-            light_position: lighting
+            light_position: player_lighting
                 .map(|lighting| lighting.position)
                 .unwrap_or([200_000.0, 500_000.0, 200_000.0]),
-            light_color: lighting
+            light_color: player_lighting
                 .map(|lighting| gpu_viewport::color_u8_to_f32(lighting.color))
                 .unwrap_or([1.0; 4]),
-            ambient_color: lighting.map(|lighting| gpu_viewport::color_u8_to_f32(lighting.ambient)),
+            ambient_color: player_lighting
+                .map(|lighting| gpu_viewport::color_u8_to_f32(lighting.ambient)),
+            object_light_position: object_lighting
+                .map(|lighting| lighting.position)
+                .unwrap_or([200_000.0, 500_000.0, 200_000.0]),
+            object_light_color: object_lighting
+                .map(|lighting| gpu_viewport::color_u8_to_f32(lighting.color))
+                .unwrap_or([1.0; 4]),
+            object_ambient_color: object_lighting
+                .map(|lighting| gpu_viewport::color_u8_to_f32(lighting.ambient)),
             show_grid: self.renderer.config().show_grid,
             death_barrier_y: (self.selected_world_member
                 == Some(WorldHierarchyMember::DeathBarrier))

@@ -1200,6 +1200,9 @@ fn repository_authored_textured_import_renders_non_black() {
             light_position: camera_position,
             light_color: [1.0; 4],
             ambient_color: Some([1.0; 4]),
+            object_light_position: camera_position,
+            object_light_color: [1.0; 4],
+            object_ambient_color: Some([1.0; 4]),
             show_grid: false,
             death_barrier_y: None,
         },
@@ -1780,6 +1783,57 @@ fn gx_subtract_blend_subtracts_source_from_framebuffer() {
     assert_eq!(blend.color.dst_factor, wgpu::BlendFactor::One);
     assert_eq!(blend.color.operation, wgpu::BlendOperation::ReverseSubtract);
     assert_eq!(blend.alpha.operation, wgpu::BlendOperation::ReverseSubtract);
+}
+
+#[test]
+fn custom_lit_map_uses_player_lighting_while_objects_use_object_lighting() {
+    let mut preview = geometry_update_preview();
+    preview.materials = vec![test_material(1), test_material(1)];
+    preview.materials[1].material_index = 1;
+    for material in &mut preview.materials {
+        material.lighting_enabled = true;
+        material.ambient_colors[0] = [152, 152, 152, 0];
+        material.color_channels[0] = J3dColorChannel {
+            enable: 1,
+            mat_src: 1,
+            light_mask: 3,
+            diffuse_fn: 2,
+            attenuation_fn: 1,
+            amb_src: 0,
+        };
+    }
+    preview.triangles[0].material_index = Some(0);
+    preview.triangles[1].material_index = Some(1);
+    preview.object_model_indices.insert(
+        "placed-object".to_string(),
+        preview.triangles[1].model_index,
+    );
+
+    let scene = GpuSceneData::from_preview(&preview);
+
+    assert_eq!(scene.materials[0].uniform.runtime_parameters[3], 0.0);
+    assert_eq!(scene.materials[1].uniform.runtime_parameters[3], 1.0);
+    assert!(J3D_SHADER.contains("camera.object_light_position.xyz"));
+    assert!(J3D_SHADER.contains("camera.object_ambient_color"));
+    assert!(J3D_SHADER.contains(
+        "camera.lighting_meta.x,\n        camera.lighting_meta.y,\n        uses_stage_object_lighting"
+    ));
+
+    let frame = GpuViewportFrame {
+        light_position: [1.0, 2.0, 3.0],
+        light_color: [0.5; 4],
+        ambient_color: Some([60.0 / 255.0; 4]),
+        object_light_position: [4.0, 5.0, 6.0],
+        object_light_color: [0.25; 4],
+        object_ambient_color: Some([0.0, 0.0, 0.0, 1.0]),
+        ..Default::default()
+    };
+    let uniform = GpuCameraUniform::from_frame(frame, TEST_RENDER_TARGET_SIZE);
+    assert_eq!(uniform.light_position, [1.0, 2.0, 3.0, 0.0]);
+    assert_eq!(uniform.ambient_color, [60.0 / 255.0; 4]);
+    assert_eq!(uniform.object_light_position, [4.0, 5.0, 6.0, 0.0]);
+    assert_eq!(uniform.object_ambient_color, [0.0, 0.0, 0.0, 1.0]);
+    assert_eq!(uniform.lighting_meta, [1.0, 1.0, 0.0, 0.0]);
 }
 
 #[test]

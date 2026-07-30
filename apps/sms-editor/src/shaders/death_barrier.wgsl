@@ -8,6 +8,9 @@ struct Camera {
     light_position: vec4<f32>,
     light_color: vec4<f32>,
     ambient_color: vec4<f32>,
+    object_light_position: vec4<f32>,
+    object_light_color: vec4<f32>,
+    object_ambient_color: vec4<f32>,
     lighting_meta: vec4<f32>,
     render_target_size: vec4<f32>,
 };

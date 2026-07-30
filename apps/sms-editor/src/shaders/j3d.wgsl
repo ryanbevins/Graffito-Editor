@@ -8,6 +8,9 @@ struct Camera {
     light_position: vec4<f32>,
     light_color: vec4<f32>,
     ambient_color: vec4<f32>,
+    object_light_position: vec4<f32>,
+    object_light_color: vec4<f32>,
+    object_ambient_color: vec4<f32>,
     lighting_meta: vec4<f32>,
     render_target_size: vec4<f32>,
 };
@@ -195,11 +198,34 @@ fn compute_color_channel(
         return mat;
     }
 
+    // TMap uses TLightCommon's default Player profile. TLightWithDBSet switches
+    // actor/object draw buffers to the stage's Objects profile.
+    let uses_stage_object_lighting = material.runtime_parameters.w > 0.5;
+    let profile_light_position = select(
+        camera.light_position.xyz,
+        camera.object_light_position.xyz,
+        uses_stage_object_lighting,
+    );
+    let profile_light_color = select(
+        camera.light_color,
+        camera.object_light_color,
+        uses_stage_object_lighting,
+    );
+    let profile_ambient = select(
+        camera.ambient_color,
+        camera.object_ambient_color,
+        uses_stage_object_lighting,
+    );
+    let profile_has_ambient = select(
+        camera.lighting_meta.x,
+        camera.lighting_meta.y,
+        uses_stage_object_lighting,
+    ) > 0.5;
     let ambient_source = control.z;
     let stored_ambient = select(
         material.ambient_colors[material_index],
-        camera.ambient_color,
-        material_index == 0u && camera.lighting_meta.x > 0.5,
+        profile_ambient,
+        material_index == 0u && profile_has_ambient,
     );
     let ambient = channel_source(
         ambient_source,
@@ -210,8 +236,8 @@ fn compute_color_channel(
     let diffuse_function = packed & 0xffu;
     let attenuation_function = (packed >> 8u) & 0xffu;
     let light_mask = (packed >> 16u) & 0xffu;
-    let light_position = camera.light_position.xyz;
-    let light_color = camera.light_color;
+    let light_position = profile_light_position;
+    let light_color = profile_light_color;
     let light_direction = normalize(light_position - position);
     let normalized_normal = normalize(normal);
     if (attenuation_function == 0u) {
