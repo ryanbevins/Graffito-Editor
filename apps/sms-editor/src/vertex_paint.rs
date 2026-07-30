@@ -190,15 +190,88 @@ fn enable_vertex_colors(document: &mut ModelAssetDocument) {
     }
 }
 
+/// Nearest placement-surface hit under a viewport ray, with the geometric
+/// normal of the triangle that was hit.
+///
+/// The brush ring needs the normal so it can lie on the surface rather than
+/// always lying flat, and a wall gets a ring standing on the wall.
+fn nearest_surface_hit(
+    triangles: &[PreviewTriangle],
+    origin: [f32; 3],
+    direction: [f32; 3],
+) -> Option<([f32; 3], [f32; 3])> {
+    let mut best: Option<(f32, [f32; 3], [f32; 3])> = None;
+    for triangle in triangles
+        .iter()
+        .filter(|triangle| preview_triangle_frames_object(triangle))
+    {
+        let [a, b, c] = triangle.vertices;
+        // Moller-Trumbore.
+        let edge_a = vec3_sub(b, a);
+        let edge_b = vec3_sub(c, a);
+        let pvec = vec3_cross(direction, edge_b);
+        let determinant = vec3_dot(edge_a, pvec);
+        if determinant.abs() < 1e-6 {
+            continue;
+        }
+        let inverse = 1.0 / determinant;
+        let tvec = vec3_sub(origin, a);
+        let u = vec3_dot(tvec, pvec) * inverse;
+        if !(-1e-4..=1.0 + 1e-4).contains(&u) {
+            continue;
+        }
+        let qvec = vec3_cross(tvec, edge_a);
+        let v = vec3_dot(direction, qvec) * inverse;
+        if v < -1e-4 || u + v > 1.0 + 1e-4 {
+            continue;
+        }
+        let distance = vec3_dot(edge_b, qvec) * inverse;
+        if distance <= 0.0 {
+            continue;
+        }
+        if best.is_none_or(|(nearest, _, _)| distance < nearest) {
+            let normal = vec3_cross(edge_a, edge_b);
+            let length = vec3_dot(normal, normal).sqrt();
+            let normal = if length > f32::EPSILON {
+                vec3_scale(normal, 1.0 / length)
+            } else {
+                [0.0, 1.0, 0.0]
+            };
+            best = Some((
+                distance,
+                vec3_add(origin, vec3_scale(direction, distance)),
+                normal,
+            ));
+        }
+    }
+    best.map(|(_, position, normal)| (position, normal))
+}
+
 impl SmsEditorApp {
     /// Assets behind every instance exported as map terrain.
     ///
     /// The stage terrain is composed from all of them, so a paint operation
     /// covers the lot rather than whichever one happens to be selected.
     fn terrain_paint_targets(&self) -> Vec<PaintTarget> {
+        self.terrain_paint_targets_scoped(false)
+    }
+
+    /// Terrain assets to operate on.
+    ///
+    /// `selection_only` restricts to the selected instance's asset, which is
+    /// what a brush stroke wants: the stage terrain overlaps in world space, so
+    /// an unscoped stroke near a ramp also drags the floor beneath it. Whole
+    /// stage bakes leave it false and cover everything.
+    fn terrain_paint_targets_scoped(&self, selection_only: bool) -> Vec<PaintTarget> {
         let Some(catalog) = self.model_catalog().ok() else {
             return Vec::new();
         };
+        let selected = selection_only
+            .then(|| {
+                self.selected_model_instance()
+                    .map(|instance| instance.placement.asset_id)
+            })
+            .flatten();
         let mut by_asset: BTreeMap<AssetId, Vec<[[f32; 4]; 4]>> = BTreeMap::new();
         for instance in self
             .model_instances
@@ -207,6 +280,7 @@ impl SmsEditorApp {
             .filter(|instance| {
                 instance.placement.export_mode == ModelInstanceExportMode::MapTerrain
             })
+            .filter(|instance| selected.is_none_or(|asset| instance.placement.asset_id == asset))
         {
             by_asset
                 .entry(instance.placement.asset_id)
@@ -302,9 +376,18 @@ impl SmsEditorApp {
     fn edit_terrain_vertex_colors(
         &mut self,
         label: &str,
+        edit: impl FnMut(&WorldVertex, &mut [f32; 4]),
+    ) {
+        self.edit_terrain_vertex_colors_scoped(label, false, edit);
+    }
+
+    fn edit_terrain_vertex_colors_scoped(
+        &mut self,
+        label: &str,
+        selection_only: bool,
         mut edit: impl FnMut(&WorldVertex, &mut [f32; 4]),
     ) {
-        let mut targets = self.terrain_paint_targets();
+        let mut targets = self.terrain_paint_targets_scoped(selection_only);
         if targets.is_empty() {
             self.log.push(
                 "No terrain to paint: set a model instance to 'Bake as map terrain' first."
@@ -355,6 +438,14 @@ impl SmsEditorApp {
         ];
         let softness = self.vertex_paint_sun_softness.clamp(0.0, 1.0);
         let shadow = self.vertex_paint_sun_shadow.clamp(0.0, 1.0);
+        let smooth_normals = self.vertex_paint_sun_smooth_normals;
+        if smooth_normals {
+            // Faceted meshes carry a face normal on every vertex, so N.L jumps
+            // at each edge and the bake comes out hard-edged. Averaging the
+            // normals across welded positions first gives the gradient a
+            // smooth-shaded mesh would have had.
+            self.smooth_terrain_normals_for_bake();
+        }
         self.edit_terrain_vertex_colors("Baked sun into vertex paint", |vertex, color| {
             let lambert = vec3_dot(vertex.normal, light);
             let hard = lambert.max(0.0);
@@ -375,6 +466,7 @@ impl SmsEditorApp {
     /// ambient light cannot reach; convex and flat areas stay untouched.
     pub(super) fn bake_terrain_dirt(&mut self) {
         let amount = self.vertex_paint_dirt.clamp(0.0, 1.0);
+        let ramp = self.vertex_paint_dirt_ramp.clamp(0.05, 8.0);
         let mut targets = self.terrain_paint_targets();
         if targets.is_empty() {
             self.log.push(
@@ -389,7 +481,16 @@ impl SmsEditorApp {
                     let dirt = primitive_cavity(primitive);
                     let colors = primitive_colors_mut(primitive);
                     for (index, color) in colors.iter_mut().enumerate() {
-                        let shade = 1.0 - dirt.get(index).copied().unwrap_or(0.0) * amount;
+                        // The ramp is a contrast curve on the cavity factor:
+                        // above 1 the dirt tightens into the deepest creases,
+                        // below 1 it spreads across the shallower ones.
+                        let cavity = dirt
+                            .get(index)
+                            .copied()
+                            .unwrap_or(0.0)
+                            .clamp(0.0, 1.0)
+                            .powf(ramp);
+                        let shade = 1.0 - cavity * amount;
                         for channel in color.iter_mut().take(3) {
                             *channel = (*channel * shade).clamp(0.0, 1.0);
                         }
@@ -400,9 +501,119 @@ impl SmsEditorApp {
         self.commit_paint_targets(targets, "Baked cavity dirt into vertex paint");
     }
 
+    /// Subdivides the selected terrain instance, or all of it when nothing is
+    /// selected.
+    pub(super) fn subdivide_terrain(&mut self) {
+        let mut targets = self.terrain_paint_targets_scoped(true);
+        if targets.is_empty() {
+            self.log
+                .push("Nothing to subdivide: select a terrain instance first.".to_string());
+            return;
+        }
+        let mut triangles = 0usize;
+        for target in &mut targets {
+            for mesh in &mut target.document.meshes {
+                for primitive in &mut mesh.primitives {
+                    subdivide_primitive(primitive);
+                    triangles += primitive.indices.len() / 3;
+                }
+            }
+        }
+        self.commit_paint_targets(targets, "Subdivided terrain");
+        self.log
+            .push(format!("Terrain now has {triangles} triangle(s)."));
+    }
+
+    /// Averages vertex normals across welded positions, in place.
+    ///
+    /// Only used ahead of a lighting bake: it changes shading, not geometry,
+    /// and a faceted mesh otherwise bakes hard steps at every edge.
+    fn smooth_terrain_normals_for_bake(&mut self) {
+        let mut targets = self.terrain_paint_targets();
+        if targets.is_empty() {
+            return;
+        }
+        for target in &mut targets {
+            for mesh in &mut target.document.meshes {
+                for primitive in &mut mesh.primitives {
+                    let welds = weld_positions(&primitive.positions);
+                    let mut sums: BTreeMap<usize, [f32; 3]> = BTreeMap::new();
+                    for (index, weld) in welds.iter().enumerate() {
+                        let normal = primitive
+                            .normals
+                            .get(index)
+                            .copied()
+                            .unwrap_or([0.0, 1.0, 0.0]);
+                        let entry = sums.entry(*weld).or_insert([0.0; 3]);
+                        for (sum, axis) in entry.iter_mut().zip(normal.iter()) {
+                            *sum += *axis;
+                        }
+                    }
+                    for (index, weld) in welds.iter().enumerate() {
+                        let Some(sum) = sums.get(weld) else {
+                            continue;
+                        };
+                        let length = vec3_dot(*sum, *sum).sqrt();
+                        if length <= f32::EPSILON {
+                            continue;
+                        }
+                        if let Some(normal) = primitive.normals.get_mut(index) {
+                            *normal = vec3_scale(*sum, 1.0 / length);
+                        }
+                    }
+                }
+            }
+        }
+        self.commit_paint_targets(targets, "Smoothed normals for baking");
+    }
+
+    /// Lays a gradient along a world axis over the terrain's bounds.
+    pub(super) fn bake_terrain_ramp(&mut self) {
+        let axis = self.vertex_paint_ramp_axis.min(2);
+        let start = self.vertex_paint_ramp_start;
+        let end = self.vertex_paint_ramp_end;
+        let curve = self.vertex_paint_ramp_curve.clamp(0.05, 8.0);
+        let invert = self.vertex_paint_ramp_invert;
+        let color = self.vertex_paint_color;
+        let strength = self.vertex_paint_strength.clamp(0.0, 1.0);
+
+        // Bounds first, so start and end read as fractions of the terrain
+        // rather than raw world coordinates the user would have to look up.
+        let mut minimum = f32::INFINITY;
+        let mut maximum = f32::NEG_INFINITY;
+        for target in &self.terrain_paint_targets() {
+            for primitive in Self::target_world_vertices(target) {
+                for vertex in primitive {
+                    minimum = minimum.min(vertex.position[axis]);
+                    maximum = maximum.max(vertex.position[axis]);
+                }
+            }
+        }
+        if !minimum.is_finite() || maximum <= minimum {
+            self.log
+                .push("Ramp needs terrain with a measurable extent.".to_string());
+            return;
+        }
+        let span = maximum - minimum;
+        self.edit_terrain_vertex_colors("Baked ramp into vertex paint", |vertex, value| {
+            let normalised = ((vertex.position[axis] - minimum) / span).clamp(0.0, 1.0);
+            let range = (end - start).abs().max(1e-4);
+            let mut t = ((normalised - start.min(end)) / range).clamp(0.0, 1.0);
+            if invert {
+                t = 1.0 - t;
+            }
+            let amount = t.powf(curve) * strength;
+            for axis in 0..3 {
+                value[axis] += (color[axis] - value[axis]) * amount;
+                value[axis] = value[axis].clamp(0.0, 1.0);
+            }
+        });
+    }
+
     /// Blends every vertex toward the average of its edge neighbours.
     pub(super) fn smooth_terrain_vertex_colors(&mut self) {
         let amount = self.vertex_paint_strength.clamp(0.0, 1.0);
+        let iterations = self.vertex_paint_smooth_iterations.clamp(1, 20);
         let mut targets = self.terrain_paint_targets();
         if targets.is_empty() {
             self.log.push(
@@ -417,13 +628,80 @@ impl SmsEditorApp {
                     let welds = weld_positions(&primitive.positions);
                     let adjacency = primitive_adjacency(&primitive.indices, &welds);
                     let colors = primitive_colors_mut(primitive);
-                    let smoothed = smoothed_colors(colors, &welds, &adjacency, amount);
-                    colors.copy_from_slice(&smoothed);
+                    // Repeated passes spread the blend further than one pass
+                    // at higher strength, which just overshoots.
+                    for _ in 0..iterations {
+                        let smoothed = smoothed_colors(colors, &welds, &adjacency, amount);
+                        colors.copy_from_slice(&smoothed);
+                    }
                 }
             }
         }
         self.commit_paint_targets(targets, "Smoothed vertex paint");
     }
+}
+
+/// Splits every triangle into four by its edge midpoints.
+///
+/// Vertex colour cannot hold detail finer than the mesh, so a sparse surface
+/// simply has nothing for a small brush to write to. One pass quadruples the
+/// triangle count and halves the spacing; attributes are interpolated so the
+/// surface, its UVs and any existing paint are unchanged.
+fn subdivide_primitive(primitive: &mut sms_authoring::ModelPrimitive) {
+    let mut midpoints: BTreeMap<(u32, u32), u32> = BTreeMap::new();
+    let mut indices = Vec::with_capacity(primitive.indices.len() * 4);
+
+    let original = std::mem::take(&mut primitive.indices);
+    for triangle in original.chunks_exact(3) {
+        let (a, b, c) = (triangle[0], triangle[1], triangle[2]);
+        let mut midpoint = |primitive: &mut sms_authoring::ModelPrimitive, x: u32, y: u32| -> u32 {
+            let key = if x < y { (x, y) } else { (y, x) };
+            if let Some(existing) = midpoints.get(&key) {
+                return *existing;
+            }
+            let index = primitive.positions.len() as u32;
+            let blend3 = |values: &[[f32; 3]]| -> Option<[f32; 3]> {
+                let (first, second) = (values.get(x as usize)?, values.get(y as usize)?);
+                Some(std::array::from_fn(|axis| {
+                    (first[axis] + second[axis]) * 0.5
+                }))
+            };
+            if let Some(position) = blend3(&primitive.positions) {
+                primitive.positions.push(position);
+            }
+            if let Some(normal) = blend3(&primitive.normals) {
+                let length = vec3_dot(normal, normal).sqrt();
+                primitive.normals.push(if length > f32::EPSILON {
+                    vec3_scale(normal, 1.0 / length)
+                } else {
+                    normal
+                });
+            }
+            for set in &mut primitive.tex_coords {
+                if let (Some(first), Some(second)) =
+                    (set.values.get(x as usize), set.values.get(y as usize))
+                {
+                    let blended = std::array::from_fn(|axis| (first[axis] + second[axis]) * 0.5);
+                    set.values.push(blended);
+                }
+            }
+            for set in &mut primitive.colors {
+                if let (Some(first), Some(second)) =
+                    (set.values.get(x as usize), set.values.get(y as usize))
+                {
+                    let blended = std::array::from_fn(|axis| (first[axis] + second[axis]) * 0.5);
+                    set.values.push(blended);
+                }
+            }
+            midpoints.insert(key, index);
+            index
+        };
+        let ab = midpoint(primitive, a, b);
+        let bc = midpoint(primitive, b, c);
+        let ca = midpoint(primitive, c, a);
+        indices.extend_from_slice(&[a, ab, ca, ab, b, bc, ca, bc, c, ab, bc, ca]);
+    }
+    primitive.indices = indices;
 }
 
 /// Maps each vertex to a representative index shared by every vertex at the
@@ -613,10 +891,14 @@ impl SmsEditorApp {
     /// the pointer is moving.
     pub(super) fn commit_vertex_paint_stroke(&mut self) {
         let stroke = std::mem::take(&mut self.vertex_paint_stroke);
+        let Some(rect) = self.vertex_paint_rect else {
+            return;
+        };
         if stroke.is_empty() {
             return;
         }
-        let radius = self.vertex_paint_world_radius();
+        let projection = self.camera_projection(rect);
+        let radius = self.vertex_paint_radius.max(1.0);
         let strength = self.vertex_paint_strength.clamp(0.0, 1.0);
         let color = self.vertex_paint_color;
         let mode = self.vertex_paint_mode;
@@ -625,18 +907,32 @@ impl SmsEditorApp {
             VertexPaintMode::Eraser => "Erased vertex colour",
             VertexPaintMode::Smooth => "Softened vertex colour",
         };
-        self.edit_terrain_vertex_colors(label, |vertex, value| {
-            // Nearest stroke sample drives the falloff, so a fast drag with
-            // sparse samples still paints a continuous band.
+        // Scoped to the selected instance so a stroke cannot bleed onto the
+        // terrain underneath it.
+        // Counters so a stroke that does nothing can say why: whether any
+        // vertex was even considered, and how close the nearest one came.
+        let mut considered = 0usize;
+        let mut painted = 0usize;
+        let mut closest = f32::INFINITY;
+        self.edit_terrain_vertex_colors_scoped(label, true, |vertex, value| {
+            considered += 1;
+            // Screen space, not a surface raycast. Casting a ray and painting
+            // around the hit point misses wherever the ray leaves the mesh, so
+            // edges and silhouettes could not be painted at all. Projecting the
+            // vertices instead also makes the radius genuinely pixels, which is
+            // what the slider claims.
+            let Some((screen, _)) = projection.project_world_to_screen(vertex.position) else {
+                return;
+            };
             let mut nearest = f32::INFINITY;
-            for point in &stroke {
-                let delta = vec3_sub(vertex.position, *point);
-                nearest = nearest.min(vec3_dot(delta, delta).sqrt());
+            for sample in &stroke {
+                nearest = nearest.min(screen.distance(*sample));
             }
+            closest = closest.min(nearest);
             if nearest >= radius {
                 return;
             }
-            // Smooth falloff to the rim so overlapping dabs do not band.
+            painted += 1;
             let falloff = 1.0 - (nearest / radius).clamp(0.0, 1.0);
             let amount = (falloff * falloff * strength).clamp(0.0, 1.0);
             // White is the identity for a vertex-lit surface, so erasing blends
@@ -650,14 +946,9 @@ impl SmsEditorApp {
                 value[axis] = value[axis].clamp(0.0, 1.0);
             }
         });
-    }
-
-    /// Brush radius in world units.
-    ///
-    /// The slider is in pixels, matching Affinity, so it is scaled by the
-    /// camera distance to stay the size it looks on screen.
-    fn vertex_paint_world_radius(&self) -> f32 {
-        (self.vertex_paint_radius * self.renderer.camera().distance * 0.0015).max(1.0)
+        self.log.push(format!(
+            "Vertex paint: {painted} of {considered} vertices within {radius:.0}px; nearest was {closest:.0}px."
+        ));
     }
 
     /// Collects stroke samples while the pointer is down over the viewport.
@@ -670,17 +961,18 @@ impl SmsEditorApp {
         if self.tool != EditorTool::VertexPaint {
             return false;
         }
+        self.vertex_paint_rect = Some(rect);
         let pointer = ui.input(|input| input.pointer.interact_pos());
-        // Tracked even when not painting so the brush ring follows the surface
-        // the way the goop cursor does.
+        // Surface hit is only for drawing the ring; painting itself is screen
+        // space, so a miss here never stops a stroke.
         self.vertex_paint_cursor = response
             .hovered()
-            .then(|| pointer.and_then(|pointer| self.viewport_placement_position(rect, pointer)))
+            .then(|| pointer.and_then(|pointer| self.vertex_paint_surface_hit(rect, pointer)))
             .flatten();
         let down = ui.input(|input| input.pointer.primary_down());
         if down && response.hovered() {
-            if let Some(world) = self.vertex_paint_cursor {
-                self.vertex_paint_stroke.push(world);
+            if let Some(pointer) = pointer {
+                self.vertex_paint_stroke.push(pointer);
             }
             return true;
         }
@@ -691,6 +983,26 @@ impl SmsEditorApp {
         false
     }
 
+    /// Surface point and normal under a viewport position.
+    fn vertex_paint_surface_hit(
+        &self,
+        rect: egui::Rect,
+        position: egui::Pos2,
+    ) -> Option<([f32; 3], [f32; 3])> {
+        let preview = self.model_preview.as_ref()?;
+        let frame = self.camera_frame();
+        let focal = perspective_focal_length(rect, self.viewport_zoom).max(1.0);
+        let local = position - rect.center() - self.viewport_pan;
+        let ray = vec3_normalize(vec3_add(
+            frame.forward,
+            vec3_add(
+                vec3_scale(frame.right, local.x / focal),
+                vec3_scale(frame.up, -local.y / focal),
+            ),
+        ));
+        nearest_surface_hit(&preview.triangles, frame.position, ray)
+    }
+
     /// Brush ring and sun direction, drawn only while the tool is active.
     pub(super) fn paint_vertex_paint_overlay(&self, painter: &egui::Painter, rect: egui::Rect) {
         if self.tool != EditorTool::VertexPaint {
@@ -698,7 +1010,8 @@ impl SmsEditorApp {
         }
         let projection = self.camera_projection(rect);
 
-        // Sun direction, so the bake angle is visible before committing to it.
+        // Sun direction, anchored at the camera focus rather than the pointer
+        // so it does not sit across the brush ring while painting.
         let (yaw, pitch) = (
             self.vertex_paint_sun_yaw.to_radians(),
             self.vertex_paint_sun_pitch.to_radians(),
@@ -708,10 +1021,8 @@ impl SmsEditorApp {
             pitch.sin(),
             pitch.cos() * yaw.cos(),
         ];
-        let anchor = self
-            .vertex_paint_cursor
-            .unwrap_or(self.renderer.camera().focus);
-        let reach = (self.renderer.camera().distance * 0.6).max(500.0);
+        let anchor = self.renderer.camera().focus;
+        let reach = (self.renderer.camera().distance * 0.5).max(500.0);
         if let Some([start, end]) = projection
             .project_world_segment_to_screen(anchor, vec3_add(anchor, vec3_scale(light, reach)))
         {
@@ -722,29 +1033,43 @@ impl SmsEditorApp {
             painter.circle_filled(end, 3.5, egui::Color32::from_rgb(240, 200, 90));
         }
 
-        // Brush ring on the surface under the pointer.
-        let Some(center) = self.vertex_paint_cursor else {
+        // Brush ring, lying in the surface's tangent plane so painting a wall
+        // shows a ring standing on that wall rather than a flat disc.
+        let Some((center, normal)) = self.vertex_paint_cursor else {
             return;
         };
-        let radius = self.vertex_paint_world_radius();
-        let mut ring = Vec::new();
-        for step in 0..=48 {
-            let angle = step as f32 / 48.0 * std::f32::consts::TAU;
-            let point = [
-                center[0] + angle.cos() * radius,
-                center[1],
-                center[2] + angle.sin() * radius,
-            ];
-            match projection.project_world_to_screen(point) {
-                Some((screen, _)) => ring.push(screen),
-                None => return,
-            }
-        }
+        let reference = if normal[1].abs() > 0.9 {
+            [1.0, 0.0, 0.0]
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        let tangent = vec3_normalize(vec3_cross(reference, normal));
+        let bitangent = vec3_cross(normal, tangent);
+        // The slider is in pixels, so the ring is sized at the surface's depth
+        // to match what the brush will actually reach.
+        let world_radius = projection
+            .project_world_to_screen(center)
+            .map_or(1.0, |(_, depth)| {
+                let focal = perspective_focal_length(rect, self.viewport_zoom).max(1.0);
+                (self.vertex_paint_radius * depth / focal).max(0.01)
+            });
         let color = egui::Color32::from_rgb(
             (self.vertex_paint_color[0] * 255.0) as u8,
             (self.vertex_paint_color[1] * 255.0) as u8,
             (self.vertex_paint_color[2] * 255.0) as u8,
         );
+        let mut ring = Vec::with_capacity(49);
+        for step in 0..=48 {
+            let angle = step as f32 / 48.0 * std::f32::consts::TAU;
+            let offset = vec3_add(
+                vec3_scale(tangent, angle.cos() * world_radius),
+                vec3_scale(bitangent, angle.sin() * world_radius),
+            );
+            match projection.project_world_to_screen(vec3_add(center, offset)) {
+                Some((screen, _)) => ring.push(screen),
+                None => return,
+            }
+        }
         painter.add(egui::Shape::line(ring, egui::Stroke::new(2.0, color)));
     }
 
@@ -780,9 +1105,19 @@ impl SmsEditorApp {
             return;
         }
         self.prepare_terrain_for_vertex_paint();
-        ui.small(format!(
-            "Painting {terrain} terrain instance(s); every one is affected."
-        ));
+        // Says which asset a stroke will hit, since that differs from what the
+        // whole-stage bakes below cover.
+        match self.selected_model_instance() {
+            Some(instance) => {
+                ui.small(format!("Brush paints '{}'.", instance.placement.name));
+            }
+            None => {
+                ui.small(format!(
+                    "No instance selected; the brush paints all {terrain} terrain instance(s)."
+                ));
+            }
+        }
+        ui.small("Bakes below always cover the whole stage.");
         ui.separator();
 
         ui.horizontal(|ui| {
@@ -802,6 +1137,16 @@ impl SmsEditorApp {
         ui.add(egui::Slider::new(&mut self.vertex_paint_strength, 0.0..=1.0).text("Strength"));
 
         ui.separator();
+        if ui
+            .button("Subdivide")
+            .on_hover_text(
+                "Split every triangle into four. Vertex colour cannot hold detail finer than                  the mesh, so a sparse surface has nothing for a small brush to paint.",
+            )
+            .clicked()
+        {
+            self.subdivide_terrain();
+        }
+
         ui.horizontal(|ui| {
             if ui
                 .button("Smooth Out")
@@ -819,9 +1164,20 @@ impl SmsEditorApp {
             }
         });
 
+        ui.add(
+            egui::Slider::new(&mut self.vertex_paint_smooth_iterations, 1..=20)
+                .text("Smooth passes"),
+        );
+
         ui.separator();
         ui.strong("Dirty (cavity AO)");
         ui.add(egui::Slider::new(&mut self.vertex_paint_dirt, 0.0..=1.0).text("Dirty"));
+        ui.add(
+            egui::Slider::new(&mut self.vertex_paint_dirt_ramp, 0.05..=8.0)
+                .logarithmic(true)
+                .text("Ramp"),
+        )
+        .on_hover_text("Above 1 tightens dirt into deep creases; below 1 spreads it wider");
         if ui
             .button("Bake Dirt")
             .on_hover_text("Darken creases and inner edges")
@@ -831,11 +1187,42 @@ impl SmsEditorApp {
         }
 
         ui.separator();
+        ui.strong("Ramp");
+        ui.horizontal(|ui| {
+            for (index, label) in ["X", "Y", "Z"].into_iter().enumerate() {
+                ui.selectable_value(&mut self.vertex_paint_ramp_axis, index, label);
+            }
+            ui.checkbox(&mut self.vertex_paint_ramp_invert, "Invert");
+        });
+        ui.add(egui::Slider::new(&mut self.vertex_paint_ramp_start, 0.0..=1.0).text("Start"));
+        ui.add(egui::Slider::new(&mut self.vertex_paint_ramp_end, 0.0..=1.0).text("End"));
+        ui.add(
+            egui::Slider::new(&mut self.vertex_paint_ramp_curve, 0.05..=8.0)
+                .logarithmic(true)
+                .text("Curve"),
+        );
+        if ui
+            .button("Bake Ramp")
+            .on_hover_text("Blend the brush colour along an axis across the terrain bounds")
+            .clicked()
+        {
+            self.bake_terrain_ramp();
+        }
+
+        ui.separator();
         ui.strong("Sun (directional light bake)");
         ui.add(egui::Slider::new(&mut self.vertex_paint_sun_yaw, 0.0..=360.0).text("Yaw"));
         ui.add(egui::Slider::new(&mut self.vertex_paint_sun_pitch, -89.0..=89.0).text("Pitch"));
         ui.add(egui::Slider::new(&mut self.vertex_paint_sun_softness, 0.0..=1.0).text("Softness"));
         ui.add(egui::Slider::new(&mut self.vertex_paint_sun_shadow, 0.0..=1.0).text("Shadow"));
+        ui.checkbox(
+            &mut self.vertex_paint_sun_smooth_normals,
+            "Smooth normals first",
+        )
+        .on_hover_text(
+            "Average normals across shared positions before lighting. A faceted mesh otherwise \
+             bakes a hard step at every edge.",
+        );
         if ui
             .button("Bake Sun")
             .on_hover_text("Multiply vertex colours by a directional light term")
