@@ -188,7 +188,20 @@ impl VertexPaintGradeSettings {
             && self.tint_amount == 0.0
     }
 
-    pub(super) fn apply(self, color: &mut [f32; 4]) {
+    /// `base` is the material's own diffuse, which is what makes "shadow"
+    /// mean shadow. Weighting by darkness alone treats a surface that is
+    /// simply dark by design as though it were in shade, so a black floor
+    /// takes the full shadow tint and the grade bleeds across the whole model.
+    /// Measured against the diffuse, a vertex sitting at its material colour
+    /// is unshaded whatever that colour is.
+    pub(super) fn apply(self, color: &mut [f32; 4], base: [f32; 3]) {
+        let luma = |value: [f32; 3]| 0.299 * value[0] + 0.587 * value[1] + 0.114 * value[2];
+        let unshaded = luma(base).max(1e-3);
+        let shading = |value: &[f32; 4]| {
+            let lit = luma([value[0], value[1], value[2]]);
+            (1.0 - lit / unshaded).clamp(0.0, 1.0)
+        };
+
         let exposure = self.exposure.exp2();
         for channel in color.iter_mut().take(3) {
             *channel *= exposure;
@@ -204,12 +217,12 @@ impl VertexPaintGradeSettings {
         // Vibrance leans on whatever is already dull. Scaling saturation flat
         // blows out the colours that were already strong, which on baked
         // terrain means the few painted patches go first.
-        let luma = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2];
+        let grey = luma([color[0], color[1], color[2]]);
         let high = color[0].max(color[1]).max(color[2]);
         let low = color[0].min(color[1]).min(color[2]);
         let reach = 1.0 + self.vibrance * (1.0 - (high - low).clamp(0.0, 1.0));
         for channel in color.iter_mut().take(3) {
-            *channel = luma + (*channel - luma) * reach;
+            *channel = grey + (*channel - grey) * reach;
         }
 
         // Rotation about the grey axis, which keeps luminance where it is:
@@ -238,8 +251,7 @@ impl VertexPaintGradeSettings {
         // vertex is, so an occlusion bake can be deepened or lifted without
         // dragging the lit surfaces with it.
         if self.shadow != 0.0 {
-            let luma = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2];
-            let weight = (1.0 - luma).clamp(0.0, 1.0);
+            let weight = shading(color);
             for channel in color.iter_mut().take(3) {
                 *channel = match self.shadow > 0.0 {
                     true => *channel * (1.0 - self.shadow * weight),
@@ -253,8 +265,7 @@ impl VertexPaintGradeSettings {
         // grade is wanted for is warming or cooling the shadows an occlusion
         // bake laid down, leaving the lit surfaces where they are.
         if self.tint_amount != 0.0 {
-            let luma = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2];
-            let weight = (1.0 - luma).clamp(0.0, 1.0) * self.tint_amount;
+            let weight = shading(color) * self.tint_amount;
             for (channel, tint) in color.iter_mut().take(3).zip(self.tint.iter()) {
                 *channel += (tint - *channel) * weight;
             }
@@ -2269,10 +2280,21 @@ impl SmsEditorApp {
         };
         for (target, baseline) in grade.targets.iter_mut().zip(grade.baseline.iter()) {
             restore_paint_state(&mut target.document, baseline);
+            let diffuse = target
+                .document
+                .materials
+                .iter()
+                .map(|material| material.source_base_color)
+                .collect::<Vec<_>>();
             for mesh in &mut target.document.meshes {
                 for primitive in &mut mesh.primitives {
+                    let base = primitive
+                        .material
+                        .and_then(|index| diffuse.get(index as usize))
+                        .copied()
+                        .unwrap_or([1.0; 4]);
                     for color in primitive_colors_mut(primitive) {
-                        settings.apply(color);
+                        settings.apply(color, [base[0], base[1], base[2]]);
                     }
                 }
             }

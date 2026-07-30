@@ -5249,7 +5249,7 @@ fn rotating_hue_holds_luminance_and_leaves_grey_alone() {
             [0.35, 0.35, 0.35, 1.0],
         ] {
             let mut color = start;
-            settings.apply(&mut color);
+            settings.apply(&mut color, [1.0; 3]);
             assert!(
                 (luma(color) - luma(start)).abs() < 0.005,
                 "hue {degrees} moved luminance of {start:?} to {color:?}"
@@ -5258,7 +5258,7 @@ fn rotating_hue_holds_luminance_and_leaves_grey_alone() {
 
         // Grey has no hue to turn, so it has to come back untouched.
         let mut grey = [0.5, 0.5, 0.5, 1.0];
-        settings.apply(&mut grey);
+        settings.apply(&mut grey, [1.0; 3]);
         for channel in grey.iter().take(3) {
             assert!(
                 (channel - 0.5).abs() < 0.01,
