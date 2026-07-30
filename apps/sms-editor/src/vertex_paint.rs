@@ -412,6 +412,10 @@ const GX_SRC_VTX: u8 = 1;
 /// source did not mark double sided.
 const GX_CULL_NONE: u32 = 0;
 
+/// `GX_CULL_BACK`, what the importer writes for anything the source did not
+/// mark double sided.
+const GX_CULL_BACK: u32 = 2;
+
 /// An untextured material whose single TEV stage passes the rasterised colour
 /// straight through, matching what the importer builds for a textureless
 /// primitive. `GX_CC_RASC` is input 10, and `color_channel` 4 is `GX_COLOR0A0`.
@@ -1268,7 +1272,35 @@ impl SmsEditorApp {
         ));
     }
 
-    /// Turns culling off for the selected terrain's materials.
+    /// Whether the selected terrain draws both sides, reading the asset once
+    /// and remembering the answer.
+    ///
+    /// The panel asks every frame, and the answer lives in the asset on disk,
+    /// so it is cached against the id it was read for and re-read only when
+    /// the selection moves or this tool changes it.
+    fn terrain_draws_both_sides(&mut self) -> Option<bool> {
+        let asset = self
+            .selected_model_instance()
+            .map(|instance| instance.placement.asset_id)?;
+        if let Some((cached, value)) = self.vertex_paint_double_sided {
+            if cached == asset {
+                return Some(value);
+            }
+        }
+        let document = self.model_catalog().ok()?.load_asset(asset).ok()?;
+        // An empty material list is the textureless case, which paints against
+        // a material this tool synthesises later; report it as single sided so
+        // the toggle still offers the fix.
+        let both = !document.materials.is_empty()
+            && document
+                .materials
+                .iter()
+                .all(|material| material.gx.cull_mode == GX_CULL_NONE);
+        self.vertex_paint_double_sided = Some((asset, both));
+        Some(both)
+    }
+
+    /// Turns culling on or off for the selected terrain's materials.
     ///
     /// Baking as terrain is where a single-sided material starts costing you
     /// faces: the same mesh drawn as a separate object keeps them, so the two
@@ -1278,7 +1310,7 @@ impl SmsEditorApp {
     ///
     /// It is not free. Both sides of every triangle get rasterised, so reach
     /// for `Fix Facing` first and keep this for meshes it cannot resolve.
-    pub(super) fn make_terrain_double_sided(&mut self) {
+    pub(super) fn set_terrain_double_sided(&mut self, both: bool) {
         let mut targets = self.terrain_paint_targets_scoped(true);
         if targets.is_empty() {
             self.log.push(
@@ -1287,25 +1319,41 @@ impl SmsEditorApp {
             );
             return;
         }
+        let wanted = match both {
+            true => GX_CULL_NONE,
+            false => GX_CULL_BACK,
+        };
         let mut changed = 0usize;
         for target in &mut targets {
             for material in &mut target.document.materials {
-                if material.gx.cull_mode != GX_CULL_NONE {
-                    material.gx.cull_mode = GX_CULL_NONE;
-                    material.source_double_sided = true;
+                if material.gx.cull_mode != wanted {
+                    material.gx.cull_mode = wanted;
+                    material.source_double_sided = both;
                     changed += 1;
                 }
             }
         }
+        // The cache is stale either way now: the write may have changed
+        // nothing, in which case the state was already what was asked for.
+        self.vertex_paint_double_sided = None;
         if changed == 0 {
-            self.log
-                .push("That terrain already draws both sides.".to_string());
+            self.log.push(match both {
+                true => "That terrain already draws both sides.".to_string(),
+                false => "That terrain already culls back faces.".to_string(),
+            });
             return;
         }
-        self.commit_terrain_targets(targets, "Made terrain double sided", false);
-        self.log.push(format!(
-            "{changed} material(s) now draw both sides, so no face drops out of the terrain bake."
-        ));
+        let label = match both {
+            true => "Made terrain double sided",
+            false => "Made terrain single sided",
+        };
+        self.commit_terrain_targets(targets, label, false);
+        self.log.push(match both {
+            true => format!(
+                "{changed} material(s) now draw both sides, so no face drops out of the bake."
+            ),
+            false => format!("{changed} material(s) now cull back faces again."),
+        });
     }
 
     pub(super) fn clear_terrain_vertex_colors(&mut self) {
@@ -2230,6 +2278,18 @@ impl SmsEditorApp {
         );
 
         ui.separator();
+        if let Some(both) = self.terrain_draws_both_sides() {
+            let mut wanted = both;
+            if ui
+                .checkbox(&mut wanted, "Draw both sides")
+                .on_hover_text(
+                    "Stops terrain culling back faces, so none can drop out of the bake. Costs                      fill rate; try Fix Facing first",
+                )
+                .changed()
+            {
+                self.set_terrain_double_sided(wanted);
+            }
+        }
         if ui
             .button("Subdivide")
             .on_hover_text(
@@ -2247,15 +2307,6 @@ impl SmsEditorApp {
                 .clicked()
             {
                 self.smooth_terrain_vertex_colors();
-            }
-            if ui
-                .button("Double-Sided")
-                .on_hover_text(
-                    "Draw both sides of the selected terrain, so no face can drop out of the                      bake. Costs fill rate; try Fix Facing first",
-                )
-                .clicked()
-            {
-                self.make_terrain_double_sided();
             }
             if ui
                 .button("Fix Facing")

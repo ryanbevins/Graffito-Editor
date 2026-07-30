@@ -1312,6 +1312,9 @@ struct SmsEditorApp {
     /// Open while the grade sliders are in use, holding the terrain and the
     /// colours it had before they moved.
     vertex_paint_grade: Option<VertexPaintGrade>,
+    /// Cached culling state of the selected terrain, against the asset it was
+    /// read for, so the panel does not load the asset every frame.
+    vertex_paint_double_sided: Option<(sms_authoring::AssetId, bool)>,
     vertex_paint_sun_yaw: f32,
     vertex_paint_sun_pitch: f32,
     vertex_paint_sun_softness: f32,
@@ -1623,6 +1626,7 @@ impl Default for SmsEditorApp {
             vertex_paint_strength: 0.75,
             vertex_paint_grade_settings: VertexPaintGradeSettings::default(),
             vertex_paint_grade: None,
+            vertex_paint_double_sided: None,
             vertex_paint_sun_yaw: 34.0,
             vertex_paint_sun_pitch: 46.0,
             vertex_paint_sun_softness: 0.5,
