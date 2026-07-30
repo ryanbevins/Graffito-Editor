@@ -57,9 +57,257 @@ fn snapshot_paint_state(id: AssetId, document: &ModelAssetDocument) -> VertexPai
     }
 }
 
-#[cfg(test)]
 fn restore_paint_state(document: &mut ModelAssetDocument, snapshot: &VertexPaintSnapshot) {
     document.clone_from(&snapshot.document);
+}
+
+/// Hue rotation, split into its constant, cosine and sine parts so a rotation
+/// is three dot products rather than a conversion out to HSV and back.
+const HUE_LUMA: [f32; 3] = [0.213, 0.715, 0.072];
+const HUE_ROTATION: [[f32; 3]; 3] = [HUE_LUMA, HUE_LUMA, HUE_LUMA];
+const HUE_COSINE: [[f32; 3]; 3] = [
+    [1.0 - HUE_LUMA[0], -HUE_LUMA[1], -HUE_LUMA[2]],
+    [-HUE_LUMA[0], 1.0 - HUE_LUMA[1], -HUE_LUMA[2]],
+    [-HUE_LUMA[0], -HUE_LUMA[1], 1.0 - HUE_LUMA[2]],
+];
+const HUE_SINE: [[f32; 3]; 3] = [
+    [-HUE_LUMA[0], -HUE_LUMA[1], 1.0 - HUE_LUMA[2]],
+    [0.143, 0.140, -0.283],
+    [-(1.0 - HUE_LUMA[0]), HUE_LUMA[1], HUE_LUMA[2]],
+];
+
+/// Rewinds triangles whose winding disagrees with their own vertex normals.
+///
+/// Returns how many were flipped and how many were judged.
+///
+/// A mesh can arrive wound against its normals. Nothing shows while it is drawn
+/// as an object, but map terrain is loaded with flags that leave back-face
+/// culling on, so the disagreeing faces drop out and the model reads as inside
+/// out. The normals are the intent -- they say which way the artist meant the
+/// surface to face -- so the winding is what gets corrected, and only on the
+/// triangles that actually disagree. A consistent mesh comes back untouched.
+///
+/// Local space is the right place for this. Compile reverses winding again for
+/// a mirrored placement and carries normals through the same transform, so
+/// agreement here survives into the baked model.
+pub(super) fn repair_document_winding(document: &mut ModelAssetDocument) -> (usize, usize) {
+    let mut flipped = 0usize;
+    let mut checked = 0usize;
+    for mesh in &mut document.meshes {
+        for primitive in &mut mesh.primitives {
+            let positions = primitive.positions.clone();
+            let normals = primitive.normals.clone();
+            for face in primitive.indices.chunks_exact_mut(3) {
+                let corners = [face[0] as usize, face[1] as usize, face[2] as usize];
+                let Some(corner_positions) = corners
+                    .iter()
+                    .map(|index| positions.get(*index).copied())
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    continue;
+                };
+                let geometric = vec3_cross(
+                    vec3_sub(corner_positions[1], corner_positions[0]),
+                    vec3_sub(corner_positions[2], corner_positions[0]),
+                );
+                // A sliver has no reliable facing, so leave it rather than
+                // flip it on rounding noise.
+                if vec3_dot(geometric, geometric) <= 1e-8 {
+                    continue;
+                }
+                let intended = corners
+                    .iter()
+                    .filter_map(|index| normals.get(*index))
+                    .fold([0.0f32; 3], |sum, normal| vec3_add(sum, *normal));
+                if vec3_dot(intended, intended) <= 1e-8 {
+                    continue;
+                }
+                checked += 1;
+                if vec3_dot(geometric, intended) < 0.0 {
+                    face.swap(1, 2);
+                    flipped += 1;
+                }
+            }
+        }
+    }
+    (flipped, checked)
+}
+
+/// A non-destructive grade over vertex colours.
+///
+/// Held open while the sliders are being moved so every change re-grades the
+/// colours the terrain had when the session started, rather than compounding
+/// on its own output. Dragging exposure up and back down therefore lands
+/// exactly where it began.
+pub(super) struct VertexPaintGrade {
+    targets: Vec<PaintTarget>,
+    /// The terrain as it was before the first slider moved.
+    baseline: Vec<VertexPaintSnapshot>,
+}
+
+/// Exposure, contrast, vibrance and tint, applied in that order.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct VertexPaintGradeSettings {
+    /// Stops. Doubling light per stop is how exposure reads everywhere else,
+    /// so it is a multiply by two to the power rather than a linear scale.
+    pub(super) exposure: f32,
+    pub(super) contrast: f32,
+    pub(super) vibrance: f32,
+    /// Degrees around the colour wheel.
+    pub(super) hue: f32,
+    /// Positive deepens the dark end, negative lifts it. Weighted by how dark
+    /// a vertex already is, so it reaches shadow without touching highlights
+    /// the way exposure would.
+    pub(super) shadow: f32,
+    pub(super) tint: [f32; 3],
+    pub(super) tint_amount: f32,
+}
+
+impl Default for VertexPaintGradeSettings {
+    fn default() -> Self {
+        Self {
+            exposure: 0.0,
+            contrast: 0.0,
+            vibrance: 0.0,
+            hue: 0.0,
+            shadow: 0.0,
+            tint: [1.0, 1.0, 1.0],
+            tint_amount: 0.0,
+        }
+    }
+}
+
+impl VertexPaintGradeSettings {
+    /// Whether the grade would leave the colours untouched.
+    fn is_neutral(self) -> bool {
+        self.exposure == 0.0
+            && self.contrast == 0.0
+            && self.vibrance == 0.0
+            && self.hue == 0.0
+            && self.shadow == 0.0
+            && self.tint_amount == 0.0
+    }
+
+    /// `base` is the material's own diffuse, which is what makes "shadow"
+    /// mean shadow. Weighting by darkness alone treats a surface that is
+    /// simply dark by design as though it were in shade, so a black floor
+    /// takes the full shadow tint and the grade bleeds across the whole model.
+    /// Measured against the diffuse, a vertex sitting at its material colour
+    /// Grades the shading a bake left on a vertex.
+    ///
+    /// `neutral` is the vertex colour that means "unshaded", which the TEV
+    /// program decides: a textured material multiplies, so neutral is white
+    /// and the texture comes through as authored; an untextured one has the
+    /// vertex colour *as* the surface, so neutral is the material colour.
+    ///
+    /// Everything works on `colour / neutral`, the shading factor, where 1 is
+    /// clean and 0 is fully shadowed. That is the whole reason the controls
+    /// behave: contrast pivots on half shadow rather than on mid grey, which
+    /// is meaningless on a surface whose clean state is dark green; exposure
+    /// scales shading rather than absolute light; and nothing can exceed 1, so
+    /// no control can brighten a surface past the state it was in before the
+    /// bake, which is what kept turning meshes white.
+    pub(super) fn apply(self, color: &mut [f32; 4], neutral: [f32; 3]) {
+        let luma = |value: [f32; 3]| 0.299 * value[0] + 0.587 * value[1] + 0.114 * value[2];
+        // A neutral channel at zero carries no shading information: the
+        // surface is black there whatever the vertex says, so leave it be.
+        let mut factor: [f32; 3] = std::array::from_fn(|axis| match neutral[axis] > 1e-3 {
+            true => (color[axis] / neutral[axis]).clamp(0.0, 1.0),
+            false => 1.0,
+        });
+        let scope = 1.0 - luma(factor).clamp(0.0, 1.0);
+        let original = factor;
+
+        let exposure = self.exposure.exp2();
+        for channel in factor.iter_mut() {
+            *channel *= exposure;
+        }
+
+        // Pivoted on half shadow, so contrast separates the deep shading from
+        // the shallow instead of just lifting all of it.
+        let scale = 1.0 + self.contrast;
+        for channel in factor.iter_mut() {
+            *channel = (*channel - 0.5) * scale + 0.5;
+        }
+
+        // Vibrance leans on whatever is already dull, so a bake that is barely
+        // coloured gains more than one that is already strongly tinted.
+        let grey = luma(factor);
+        let high = factor[0].max(factor[1]).max(factor[2]);
+        let low = factor[0].min(factor[1]).min(factor[2]);
+        let reach = 1.0 + self.vibrance * (1.0 - (high - low).clamp(0.0, 1.0));
+        for channel in factor.iter_mut() {
+            *channel = grey + (*channel - grey) * reach;
+        }
+
+        // Rotation about the grey axis, which keeps the shading depth where it
+        // is: spinning hue recolours a bake rather than relighting it.
+        if self.hue != 0.0 {
+            let (sin, cos) = self.hue.to_radians().sin_cos();
+            factor = std::array::from_fn(|channel| {
+                let weights = HUE_ROTATION[channel];
+                weights[0] * factor[0]
+                    + weights[1] * factor[1]
+                    + weights[2] * factor[2]
+                    + cos
+                        * (HUE_COSINE[channel][0] * factor[0]
+                            + HUE_COSINE[channel][1] * factor[1]
+                            + HUE_COSINE[channel][2] * factor[2])
+                    + sin
+                        * (HUE_SINE[channel][0] * factor[0]
+                            + HUE_SINE[channel][1] * factor[1]
+                            + HUE_SINE[channel][2] * factor[2])
+            });
+        }
+
+        // Mixed back in by how shaded the vertex was, so a vertex the bake
+        // left clean comes out exactly as it went in.
+        for (channel, before) in factor.iter_mut().zip(original.iter()) {
+            *channel = before + (*channel - before) * scope;
+        }
+
+        if self.shadow != 0.0 {
+            match self.shadow > 0.0 {
+                true => {
+                    for channel in factor.iter_mut() {
+                        *channel *= 1.0 - self.shadow * scope;
+                    }
+                }
+                // Lifting resolves toward 1, which is the clean surface. At -1
+                // the vertex stops contributing anything at all: a textured
+                // material goes back to its texture as authored, an untextured
+                // one to its material colour.
+                false => {
+                    for channel in factor.iter_mut() {
+                        *channel += (1.0 - *channel) * -self.shadow;
+                    }
+                }
+            }
+        }
+
+        if self.tint_amount != 0.0 {
+            // A multiply, not a blend toward the colour. Blending moves a
+            // channel toward the tint from either side, so a saturated tint
+            // raises its own channel and reaches past the darks. Multiplying
+            // by a factor that is 1 where nothing is shaded can only take
+            // light away, which is what tinting a shadow means.
+            let weight = scope * self.tint_amount;
+            for (channel, tint) in factor.iter_mut().zip(self.tint.iter()) {
+                *channel *= 1.0 + (tint - 1.0) * weight;
+            }
+        }
+
+        // Back to a colour. Clamping the factor is what stops any control
+        // brightening the surface past its clean state.
+        for ((channel, clean), shading) in color
+            .iter_mut()
+            .take(3)
+            .zip(neutral.iter())
+            .zip(factor.iter())
+        {
+            *channel = (clean * shading).clamp(0.0, 1.0);
+        }
+    }
 }
 
 /// A stroke in progress.
@@ -188,11 +436,22 @@ pub(super) fn transform_normal(matrix: [[f32; 4]; 4], normal: [f32; 3]) -> [f32;
 /// Colour set 0 for a primitive, created opaque white when the mesh arrived
 /// without one. White is the identity for a vertex-lit surface, so an
 /// untouched model looks the same before and after the set exists.
-fn primitive_colors_mut(primitive: &mut sms_authoring::ModelPrimitive) -> &mut Vec<[f32; 4]> {
+/// Colour set 0 of a primitive, created from `base` if it does not have one.
+///
+/// `base` is the material's own diffuse. A mesh that shipped without vertex
+/// colours used to be seeded white, and because painting points the colour
+/// channel at the vertex array, that white immediately replaced the material
+/// colour on the surface -- so merely touching a mesh with any of these tools
+/// bleached it before a single stroke landed. Seeding from the diffuse means
+/// gaining a colour set changes nothing about how the model looks.
+fn primitive_colors_mut(
+    primitive: &mut sms_authoring::ModelPrimitive,
+    base: [f32; 4],
+) -> &mut Vec<[f32; 4]> {
     if !primitive.colors.iter().any(|set| set.set == 0) {
         primitive.colors.push(sms_authoring::ColorSet {
             set: 0,
-            values: vec![[1.0, 1.0, 1.0, 1.0]; primitive.positions.len()],
+            values: vec![base; primitive.positions.len()],
         });
     }
     let values = &mut primitive
@@ -203,14 +462,89 @@ fn primitive_colors_mut(primitive: &mut sms_authoring::ModelPrimitive) -> &mut V
         .values;
     // An imported set can be shorter than the position list if the source only
     // coloured part of the mesh.
-    values.resize(primitive.positions.len(), [1.0, 1.0, 1.0, 1.0]);
+    values.resize(primitive.positions.len(), base);
     values
+}
+
+/// The vertex colour that means "unshaded", per primitive, as a luma level.
+///
+/// This is decided by the TEV program the importer writes, not by taste:
+///
+/// - A textured material gets `out = RASC * TEXC`, so the vertex colour
+///   multiplies the texture. White leaves it alone and nothing above white
+///   exists, so neutral is 1.0 and the colour can only ever darken.
+/// - An untextured material gets `out = RASC`, so the vertex colour is the
+///   surface. Neutral is the material's own base colour, and white is not
+///   neutral at all -- it is a white surface.
+///
+/// Measuring shade against the brightest vertex a mesh happens to carry looks
+/// similar until something is baked, at which point no vertex sits at neutral
+/// any more and the reference sinks with the bake, so a lift can never restore
+/// what the bake took.
+fn document_primitive_unshaded(document: &ModelAssetDocument) -> Vec<[f32; 3]> {
+    let levels = document
+        .materials
+        .iter()
+        .map(|material| match material.base_color_texture.is_some() {
+            // A multiplier of white leaves the texture exactly as authored.
+            true => [1.0; 3],
+            false => [
+                material.source_base_color[0],
+                material.source_base_color[1],
+                material.source_base_color[2],
+            ],
+        })
+        .collect::<Vec<_>>();
+    document
+        .meshes
+        .iter()
+        .flat_map(|mesh| &mesh.primitives)
+        .map(|primitive| {
+            primitive
+                .material
+                .and_then(|index| levels.get(index as usize))
+                .copied()
+                .unwrap_or([1.0; 3])
+        })
+        .collect()
+}
+
+/// The material diffuse each primitive of a document should fall back to.
+fn document_primitive_diffuse(document: &ModelAssetDocument) -> Vec<[f32; 4]> {
+    let materials = document
+        .materials
+        .iter()
+        .map(|material| material.source_base_color)
+        .collect::<Vec<_>>();
+    document
+        .meshes
+        .iter()
+        .flat_map(|mesh| &mesh.primitives)
+        .map(|primitive| {
+            primitive
+                .material
+                .and_then(|index| materials.get(index as usize))
+                .copied()
+                // No material at all is the textureless case. White is the
+                // only honest answer there, and it is also what the material
+                // this tool synthesises for such a mesh will carry.
+                .unwrap_or([1.0; 4])
+        })
+        .collect()
 }
 
 /// GX_SRC_VTX. `GXColorSrc` in the decomp is `{ GX_SRC_REG = 0, GX_SRC_VTX = 1 }`,
 /// so a channel left on the default register source ignores the vertex colour
 /// array entirely.
 const GX_SRC_VTX: u8 = 1;
+
+/// `GX_CULL_NONE`. The importer writes 2, `GX_CULL_BACK`, for anything the
+/// source did not mark double sided.
+const GX_CULL_NONE: u32 = 0;
+
+/// `GX_CULL_BACK`, what the importer writes for anything the source did not
+/// mark double sided.
+const GX_CULL_BACK: u32 = 2;
 
 /// An untextured material whose single TEV stage passes the rasterised colour
 /// straight through, matching what the importer builds for a textureless
@@ -324,7 +658,12 @@ fn enable_vertex_colors(document: &mut ModelAssetDocument) {
             else {
                 continue;
             };
-            for color in primitive_colors_mut(primitive) {
+            // White is the right seed *here*, and only here: the fold below
+            // multiplies by the register colour immediately, so white is its
+            // identity and a set created now comes out at the material colour.
+            // Seeding the diffuse instead would apply it twice and land the
+            // mesh at its colour squared.
+            for color in primitive_colors_mut(primitive, [1.0; 4]) {
                 for channel in 0..4 {
                     color[channel] = (color[channel] * factor[channel]).clamp(0.0, 1.0);
                 }
@@ -984,12 +1323,14 @@ impl SmsEditorApp {
         }
         for target in &mut targets {
             enable_vertex_colors(&mut target.document);
+            let diffuse = document_primitive_diffuse(&target.document);
             let world = Self::target_world_vertex_occurrences(target);
             let mut primitive_index = 0usize;
             for mesh in &mut target.document.meshes {
                 for primitive in &mut mesh.primitives {
                     let occurrences = &world[primitive_index];
-                    let colors = primitive_colors_mut(primitive);
+                    let base = diffuse.get(primitive_index).copied().unwrap_or([1.0; 4]);
+                    let colors = primitive_colors_mut(primitive, base);
                     for (index, color) in colors.iter_mut().enumerate() {
                         let vertices = occurrences
                             .iter()
@@ -1006,11 +1347,254 @@ impl SmsEditorApp {
         self.commit_terrain_targets(targets, label, true);
     }
 
+    /// Blends every vertex toward the average of its edge neighbours.
+    pub(super) fn smooth_terrain_vertex_colors(&mut self) {
+        let amount = self.vertex_paint_strength.clamp(0.0, 1.0);
+        let iterations = self.vertex_paint_smooth_iterations.clamp(1, 20);
+        let mut targets = self.terrain_paint_targets_scoped(true);
+        if targets.is_empty() {
+            self.log.push(
+                "No terrain to paint: set a model instance to 'Bake as map terrain' first."
+                    .to_string(),
+            );
+            return;
+        }
+        for target in &mut targets {
+            let diffuse = document_primitive_diffuse(&target.document);
+            let mut primitive_index = 0usize;
+            for mesh in &mut target.document.meshes {
+                for primitive in &mut mesh.primitives {
+                    let base = diffuse.get(primitive_index).copied().unwrap_or([1.0; 4]);
+                    primitive_index += 1;
+                    let welds = weld_positions(&primitive.positions);
+                    let adjacency = primitive_adjacency(&primitive.indices, &welds);
+                    let colors = primitive_colors_mut(primitive, base);
+                    // Repeated passes spread the blend further than one pass
+                    // at higher strength, which just overshoots.
+                    for _ in 0..iterations {
+                        let smoothed = smoothed_colors(colors, &welds, &adjacency, amount);
+                        colors.copy_from_slice(&smoothed);
+                    }
+                }
+            }
+        }
+        self.commit_terrain_targets(targets, "Smoothed vertex paint", true);
+    }
+
     /// Resets every terrain vertex to opaque white.
-    pub(super) fn clear_terrain_vertex_colors(&mut self) {
-        self.edit_terrain_vertex_colors_scoped("Cleared vertex paint", true, |_, color| {
-            *color = [1.0, 1.0, 1.0, color[3]];
+    /// Rewinds terrain triangles that disagree with their own vertex normals.
+    pub(super) fn repair_terrain_winding(&mut self) {
+        let mut targets = self.terrain_paint_targets_scoped(true);
+        if targets.is_empty() {
+            self.log.push(
+                "Select a terrain instance in the hierarchy before repairing winding.".to_string(),
+            );
+            return;
+        }
+        let mut flipped = 0usize;
+        let mut checked = 0usize;
+        for target in &mut targets {
+            let (mesh_flipped, mesh_checked) = repair_document_winding(&mut target.document);
+            flipped += mesh_flipped;
+            checked += mesh_checked;
+        }
+
+        if flipped == 0 {
+            self.log.push(format!(
+                "Winding already agrees with the normals across {checked} triangle(s); nothing \
+                 to repair."
+            ));
+            return;
+        }
+        // Geometry only, so the colour channel switch is left alone.
+        self.commit_terrain_targets(targets, "Repaired terrain winding", false);
+        self.log.push(format!(
+            "Rewound {flipped} of {checked} triangle(s) to face the way their normals point."
+        ));
+    }
+
+    /// Whether the selected terrain draws both sides, reading the asset once
+    /// and remembering the answer.
+    ///
+    /// The panel asks every frame, and the answer lives in the asset on disk,
+    /// so it is cached against the id it was read for and re-read only when
+    /// the selection moves or this tool changes it.
+    fn terrain_draws_both_sides(&mut self) -> Option<bool> {
+        let asset = self
+            .selected_model_instance()
+            .map(|instance| instance.placement.asset_id)?;
+        if let Some((cached, value)) = self.vertex_paint_double_sided {
+            if cached == asset {
+                return Some(value);
+            }
+        }
+        let document = self.model_catalog().ok()?.load_asset(asset).ok()?;
+        // An empty material list is the textureless case, which paints against
+        // a material this tool synthesises later; report it as single sided so
+        // the toggle still offers the fix.
+        let both = !document.materials.is_empty()
+            && document
+                .materials
+                .iter()
+                .all(|material| material.gx.cull_mode == GX_CULL_NONE);
+        self.vertex_paint_double_sided = Some((asset, both));
+        Some(both)
+    }
+
+    /// Turns culling on or off for the selected terrain's materials.
+    ///
+    /// Baking as terrain is where a single-sided material starts costing you
+    /// faces: the same mesh drawn as a separate object keeps them, so the two
+    /// modes disagree and the terrain reads as inside out. Drawing both sides
+    /// makes them agree no matter which way any given triangle is wound, which
+    /// is the one repair that does not depend on trusting the normals.
+    ///
+    /// It is not free. Both sides of every triangle get rasterised, so reach
+    /// for `Fix Facing` first and keep this for meshes it cannot resolve.
+    pub(super) fn set_terrain_double_sided(&mut self, both: bool) {
+        let mut targets = self.terrain_paint_targets_scoped(true);
+        if targets.is_empty() {
+            self.log.push(
+                "Select a terrain instance in the hierarchy before changing its culling."
+                    .to_string(),
+            );
+            return;
+        }
+        let wanted = match both {
+            true => GX_CULL_NONE,
+            false => GX_CULL_BACK,
+        };
+        let mut changed = 0usize;
+        for target in &mut targets {
+            for material in &mut target.document.materials {
+                if material.gx.cull_mode != wanted {
+                    material.gx.cull_mode = wanted;
+                    material.source_double_sided = both;
+                    changed += 1;
+                }
+            }
+        }
+        // The cache is stale either way now: the write may have changed
+        // nothing, in which case the state was already what was asked for.
+        self.vertex_paint_double_sided = None;
+        if changed == 0 {
+            self.log.push(match both {
+                true => "That terrain already draws both sides.".to_string(),
+                false => "That terrain already culls back faces.".to_string(),
+            });
+            return;
+        }
+        let label = match both {
+            true => "Made terrain double sided",
+            false => "Made terrain single sided",
+        };
+        self.commit_terrain_targets(targets, label, false);
+        self.log.push(match both {
+            true => format!(
+                "{changed} material(s) now draw both sides, so no face drops out of the bake."
+            ),
+            false => format!("{changed} material(s) now cull back faces again."),
         });
+    }
+
+    /// Turns blended terrain materials back into opaque ones.
+    ///
+    /// A glTF exporter will mark a material `BLEND` for having any alpha
+    /// plumbing at all, whether or not anything is actually transparent, and
+    /// the importer maps that faithfully: blending on and depth writes off.
+    /// Terrain then stops occluding itself and the stage looks like its faces
+    /// are missing, because you are seeing through them rather than at them.
+    ///
+    /// The separate-object path hides this. Its loader flags derive
+    /// pixel-engine state from material mode and overwrite the stored blend
+    /// and depth state, so the same asset looks right there and wrong once it
+    /// bakes as terrain.
+    ///
+    /// Materials whose base colour is genuinely translucent are left alone, so
+    /// this cannot quietly turn real glass into a wall.
+    pub(super) fn make_terrain_opaque(&mut self) {
+        let mut targets = self.terrain_paint_targets_scoped(true);
+        if targets.is_empty() {
+            self.log.push(
+                "Select a terrain instance in the hierarchy before changing its blending."
+                    .to_string(),
+            );
+            return;
+        }
+        let mut changed = 0usize;
+        let mut kept = 0usize;
+        for target in &mut targets {
+            for material in &mut target.document.materials {
+                let blended = material.gx.blend_mode != sms_formats::GxBlendMode::default()
+                    || material.gx.depth_mode.update_enabled == 0;
+                if !blended {
+                    continue;
+                }
+                if material.source_base_color[3] < 0.999 {
+                    kept += 1;
+                    continue;
+                }
+                material.gx.blend_mode = sms_formats::GxBlendMode::default();
+                material.gx.depth_mode.update_enabled = 1;
+                material.source_alpha_mode = sms_authoring::ImportedAlphaMode::Opaque;
+                changed += 1;
+            }
+        }
+
+        if changed == 0 {
+            self.log.push(match kept {
+                0 => "That terrain is already opaque.".to_string(),
+                _ => format!(
+                    "Left {kept} translucent material(s) alone; nothing else on that terrain                      was blended."
+                ),
+            });
+            return;
+        }
+        self.commit_terrain_targets(targets, "Made terrain opaque", false);
+        let mut message =
+            format!("{changed} material(s) now write depth again, so the terrain occludes itself.");
+        if kept > 0 {
+            message.push_str(&format!(
+                " Left {kept} alone for having a genuinely translucent base colour."
+            ));
+        }
+        self.log.push(message);
+    }
+
+    pub(super) fn clear_terrain_vertex_colors(&mut self) {
+        let mut targets = self.terrain_paint_targets_scoped(true);
+        if targets.is_empty() {
+            self.log.push(
+                "No terrain to clear: set a model instance to 'Bake as map terrain' first."
+                    .to_string(),
+            );
+            return;
+        }
+        // Back to the material's own diffuse, not to white. Painting points the
+        // colour channel at the vertex array, so the material register stops
+        // contributing; clearing to flat white therefore threw the model's
+        // diffuse away along with the paint, and the mesh came back blank.
+        for target in &mut targets {
+            let diffuse = target
+                .document
+                .materials
+                .iter()
+                .map(|material| material.source_base_color)
+                .collect::<Vec<_>>();
+            for mesh in &mut target.document.meshes {
+                for primitive in &mut mesh.primitives {
+                    let base = primitive
+                        .material
+                        .and_then(|index| diffuse.get(index as usize))
+                        .copied()
+                        .unwrap_or([1.0; 4]);
+                    for color in primitive_colors_mut(primitive, base) {
+                        *color = [base[0], base[1], base[2], color[3]];
+                    }
+                }
+            }
+        }
+        self.commit_terrain_targets(targets, "Cleared vertex paint", true);
     }
 
     /// Directional light baked into vertex colours.
@@ -1215,89 +1799,6 @@ impl SmsEditorApp {
             }
         }
         self.commit_terrain_targets(targets, "Smoothed normals for baking", false);
-    }
-
-    /// Lays a gradient along a world axis over the terrain's bounds.
-    pub(super) fn bake_terrain_ramp(&mut self) {
-        let axis = self.vertex_paint_ramp_axis.min(2);
-        let start = self.vertex_paint_ramp_start;
-        let end = self.vertex_paint_ramp_end;
-        let curve = self.vertex_paint_ramp_curve.clamp(0.05, 8.0);
-        let invert = self.vertex_paint_ramp_invert;
-        let color = self.vertex_paint_color;
-        let strength = self.vertex_paint_strength.clamp(0.0, 1.0);
-
-        // Bounds first, so start and end read as fractions of the terrain
-        // rather than raw world coordinates the user would have to look up.
-        let mut minimum = f32::INFINITY;
-        let mut maximum = f32::NEG_INFINITY;
-        for target in &self.terrain_paint_targets_scoped(true) {
-            for primitive in Self::target_world_vertex_occurrences(target) {
-                for occurrence in primitive {
-                    for vertex in occurrence {
-                        minimum = minimum.min(vertex.position[axis]);
-                        maximum = maximum.max(vertex.position[axis]);
-                    }
-                }
-            }
-        }
-        if !minimum.is_finite() || maximum <= minimum {
-            self.log
-                .push("Ramp needs terrain with a measurable extent.".to_string());
-            return;
-        }
-        let span = maximum - minimum;
-        self.edit_terrain_vertex_colors_scoped(
-            "Baked ramp into vertex paint",
-            true,
-            |vertices, value| {
-                let normalised = vertices
-                    .iter()
-                    .map(|vertex| ((vertex.position[axis] - minimum) / span).clamp(0.0, 1.0))
-                    .sum::<f32>()
-                    / vertices.len() as f32;
-                let range = (end - start).abs().max(1e-4);
-                let mut t = ((normalised - start.min(end)) / range).clamp(0.0, 1.0);
-                if invert {
-                    t = 1.0 - t;
-                }
-                let amount = t.powf(curve) * strength;
-                for axis in 0..3 {
-                    value[axis] += (color[axis] - value[axis]) * amount;
-                    value[axis] = value[axis].clamp(0.0, 1.0);
-                }
-            },
-        );
-    }
-
-    /// Blends every vertex toward the average of its edge neighbours.
-    pub(super) fn smooth_terrain_vertex_colors(&mut self) {
-        let amount = self.vertex_paint_strength.clamp(0.0, 1.0);
-        let iterations = self.vertex_paint_smooth_iterations.clamp(1, 20);
-        let mut targets = self.terrain_paint_targets_scoped(true);
-        if targets.is_empty() {
-            self.log.push(
-                "No terrain to paint: set a model instance to 'Bake as map terrain' first."
-                    .to_string(),
-            );
-            return;
-        }
-        for target in &mut targets {
-            for mesh in &mut target.document.meshes {
-                for primitive in &mut mesh.primitives {
-                    let welds = weld_positions(&primitive.positions);
-                    let adjacency = primitive_adjacency(&primitive.indices, &welds);
-                    let colors = primitive_colors_mut(primitive);
-                    // Repeated passes spread the blend further than one pass
-                    // at higher strength, which just overshoots.
-                    for _ in 0..iterations {
-                        let smoothed = smoothed_colors(colors, &welds, &adjacency, amount);
-                        colors.copy_from_slice(&smoothed);
-                    }
-                }
-            }
-        }
-        self.commit_terrain_targets(targets, "Smoothed vertex paint", true);
     }
 }
 
@@ -1631,6 +2132,17 @@ impl SmsEditorApp {
     ) {
         for target in targets {
             let world = Self::target_world_vertex_occurrences(target);
+            // Erasing goes back to the material's own diffuse, the same place
+            // Clear Paint goes. Painting points the colour channel at the
+            // vertex array, so the material register stops reaching the
+            // surface: white in that array is not "no paint", it is a white
+            // surface, and erasing to it bleached the model.
+            let diffuse = target
+                .document
+                .materials
+                .iter()
+                .map(|material| material.source_base_color)
+                .collect::<Vec<_>>();
             // Apply the fixed-distance dabs in order. Grouping them by UI
             // frame would change repeated brush blends, and smoothing would
             // sample a different intermediate neighbourhood.
@@ -1642,9 +2154,14 @@ impl SmsEditorApp {
                             continue;
                         };
                         primitive_index += 1;
+                        let base = primitive
+                            .material
+                            .and_then(|index| diffuse.get(index as usize))
+                            .copied()
+                            .unwrap_or([1.0; 4]);
                         let welds = weld_positions(&primitive.positions);
                         let adjacency = primitive_adjacency(&primitive.indices, &welds);
-                        let colors = primitive_colors_mut(primitive);
+                        let colors = primitive_colors_mut(primitive, base);
                         let smoothed = matches!(application.mode, VertexPaintMode::Smooth)
                             .then(|| smoothed_colors(colors, &welds, &adjacency, 1.0));
 
@@ -1674,12 +2191,9 @@ impl SmsEditorApp {
                             if amount <= f32::EPSILON {
                                 continue;
                             }
-                            // White is the identity for a vertex-lit surface,
-                            // so erasing blends back toward it rather than to
-                            // black.
                             let goal = match application.mode {
                                 VertexPaintMode::Brush => application.color,
-                                VertexPaintMode::Eraser => [1.0, 1.0, 1.0],
+                                VertexPaintMode::Eraser => [base[0], base[1], base[2]],
                                 VertexPaintMode::Smooth => smoothed
                                     .as_ref()
                                     .and_then(|set| set.get(index))
@@ -1849,6 +2363,94 @@ impl SmsEditorApp {
         painter.add(egui::Shape::line(ring, egui::Stroke::new(2.0, color)));
     }
 
+    /// Re-grades from the baseline and shows it, without touching the catalog.
+    fn refresh_vertex_paint_grade(&mut self) {
+        let settings = self.vertex_paint_grade_settings;
+        let asset = self
+            .selected_model_instance()
+            .map(|instance| instance.placement.asset_id);
+
+        // A session belongs to the terrain it opened on. Grading whatever got
+        // selected later against a stale baseline would write one mesh's
+        // colours onto another.
+        if self
+            .vertex_paint_grade
+            .as_ref()
+            .is_some_and(|grade| grade.baseline.first().map(|entry| entry.id) != asset)
+        {
+            self.vertex_paint_grade = None;
+        }
+        if self.vertex_paint_grade.is_none() {
+            if settings.is_neutral() {
+                return;
+            }
+            let targets = self.terrain_paint_targets_scoped(true);
+            if targets.is_empty() {
+                self.log
+                    .push("Select a terrain instance in the hierarchy before grading.".to_string());
+                return;
+            }
+            let baseline = targets
+                .iter()
+                .map(|target| snapshot_paint_state(target.id, &target.document))
+                .collect();
+            self.vertex_paint_grade = Some(VertexPaintGrade { targets, baseline });
+        }
+
+        let Some(mut grade) = self.vertex_paint_grade.take() else {
+            return;
+        };
+        for (target, baseline) in grade.targets.iter_mut().zip(grade.baseline.iter()) {
+            restore_paint_state(&mut target.document, baseline);
+            let diffuse = document_primitive_diffuse(&target.document);
+            let neutral = document_primitive_unshaded(&target.document);
+            let mut primitive_index = 0usize;
+            for mesh in &mut target.document.meshes {
+                for primitive in &mut mesh.primitives {
+                    let base = diffuse.get(primitive_index).copied().unwrap_or([1.0; 4]);
+                    primitive_index += 1;
+                    let unshaded = neutral
+                        .get(primitive_index - 1)
+                        .copied()
+                        .unwrap_or([1.0; 3]);
+                    let colors = primitive_colors_mut(primitive, base);
+                    for color in colors.iter_mut() {
+                        settings.apply(color, unshaded);
+                    }
+                }
+            }
+        }
+        for target in &grade.targets {
+            self.cache_model_previews_for_document(target.id, &target.document);
+        }
+        self.vertex_paint_grade = Some(grade);
+    }
+
+    /// Writes the grade to the catalog as one undo step.
+    fn apply_vertex_paint_grade(&mut self) {
+        let Some(grade) = self.vertex_paint_grade.take() else {
+            return;
+        };
+        self.commit_terrain_targets(grade.targets, "Graded vertex colour", true);
+        // The grade is in the asset now, so the sliders start again from
+        // neutral rather than re-applying themselves on the next nudge.
+        self.vertex_paint_grade_settings = VertexPaintGradeSettings::default();
+    }
+
+    /// Puts the terrain back as it was before the sliders moved.
+    fn revert_vertex_paint_grade(&mut self) {
+        self.vertex_paint_grade_settings = VertexPaintGradeSettings::default();
+        let Some(mut grade) = self.vertex_paint_grade.take() else {
+            return;
+        };
+        for (target, baseline) in grade.targets.iter_mut().zip(grade.baseline.iter()) {
+            restore_paint_state(&mut target.document, baseline);
+        }
+        for target in &grade.targets {
+            self.cache_model_previews_for_document(target.id, &target.document);
+        }
+    }
+
     pub(super) fn vertex_paint_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Vertex Paint");
         let terrain = self
@@ -1904,6 +2506,18 @@ impl SmsEditorApp {
         );
 
         ui.separator();
+        if let Some(both) = self.terrain_draws_both_sides() {
+            let mut wanted = both;
+            if ui
+                .checkbox(&mut wanted, "Draw both sides")
+                .on_hover_text(
+                    "Stops terrain culling back faces, so none can drop out of the bake. Costs                      fill rate; try Fix Facing first",
+                )
+                .changed()
+            {
+                self.set_terrain_double_sided(wanted);
+            }
+        }
         if ui
             .button("Subdivide")
             .on_hover_text(
@@ -1923,8 +2537,28 @@ impl SmsEditorApp {
                 self.smooth_terrain_vertex_colors();
             }
             if ui
+                .button("Make Opaque")
+                .on_hover_text(
+                    "Clear blending and re-enable depth writes, so terrain stops showing                      through itself",
+                )
+                .clicked()
+            {
+                self.make_terrain_opaque();
+            }
+            if ui
+                .button("Fix Facing")
+                .on_hover_text(
+                    "Rewind triangles that face away from their own normals, which is what                      makes a mesh look inside out once it bakes as terrain",
+                )
+                .clicked()
+            {
+                self.repair_terrain_winding();
+            }
+            if ui
                 .button("Clear Paint")
-                .on_hover_text("Reset every terrain vertex to white")
+                .on_hover_text(
+                    "Reset the terrain to its material diffuse, dropping paint and bakes",
+                )
                 .clicked()
             {
                 self.clear_terrain_vertex_colors();
@@ -1960,27 +2594,74 @@ impl SmsEditorApp {
         }
 
         ui.separator();
-        ui.strong("Ramp");
+        ui.strong("Grade");
+        ui.label("Adjusts the colours already on the terrain. Nothing is written until Apply.");
+        let mut changed = false;
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.vertex_paint_grade_settings.exposure, -3.0..=3.0)
+                    .text("Exposure"),
+            )
+            .on_hover_text("Stops, so each one doubles or halves the light")
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.vertex_paint_grade_settings.contrast, -1.0..=1.0)
+                    .text("Contrast"),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.vertex_paint_grade_settings.vibrance, -1.0..=1.0)
+                    .text("Vibrance"),
+            )
+            .on_hover_text("Leans on the duller colours, so painted patches do not blow out first")
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.vertex_paint_grade_settings.hue, -180.0..=180.0)
+                    .text("Hue"),
+            )
+            .on_hover_text("Rotates the colours without changing how light they are")
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.vertex_paint_grade_settings.shadow, -1.0..=1.0)
+                    .text("Shadow"),
+            )
+            .on_hover_text("Deepens or lifts the dark end without moving the lit surfaces")
+            .changed();
         ui.horizontal(|ui| {
-            for (index, label) in ["X", "Y", "Z"].into_iter().enumerate() {
-                ui.selectable_value(&mut self.vertex_paint_ramp_axis, index, label);
-            }
-            ui.checkbox(&mut self.vertex_paint_ramp_invert, "Invert");
+            changed |= ui
+                .color_edit_button_rgb(&mut self.vertex_paint_grade_settings.tint)
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut self.vertex_paint_grade_settings.tint_amount, 0.0..=1.0)
+                        .text("Shadow tint"),
+                )
+                .changed();
         });
-        ui.add(egui::Slider::new(&mut self.vertex_paint_ramp_start, 0.0..=1.0).text("Start"));
-        ui.add(egui::Slider::new(&mut self.vertex_paint_ramp_end, 0.0..=1.0).text("End"));
-        ui.add(
-            egui::Slider::new(&mut self.vertex_paint_ramp_curve, 0.05..=8.0)
-                .logarithmic(true)
-                .text("Curve"),
-        );
-        if ui
-            .button("Bake Ramp")
-            .on_hover_text("Blend the brush colour along an axis across the terrain bounds")
-            .clicked()
-        {
-            self.bake_terrain_ramp();
+        if changed {
+            self.refresh_vertex_paint_grade();
         }
+        ui.horizontal(|ui| {
+            let open = self.vertex_paint_grade.is_some();
+            if ui
+                .add_enabled(open, egui::Button::new("Apply"))
+                .on_hover_text("Write the graded colours to the asset")
+                .clicked()
+            {
+                self.apply_vertex_paint_grade();
+            }
+            if ui
+                .add_enabled(open, egui::Button::new("Revert"))
+                .on_hover_text("Put the colours back and reset the sliders")
+                .clicked()
+            {
+                self.revert_vertex_paint_grade();
+            }
+        });
 
         ui.separator();
         ui.strong("Sun (directional light bake)");
@@ -2009,6 +2690,53 @@ impl SmsEditorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Switching a mesh to vertex colour must not change how it looks.
+    ///
+    /// GX picks either the material register or the vertex array for a
+    /// channel, never both, so enabling vertex colour folds the register
+    /// colour into the vertices once. A primitive with no colour set yet is
+    /// where that is easy to get wrong: seed it with the material colour and
+    /// the fold applies that colour a second time, landing the mesh at its
+    /// colour squared.
+    #[test]
+    fn enabling_vertex_colors_lands_on_the_material_colour_once() {
+        let green = [0.05f32, 0.53, 0.05, 1.0];
+        let mut document = ModelAssetDocument::new("test");
+        let mut material = vertex_color_material("test");
+        material.source_base_color = green;
+        material.gx.material_colors[0] = Some(green.map(|value| (value * 255.0).round() as u8));
+        document.materials.push(material);
+        document.meshes.push(sms_authoring::ModelMesh {
+            name: "test".to_string(),
+            primitives: vec![sms_authoring::ModelPrimitive {
+                positions: vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                normals: vec![[0.0, 1.0, 0.0]; 3],
+                tangents: Vec::new(),
+                tex_coords: Vec::new(),
+                colors: Vec::new(),
+                indices: vec![0, 1, 2],
+                material: Some(0),
+            }],
+        });
+
+        enable_vertex_colors(&mut document);
+
+        let colors = &document.meshes[0].primitives[0]
+            .colors
+            .iter()
+            .find(|set| set.set == 0)
+            .expect("a colour set")
+            .values;
+        for color in colors.iter() {
+            for (channel, expected) in color.iter().take(3).zip(green.iter()) {
+                assert!(
+                    (channel - expected).abs() < 0.01,
+                    "expected the material colour once, got {color:?} against {green:?}"
+                );
+            }
+        }
+    }
     use sms_authoring::{ModelMesh, ModelNode, ModelPrimitive};
 
     fn test_document() -> ModelAssetDocument {
