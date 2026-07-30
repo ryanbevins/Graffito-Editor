@@ -25,11 +25,6 @@ const SCENE_PATH: &[u8] = b"map/scene.bin";
 /// what `getManagerByName` resolves. The factory name is `NameKuriManager`.
 const GOOBLE_MANAGER_NAME: &str =
     "\u{30CA}\u{30E1}\u{30AF}\u{30EA}\u{30DE}\u{30CD}\u{30FC}\u{30B8}\u{30E3}\u{30FC}";
-/// ナメクリマネージャー キャラ — the manager's character resource name.
-const GOOBLE_MANAGER_CHARACTER: &str = "\u{30CA}\u{30E1}\u{30AF}\u{30EA}\u{30DE}\u{30CD}\u{30FC}\u{30B8}\u{30E3}\u{30FC} \u{30AD}\u{30E3}\u{30E9}";
-/// マネージャーグループ — the Strategy child that owns enemy managers.
-const MANAGER_GROUP_NAME: &str =
-    "\u{30DE}\u{30CD}\u{30FC}\u{30B8}\u{30E3}\u{30FC}\u{30B0}\u{30EB}\u{30FC}\u{30D7}";
 /// 敵情報 — every retail StageEnemyInfo entry carries this object name.
 const ENEMY_INFO_NAME: &str = "\u{6575}\u{60C5}\u{5831}";
 /// 敵出現テーブル — the StageEnemyInfoHeader's object name.
@@ -46,24 +41,6 @@ fn jdrama_field(name: &str, value: sms_formats::JDramaFieldValue) -> sms_formats
     sms_formats::JDramaField {
         name: name.to_string(),
         value,
-    }
-}
-
-/// The Gooble manager exactly as bianco0 places it.
-fn gooble_manager_record() -> sms_formats::JDramaRecord {
-    sms_formats::JDramaRecord {
-        type_name: "NameKuriManager".to_string(),
-        name: GOOBLE_MANAGER_NAME.to_string(),
-        payload: sms_formats::JDramaRecordPayload::Fields {
-            fields: vec![
-                jdrama_field(
-                    "character_name",
-                    sms_formats::JDramaFieldValue::String(GOOBLE_MANAGER_CHARACTER.to_string()),
-                ),
-                jdrama_field("capacity", sms_formats::JDramaFieldValue::U32(20)),
-                jdrama_field("manager_load_value", sms_formats::JDramaFieldValue::U32(3)),
-            ],
-        },
     }
 }
 
@@ -325,47 +302,47 @@ impl SmsEditorApp {
             );
         }
 
-        if !enabled {
-            // The manager stays: presence and spawning are separate concerns,
-            // exactly as the runtime treats them.
-            return Ok(());
-        }
+        // An earlier revision inserted a bare NameKuriManager record here. A
+        // manager is not just a record: TObjManager::load resolves its
+        // character archive by name and dereferences the result, so a manager
+        // without its resources crashes the stage on load. Placing the manager
+        // is the content browser's job, where the authoring template carries
+        // every resource the runtime touches. Strip any bare insert an earlier
+        // revision left behind, so an affected stage heals on the next toggle.
+        document.archive_edits.placement_inserts.retain(|insert| {
+            !(insert.raw_resource_path == SCENE_PATH
+                && insert.record.type_name == "NameKuriManager"
+                && matches!(
+                    &insert.record.payload,
+                    sms_formats::JDramaRecordPayload::Fields { .. }
+                ))
+        });
+        Ok(())
+    }
 
-        // The actor pool, in scene.bin. Skip if any effective record or a
-        // pending insert already carries the manager's name.
-        let Some(StageResourceDocument::Placement(scene)) = document
-            .effective_resource_clone(SCENE_PATH)
-            .map_err(|error| error.to_string())?
-        else {
-            return Err("map/scene.bin is missing or is not typed placement data".to_string());
+    /// Whether the effective scene carries the Gooble manager, from any
+    /// source: the base archive or a placed template.
+    pub(super) fn gooble_manager_present(&self) -> bool {
+        let Some(document) = self.document.as_ref() else {
+            return false;
         };
-        let already_placed = any_record(&scene.root, &|record| record.name == GOOBLE_MANAGER_NAME)
-            || document
-                .archive_edits
-                .placement_inserts
-                .iter()
-                .any(|insert| {
-                    insert.raw_resource_path == SCENE_PATH
-                        && any_record(&insert.record, &|record| record.name == GOOBLE_MANAGER_NAME)
-                });
-        if already_placed {
-            return Ok(());
-        }
-        let mut group_path = Vec::new();
-        if !find_record_path(&scene.root, &mut group_path, &|record| {
-            record.name == MANAGER_GROUP_NAME
-        }) {
-            return Err("the scene has no manager group to hold the Gooble manager".to_string());
-        }
-        document
+        let placed = document
             .archive_edits
             .placement_inserts
-            .push(sms_scene::StagePlacementInsert {
-                raw_resource_path: SCENE_PATH.to_vec(),
-                parent_record_path: group_path,
-                record: gooble_manager_record(),
+            .iter()
+            .any(|insert| {
+                insert.raw_resource_path == SCENE_PATH
+                    && any_record(&insert.record, &|record| record.name == GOOBLE_MANAGER_NAME)
             });
-        Ok(())
+        if placed {
+            return true;
+        }
+        let Ok(Some(StageResourceDocument::Placement(scene))) =
+            document.effective_resource_clone(SCENE_PATH)
+        else {
+            return false;
+        };
+        any_record(&scene.root, &|record| record.name == GOOBLE_MANAGER_NAME)
     }
 
     /// The Spawning section of the goop inspector.
@@ -377,12 +354,19 @@ impl SmsEditorApp {
             .checkbox(&mut enabled, "Spawn Goobles from goop")
             .on_hover_text(
                 "Writes the retail enemy table: the conductor periodically picks a spot near \
-                 Mario and spawns a Gooble there if that spot is goop. Adds the NameKuri \
-                 manager to the scene the first time it is enabled.",
+                 Mario and spawns a Gooble there if that spot is goop. The stage also needs \
+                 a NameKuri Manager placed from the content browser to supply the actors.",
             )
             .changed()
         {
             self.set_gooble_spawn(enabled);
+        }
+        if enabled && !self.gooble_manager_present() {
+            ui.colored_label(
+                egui::Color32::from_rgb(245, 180, 70),
+                "No NameKuri Manager in this stage: nothing will spawn. Place one from the \
+                 content browser (search \"namekuri\").",
+            );
         }
     }
 }
