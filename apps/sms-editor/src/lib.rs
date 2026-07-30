@@ -1303,6 +1303,7 @@ struct SmsEditorApp {
     vertex_paint_dirt: f32,
     vertex_paint_dirt_ramp: f32,
     vertex_paint_dirt_bias: f32,
+    vertex_paint_dirt_spread: u32,
     vertex_paint_dirt_yaw: f32,
     vertex_paint_dirt_pitch: f32,
     vertex_paint_smooth_iterations: u32,
@@ -1313,11 +1314,12 @@ struct SmsEditorApp {
     vertex_paint_ramp_curve: f32,
     vertex_paint_ramp_invert: bool,
     vertex_paint_stroke: Vec<egui::Pos2>,
-    /// Latched when a stroke starts, so releasing shift mid-stroke does not
-    /// change what that stroke does.
-    vertex_paint_stroke_erases: bool,
-    /// Live shift state, used only to colour the brush ring.
-    vertex_paint_shift_erase: bool,
+    /// The stroke in progress, held in memory so the viewport can show paint
+    /// going down before anything reaches the catalog.
+    vertex_paint_live: Option<VertexPaintLiveStroke>,
+    /// What the held modifiers would paint, used to colour the brush ring and
+    /// to pick the mode a new stroke latches.
+    vertex_paint_modifier_mode: Option<VertexPaintMode>,
     vertex_paint_undo_stack: VecDeque<VertexPaintUndoRecord>,
     vertex_paint_redo_stack: VecDeque<VertexPaintUndoRecord>,
     vertex_paint_undo_group: Option<VertexPaintUndoRecord>,
@@ -1611,6 +1613,7 @@ impl Default for SmsEditorApp {
             vertex_paint_dirt: 0.6,
             vertex_paint_dirt_ramp: 1.0,
             vertex_paint_dirt_bias: 0.0,
+            vertex_paint_dirt_spread: 2,
             vertex_paint_dirt_yaw: 0.0,
             vertex_paint_dirt_pitch: -90.0,
             vertex_paint_smooth_iterations: 1,
@@ -1621,8 +1624,8 @@ impl Default for SmsEditorApp {
             vertex_paint_ramp_curve: 1.0,
             vertex_paint_ramp_invert: false,
             vertex_paint_stroke: Vec::new(),
-            vertex_paint_stroke_erases: false,
-            vertex_paint_shift_erase: false,
+            vertex_paint_live: None,
+            vertex_paint_modifier_mode: None,
             vertex_paint_undo_stack: VecDeque::new(),
             vertex_paint_redo_stack: VecDeque::new(),
             vertex_paint_undo_group: None,

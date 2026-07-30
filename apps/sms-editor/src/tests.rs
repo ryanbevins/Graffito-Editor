@@ -5156,7 +5156,7 @@ fn cavity_does_not_lean_along_the_triangulation() {
         })
         .collect::<Vec<_>>();
 
-    let cavity = crate::vertex_paint::primitive_cavity(&primitive, &world, [0.0, 1.0, 0.0], 0.0);
+    let cavity = crate::vertex_paint::primitive_cavity(&primitive, &world, [0.0, 1.0, 0.0], 0.0, 2);
     let middle = SIDE / 2;
     let ring = [
         cavity[middle * SIDE + middle - 1],
@@ -5214,7 +5214,7 @@ fn probe_cavity_on_a_real_asset() {
                 ("-x", [-1.0, 0.0, 0.0], 1.0),
             ] {
                 let cavity =
-                    crate::vertex_paint::primitive_cavity(primitive, &world, direction, bias);
+                    crate::vertex_paint::primitive_cavity(primitive, &world, direction, bias, 2);
                 let nonzero = cavity.iter().filter(|value| **value > 0.001).count();
                 let high = cavity.iter().copied().fold(0.0f32, f32::max);
                 let sum: f32 = cavity.iter().sum();
@@ -5227,7 +5227,7 @@ fn probe_cavity_on_a_real_asset() {
                 );
             }
             let cavity =
-                crate::vertex_paint::primitive_cavity(primitive, &world, [0.0, 1.0, 0.0], 0.0);
+                crate::vertex_paint::primitive_cavity(primitive, &world, [0.0, 1.0, 0.0], 0.0, 2);
             for (index, value) in cavity.iter().enumerate().take(60) {
                 println!(
                     "    v{index:>3} pos {:>9.1} {:>9.1} {:>9.1}  n {:>6.2} {:>6.2} {:>6.2}  \

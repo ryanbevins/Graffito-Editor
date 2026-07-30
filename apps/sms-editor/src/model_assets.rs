@@ -1831,7 +1831,11 @@ impl SmsEditorApp {
         }
     }
 
-    fn cache_model_previews_for_document(&mut self, id: AssetId, document: &ModelAssetDocument) {
+    pub(super) fn cache_model_previews_for_document(
+        &mut self,
+        id: AssetId,
+        document: &ModelAssetDocument,
+    ) {
         let flags = self
             .model_instances
             .iter()

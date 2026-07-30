@@ -76,9 +76,21 @@ fn restore_paint_state(document: &mut ModelAssetDocument, snapshot: &VertexPaint
     }
 }
 
+/// A stroke in progress.
+///
+/// The assets stay in memory for the length of the drag so the viewport can
+/// show the paint going down. Only the release writes to disk.
+pub(super) struct VertexPaintLiveStroke {
+    targets: Vec<PaintTarget>,
+    /// How many stroke samples are already folded in, so each frame applies
+    /// only what arrived since the last one.
+    applied: usize,
+    mode: VertexPaintMode,
+}
+
 /// A terrain asset opened for painting, with the world transform of every
 /// instance that uses it.
-struct PaintTarget {
+pub(super) struct PaintTarget {
     id: AssetId,
     document: ModelAssetDocument,
     /// One asset can be placed several times; a stroke has to consider each
@@ -723,7 +735,7 @@ impl SmsEditorApp {
     /// ambient light cannot reach; convex and flat areas stay untouched.
     pub(super) fn bake_terrain_dirt(&mut self) {
         let amount = self.vertex_paint_dirt.clamp(0.0, 1.0);
-        let ramp = self.vertex_paint_dirt_ramp.clamp(0.05, 8.0);
+        let ramp = self.vertex_paint_dirt_ramp.clamp(0.25, 4.0);
         let (yaw, pitch) = (
             self.vertex_paint_dirt_yaw.to_radians(),
             self.vertex_paint_dirt_pitch.to_radians(),
@@ -734,6 +746,7 @@ impl SmsEditorApp {
             pitch.cos() * yaw.cos(),
         ];
         let bias = self.vertex_paint_dirt_bias.clamp(0.0, 1.0);
+        let spread = self.vertex_paint_dirt_spread;
         let mut targets = self.terrain_paint_targets_scoped(true);
         if targets.is_empty() {
             self.log.push(
@@ -747,8 +760,13 @@ impl SmsEditorApp {
             let mut primitive_index = 0usize;
             for mesh in &mut target.document.meshes {
                 for primitive in &mut mesh.primitives {
-                    let dirt =
-                        primitive_cavity(primitive, &world[primitive_index], direction, bias);
+                    let dirt = primitive_cavity(
+                        primitive,
+                        &world[primitive_index],
+                        direction,
+                        bias,
+                        spread,
+                    );
                     primitive_index += 1;
                     let colors = primitive_colors_mut(primitive);
                     for (index, color) in colors.iter_mut().enumerate() {
@@ -1095,6 +1113,7 @@ pub(super) fn primitive_cavity(
     world: &[WorldVertex],
     direction: [f32; 3],
     bias: f32,
+    spread: u32,
 ) -> Vec<f32> {
     // World space, because a non-uniform scale on the node or the placement
     // would otherwise skew the result along an axis.
@@ -1218,7 +1237,20 @@ pub(super) fn primitive_cavity(
     // reaches about 0.1 and the Dirty slider looks like it does nothing. Since
     // it never spans its own range, grade it against the sharpest crease the
     // mesh actually has.
-    let peak = relaxed.values().copied().fold(0.0f32, f32::max);
+    // A high percentile rather than the maximum. One freak vertex -- the apex
+    // of a fold, a spike where two edges nearly meet -- would otherwise set the
+    // scale for the whole mesh and squash every other crease toward nothing,
+    // which reads as one side of a ramp dirtying and the other staying clean.
+    let mut ordered = relaxed
+        .values()
+        .copied()
+        .filter(|value| *value > 0.0)
+        .collect::<Vec<_>>();
+    ordered.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let peak = ordered
+        .get(ordered.len().saturating_sub(1).min(ordered.len() * 9 / 10))
+        .copied()
+        .unwrap_or(0.0);
     // Below this there is no crease to speak of, only the noise a flat surface
     // makes at its border, and stretching that to full black would be a lie.
     let graded: BTreeMap<usize, f32> = match peak > 0.004 {
@@ -1228,6 +1260,28 @@ pub(super) fn primitive_cavity(
             .collect(),
         false => BTreeMap::new(),
     };
+
+    // Spread walks the dirt outward from the creases it was measured on.
+    // Concavity only exists at a fold, so on coarse terrain it lands on a
+    // handful of vertices and stops; the surrounding faces are flat and score
+    // nothing however strong the bake is. Each pass lets a vertex take a
+    // fraction of its dirtiest neighbour, so the dirt reaches across the
+    // surface instead of clinging to the edge that produced it.
+    let mut graded = graded;
+    for _ in 0..spread.min(12) {
+        graded = graded
+            .iter()
+            .map(|(weld, value)| {
+                let reached = adjacency
+                    .get(weld)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|neighbour| graded.get(neighbour))
+                    .fold(0.0f32, |highest, neighbour| highest.max(*neighbour));
+                (*weld, value.max(reached * 0.72))
+            })
+            .collect();
+    }
 
     let bias = bias.clamp(0.0, 1.0);
     welds
@@ -1247,86 +1301,161 @@ pub(super) fn primitive_cavity(
 }
 
 impl SmsEditorApp {
-    /// Applies the accumulated stroke points to every terrain asset at once.
-    ///
-    /// Strokes commit on release rather than per frame: each commit rewrites
-    /// and saves whole `.smsmodel` documents, far too much work to repeat while
-    /// the pointer is moving.
-    pub(super) fn commit_vertex_paint_stroke(&mut self) {
-        let stroke = std::mem::take(&mut self.vertex_paint_stroke);
-        let Some(rect) = self.vertex_paint_rect else {
-            return;
-        };
-        if stroke.is_empty() {
+    /// Shift erases and Ctrl smooths, whatever the panel is set to. Ctrl wins
+    /// when both are held, since smoothing is the harder one to reach.
+    fn vertex_paint_modifier_mode(shift: bool, ctrl: bool) -> Option<VertexPaintMode> {
+        match (ctrl, shift) {
+            (true, _) => Some(VertexPaintMode::Smooth),
+            (_, true) => Some(VertexPaintMode::Eraser),
+            _ => None,
+        }
+    }
+
+    /// Opens a stroke, loading the assets it will paint.
+    fn begin_vertex_paint_live_stroke(&mut self, mode: VertexPaintMode) {
+        if self.vertex_paint_live.is_some() {
             return;
         }
-        if self.selected_model_instance().is_none() {
+        let mut targets = self.terrain_paint_targets_scoped(true);
+        if targets.is_empty() {
             self.log.push(
-                "Select a terrain instance in the hierarchy before painting; the brush only                  paints the selected one."
+                "Select a terrain instance in the hierarchy before painting; the brush only \
+                 paints the selected one."
                     .to_string(),
             );
             return;
         }
-        let projection = self.camera_projection(rect);
-        let radius = self.vertex_paint_radius.max(1.0);
-        let strength = self.vertex_paint_strength.clamp(0.0, 1.0);
-        let color = self.vertex_paint_color;
-        // Shift is a quick erase, so a correction does not mean going to the
-        // panel and back for every stroke.
-        let mode = match self.vertex_paint_stroke_erases {
-            true => VertexPaintMode::Eraser,
-            false => self.vertex_paint_mode,
+        // Up front, not at the commit: the preview reads the same material
+        // switch the export does, so without it the stroke would go down
+        // invisibly and only appear once the asset was saved.
+        for target in &mut targets {
+            enable_vertex_colors(&mut target.document);
+        }
+        self.vertex_paint_live = Some(VertexPaintLiveStroke {
+            targets,
+            applied: 0,
+            mode,
+        });
+    }
+
+    /// Folds the samples added since the last frame into the open stroke.
+    fn advance_vertex_paint_live_stroke(&mut self) {
+        let Some(rect) = self.vertex_paint_rect else {
+            return;
         };
-        let label = match mode {
+        let Some(mut live) = self.vertex_paint_live.take() else {
+            return;
+        };
+        if self.vertex_paint_stroke.len() <= live.applied {
+            self.vertex_paint_live = Some(live);
+            return;
+        }
+        let samples = self.vertex_paint_stroke[live.applied..].to_vec();
+        live.applied = self.vertex_paint_stroke.len();
+
+        Self::apply_stroke_to_targets(
+            &mut live.targets,
+            &samples,
+            &self.camera_projection(rect),
+            self.vertex_paint_radius.max(1.0),
+            self.vertex_paint_strength.clamp(0.0, 1.0),
+            self.vertex_paint_color,
+            live.mode,
+        );
+
+        // Rebuilt from memory. The catalog is not touched until the stroke
+        // ends, so dragging costs no disk writes.
+        for target in &live.targets {
+            self.cache_model_previews_for_document(target.id, &target.document);
+        }
+        self.vertex_paint_live = Some(live);
+    }
+
+    /// Ends a stroke and writes it to the catalog as one undoable step.
+    fn finish_vertex_paint_live_stroke(&mut self) {
+        self.vertex_paint_stroke.clear();
+        let Some(live) = self.vertex_paint_live.take() else {
+            return;
+        };
+        let label = match live.mode {
             VertexPaintMode::Brush => "Painted vertex colour",
             VertexPaintMode::Eraser => "Erased vertex colour",
             VertexPaintMode::Smooth => "Softened vertex colour",
         };
-        // Scoped to the selected instance so a stroke cannot bleed onto the
-        // terrain underneath it.
-        // Counters so a stroke that does nothing can say why: whether any
-        // vertex was even considered, and how close the nearest one came.
-        let mut considered = 0usize;
-        let mut painted = 0usize;
-        let mut closest = f32::INFINITY;
-        self.edit_terrain_vertex_colors_scoped(label, true, |vertex, value| {
-            considered += 1;
-            // Screen space, not a surface raycast. Casting a ray and painting
-            // around the hit point misses wherever the ray leaves the mesh, so
-            // edges and silhouettes could not be painted at all. Projecting the
-            // vertices instead also makes the radius genuinely pixels, which is
-            // what the slider claims.
-            let Some((screen, _)) = projection.project_world_to_screen(vertex.position) else {
-                return;
-            };
-            let mut nearest = f32::INFINITY;
-            for sample in &stroke {
-                nearest = nearest.min(screen.distance(*sample));
-            }
-            closest = closest.min(nearest);
-            if nearest >= radius {
-                return;
-            }
-            painted += 1;
-            let falloff = 1.0 - (nearest / radius).clamp(0.0, 1.0);
-            let amount = (falloff * falloff * strength).clamp(0.0, 1.0);
-            // White is the identity for a vertex-lit surface, so erasing blends
-            // back toward it rather than toward black.
-            let target = match mode {
-                VertexPaintMode::Brush => color,
-                VertexPaintMode::Eraser | VertexPaintMode::Smooth => [1.0, 1.0, 1.0],
-            };
-            for axis in 0..3 {
-                value[axis] += (target[axis] - value[axis]) * amount;
-                value[axis] = value[axis].clamp(0.0, 1.0);
-            }
-        });
-        self.log.push(format!(
-            "Vertex paint: {painted} of {considered} vertices within {radius:.0}px; nearest was {closest:.0}px."
-        ));
+        self.commit_paint_targets(live.targets, label);
     }
 
-    /// Collects stroke samples while the pointer is down over the viewport.
+    /// Applies stroke samples to already-loaded assets.
+    ///
+    /// Screen space, not a surface raycast. Casting a ray and painting around
+    /// the hit point misses wherever the ray leaves the mesh, so edges and
+    /// silhouettes could not be painted at all. Projecting the vertices instead
+    /// also makes the radius genuinely pixels, which is what the slider claims.
+    fn apply_stroke_to_targets(
+        targets: &mut [PaintTarget],
+        samples: &[egui::Pos2],
+        projection: &crate::camera::CameraProjection,
+        radius: f32,
+        strength: f32,
+        color: [f32; 3],
+        mode: VertexPaintMode,
+    ) {
+        for target in targets {
+            let world = Self::target_world_vertices(target);
+            let mut primitive_index = 0usize;
+            for mesh in &mut target.document.meshes {
+                for primitive in &mut mesh.primitives {
+                    let Some(vertices) = world.get(primitive_index) else {
+                        continue;
+                    };
+                    primitive_index += 1;
+                    let welds = weld_positions(&primitive.positions);
+                    let adjacency = primitive_adjacency(&primitive.indices, &welds);
+                    let colors = primitive_colors_mut(primitive);
+                    // The neighbourhood average is taken before the brush
+                    // touches anything, so a slow drag cannot chase its own
+                    // output across the surface.
+                    let smoothed = matches!(mode, VertexPaintMode::Smooth)
+                        .then(|| smoothed_colors(colors, &welds, &adjacency, 1.0));
+
+                    for (index, value) in colors.iter_mut().enumerate() {
+                        let Some(vertex) = vertices.get(index) else {
+                            continue;
+                        };
+                        let Some((screen, _)) = projection.project_world_to_screen(vertex.position)
+                        else {
+                            continue;
+                        };
+                        let nearest = samples
+                            .iter()
+                            .map(|sample| screen.distance(*sample))
+                            .fold(f32::INFINITY, f32::min);
+                        if nearest >= radius {
+                            continue;
+                        }
+                        let falloff = 1.0 - (nearest / radius).clamp(0.0, 1.0);
+                        let amount = (falloff * falloff * strength).clamp(0.0, 1.0);
+                        // White is the identity for a vertex-lit surface, so
+                        // erasing blends back toward it rather than to black.
+                        let goal = match mode {
+                            VertexPaintMode::Brush => color,
+                            VertexPaintMode::Eraser => [1.0, 1.0, 1.0],
+                            VertexPaintMode::Smooth => smoothed
+                                .as_ref()
+                                .and_then(|set| set.get(index))
+                                .map(|blend| [blend[0], blend[1], blend[2]])
+                                .unwrap_or([value[0], value[1], value[2]]),
+                        };
+                        for axis in 0..3 {
+                            value[axis] += (goal[axis] - value[axis]) * amount;
+                            value[axis] = value[axis].clamp(0.0, 1.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) fn handle_vertex_paint_input(
         &mut self,
         ui: &egui::Ui,
@@ -1344,21 +1473,31 @@ impl SmsEditorApp {
             .hovered()
             .then(|| pointer.and_then(|pointer| self.vertex_paint_surface_hit(rect, pointer)))
             .flatten();
-        let (down, shift) = ui.input(|input| (input.pointer.primary_down(), input.modifiers.shift));
-        self.vertex_paint_shift_erase = shift;
+        let (down, shift, ctrl) = ui.input(|input| {
+            (
+                input.pointer.primary_down(),
+                input.modifiers.shift,
+                input.modifiers.command,
+            )
+        });
+        self.vertex_paint_modifier_mode = Self::vertex_paint_modifier_mode(shift, ctrl);
         if down && response.hovered() {
-            if self.vertex_paint_stroke.is_empty() {
-                // Latched at the start of the stroke: letting go of shift
+            if self.vertex_paint_live.is_none() {
+                // Latched at the start of the stroke: letting a modifier go
                 // halfway through should not switch what the stroke is doing.
-                self.vertex_paint_stroke_erases = shift;
+                let mode = self
+                    .vertex_paint_modifier_mode
+                    .unwrap_or(self.vertex_paint_mode);
+                self.begin_vertex_paint_live_stroke(mode);
             }
             if let Some(pointer) = pointer {
                 self.vertex_paint_stroke.push(pointer);
             }
+            self.advance_vertex_paint_live_stroke();
             return true;
         }
-        if !down && !self.vertex_paint_stroke.is_empty() {
-            self.commit_vertex_paint_stroke();
+        if !down && (self.vertex_paint_live.is_some() || !self.vertex_paint_stroke.is_empty()) {
+            self.finish_vertex_paint_live_stroke();
             return true;
         }
         false
@@ -1434,11 +1573,14 @@ impl SmsEditorApp {
                 let focal = perspective_focal_length(rect, self.viewport_zoom).max(1.0);
                 (self.vertex_paint_radius * depth / focal).max(0.01)
             });
-        let erasing =
-            self.vertex_paint_shift_erase || self.vertex_paint_mode != VertexPaintMode::Brush;
-        let color = match erasing {
-            true => egui::Color32::from_rgb(230, 230, 230),
-            false => egui::Color32::from_rgb(
+        // The ring shows what a click would actually do, modifiers included.
+        let color = match self
+            .vertex_paint_modifier_mode
+            .unwrap_or(self.vertex_paint_mode)
+        {
+            VertexPaintMode::Eraser => egui::Color32::from_rgb(230, 230, 230),
+            VertexPaintMode::Smooth => egui::Color32::from_rgb(120, 190, 235),
+            VertexPaintMode::Brush => egui::Color32::from_rgb(
                 (self.vertex_paint_color[0] * 255.0) as u8,
                 (self.vertex_paint_color[1] * 255.0) as u8,
                 (self.vertex_paint_color[2] * 255.0) as u8,
@@ -1530,7 +1672,9 @@ impl SmsEditorApp {
         });
         ui.add(egui::Slider::new(&mut self.vertex_paint_radius, 4.0..=200.0).text("Radius"));
         ui.add(egui::Slider::new(&mut self.vertex_paint_strength, 0.0..=1.0).text("Strength"));
-        ui.label("Hold Shift while painting to erase. Ctrl+Z and Ctrl+Y step through strokes.");
+        ui.label(
+            "Shift while painting erases, Ctrl smooths. Ctrl+Z and Ctrl+Y step through strokes.",
+        );
 
         ui.separator();
         if ui
@@ -1569,11 +1713,13 @@ impl SmsEditorApp {
         ui.strong("Dirty (cavity AO)");
         ui.add(egui::Slider::new(&mut self.vertex_paint_dirt, 0.0..=1.0).text("Dirty"));
         ui.add(
-            egui::Slider::new(&mut self.vertex_paint_dirt_ramp, 0.05..=8.0)
+            egui::Slider::new(&mut self.vertex_paint_dirt_ramp, 0.25..=4.0)
                 .logarithmic(true)
                 .text("Ramp"),
         )
         .on_hover_text("Above 1 tightens dirt into deep creases; below 1 spreads it wider");
+        ui.add(egui::Slider::new(&mut self.vertex_paint_dirt_spread, 0..=12).text("Spread"))
+            .on_hover_text("How far the dirt travels out from the creases it was measured on");
         ui.add(egui::Slider::new(&mut self.vertex_paint_dirt_bias, 0.0..=1.0).text("Direction"))
             .on_hover_text("0 dirties every crease equally; 1 only those facing the angle below");
         ui.add_enabled_ui(self.vertex_paint_dirt_bias > 0.0, |ui| {
