@@ -83,6 +83,7 @@ fn stage_document_resolves_existing_and_authored_parameters() {
         target_group_index: 3,
         prototype: record("authored", 20),
         dependencies: Vec::new(),
+        pool_only: false,
     }));
     authored.insert_source_raw_param("value", "21");
     let descriptors = document.editable_parameters_for_object(&authored).unwrap();

@@ -1484,6 +1484,7 @@ mod editability_tests {
                     record: record(name),
                 })
                 .collect(),
+            pool_only: false,
         })
     }
 
@@ -2326,6 +2327,7 @@ mod editability_tests {
                 target_group_index: 2,
                 record: record("manager_a"),
             }],
+            pool_only: false,
         });
 
         for key in ["name", "resource_name", "character_name"] {

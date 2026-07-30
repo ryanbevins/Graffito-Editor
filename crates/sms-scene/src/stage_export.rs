@@ -1751,6 +1751,12 @@ fn reconcile_scene_objects_with_owned_dialogue_names(
         )?;
     }
     for (placement, object, record) in authored {
+        // Pool-only placements contribute their dependencies -- already
+        // ensured above -- and stop there: the manager's pool supplies the
+        // enemies, and no actor stands in the world.
+        if placement.pool_only {
+            continue;
+        }
         let parent_path = authored_target_group_path(
             archive,
             &placement.raw_resource_path,
@@ -4867,6 +4873,7 @@ mod tests {
             target_group_index,
             prototype,
             dependencies,
+            pool_only: false,
         }));
         object
     }

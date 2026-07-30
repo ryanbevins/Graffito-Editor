@@ -692,6 +692,7 @@ mod tests {
             target_group_index: 0,
             prototype: JDramaRecord::new("Group", "Group", JDramaRecordPayload::Empty).unwrap(),
             dependencies: Vec::new(),
+            pool_only: false,
         }));
         assert!(route_reference_requires_named_graph(&object, None));
     }

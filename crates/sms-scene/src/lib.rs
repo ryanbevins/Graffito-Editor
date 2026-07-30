@@ -1663,6 +1663,16 @@ pub struct AuthoredPlacement {
     pub prototype: JDramaRecord,
     #[serde(default)]
     pub dependencies: Vec<AuthoredPlacementDependency>,
+    /// Export the dependencies -- manager, characters, resources -- without
+    /// the actor record itself.
+    ///
+    /// The conductor fills every registered enemy manager's pool to capacity
+    /// at init, so a manager alone is enough for goop or generator spawning;
+    /// retail bianco0 ships NameKuriManager with zero placed NameKuri this
+    /// exact way. The placed object then acts as the editor-side handle for
+    /// the manager rather than as a creature standing in the world.
+    #[serde(default)]
+    pub pool_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3762,6 +3772,7 @@ mod tests {
             target_group_index: 4,
             prototype,
             dependencies: Vec::new(),
+            pool_only: false,
         }));
         object
     }
