@@ -252,26 +252,27 @@ impl SmsEditorApp {
     ///
     /// The stage terrain is composed from all of them, so a paint operation
     /// covers the lot rather than whichever one happens to be selected.
-    fn terrain_paint_targets(&self) -> Vec<PaintTarget> {
-        self.terrain_paint_targets_scoped(false)
-    }
-
     /// Terrain assets to operate on.
     ///
-    /// `selection_only` restricts to the selected instance's asset, which is
-    /// what a brush stroke wants: the stage terrain overlaps in world space, so
-    /// an unscoped stroke near a ramp also drags the floor beneath it. Whole
-    /// stage bakes leave it false and cover everything.
+    /// `selection_only` restricts to the selected instance's asset. Every
+    /// paint and bake uses it: stage terrain overlaps in world space, so an
+    /// unscoped operation aimed at a ramp also rewrites the floor beneath it.
+    /// Only preparing a stage on tool open leaves it false, since that has to
+    /// reach every asset before anything is selected.
     fn terrain_paint_targets_scoped(&self, selection_only: bool) -> Vec<PaintTarget> {
         let Some(catalog) = self.model_catalog().ok() else {
             return Vec::new();
         };
-        let selected = selection_only
-            .then(|| {
-                self.selected_model_instance()
-                    .map(|instance| instance.placement.asset_id)
-            })
-            .flatten();
+        // A stroke with no selection used to fall through to every terrain
+        // asset, which is how a brush aimed at a ramp ended up repainting the
+        // floor. Scoped operations now require a selection outright.
+        let selected = match selection_only {
+            true => match self.selected_model_instance() {
+                Some(instance) => Some(instance.placement.asset_id),
+                None => return Vec::new(),
+            },
+            false => None,
+        };
         let mut by_asset: BTreeMap<AssetId, Vec<[[f32; 4]; 4]>> = BTreeMap::new();
         for instance in self
             .model_instances
@@ -373,14 +374,6 @@ impl SmsEditorApp {
 
     /// Runs `edit` over every terrain vertex, giving it the world position,
     /// world normal and the colour to modify.
-    fn edit_terrain_vertex_colors(
-        &mut self,
-        label: &str,
-        edit: impl FnMut(&WorldVertex, &mut [f32; 4]),
-    ) {
-        self.edit_terrain_vertex_colors_scoped(label, false, edit);
-    }
-
     fn edit_terrain_vertex_colors_scoped(
         &mut self,
         label: &str,
@@ -416,7 +409,7 @@ impl SmsEditorApp {
 
     /// Resets every terrain vertex to opaque white.
     pub(super) fn clear_terrain_vertex_colors(&mut self) {
-        self.edit_terrain_vertex_colors("Cleared vertex paint", |_, color| {
+        self.edit_terrain_vertex_colors_scoped("Cleared vertex paint", true, |_, color| {
             *color = [1.0, 1.0, 1.0, color[3]];
         });
     }
@@ -446,16 +439,20 @@ impl SmsEditorApp {
             // smooth-shaded mesh would have had.
             self.smooth_terrain_normals_for_bake();
         }
-        self.edit_terrain_vertex_colors("Baked sun into vertex paint", |vertex, color| {
-            let lambert = vec3_dot(vertex.normal, light);
-            let hard = lambert.max(0.0);
-            let wrap = lambert * 0.5 + 0.5;
-            let blended = (hard + (wrap - hard) * softness).clamp(0.0, 1.0);
-            let shade = (1.0 - shadow) + shadow * blended;
-            for channel in color.iter_mut().take(3) {
-                *channel = (*channel * shade).clamp(0.0, 1.0);
-            }
-        });
+        self.edit_terrain_vertex_colors_scoped(
+            "Baked sun into vertex paint",
+            true,
+            |vertex, color| {
+                let lambert = vec3_dot(vertex.normal, light);
+                let hard = lambert.max(0.0);
+                let wrap = lambert * 0.5 + 0.5;
+                let blended = (hard + (wrap - hard) * softness).clamp(0.0, 1.0);
+                let shade = (1.0 - shadow) + shadow * blended;
+                for channel in color.iter_mut().take(3) {
+                    *channel = (*channel * shade).clamp(0.0, 1.0);
+                }
+            },
+        );
     }
 
     /// Darkens creases, following Blender's "Dirty Vertex Colors".
@@ -467,7 +464,7 @@ impl SmsEditorApp {
     pub(super) fn bake_terrain_dirt(&mut self) {
         let amount = self.vertex_paint_dirt.clamp(0.0, 1.0);
         let ramp = self.vertex_paint_dirt_ramp.clamp(0.05, 8.0);
-        let mut targets = self.terrain_paint_targets();
+        let mut targets = self.terrain_paint_targets_scoped(true);
         if targets.is_empty() {
             self.log.push(
                 "No terrain to paint: set a model instance to 'Bake as map terrain' first."
@@ -529,7 +526,7 @@ impl SmsEditorApp {
     /// Only used ahead of a lighting bake: it changes shading, not geometry,
     /// and a faceted mesh otherwise bakes hard steps at every edge.
     fn smooth_terrain_normals_for_bake(&mut self) {
-        let mut targets = self.terrain_paint_targets();
+        let mut targets = self.terrain_paint_targets_scoped(true);
         if targets.is_empty() {
             return;
         }
@@ -581,7 +578,7 @@ impl SmsEditorApp {
         // rather than raw world coordinates the user would have to look up.
         let mut minimum = f32::INFINITY;
         let mut maximum = f32::NEG_INFINITY;
-        for target in &self.terrain_paint_targets() {
+        for target in &self.terrain_paint_targets_scoped(true) {
             for primitive in Self::target_world_vertices(target) {
                 for vertex in primitive {
                     minimum = minimum.min(vertex.position[axis]);
@@ -595,26 +592,30 @@ impl SmsEditorApp {
             return;
         }
         let span = maximum - minimum;
-        self.edit_terrain_vertex_colors("Baked ramp into vertex paint", |vertex, value| {
-            let normalised = ((vertex.position[axis] - minimum) / span).clamp(0.0, 1.0);
-            let range = (end - start).abs().max(1e-4);
-            let mut t = ((normalised - start.min(end)) / range).clamp(0.0, 1.0);
-            if invert {
-                t = 1.0 - t;
-            }
-            let amount = t.powf(curve) * strength;
-            for axis in 0..3 {
-                value[axis] += (color[axis] - value[axis]) * amount;
-                value[axis] = value[axis].clamp(0.0, 1.0);
-            }
-        });
+        self.edit_terrain_vertex_colors_scoped(
+            "Baked ramp into vertex paint",
+            true,
+            |vertex, value| {
+                let normalised = ((vertex.position[axis] - minimum) / span).clamp(0.0, 1.0);
+                let range = (end - start).abs().max(1e-4);
+                let mut t = ((normalised - start.min(end)) / range).clamp(0.0, 1.0);
+                if invert {
+                    t = 1.0 - t;
+                }
+                let amount = t.powf(curve) * strength;
+                for axis in 0..3 {
+                    value[axis] += (color[axis] - value[axis]) * amount;
+                    value[axis] = value[axis].clamp(0.0, 1.0);
+                }
+            },
+        );
     }
 
     /// Blends every vertex toward the average of its edge neighbours.
     pub(super) fn smooth_terrain_vertex_colors(&mut self) {
         let amount = self.vertex_paint_strength.clamp(0.0, 1.0);
         let iterations = self.vertex_paint_smooth_iterations.clamp(1, 20);
-        let mut targets = self.terrain_paint_targets();
+        let mut targets = self.terrain_paint_targets_scoped(true);
         if targets.is_empty() {
             self.log.push(
                 "No terrain to paint: set a model instance to 'Bake as map terrain' first."
@@ -897,6 +898,13 @@ impl SmsEditorApp {
         if stroke.is_empty() {
             return;
         }
+        if self.selected_model_instance().is_none() {
+            self.log.push(
+                "Select a terrain instance in the hierarchy before painting; the brush only                  paints the selected one."
+                    .to_string(),
+            );
+            return;
+        }
         let projection = self.camera_projection(rect);
         let radius = self.vertex_paint_radius.max(1.0);
         let strength = self.vertex_paint_strength.clamp(0.0, 1.0);
@@ -1084,7 +1092,13 @@ impl SmsEditorApp {
             return;
         }
         self.vertex_paint_prepared = Some(self.stage_id.clone());
-        self.edit_terrain_vertex_colors("Prepared terrain for vertex paint", |_, _| {});
+        // Unscoped on purpose: every terrain asset needs its colour set and
+        // material before anything is selected.
+        self.edit_terrain_vertex_colors_scoped(
+            "Prepared terrain for vertex paint",
+            false,
+            |_, _| {},
+        );
     }
 
     pub(super) fn vertex_paint_panel(&mut self, ui: &mut egui::Ui) {
@@ -1109,15 +1123,18 @@ impl SmsEditorApp {
         // whole-stage bakes below cover.
         match self.selected_model_instance() {
             Some(instance) => {
-                ui.small(format!("Brush paints '{}'.", instance.placement.name));
-            }
-            None => {
                 ui.small(format!(
-                    "No instance selected; the brush paints all {terrain} terrain instance(s)."
+                    "Painting and baking '{}' only.",
+                    instance.placement.name
                 ));
             }
+            None => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(245, 190, 90),
+                    "Select a terrain instance in the hierarchy to paint or bake it.",
+                );
+            }
         }
-        ui.small("Bakes below always cover the whole stage.");
         ui.separator();
 
         ui.horizontal(|ui| {
