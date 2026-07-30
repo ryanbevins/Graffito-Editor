@@ -193,137 +193,119 @@ impl VertexPaintGradeSettings {
     /// simply dark by design as though it were in shade, so a black floor
     /// takes the full shadow tint and the grade bleeds across the whole model.
     /// Measured against the diffuse, a vertex sitting at its material colour
-    /// is unshaded whatever that colour is.
-    pub(super) fn apply(self, color: &mut [f32; 4], unshaded: f32) {
+    /// Grades the shading a bake left on a vertex.
+    ///
+    /// `neutral` is the vertex colour that means "unshaded", which the TEV
+    /// program decides: a textured material multiplies, so neutral is white
+    /// and the texture comes through as authored; an untextured one has the
+    /// vertex colour *as* the surface, so neutral is the material colour.
+    ///
+    /// Everything works on `colour / neutral`, the shading factor, where 1 is
+    /// clean and 0 is fully shadowed. That is the whole reason the controls
+    /// behave: contrast pivots on half shadow rather than on mid grey, which
+    /// is meaningless on a surface whose clean state is dark green; exposure
+    /// scales shading rather than absolute light; and nothing can exceed 1, so
+    /// no control can brighten a surface past the state it was in before the
+    /// bake, which is what kept turning meshes white.
+    pub(super) fn apply(self, color: &mut [f32; 4], neutral: [f32; 3]) {
         let luma = |value: [f32; 3]| 0.299 * value[0] + 0.587 * value[1] + 0.114 * value[2];
-        let unshaded = unshaded.max(1e-3);
-        let shading = |value: &[f32; 4]| {
-            let lit = luma([value[0], value[1], value[2]]);
-            (1.0 - lit / unshaded).clamp(0.0, 1.0)
-        };
-
-        // Everything here grades the bake, not the model. A vertex the bake
-        // left alone is the surface's own colour, and exposure or hue has no
-        // business moving it: that is a texture edit wearing a grade's
-        // clothes. So the four tonal controls below are mixed back in by how
-        // shaded the vertex is, which is zero where nothing was baked. Shadow
-        // and tint further down already work this way by construction.
-        let scope = shading(color);
-        let original = *color;
+        // A neutral channel at zero carries no shading information: the
+        // surface is black there whatever the vertex says, so leave it be.
+        let mut factor: [f32; 3] = std::array::from_fn(|axis| match neutral[axis] > 1e-3 {
+            true => (color[axis] / neutral[axis]).clamp(0.0, 1.0),
+            false => 1.0,
+        });
+        let scope = 1.0 - luma(factor).clamp(0.0, 1.0);
+        let original = factor;
 
         let exposure = self.exposure.exp2();
-        for channel in color.iter_mut().take(3) {
+        for channel in factor.iter_mut() {
             *channel *= exposure;
         }
 
-        // Pivoted on mid grey, so contrast pulls light and dark apart instead
-        // of just brightening everything.
+        // Pivoted on half shadow, so contrast separates the deep shading from
+        // the shallow instead of just lifting all of it.
         let scale = 1.0 + self.contrast;
-        for channel in color.iter_mut().take(3) {
+        for channel in factor.iter_mut() {
             *channel = (*channel - 0.5) * scale + 0.5;
         }
 
-        // Vibrance leans on whatever is already dull. Scaling saturation flat
-        // blows out the colours that were already strong, which on baked
-        // terrain means the few painted patches go first.
-        let grey = luma([color[0], color[1], color[2]]);
-        let high = color[0].max(color[1]).max(color[2]);
-        let low = color[0].min(color[1]).min(color[2]);
+        // Vibrance leans on whatever is already dull, so a bake that is barely
+        // coloured gains more than one that is already strongly tinted.
+        let grey = luma(factor);
+        let high = factor[0].max(factor[1]).max(factor[2]);
+        let low = factor[0].min(factor[1]).min(factor[2]);
         let reach = 1.0 + self.vibrance * (1.0 - (high - low).clamp(0.0, 1.0));
-        for channel in color.iter_mut().take(3) {
+        for channel in factor.iter_mut() {
             *channel = grey + (*channel - grey) * reach;
         }
 
-        // Rotation about the grey axis, which keeps luminance where it is:
-        // spinning hue should recolour a bake, not relight it. The constants
-        // are the usual luma weights carried through the rotation.
+        // Rotation about the grey axis, which keeps the shading depth where it
+        // is: spinning hue recolours a bake rather than relighting it.
         if self.hue != 0.0 {
             let (sin, cos) = self.hue.to_radians().sin_cos();
-            let rotated: [f32; 3] = std::array::from_fn(|channel| {
+            factor = std::array::from_fn(|channel| {
                 let weights = HUE_ROTATION[channel];
-                weights[0] * color[0]
-                    + weights[1] * color[1]
-                    + weights[2] * color[2]
+                weights[0] * factor[0]
+                    + weights[1] * factor[1]
+                    + weights[2] * factor[2]
                     + cos
-                        * (HUE_COSINE[channel][0] * color[0]
-                            + HUE_COSINE[channel][1] * color[1]
-                            + HUE_COSINE[channel][2] * color[2])
+                        * (HUE_COSINE[channel][0] * factor[0]
+                            + HUE_COSINE[channel][1] * factor[1]
+                            + HUE_COSINE[channel][2] * factor[2])
                     + sin
-                        * (HUE_SINE[channel][0] * color[0]
-                            + HUE_SINE[channel][1] * color[1]
-                            + HUE_SINE[channel][2] * color[2])
+                        * (HUE_SINE[channel][0] * factor[0]
+                            + HUE_SINE[channel][1] * factor[1]
+                            + HUE_SINE[channel][2] * factor[2])
             });
-            color[..3].copy_from_slice(&rotated);
         }
 
-        // Mix the tonal work back in over the untouched colour, so an
-        // unshaded vertex comes out exactly as it went in.
-        for (channel, before) in color.iter_mut().take(3).zip(original.iter()) {
+        // Mixed back in by how shaded the vertex was, so a vertex the bake
+        // left clean comes out exactly as it went in.
+        for (channel, before) in factor.iter_mut().zip(original.iter()) {
             *channel = before + (*channel - before) * scope;
         }
 
-        // Shadow after vibrance, before tint. The weight is how dark the
-        // vertex is, so an occlusion bake can be deepened or lifted without
-        // dragging the lit surfaces with it.
         if self.shadow != 0.0 {
             match self.shadow > 0.0 {
                 true => {
-                    let weight = shading(color);
-                    for channel in color.iter_mut().take(3) {
-                        *channel *= 1.0 - self.shadow * weight;
+                    for channel in factor.iter_mut() {
+                        *channel *= 1.0 - self.shadow * scope;
                     }
                 }
+                // Lifting resolves toward 1, which is the clean surface. At -1
+                // the vertex stops contributing anything at all: a textured
+                // material goes back to its texture as authored, an untextured
+                // one to its material colour.
                 false => {
-                    // Lifting scales the colour back up toward the unshaded
-                    // level, keeping its hue. Blending toward white instead
-                    // washes the colour out on the way, which is not relieving
-                    // a shadow, and at -1 it would leave a lit green surface
-                    // white rather than green.
-                    let lit = luma([color[0], color[1], color[2]]);
-                    if lit > 1e-4 && lit < unshaded {
-                        let target = lit + (unshaded - lit) * -self.shadow;
-                        let scale = target / lit;
-                        for channel in color.iter_mut().take(3) {
-                            *channel *= scale;
-                        }
+                    for channel in factor.iter_mut() {
+                        *channel += (1.0 - *channel) * -self.shadow;
                     }
                 }
             }
         }
 
-        // Tint rides the dark end only. Tinting everything is a colour cast
-        // over the whole mesh, which is what a brush stroke is for; what a
-        // grade is wanted for is warming or cooling the shadows an occlusion
-        // bake laid down, leaving the lit surfaces where they are.
         if self.tint_amount != 0.0 {
             // A multiply, not a blend toward the colour. Blending moves a
             // channel toward the tint from either side, so a saturated tint
-            // raises its own channel and the tint reaches past the darks into
-            // surfaces that were never shaded. Multiplying by a factor that is
-            // 1 where nothing is shaded and the tint colour where everything
-            // is can only take light away, which is what tinting a shadow is.
-            let weight = shading(color) * self.tint_amount;
-            for (channel, tint) in color.iter_mut().take(3).zip(self.tint.iter()) {
+            // raises its own channel and reaches past the darks. Multiplying
+            // by a factor that is 1 where nothing is shaded can only take
+            // light away, which is what tinting a shadow means.
+            let weight = scope * self.tint_amount;
+            for (channel, tint) in factor.iter_mut().zip(self.tint.iter()) {
                 *channel *= 1.0 + (tint - 1.0) * weight;
             }
         }
 
-        // The unshaded level is a ceiling. A bake only ever darkens, so a
-        // grade that pushes a vertex past what the surface was before it is
-        // inventing light the vertex colour cannot carry, and the way that
-        // shows is white: exposure or contrast lifts the channels unevenly,
-        // the brightest hits 1.0 first, the others catch up, and the colour
-        // washes out on the way. Scaling back keeps the hue and stops it.
-        let lit = luma([color[0], color[1], color[2]]);
-        if lit > unshaded {
-            let scale = unshaded / lit;
-            for channel in color.iter_mut().take(3) {
-                *channel *= scale;
-            }
-        }
-
-        for channel in color.iter_mut().take(3) {
-            *channel = channel.clamp(0.0, 1.0);
+        // Back to a colour. Clamping the factor is what stops any control
+        // brightening the surface past its clean state.
+        for ((channel, clean), shading) in color
+            .iter_mut()
+            .take(3)
+            .zip(neutral.iter())
+            .zip(factor.iter())
+        {
+            *channel = (clean * shading).clamp(0.0, 1.0);
         }
     }
 }
@@ -499,14 +481,18 @@ fn primitive_colors_mut(
 /// similar until something is baked, at which point no vertex sits at neutral
 /// any more and the reference sinks with the bake, so a lift can never restore
 /// what the bake took.
-fn document_primitive_unshaded(document: &ModelAssetDocument) -> Vec<f32> {
-    let luma = |value: [f32; 4]| 0.299 * value[0] + 0.587 * value[1] + 0.114 * value[2];
+fn document_primitive_unshaded(document: &ModelAssetDocument) -> Vec<[f32; 3]> {
     let levels = document
         .materials
         .iter()
         .map(|material| match material.base_color_texture.is_some() {
-            true => 1.0,
-            false => luma(material.source_base_color),
+            // A multiplier of white leaves the texture exactly as authored.
+            true => [1.0; 3],
+            false => [
+                material.source_base_color[0],
+                material.source_base_color[1],
+                material.source_base_color[2],
+            ],
         })
         .collect::<Vec<_>>();
     document
@@ -518,7 +504,7 @@ fn document_primitive_unshaded(document: &ModelAssetDocument) -> Vec<f32> {
                 .material
                 .and_then(|index| levels.get(index as usize))
                 .copied()
-                .unwrap_or(1.0)
+                .unwrap_or([1.0; 3])
         })
         .collect()
 }
@@ -2423,7 +2409,10 @@ impl SmsEditorApp {
                 for primitive in &mut mesh.primitives {
                     let base = diffuse.get(primitive_index).copied().unwrap_or([1.0; 4]);
                     primitive_index += 1;
-                    let unshaded = neutral.get(primitive_index - 1).copied().unwrap_or(1.0);
+                    let unshaded = neutral
+                        .get(primitive_index - 1)
+                        .copied()
+                        .unwrap_or([1.0; 3]);
                     let colors = primitive_colors_mut(primitive, base);
                     for color in colors.iter_mut() {
                         settings.apply(color, unshaded);
