@@ -296,17 +296,15 @@ impl VertexPaintGradeSettings {
         // grade is wanted for is warming or cooling the shadows an occlusion
         // bake laid down, leaving the lit surfaces where they are.
         if self.tint_amount != 0.0 {
+            // A multiply, not a blend toward the colour. Blending moves a
+            // channel toward the tint from either side, so a saturated tint
+            // raises its own channel and the tint reaches past the darks into
+            // surfaces that were never shaded. Multiplying by a factor that is
+            // 1 where nothing is shaded and the tint colour where everything
+            // is can only take light away, which is what tinting a shadow is.
             let weight = shading(color) * self.tint_amount;
-            // The tint is matched to the vertex's own brightness before it is
-            // blended in, so it colours the shadow without lightening it.
-            // Blending toward the raw colour carries its brightness too: a
-            // white tint then pulled shadows toward white, which is relieving
-            // them rather than tinting them, and that is what Shadow is for.
-            let level = luma([color[0], color[1], color[2]]);
-            let strength = luma(self.tint).max(1e-3);
-            let matched: [f32; 3] = std::array::from_fn(|axis| self.tint[axis] * level / strength);
-            for (channel, tint) in color.iter_mut().take(3).zip(matched.iter()) {
-                *channel += (tint - *channel) * weight;
+            for (channel, tint) in color.iter_mut().take(3).zip(self.tint.iter()) {
+                *channel *= 1.0 + (tint - 1.0) * weight;
             }
         }
 
