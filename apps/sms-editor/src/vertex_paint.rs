@@ -81,6 +81,10 @@ pub(super) struct VertexPaintGradeSettings {
     pub(super) exposure: f32,
     pub(super) contrast: f32,
     pub(super) vibrance: f32,
+    /// Positive deepens the dark end, negative lifts it. Weighted by how dark
+    /// a vertex already is, so it reaches shadow without touching highlights
+    /// the way exposure would.
+    pub(super) shadow: f32,
     pub(super) tint: [f32; 3],
     pub(super) tint_amount: f32,
 }
@@ -91,6 +95,7 @@ impl Default for VertexPaintGradeSettings {
             exposure: 0.0,
             contrast: 0.0,
             vibrance: 0.0,
+            shadow: 0.0,
             tint: [1.0, 1.0, 1.0],
             tint_amount: 0.0,
         }
@@ -103,6 +108,7 @@ impl VertexPaintGradeSettings {
         self.exposure == 0.0
             && self.contrast == 0.0
             && self.vibrance == 0.0
+            && self.shadow == 0.0
             && self.tint_amount == 0.0
     }
 
@@ -128,6 +134,20 @@ impl VertexPaintGradeSettings {
         let reach = 1.0 + self.vibrance * (1.0 - (high - low).clamp(0.0, 1.0));
         for channel in color.iter_mut().take(3) {
             *channel = luma + (*channel - luma) * reach;
+        }
+
+        // Shadow after vibrance, before tint. The weight is how dark the
+        // vertex is, so an occlusion bake can be deepened or lifted without
+        // dragging the lit surfaces with it.
+        if self.shadow != 0.0 {
+            let luma = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2];
+            let weight = (1.0 - luma).clamp(0.0, 1.0);
+            for channel in color.iter_mut().take(3) {
+                *channel = match self.shadow > 0.0 {
+                    true => *channel * (1.0 - self.shadow * weight),
+                    false => *channel + (1.0 - *channel) * (-self.shadow) * weight,
+                };
+            }
         }
 
         for (channel, tint) in color.iter_mut().take(3).zip(self.tint.iter()) {
@@ -1116,9 +1136,39 @@ impl SmsEditorApp {
 
     /// Resets every terrain vertex to opaque white.
     pub(super) fn clear_terrain_vertex_colors(&mut self) {
-        self.edit_terrain_vertex_colors_scoped("Cleared vertex paint", true, |_, color| {
-            *color = [1.0, 1.0, 1.0, color[3]];
-        });
+        let mut targets = self.terrain_paint_targets_scoped(true);
+        if targets.is_empty() {
+            self.log.push(
+                "No terrain to clear: set a model instance to 'Bake as map terrain' first."
+                    .to_string(),
+            );
+            return;
+        }
+        // Back to the material's own diffuse, not to white. Painting points the
+        // colour channel at the vertex array, so the material register stops
+        // contributing; clearing to flat white therefore threw the model's
+        // diffuse away along with the paint, and the mesh came back blank.
+        for target in &mut targets {
+            let diffuse = target
+                .document
+                .materials
+                .iter()
+                .map(|material| material.source_base_color)
+                .collect::<Vec<_>>();
+            for mesh in &mut target.document.meshes {
+                for primitive in &mut mesh.primitives {
+                    let base = primitive
+                        .material
+                        .and_then(|index| diffuse.get(index as usize))
+                        .copied()
+                        .unwrap_or([1.0; 4]);
+                    for color in primitive_colors_mut(primitive) {
+                        *color = [base[0], base[1], base[2], color[3]];
+                    }
+                }
+            }
+        }
+        self.commit_terrain_targets(targets, "Cleared vertex paint", true);
     }
 
     /// Directional light baked into vertex colours.
@@ -2027,7 +2077,9 @@ impl SmsEditorApp {
             }
             if ui
                 .button("Clear Paint")
-                .on_hover_text("Reset every terrain vertex to white")
+                .on_hover_text(
+                    "Reset the terrain to its material diffuse, dropping paint and bakes",
+                )
                 .clicked()
             {
                 self.clear_terrain_vertex_colors();
@@ -2085,6 +2137,13 @@ impl SmsEditorApp {
                     .text("Vibrance"),
             )
             .on_hover_text("Leans on the duller colours, so painted patches do not blow out first")
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.vertex_paint_grade_settings.shadow, -1.0..=1.0)
+                    .text("Shadow"),
+            )
+            .on_hover_text("Deepens or lifts the dark end without moving the lit surfaces")
             .changed();
         ui.horizontal(|ui| {
             changed |= ui
