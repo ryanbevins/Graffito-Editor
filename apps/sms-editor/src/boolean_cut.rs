@@ -17,7 +17,10 @@ use std::collections::BTreeMap;
 
 use sms_authoring::{AssetId, ModelInstanceExportMode};
 
-use crate::vertex_paint::{invert_affine, mesh_node_transforms, multiply_matrix, transform_point};
+use crate::triangle_bvh::TriangleBvh;
+use crate::vertex_paint::{
+    invert_affine, mesh_node_transforms, multiply_matrix, transform_direction, transform_point,
+};
 
 /// Triangles past this and the cut is refused rather than run.
 ///
@@ -25,6 +28,12 @@ use crate::vertex_paint::{invert_affine, mesh_node_transforms, multiply_matrix, 
 /// of meshes grows fast. The editor freezing is worse than the cut not
 /// happening.
 const TRIANGLE_CEILING: usize = 400_000;
+
+/// How far a coverage ray looks for the cutter.
+///
+/// Stages are thousands of units across and a cutter can sit well above what
+/// it covers, so this is deliberately far past any of that.
+const COVER_REACH: f32 = 1.0e7;
 
 /// How far off a plane a vertex has to sit before it counts as crossing it.
 ///
@@ -306,6 +315,7 @@ impl SmsEditorApp {
         }
 
         let mut added = 0usize;
+        let mut removed = 0usize;
         let mut total = 0usize;
         for target in &mut targets {
             let placement = target.transforms.first().copied().unwrap_or(IDENTITY);
@@ -317,23 +327,33 @@ impl SmsEditorApp {
                 let Some(to_local) = invert_affine(multiply_matrix(placement, node)) else {
                     continue;
                 };
-                let local_cutter = cutter
-                    .iter()
-                    .map(|triangle| {
-                        [
-                            transform_point(to_local, triangle[0]),
-                            transform_point(to_local, triangle[1]),
-                            transform_point(to_local, triangle[2]),
-                        ]
-                    })
-                    .collect::<Vec<_>>();
+                let local_cutter = TriangleBvh::build(
+                    cutter
+                        .iter()
+                        .map(|triangle| {
+                            [
+                                transform_point(to_local, triangle[0]),
+                                transform_point(to_local, triangle[1]),
+                                transform_point(to_local, triangle[2]),
+                            ]
+                        })
+                        .collect(),
+                );
 
+                // The axis is a world direction, and the cut runs in the
+                // mesh's own space, so it has to travel there too.
+                let hole = self.boolean_cut_hole.then(|| {
+                    let mut axis = [0.0f32; 3];
+                    axis[self.boolean_cut_axis.min(2)] = 1.0;
+                    vec3_normalize(transform_direction(to_local, axis))
+                });
                 for primitive in &mut mesh.primitives {
                     let before = primitive.indices.len() / 3;
-                    match cut_primitive(primitive, &local_cutter) {
+                    match cut_primitive(primitive, &local_cutter, hole) {
                         Ok(()) => {
                             let after = primitive.indices.len() / 3;
                             added += after.saturating_sub(before);
+                            removed += before.saturating_sub(after);
                             total += after;
                         }
                         Err(error) => {
@@ -345,7 +365,7 @@ impl SmsEditorApp {
             }
         }
 
-        if added == 0 {
+        if added == 0 && removed == 0 {
             self.log.push(
                 "Nothing was cut: the two meshes do not cross anywhere. Move them so they \
                  intersect, or pick a different cutter."
@@ -354,9 +374,15 @@ impl SmsEditorApp {
             return;
         }
         self.commit_paint_targets(targets, "Cut terrain along intersection");
-        self.log.push(format!(
-            "Added {added} triangle(s) along the seam; the mesh now has {total}."
-        ));
+        match self.boolean_cut_hole {
+            true => self.log.push(format!(
+                "Cut the covered area out: {removed} triangle(s) removed, {added} added along \
+                 the seam. The mesh now has {total}."
+            )),
+            false => self.log.push(format!(
+                "Added {added} triangle(s) along the seam; the mesh now has {total}."
+            )),
+        }
     }
 }
 
@@ -370,19 +396,9 @@ const IDENTITY: [[f32; 4]; 4] = [
 /// Splits every triangle of a primitive that a cutter triangle crosses.
 fn cut_primitive(
     primitive: &mut sms_authoring::ModelPrimitive,
-    cutter: &[[[f32; 3]; 3]],
+    cutter: &TriangleBvh,
+    hole: Option<[f32; 3]>,
 ) -> Result<(), String> {
-    let tex_sets = primitive
-        .tex_coords
-        .iter()
-        .map(|set| set.set)
-        .collect::<Vec<_>>();
-    let color_sets = primitive
-        .colors
-        .iter()
-        .map(|set| set.set)
-        .collect::<Vec<_>>();
-
     let vertex = |index: usize| CutVertex {
         position: primitive.positions.get(index).copied().unwrap_or_default(),
         normal: primitive
@@ -402,45 +418,66 @@ fn cut_primitive(
             .collect(),
     };
 
-    let mut working = primitive
+    // Each triangle carries the blade to resume at. Splitting by a plane
+    // leaves both halves wholly on one side of it, so neither can be cut by
+    // that blade again, and a blade that missed the parent cannot reach a
+    // piece of it. Only ever moving forward is what makes this terminate.
+    let mut pending = primitive
         .indices
         .chunks_exact(3)
         .map(|face| {
-            [
-                vertex(face[0] as usize),
-                vertex(face[1] as usize),
-                vertex(face[2] as usize),
-            ]
+            (
+                [
+                    vertex(face[0] as usize),
+                    vertex(face[1] as usize),
+                    vertex(face[2] as usize),
+                ],
+                0u32,
+            )
         })
         .collect::<Vec<_>>();
+    let mut done: Vec<[CutVertex; 3]> = Vec::with_capacity(pending.len());
+    let mut candidates = Vec::new();
 
-    for blade in cutter {
-        let Some((normal, offset)) = triangle_plane(blade) else {
-            continue;
-        };
-        let mut next = Vec::with_capacity(working.len());
-        for triangle in working {
-            let corners = [
-                triangle[0].position,
-                triangle[1].position,
-                triangle[2].position,
-            ];
-            // The plane is unbounded but the cutter triangle is not, so the
-            // crossing has to land inside it. Without this a blade would slice
-            // the whole mesh along its plane instead of only where the two
-            // surfaces actually meet.
-            let crossed = triangle_plane_segment(&corners, normal, offset)
-                .is_some_and(|(start, end)| segment_touches_triangle(start, end, blade, normal));
-            match crossed
-                .then(|| split_triangle(&triangle, normal, offset))
-                .flatten()
+    while let Some((triangle, resume)) = pending.pop() {
+        let corners = [
+            triangle[0].position,
+            triangle[1].position,
+            triangle[2].position,
+        ];
+        let low = std::array::from_fn(|axis| {
+            corners[0][axis].min(corners[1][axis]).min(corners[2][axis]) - PLANE_EPSILON
+        });
+        let high = std::array::from_fn(|axis| {
+            corners[0][axis].max(corners[1][axis]).max(corners[2][axis]) + PLANE_EPSILON
+        });
+        cutter.overlapping(low, high, &mut candidates);
+
+        let mut split = None;
+        for blade_index in candidates.iter().copied().filter(|index| *index >= resume) {
+            let blade = cutter.triangle(blade_index as usize);
+            let Some((normal, offset)) = triangle_plane(blade) else {
+                continue;
+            };
+            // The plane is unbounded but the blade is not, so the crossing has
+            // to land inside it. Without this a blade would slice the whole
+            // mesh along its plane instead of only where the surfaces meet.
+            if !triangle_plane_segment(&corners, normal, offset)
+                .is_some_and(|(start, end)| segment_touches_triangle(start, end, blade, normal))
             {
-                Some(pieces) => next.extend(pieces),
-                None => next.push(triangle),
+                continue;
+            }
+            if let Some(pieces) = split_triangle(&triangle, normal, offset) {
+                split = Some((pieces, blade_index + 1));
+                break;
             }
         }
-        working = next;
-        if working.len() > TRIANGLE_CEILING {
+
+        match split {
+            Some((pieces, next)) => pending.extend(pieces.into_iter().map(|piece| (piece, next))),
+            None => done.push(triangle),
+        }
+        if done.len() + pending.len() > TRIANGLE_CEILING {
             return Err(format!(
                 "Cut abandoned: it passed {TRIANGLE_CEILING} triangles. Simplify the cutter or \
                  cut against a smaller piece of terrain."
@@ -448,12 +485,32 @@ fn cut_primitive(
         }
     }
 
-    let mut positions = Vec::with_capacity(working.len() * 3);
-    let mut normals = Vec::with_capacity(working.len() * 3);
-    let mut tex = vec![Vec::with_capacity(working.len() * 3); tex_sets.len()];
-    let mut colors = vec![Vec::with_capacity(working.len() * 3); color_sets.len()];
-    let mut indices = Vec::with_capacity(working.len() * 3);
-    for triangle in &working {
+    // With the seam in place, every remaining triangle is wholly inside the
+    // cutter's footprint or wholly outside it, never straddling. That is what
+    // makes a centroid enough to decide, and why the hole comes out with a
+    // clean edge instead of a staircase.
+    if let Some(axis) = hole {
+        done.retain(|triangle| {
+            let centroid: [f32; 3] = std::array::from_fn(|component| {
+                (triangle[0].position[component]
+                    + triangle[1].position[component]
+                    + triangle[2].position[component])
+                    / 3.0
+            });
+            // Covered means the cutter is somewhere along the axis, either
+            // side. A ramp resting on a floor is above it; a ceiling is below.
+            let covered = cutter.ray_hits(centroid, axis, COVER_REACH)
+                || cutter.ray_hits(centroid, vec3_scale(axis, -1.0), COVER_REACH);
+            !covered
+        });
+    }
+
+    let mut positions = Vec::with_capacity(done.len() * 3);
+    let mut normals = Vec::with_capacity(done.len() * 3);
+    let mut tex = vec![Vec::with_capacity(done.len() * 3); primitive.tex_coords.len()];
+    let mut colors = vec![Vec::with_capacity(done.len() * 3); primitive.colors.len()];
+    let mut indices = Vec::with_capacity(done.len() * 3);
+    for triangle in &done {
         for corner in triangle {
             indices.push(positions.len() as u32);
             positions.push(corner.position);
@@ -487,9 +544,8 @@ impl SmsEditorApp {
     pub(super) fn boolean_cut_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Boolean Cut");
         ui.label(
-            "Cuts the selected terrain wherever another mesh passes through it, adding vertices \
-             along the seam. The shape does not change: every new vertex sits on an edge of the \
-             triangle it came from.",
+            "Cuts the selected terrain where another mesh passes over or through it: the seam \
+             becomes real edges, and the covered area is removed.",
         );
         ui.separator();
 
@@ -540,20 +596,36 @@ impl SmsEditorApp {
         }
 
         ui.separator();
+        ui.checkbox(&mut self.boolean_cut_hole, "Cut a hole")
+            .on_hover_text("Remove the part of the terrain the cutter covers, not just the seam");
+        ui.add_enabled_ui(self.boolean_cut_hole, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Along");
+                for (index, label) in ["X", "Y", "Z"].into_iter().enumerate() {
+                    ui.selectable_value(&mut self.boolean_cut_axis, index, label);
+                }
+            });
+        });
+        ui.label(
+            "Covered means the cutter sits somewhere along that axis, either side of the \
+             surface. Y suits a ramp or a building standing on a floor.",
+        );
+
+        ui.separator();
         if ui
             .add_enabled(
                 selected.is_some() && self.boolean_cutter.is_some(),
-                egui::Button::new("Cut Along Intersection"),
+                egui::Button::new("Cut"),
             )
-            .on_hover_text("Split the selected terrain everywhere the cutter crosses it")
+            .on_hover_text("Split the selected terrain where the cutter meets it")
             .clicked()
         {
             self.cut_terrain_with_selected_cutter();
         }
         ui.label(
-            "Seam cut, not solid CSG. Stage terrain is open surfaces -- a ramp with no underside \
-             on a floor with no thickness -- so there is no inside for union or difference to \
-             work against.",
+            "Not solid CSG. Stage terrain is open surfaces -- a ramp with no underside on a \
+             floor with no thickness -- so there is no volume to subtract. The hole is the \
+             covered footprint, which is the same result for terrain that sits on terrain.",
         );
     }
 }

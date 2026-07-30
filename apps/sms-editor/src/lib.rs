@@ -63,6 +63,7 @@ mod routes;
 mod scene_labels;
 mod skybox_library;
 mod stage_creation;
+mod triangle_bvh;
 mod ui_panels;
 mod vertex_paint;
 mod viewport_ui;
@@ -1308,6 +1309,8 @@ struct SmsEditorApp {
     vertex_paint_ao_distance: f32,
     vertex_paint_ao_rays: u32,
     boolean_cutter: Option<sms_authoring::AssetId>,
+    boolean_cut_hole: bool,
+    boolean_cut_axis: usize,
     vertex_paint_smooth_iterations: u32,
     vertex_paint_sun_smooth_normals: bool,
     vertex_paint_ramp_axis: usize,
@@ -1616,6 +1619,8 @@ impl Default for SmsEditorApp {
             vertex_paint_ao_distance: 400.0,
             vertex_paint_ao_rays: 64,
             boolean_cutter: None,
+            boolean_cut_hole: true,
+            boolean_cut_axis: 1,
             vertex_paint_smooth_iterations: 1,
             vertex_paint_sun_smooth_normals: true,
             vertex_paint_ramp_axis: 1,

@@ -116,7 +116,7 @@ pub(super) fn transform_point(matrix: [[f32; 4]; 4], point: [f32; 3]) -> [f32; 3
     })
 }
 
-fn transform_direction(matrix: [[f32; 4]; 4], direction: [f32; 3]) -> [f32; 3] {
+pub(super) fn transform_direction(matrix: [[f32; 4]; 4], direction: [f32; 3]) -> [f32; 3] {
     let rotated: [f32; 3] = std::array::from_fn(|row| {
         matrix[0][row] * direction[0]
             + matrix[1][row] * direction[1]
@@ -413,36 +413,6 @@ pub(super) fn mesh_node_transforms(document: &ModelAssetDocument) -> BTreeMap<u3
         }
     }
     by_mesh
-}
-
-/// Any-hit ray/triangle test, Moller-Trumbore. Stops at the first blocker
-/// rather than finding the nearest, which is all occlusion needs.
-fn ray_hits_triangle(
-    origin: [f32; 3],
-    direction: [f32; 3],
-    triangle: &[[f32; 3]; 3],
-    reach: f32,
-) -> bool {
-    let edge_a = vec3_sub(triangle[1], triangle[0]);
-    let edge_b = vec3_sub(triangle[2], triangle[0]);
-    let pvec = vec3_cross(direction, edge_b);
-    let determinant = vec3_dot(edge_a, pvec);
-    if determinant.abs() < 1e-8 {
-        return false;
-    }
-    let inverse = 1.0 / determinant;
-    let tvec = vec3_sub(origin, triangle[0]);
-    let u = vec3_dot(tvec, pvec) * inverse;
-    if !(0.0..=1.0).contains(&u) {
-        return false;
-    }
-    let qvec = vec3_cross(tvec, edge_a);
-    let v = vec3_dot(direction, qvec) * inverse;
-    if v < 0.0 || u + v > 1.0 {
-        return false;
-    }
-    let distance = vec3_dot(edge_b, qvec) * inverse;
-    distance > 1e-3 && distance < reach
 }
 
 /// Cosine-weighted hemisphere directions around `normal`.
@@ -883,6 +853,9 @@ impl SmsEditorApp {
                 .push("No terrain to occlude: nothing is flagged as map terrain.".to_string());
             return;
         }
+        // Indexed, not walked. Every ray would otherwise test every triangle,
+        // which is rays times vertices times triangles for a single bake.
+        let occluders = crate::triangle_bvh::TriangleBvh::build(occluders);
         self.log.push(format!(
             "Baking occlusion against {} triangles at {rays} rays per vertex...",
             occluders.len()
@@ -899,11 +872,7 @@ impl SmsEditorApp {
                 let directions = hemisphere_directions(normal, rays);
                 let blocked = directions
                     .iter()
-                    .filter(|direction| {
-                        occluders
-                            .iter()
-                            .any(|triangle| ray_hits_triangle(origin, **direction, triangle, reach))
-                    })
+                    .filter(|direction| occluders.ray_hits(origin, **direction, reach))
                     .count();
                 let occlusion = blocked as f32 / directions.len().max(1) as f32;
                 let shade = 1.0 - occlusion * amount;
