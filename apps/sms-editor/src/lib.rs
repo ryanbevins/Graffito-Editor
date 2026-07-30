@@ -1310,6 +1310,14 @@ struct SmsEditorApp {
     vertex_paint_ramp_curve: f32,
     vertex_paint_ramp_invert: bool,
     vertex_paint_stroke: Vec<egui::Pos2>,
+    /// Latched when a stroke starts, so releasing shift mid-stroke does not
+    /// change what that stroke does.
+    vertex_paint_stroke_erases: bool,
+    /// Live shift state, used only to colour the brush ring.
+    vertex_paint_shift_erase: bool,
+    vertex_paint_undo_stack: VecDeque<VertexPaintUndoRecord>,
+    vertex_paint_redo_stack: VecDeque<VertexPaintUndoRecord>,
+    vertex_paint_undo_group: Option<VertexPaintUndoRecord>,
     vertex_paint_cursor: Option<([f32; 3], [f32; 3])>,
     vertex_paint_rect: Option<egui::Rect>,
     /// Stage whose terrain has been given vertex-colour materials.
@@ -1607,6 +1615,11 @@ impl Default for SmsEditorApp {
             vertex_paint_ramp_curve: 1.0,
             vertex_paint_ramp_invert: false,
             vertex_paint_stroke: Vec::new(),
+            vertex_paint_stroke_erases: false,
+            vertex_paint_shift_erase: false,
+            vertex_paint_undo_stack: VecDeque::new(),
+            vertex_paint_redo_stack: VecDeque::new(),
+            vertex_paint_undo_group: None,
             vertex_paint_cursor: None,
             vertex_paint_rect: None,
             vertex_paint_prepared: None,
@@ -2710,6 +2723,9 @@ impl SmsEditorApp {
         self.confirm_delete_generated_goop = false;
         self.goop_undo_stack.clear();
         self.goop_redo_stack.clear();
+        self.vertex_paint_undo_stack.clear();
+        self.vertex_paint_redo_stack.clear();
+        self.vertex_paint_undo_group = None;
         if has_scene_index {
             self.scene_labels = scene_labels;
             self.retail_skyboxes = retail_skyboxes;

@@ -25,6 +25,57 @@ impl VertexPaintMode {
     }
 }
 
+/// Colour and normal state of one asset, captured for vertex paint undo.
+///
+/// Normals ride along because the sun bake can smooth them; restoring only the
+/// colours would leave the shading permanently changed.
+#[derive(Clone)]
+pub(super) struct VertexPaintSnapshot {
+    id: AssetId,
+    /// Flattened over meshes then primitives, matching the iteration order
+    /// every paint operation uses.
+    colors: Vec<Vec<sms_authoring::ColorSet>>,
+    normals: Vec<Vec<[f32; 3]>>,
+}
+
+/// One undoable vertex paint operation, however many assets it touched.
+pub(super) struct VertexPaintUndoRecord {
+    label: String,
+    before: Vec<VertexPaintSnapshot>,
+    after: Vec<VertexPaintSnapshot>,
+}
+
+fn snapshot_paint_state(id: AssetId, document: &ModelAssetDocument) -> VertexPaintSnapshot {
+    let mut colors = Vec::new();
+    let mut normals = Vec::new();
+    for mesh in &document.meshes {
+        for primitive in &mesh.primitives {
+            colors.push(primitive.colors.clone());
+            normals.push(primitive.normals.clone());
+        }
+    }
+    VertexPaintSnapshot {
+        id,
+        colors,
+        normals,
+    }
+}
+
+fn restore_paint_state(document: &mut ModelAssetDocument, snapshot: &VertexPaintSnapshot) {
+    let mut index = 0usize;
+    for mesh in &mut document.meshes {
+        for primitive in &mut mesh.primitives {
+            if let Some(colors) = snapshot.colors.get(index) {
+                primitive.colors.clone_from(colors);
+            }
+            if let Some(normals) = snapshot.normals.get(index) {
+                primitive.normals.clone_from(normals);
+            }
+            index += 1;
+        }
+    }
+}
+
 /// A terrain asset opened for painting, with the world transform of every
 /// instance that uses it.
 struct PaintTarget {
@@ -33,6 +84,9 @@ struct PaintTarget {
     /// One asset can be placed several times; a stroke has to consider each
     /// placement, and every placement writes back to the same vertices.
     transforms: Vec<[[f32; 4]; 4]>,
+    /// State as loaded, so the commit can record an undo step without a second
+    /// read from disk.
+    baseline: VertexPaintSnapshot,
 }
 
 /// One vertex of a target, resolved into world space.
@@ -247,6 +301,67 @@ fn nearest_surface_hit(
     best.map(|(_, position, normal)| (position, normal))
 }
 
+const IDENTITY_MATRIX: [[f32; 4]; 4] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+];
+
+/// Column-major 4x4 multiply, `a` applied after `b`.
+fn multiply_matrix(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    std::array::from_fn(|column| {
+        std::array::from_fn(|row| {
+            (0..4)
+                .map(|index| a[index][row] * b[column][index])
+                .sum::<f32>()
+        })
+    })
+}
+
+/// World transform of every mesh in a document, by mesh index.
+///
+/// Compilation applies each node's global transform to its primitives, so raw
+/// primitive positions are not where the mesh is drawn. Screen-space painting
+/// projects vertices, and skipping this put every projected vertex somewhere
+/// the mesh is not.
+fn mesh_node_transforms(document: &ModelAssetDocument) -> BTreeMap<u32, [[f32; 4]; 4]> {
+    const IDENTITY: [[f32; 4]; 4] = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ];
+    let mut globals: Vec<[[f32; 4]; 4]> = Vec::with_capacity(document.nodes.len());
+    for index in 0..document.nodes.len() {
+        // Walk to the root, then apply the chain downward. Depth is tiny and
+        // the parent link is already resolved, so this stays simple.
+        let mut chain = Vec::new();
+        let mut cursor = Some(index);
+        let mut guard = 0usize;
+        while let Some(current) = cursor {
+            chain.push(current);
+            cursor = document.nodes[current].parent.map(|parent| parent as usize);
+            guard += 1;
+            if guard > document.nodes.len() {
+                break;
+            }
+        }
+        let mut transform = IDENTITY;
+        for node in chain.into_iter().rev() {
+            transform = multiply_matrix(transform, document.nodes[node].local_transform);
+        }
+        globals.push(transform);
+    }
+    let mut by_mesh = BTreeMap::new();
+    for (index, node) in document.nodes.iter().enumerate() {
+        if let Some(mesh) = node.mesh {
+            by_mesh.entry(mesh).or_insert(globals[index]);
+        }
+    }
+    by_mesh
+}
+
 impl SmsEditorApp {
     /// Assets behind every instance exported as map terrain.
     ///
@@ -293,6 +408,7 @@ impl SmsEditorApp {
             .filter_map(|(id, transforms)| {
                 catalog.load_asset(id).ok().map(|document| PaintTarget {
                     id,
+                    baseline: snapshot_paint_state(id, &document),
                     document,
                     transforms,
                 })
@@ -310,30 +426,167 @@ impl SmsEditorApp {
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ]);
+        let nodes = mesh_node_transforms(&target.document);
         target
             .document
             .meshes
             .iter()
-            .flat_map(|mesh| mesh.primitives.iter())
-            .map(|primitive| {
-                primitive
-                    .positions
+            .enumerate()
+            .flat_map(|(mesh_index, mesh)| {
+                // The node transform runs first, exactly as compilation does
+                // it, then the instance placement puts it in the stage.
+                let node = nodes
+                    .get(&(mesh_index as u32))
+                    .copied()
+                    .unwrap_or(IDENTITY_MATRIX);
+                let combined = multiply_matrix(transform, node);
+                mesh.primitives
                     .iter()
-                    .enumerate()
-                    .map(|(index, position)| WorldVertex {
-                        position: transform_point(transform, *position),
-                        normal: transform_direction(
-                            transform,
-                            primitive
-                                .normals
-                                .get(index)
-                                .copied()
-                                .unwrap_or([0.0, 1.0, 0.0]),
-                        ),
+                    .map(move |primitive| {
+                        primitive
+                            .positions
+                            .iter()
+                            .enumerate()
+                            .map(|(index, position)| WorldVertex {
+                                position: transform_point(combined, *position),
+                                normal: transform_direction(
+                                    combined,
+                                    primitive
+                                        .normals
+                                        .get(index)
+                                        .copied()
+                                        .unwrap_or([0.0, 1.0, 0.0]),
+                                ),
+                            })
+                            .collect()
                     })
-                    .collect()
+                    .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    /// Files an undo step for a paint operation, or folds it into the open
+    /// group if one is running.
+    fn record_vertex_paint_undo(
+        &mut self,
+        label: &str,
+        before: Vec<VertexPaintSnapshot>,
+        after: Vec<VertexPaintSnapshot>,
+    ) {
+        if let Some(group) = &mut self.vertex_paint_undo_group {
+            // A bake that smooths normals first commits twice. Keeping the
+            // earliest `before` and the latest `after` makes it one undo press,
+            // which is what the button looks like from outside.
+            for snapshot in before {
+                if !group.before.iter().any(|entry| entry.id == snapshot.id) {
+                    group.before.push(snapshot);
+                }
+            }
+            for snapshot in after {
+                match group.after.iter_mut().find(|entry| entry.id == snapshot.id) {
+                    Some(entry) => *entry = snapshot,
+                    None => group.after.push(snapshot),
+                }
+            }
+            return;
+        }
+        self.push_vertex_paint_undo(VertexPaintUndoRecord {
+            label: label.to_string(),
+            before,
+            after,
+        });
+    }
+
+    fn push_vertex_paint_undo(&mut self, record: VertexPaintUndoRecord) {
+        if record.before.is_empty() {
+            return;
+        }
+        self.vertex_paint_undo_stack.push_back(record);
+        if self.vertex_paint_undo_stack.len() > 40 {
+            self.vertex_paint_undo_stack.pop_front();
+        }
+        self.vertex_paint_redo_stack.clear();
+    }
+
+    /// Collects every commit until [`Self::end_vertex_paint_undo_group`] into a
+    /// single undo step.
+    fn begin_vertex_paint_undo_group(&mut self) {
+        if self.vertex_paint_undo_group.is_none() {
+            self.vertex_paint_undo_group = Some(VertexPaintUndoRecord {
+                label: String::new(),
+                before: Vec::new(),
+                after: Vec::new(),
+            });
+        }
+    }
+
+    fn end_vertex_paint_undo_group(&mut self, label: &str) {
+        let Some(mut group) = self.vertex_paint_undo_group.take() else {
+            return;
+        };
+        group.label = label.to_string();
+        self.push_vertex_paint_undo(group);
+    }
+
+    pub(super) fn undo_vertex_paint(&mut self) -> bool {
+        let Some(record) = self.vertex_paint_undo_stack.pop_back() else {
+            return false;
+        };
+        let label = format!("Undo {}", record.label.to_lowercase());
+        if self.apply_vertex_paint_snapshots(&record.before, &label) {
+            self.vertex_paint_redo_stack.push_back(record);
+        }
+        true
+    }
+
+    pub(super) fn redo_vertex_paint(&mut self) -> bool {
+        let Some(record) = self.vertex_paint_redo_stack.pop_back() else {
+            return false;
+        };
+        let label = format!("Redo {}", record.label.to_lowercase());
+        if self.apply_vertex_paint_snapshots(&record.after, &label) {
+            self.vertex_paint_undo_stack.push_back(record);
+        }
+        true
+    }
+
+    /// Writes snapshots back to their assets and refreshes the preview.
+    fn apply_vertex_paint_snapshots(
+        &mut self,
+        snapshots: &[VertexPaintSnapshot],
+        label: &str,
+    ) -> bool {
+        if !self.content_catalog_mutation_allowed(label) {
+            return false;
+        }
+        let Ok(catalog) = self.model_catalog() else {
+            return false;
+        };
+        let mut restored = 0usize;
+        for snapshot in snapshots {
+            let Ok(mut document) = catalog.load_asset(snapshot.id) else {
+                continue;
+            };
+            restore_paint_state(&mut document, snapshot);
+            match catalog.save_asset(snapshot.id, &document) {
+                Ok(_) => {
+                    restored += 1;
+                    self.model_asset_preview_cache
+                        .retain(|key, _| key.asset_id != snapshot.id);
+                }
+                Err(error) => self
+                    .log
+                    .push(format!("Could not restore painted asset: {error}")),
+            }
+        }
+        if restored == 0 {
+            return false;
+        }
+        self.force_refresh_model_catalog();
+        self.rebuild_model_preview_cache();
+        self.log
+            .push(format!("{label} across {restored} terrain asset(s)."));
+        true
     }
 
     /// Writes every modified target back to the catalog.
@@ -348,6 +601,8 @@ impl SmsEditorApp {
             return;
         };
         let mut saved = 0usize;
+        let mut before = Vec::new();
+        let mut after = Vec::new();
         for mut target in targets {
             // Every path that writes colour lands here, so the material switch
             // is flipped in one place rather than per operation.
@@ -355,6 +610,8 @@ impl SmsEditorApp {
             match catalog.save_asset(target.id, &target.document) {
                 Ok(_) => {
                     saved += 1;
+                    before.push(target.baseline);
+                    after.push(snapshot_paint_state(target.id, &target.document));
                     self.model_asset_preview_cache
                         .retain(|key, _| key.asset_id != target.id);
                 }
@@ -366,6 +623,7 @@ impl SmsEditorApp {
         if saved == 0 {
             return;
         }
+        self.record_vertex_paint_undo(label, before, after);
         self.force_refresh_model_catalog();
         self.rebuild_model_preview_cache();
         self.log
@@ -432,6 +690,7 @@ impl SmsEditorApp {
         let softness = self.vertex_paint_sun_softness.clamp(0.0, 1.0);
         let shadow = self.vertex_paint_sun_shadow.clamp(0.0, 1.0);
         let smooth_normals = self.vertex_paint_sun_smooth_normals;
+        self.begin_vertex_paint_undo_group();
         if smooth_normals {
             // Faceted meshes carry a face normal on every vertex, so N.L jumps
             // at each edge and the bake comes out hard-edged. Averaging the
@@ -453,6 +712,7 @@ impl SmsEditorApp {
                 }
             },
         );
+        self.end_vertex_paint_undo_group("Baked sun into vertex paint");
     }
 
     /// Darkens creases, following Blender's "Dirty Vertex Colors".
@@ -473,9 +733,12 @@ impl SmsEditorApp {
             return;
         }
         for target in &mut targets {
+            let world = Self::target_world_vertices(target);
+            let mut primitive_index = 0usize;
             for mesh in &mut target.document.meshes {
                 for primitive in &mut mesh.primitives {
-                    let dirt = primitive_cavity(primitive);
+                    let dirt = primitive_cavity(primitive, &world[primitive_index]);
+                    primitive_index += 1;
                     let colors = primitive_colors_mut(primitive);
                     for (index, color) in colors.iter_mut().enumerate() {
                         // The ramp is a contrast curve on the cavity factor:
@@ -816,15 +1079,21 @@ fn smoothed_colors(
 }
 
 /// Per-vertex cavity factor in 0..1, where 1 is a deep crease.
-pub(super) fn primitive_cavity(primitive: &sms_authoring::ModelPrimitive) -> Vec<f32> {
-    let welds = weld_positions(&primitive.positions);
+fn primitive_cavity(primitive: &sms_authoring::ModelPrimitive, world: &[WorldVertex]) -> Vec<f32> {
+    // World space, not the raw local arrays. Concavity is a dot product so
+    // rotation does not matter, but any non-uniform scale on the node or the
+    // placement skews it along an axis, which reads as the dirt being tilted.
+    let positions = world
+        .iter()
+        .map(|vertex| vertex.position)
+        .collect::<Vec<_>>();
+    let welds = weld_positions(&positions);
     let adjacency = primitive_adjacency(&primitive.indices, &welds);
     let mut normals: BTreeMap<usize, [f32; 3]> = BTreeMap::new();
     for (index, weld) in welds.iter().enumerate() {
-        let normal = primitive
-            .normals
+        let normal = world
             .get(index)
-            .copied()
+            .map(|vertex| vertex.normal)
             .unwrap_or([0.0, 1.0, 0.0]);
         let entry = normals.entry(*weld).or_insert([0.0; 3]);
         for axis in 0..3 {
@@ -840,11 +1109,11 @@ pub(super) fn primitive_cavity(primitive: &sms_authoring::ModelPrimitive) -> Vec
             continue;
         }
         let normal = vec3_scale(normal, 1.0 / length);
-        let origin = primitive.positions[*position];
+        let origin = positions[*position];
         let mut concavity = 0.0f32;
         let mut count = 0usize;
         for neighbour in neighbours {
-            let Some(target) = primitive.positions.get(*neighbour) else {
+            let Some(target) = positions.get(*neighbour) else {
                 continue;
             };
             let delta = vec3_sub(*target, origin);
@@ -909,7 +1178,12 @@ impl SmsEditorApp {
         let radius = self.vertex_paint_radius.max(1.0);
         let strength = self.vertex_paint_strength.clamp(0.0, 1.0);
         let color = self.vertex_paint_color;
-        let mode = self.vertex_paint_mode;
+        // Shift is a quick erase, so a correction does not mean going to the
+        // panel and back for every stroke.
+        let mode = match self.vertex_paint_stroke_erases {
+            true => VertexPaintMode::Eraser,
+            false => self.vertex_paint_mode,
+        };
         let label = match mode {
             VertexPaintMode::Brush => "Painted vertex colour",
             VertexPaintMode::Eraser => "Erased vertex colour",
@@ -977,8 +1251,14 @@ impl SmsEditorApp {
             .hovered()
             .then(|| pointer.and_then(|pointer| self.vertex_paint_surface_hit(rect, pointer)))
             .flatten();
-        let down = ui.input(|input| input.pointer.primary_down());
+        let (down, shift) = ui.input(|input| (input.pointer.primary_down(), input.modifiers.shift));
+        self.vertex_paint_shift_erase = shift;
         if down && response.hovered() {
+            if self.vertex_paint_stroke.is_empty() {
+                // Latched at the start of the stroke: letting go of shift
+                // halfway through should not switch what the stroke is doing.
+                self.vertex_paint_stroke_erases = shift;
+            }
             if let Some(pointer) = pointer {
                 self.vertex_paint_stroke.push(pointer);
             }
@@ -1061,11 +1341,16 @@ impl SmsEditorApp {
                 let focal = perspective_focal_length(rect, self.viewport_zoom).max(1.0);
                 (self.vertex_paint_radius * depth / focal).max(0.01)
             });
-        let color = egui::Color32::from_rgb(
-            (self.vertex_paint_color[0] * 255.0) as u8,
-            (self.vertex_paint_color[1] * 255.0) as u8,
-            (self.vertex_paint_color[2] * 255.0) as u8,
-        );
+        let erasing =
+            self.vertex_paint_shift_erase || self.vertex_paint_mode != VertexPaintMode::Brush;
+        let color = match erasing {
+            true => egui::Color32::from_rgb(230, 230, 230),
+            false => egui::Color32::from_rgb(
+                (self.vertex_paint_color[0] * 255.0) as u8,
+                (self.vertex_paint_color[1] * 255.0) as u8,
+                (self.vertex_paint_color[2] * 255.0) as u8,
+            ),
+        };
         let mut ring = Vec::with_capacity(49);
         for step in 0..=48 {
             let angle = step as f32 / 48.0 * std::f32::consts::TAU;
@@ -1152,6 +1437,7 @@ impl SmsEditorApp {
         });
         ui.add(egui::Slider::new(&mut self.vertex_paint_radius, 4.0..=200.0).text("Radius"));
         ui.add(egui::Slider::new(&mut self.vertex_paint_strength, 0.0..=1.0).text("Strength"));
+        ui.label("Hold Shift while painting to erase. Ctrl+Z and Ctrl+Y step through strokes.");
 
         ui.separator();
         if ui
