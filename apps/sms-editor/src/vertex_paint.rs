@@ -374,6 +374,74 @@ fn mesh_node_transforms(document: &ModelAssetDocument) -> BTreeMap<u32, [[f32; 4
     by_mesh
 }
 
+/// Any-hit ray/triangle test, Moller-Trumbore. Stops at the first blocker
+/// rather than finding the nearest, which is all occlusion needs.
+fn ray_hits_triangle(
+    origin: [f32; 3],
+    direction: [f32; 3],
+    triangle: &[[f32; 3]; 3],
+    reach: f32,
+) -> bool {
+    let edge_a = vec3_sub(triangle[1], triangle[0]);
+    let edge_b = vec3_sub(triangle[2], triangle[0]);
+    let pvec = vec3_cross(direction, edge_b);
+    let determinant = vec3_dot(edge_a, pvec);
+    if determinant.abs() < 1e-8 {
+        return false;
+    }
+    let inverse = 1.0 / determinant;
+    let tvec = vec3_sub(origin, triangle[0]);
+    let u = vec3_dot(tvec, pvec) * inverse;
+    if !(0.0..=1.0).contains(&u) {
+        return false;
+    }
+    let qvec = vec3_cross(tvec, edge_a);
+    let v = vec3_dot(direction, qvec) * inverse;
+    if v < 0.0 || u + v > 1.0 {
+        return false;
+    }
+    let distance = vec3_dot(edge_b, qvec) * inverse;
+    distance > 1e-3 && distance < reach
+}
+
+/// Cosine-weighted hemisphere directions around `normal`.
+///
+/// Hammersley rather than random sampling: the same vertex has to bake the
+/// same value every time, and a low discrepancy set covers the hemisphere more
+/// evenly than random for the same ray count.
+fn hemisphere_directions(normal: [f32; 3], count: u32) -> Vec<[f32; 3]> {
+    let reference = match normal[1].abs() > 0.9 {
+        true => [1.0, 0.0, 0.0],
+        false => [0.0, 1.0, 0.0],
+    };
+    let tangent = vec3_normalize(vec3_cross(reference, normal));
+    let bitangent = vec3_cross(normal, tangent);
+    (0..count.max(1))
+        .map(|index| {
+            let u = (index as f32 + 0.5) / count.max(1) as f32;
+            // Radical inverse in base 2.
+            let mut bits = index;
+            bits = bits.rotate_right(16);
+            bits = ((bits & 0x5555_5555) << 1) | ((bits & 0xaaaa_aaaa) >> 1);
+            bits = ((bits & 0x3333_3333) << 2) | ((bits & 0xcccc_cccc) >> 2);
+            bits = ((bits & 0x0f0f_0f0f) << 4) | ((bits & 0xf0f0_f0f0) >> 4);
+            bits = ((bits & 0x00ff_00ff) << 8) | ((bits & 0xff00_ff00) >> 8);
+            let v = bits as f32 * 2.328_306_4e-10;
+
+            let radius = u.sqrt();
+            let phi = v * std::f32::consts::TAU;
+            let (sin, cos) = phi.sin_cos();
+            vec3_normalize(vec3_add(
+                vec3_scale(normal, (1.0 - u).max(0.0).sqrt()),
+                vec3_add(
+                    vec3_scale(tangent, radius * cos),
+                    vec3_scale(bitangent, radius * sin),
+                ),
+            ))
+        })
+        .collect()
+}
+
 impl SmsEditorApp {
     /// Assets behind every instance exported as map terrain.
     ///
@@ -728,7 +796,83 @@ impl SmsEditorApp {
     }
 
     /// Darkens creases, following Blender's "Dirty Vertex Colors".
+    /// Raycast ambient occlusion baked into vertex colours.
     ///
+    /// The cavity bake infers edges from how a vertex's neighbours sit against
+    /// its normal, so it answers "how sharp is this fold" rather than "what is
+    /// actually blocking this vertex". That makes it sensitive to triangulation
+    /// and to how sharp one fold is against another, which is why two arms of
+    /// the same ramp bake differently. This asks the question directly: fire
+    /// rays over the hemisphere and count what they hit.
+    ///
+    /// Occluders come from all terrain, not just the selection, so a floor
+    /// correctly darkens the ramp standing on it. Only the selected asset is
+    /// written.
+    pub(super) fn bake_terrain_occlusion(&mut self) {
+        let amount = self.vertex_paint_ao_strength.clamp(0.0, 1.0);
+        let reach = self.vertex_paint_ao_distance.max(1.0);
+        let rays = self.vertex_paint_ao_rays.clamp(8, 256);
+
+        // Every terrain triangle in the stage, in world space.
+        let mut occluders: Vec<[[f32; 3]; 3]> = Vec::new();
+        for target in &self.terrain_paint_targets_scoped(false) {
+            let world = Self::target_world_vertices(target);
+            let mut primitive_index = 0usize;
+            for mesh in &target.document.meshes {
+                for primitive in &mesh.primitives {
+                    let Some(vertices) = world.get(primitive_index) else {
+                        continue;
+                    };
+                    primitive_index += 1;
+                    for triangle in primitive.indices.chunks_exact(3) {
+                        let corners = [
+                            vertices.get(triangle[0] as usize),
+                            vertices.get(triangle[1] as usize),
+                            vertices.get(triangle[2] as usize),
+                        ];
+                        if let [Some(a), Some(b), Some(c)] = corners {
+                            occluders.push([a.position, b.position, c.position]);
+                        }
+                    }
+                }
+            }
+        }
+        if occluders.is_empty() {
+            self.log
+                .push("No terrain to occlude: nothing is flagged as map terrain.".to_string());
+            return;
+        }
+        self.log.push(format!(
+            "Baking occlusion against {} triangles at {rays} rays per vertex...",
+            occluders.len()
+        ));
+
+        self.edit_terrain_vertex_colors_scoped(
+            "Baked occlusion into vertex paint",
+            true,
+            |vertex, color| {
+                let normal = vec3_normalize(vertex.normal);
+                // Lifted off the surface, or every ray starts by hitting the
+                // triangle it left.
+                let origin = vec3_add(vertex.position, vec3_scale(normal, reach * 0.001 + 0.05));
+                let directions = hemisphere_directions(normal, rays);
+                let blocked = directions
+                    .iter()
+                    .filter(|direction| {
+                        occluders
+                            .iter()
+                            .any(|triangle| ray_hits_triangle(origin, **direction, triangle, reach))
+                    })
+                    .count();
+                let occlusion = blocked as f32 / directions.len().max(1) as f32;
+                let shade = 1.0 - occlusion * amount;
+                for channel in color.iter_mut().take(3) {
+                    *channel = (*channel * shade).clamp(0.0, 1.0);
+                }
+            },
+        );
+    }
+
     /// Concavity at a welded position is the mean, over its edge neighbours, of
     /// the dot between the direction to that neighbour and the vertex normal.
     /// Positive means neighbours sit above the tangent plane, which is a crease
@@ -1740,6 +1884,29 @@ impl SmsEditorApp {
             egui::Slider::new(&mut self.vertex_paint_smooth_iterations, 1..=20)
                 .text("Smooth passes"),
         );
+
+        ui.separator();
+        ui.strong("Ambient occlusion (raycast)");
+        ui.label(
+            "Fires rays from every vertex and counts what they hit. Slower than Dirty, and \
+             indifferent to how the mesh was triangulated.",
+        );
+        ui.add(egui::Slider::new(&mut self.vertex_paint_ao_strength, 0.0..=1.0).text("Strength"));
+        ui.add(
+            egui::Slider::new(&mut self.vertex_paint_ao_distance, 10.0..=4000.0)
+                .logarithmic(true)
+                .text("Distance"),
+        )
+        .on_hover_text("How far a ray looks for a blocker before calling the vertex open");
+        ui.add(egui::Slider::new(&mut self.vertex_paint_ao_rays, 8..=256).text("Rays"))
+            .on_hover_text("More rays is smoother and slower");
+        if ui
+            .button("Bake AO")
+            .on_hover_text("Occlude the selected terrain against every terrain mesh in the stage")
+            .clicked()
+        {
+            self.bake_terrain_occlusion();
+        }
 
         ui.separator();
         ui.strong("Dirty (cavity AO)");
