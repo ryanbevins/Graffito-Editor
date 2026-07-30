@@ -645,6 +645,13 @@ fn build_from_sources_with_common(
         }
     }
 
+    synthesize_conductor_spawned_candidates(
+        &sources,
+        registry,
+        common_character_document,
+        &mut candidates,
+    );
+
     let mut templates = BTreeMap::new();
     for (factory_name, factory_candidates) in candidates {
         let mut variants: BTreeMap<(u32, Vec<u8>), Vec<Candidate>> = BTreeMap::new();
@@ -837,6 +844,141 @@ fn record_group_index(record: &JDramaRecord) -> Option<u32> {
         JDramaFieldValue::U32(value) if field.name == "group_index" => Some(value),
         _ => None,
     })
+}
+
+/// An enemy the retail game only ever spawns through the conductor.
+struct ConductorSpawnedActor {
+    factory: &'static str,
+    /// Object name for the synthesized record.
+    object_name: &'static str,
+    /// The manager's JDrama object name, which `manager_name` references.
+    manager_name: &'static str,
+    /// The shared character resource the manager and its actors use.
+    character_name: &'static str,
+}
+
+/// ナメクリ (Gooble): spawned by `TConductor::genEnemyFromPollution`, never
+/// placed in any retail scene, so the census has no candidate to learn from
+/// even though every resource it needs is present wherever its manager is.
+const CONDUCTOR_SPAWNED_ACTORS: &[ConductorSpawnedActor] = &[ConductorSpawnedActor {
+    factory: "NameKuri",
+    object_name: "\u{30CA}\u{30E1}\u{30AF}\u{30EA} 0",
+    manager_name: "\u{30CA}\u{30E1}\u{30AF}\u{30EA}\u{30DE}\u{30CD}\u{30FC}\u{30B8}\u{30E3}\u{30FC}",
+    character_name: "\u{30CA}\u{30E1}\u{30AF}\u{30EA}\u{30DE}\u{30CD}\u{30FC}\u{30B8}\u{30E3}\u{30FC} \u{30AD}\u{30E3}\u{30E9}",
+}];
+
+/// Builds candidates for conductor-spawned enemies from a stage that places
+/// their manager.
+///
+/// The synthesized record mirrors a retail placed actor of the same family
+/// (measured on dolpic_ex0's HamuKuri): an Actor payload whose character is the
+/// manager's, with `manager_name`/`graph_name`/`coin_id` stream fields. The
+/// graph is empty on purpose -- `getGraphByName` misses to null, which is the
+/// state every conductor-spawned enemy already runs in. Everything else --
+/// manager record, character records, model resources -- resolves through the
+/// same dependency machinery placed actors use, so nothing is hand-provisioned.
+fn synthesize_conductor_spawned_candidates(
+    sources: &[&CatalogSource],
+    registry: &ObjectRegistry,
+    common_character_document: Option<&JDramaDocument>,
+    candidates: &mut BTreeMap<String, Vec<Candidate>>,
+) {
+    for spec in CONDUCTOR_SPAWNED_ACTORS {
+        if candidates.contains_key(spec.factory) {
+            continue;
+        }
+        for source in sources {
+            let Some(document) = source
+                .documents
+                .iter()
+                .find(|document| normalized_path(&document.raw_resource_path) == "map/scene.bin")
+            else {
+                continue;
+            };
+            let located = located_records(&document.document);
+            let has_manager = located_dependency_records(&document.document)
+                .iter()
+                .any(|item| item.record.name == spec.manager_name);
+            if !has_manager {
+                continue;
+            }
+            // Borrow the strategy group an ordinary enemy actor of this stage
+            // sits in, so placement lands the synthesized actor where retail
+            // puts enemies.
+            let Some(group_index) = located.iter().find_map(|item| {
+                let definition = authorable_definition(registry, item.record)?;
+                (definition.category == "Enemy").then_some(item.group_index)
+            }) else {
+                continue;
+            };
+
+            let record = JDramaRecord {
+                type_name: spec.factory.to_string(),
+                name: spec.object_name.to_string(),
+                payload: JDramaRecordPayload::Actor {
+                    transform: sms_formats::JDramaTransform {
+                        translation: [0.0; 3],
+                        rotation: [0.0; 3],
+                        scale: [1.0; 3],
+                    },
+                    character_name: spec.character_name.to_string(),
+                    light_map: sms_formats::JDramaLightMap {
+                        entries: Vec::new(),
+                    },
+                    fields: vec![
+                        JDramaField {
+                            name: "manager_name".to_string(),
+                            value: JDramaFieldValue::String(spec.manager_name.to_string()),
+                        },
+                        JDramaField {
+                            name: "graph_name".to_string(),
+                            value: JDramaFieldValue::String(String::new()),
+                        },
+                        JDramaField {
+                            name: "coin_id".to_string(),
+                            value: JDramaFieldValue::I32(-1),
+                        },
+                    ],
+                },
+            };
+            let Ok(dependencies) = resolve_dependencies(
+                &record,
+                spec.factory,
+                source,
+                &document.raw_resource_path,
+                registry,
+            ) else {
+                continue;
+            };
+            let Ok(character_records) = resolve_character_records(
+                &record,
+                &dependencies,
+                source,
+                common_character_document,
+                registry,
+            ) else {
+                continue;
+            };
+            candidates.insert(
+                spec.factory.to_string(),
+                vec![Candidate {
+                    factory_name: spec.factory.to_string(),
+                    group_index,
+                    record,
+                    dependencies,
+                    character_resource_records: character_records.resource_records,
+                    character_records: character_records.target_records,
+                    graph_names: BTreeSet::new(),
+                    source_stage: source.source_stage.clone(),
+                    sort_key: source.sort_key.clone(),
+                    raw_resource_path: document.raw_resource_path.clone(),
+                    source_asset_path: document.source_asset_path.clone(),
+                    record_path: Vec::new(),
+                }],
+            );
+            break;
+        }
+    }
 }
 
 fn authorable_definition<'a>(

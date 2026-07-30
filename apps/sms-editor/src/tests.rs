@@ -5496,3 +5496,63 @@ fn probe_scene_record() {
         }
     }
 }
+
+/// Byte-compares encode(parse(tables.bin)) against retail for every stage.
+/// `GRAFFITO_PROBE_BASE_ROOT=... cargo test probe_tables_roundtrip -- --ignored
+/// --nocapture`
+#[test]
+#[ignore]
+fn probe_tables_roundtrip() {
+    let Ok(base_root) = std::env::var("GRAFFITO_PROBE_BASE_ROOT") else {
+        return;
+    };
+    let base_root = std::path::Path::new(&base_root);
+    let archives = sms_formats::discover_scene_archives(base_root).expect("discover archives");
+    let mut same = 0usize;
+    let mut different = 0usize;
+    for archive in archives.iter().filter(|archive| archive.size_bytes > 0) {
+        let Ok(assets) = sms_formats::mount_scene_archive(&archive.path) else {
+            continue;
+        };
+        for asset in &assets {
+            if !asset
+                .path
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with("tables.bin")
+            {
+                continue;
+            }
+            let Ok(bytes) = sms_formats::read_stage_asset_bytes(&asset.path) else {
+                continue;
+            };
+            let Ok(document) = sms_formats::parse_jdrama_document(&bytes) else {
+                println!("{}: parse failed", archive.stage_id);
+                continue;
+            };
+            match sms_formats::encode_jdrama_document(&document) {
+                Ok(encoded) if encoded == bytes => same += 1,
+                Ok(encoded) => {
+                    different += 1;
+                    if different <= 3 {
+                        println!(
+                            "{}: DIFFERENT ({} vs {} bytes); first divergence at {:?}",
+                            archive.stage_id,
+                            encoded.len(),
+                            bytes.len(),
+                            encoded
+                                .iter()
+                                .zip(bytes.iter())
+                                .position(|(left, right)| left != right)
+                        );
+                    }
+                }
+                Err(error) => {
+                    different += 1;
+                    println!("{}: encode failed: {error}", archive.stage_id);
+                }
+            }
+        }
+    }
+    println!("identical: {same}  different: {different}");
+}
