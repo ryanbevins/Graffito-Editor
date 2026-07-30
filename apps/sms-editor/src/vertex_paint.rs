@@ -310,6 +310,20 @@ impl VertexPaintGradeSettings {
             }
         }
 
+        // The unshaded level is a ceiling. A bake only ever darkens, so a
+        // grade that pushes a vertex past what the surface was before it is
+        // inventing light the vertex colour cannot carry, and the way that
+        // shows is white: exposure or contrast lifts the channels unevenly,
+        // the brightest hits 1.0 first, the others catch up, and the colour
+        // washes out on the way. Scaling back keeps the hue and stops it.
+        let lit = luma([color[0], color[1], color[2]]);
+        if lit > unshaded {
+            let scale = unshaded / lit;
+            for channel in color.iter_mut().take(3) {
+                *channel *= scale;
+            }
+        }
+
         for channel in color.iter_mut().take(3) {
             *channel = channel.clamp(0.0, 1.0);
         }
