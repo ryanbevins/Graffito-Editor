@@ -1308,6 +1308,10 @@ struct SmsEditorApp {
     vertex_paint_color: [f32; 3],
     vertex_paint_radius: f32,
     vertex_paint_strength: f32,
+    vertex_paint_grade_settings: VertexPaintGradeSettings,
+    /// Open while the grade sliders are in use, holding the terrain and the
+    /// colours it had before they moved.
+    vertex_paint_grade: Option<VertexPaintGrade>,
     vertex_paint_sun_yaw: f32,
     vertex_paint_sun_pitch: f32,
     vertex_paint_sun_softness: f32,
@@ -1322,11 +1326,6 @@ struct SmsEditorApp {
     boolean_cut_axis: usize,
     vertex_paint_smooth_iterations: u32,
     vertex_paint_sun_smooth_normals: bool,
-    vertex_paint_ramp_axis: usize,
-    vertex_paint_ramp_start: f32,
-    vertex_paint_ramp_end: f32,
-    vertex_paint_ramp_curve: f32,
-    vertex_paint_ramp_invert: bool,
     vertex_paint_stroke: Vec<egui::Pos2>,
     /// The stroke in progress, held in memory so the viewport can show paint
     /// going down before anything reaches the catalog.
@@ -1622,6 +1621,8 @@ impl Default for SmsEditorApp {
             vertex_paint_color: [1.0, 0.25, 0.25],
             vertex_paint_radius: 28.0,
             vertex_paint_strength: 0.75,
+            vertex_paint_grade_settings: VertexPaintGradeSettings::default(),
+            vertex_paint_grade: None,
             vertex_paint_sun_yaw: 34.0,
             vertex_paint_sun_pitch: 46.0,
             vertex_paint_sun_softness: 0.5,
@@ -1634,11 +1635,6 @@ impl Default for SmsEditorApp {
             boolean_cut_axis: 1,
             vertex_paint_smooth_iterations: 1,
             vertex_paint_sun_smooth_normals: true,
-            vertex_paint_ramp_axis: 1,
-            vertex_paint_ramp_start: 0.0,
-            vertex_paint_ramp_end: 1.0,
-            vertex_paint_ramp_curve: 1.0,
-            vertex_paint_ramp_invert: false,
             vertex_paint_stroke: Vec::new(),
             vertex_paint_live: None,
             vertex_paint_modifier_mode: None,

@@ -57,9 +57,87 @@ fn snapshot_paint_state(id: AssetId, document: &ModelAssetDocument) -> VertexPai
     }
 }
 
-#[cfg(test)]
 fn restore_paint_state(document: &mut ModelAssetDocument, snapshot: &VertexPaintSnapshot) {
     document.clone_from(&snapshot.document);
+}
+
+/// A non-destructive grade over vertex colours.
+///
+/// Held open while the sliders are being moved so every change re-grades the
+/// colours the terrain had when the session started, rather than compounding
+/// on its own output. Dragging exposure up and back down therefore lands
+/// exactly where it began.
+pub(super) struct VertexPaintGrade {
+    targets: Vec<PaintTarget>,
+    /// The terrain as it was before the first slider moved.
+    baseline: Vec<VertexPaintSnapshot>,
+}
+
+/// Exposure, contrast, vibrance and tint, applied in that order.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct VertexPaintGradeSettings {
+    /// Stops. Doubling light per stop is how exposure reads everywhere else,
+    /// so it is a multiply by two to the power rather than a linear scale.
+    pub(super) exposure: f32,
+    pub(super) contrast: f32,
+    pub(super) vibrance: f32,
+    pub(super) tint: [f32; 3],
+    pub(super) tint_amount: f32,
+}
+
+impl Default for VertexPaintGradeSettings {
+    fn default() -> Self {
+        Self {
+            exposure: 0.0,
+            contrast: 0.0,
+            vibrance: 0.0,
+            tint: [1.0, 1.0, 1.0],
+            tint_amount: 0.0,
+        }
+    }
+}
+
+impl VertexPaintGradeSettings {
+    /// Whether the grade would leave the colours untouched.
+    fn is_neutral(self) -> bool {
+        self.exposure == 0.0
+            && self.contrast == 0.0
+            && self.vibrance == 0.0
+            && self.tint_amount == 0.0
+    }
+
+    fn apply(self, color: &mut [f32; 4]) {
+        let exposure = self.exposure.exp2();
+        for channel in color.iter_mut().take(3) {
+            *channel *= exposure;
+        }
+
+        // Pivoted on mid grey, so contrast pulls light and dark apart instead
+        // of just brightening everything.
+        let scale = 1.0 + self.contrast;
+        for channel in color.iter_mut().take(3) {
+            *channel = (*channel - 0.5) * scale + 0.5;
+        }
+
+        // Vibrance leans on whatever is already dull. Scaling saturation flat
+        // blows out the colours that were already strong, which on baked
+        // terrain means the few painted patches go first.
+        let luma = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2];
+        let high = color[0].max(color[1]).max(color[2]);
+        let low = color[0].min(color[1]).min(color[2]);
+        let reach = 1.0 + self.vibrance * (1.0 - (high - low).clamp(0.0, 1.0));
+        for channel in color.iter_mut().take(3) {
+            *channel = luma + (*channel - luma) * reach;
+        }
+
+        for (channel, tint) in color.iter_mut().take(3).zip(self.tint.iter()) {
+            *channel += (tint - *channel) * self.tint_amount;
+        }
+
+        for channel in color.iter_mut().take(3) {
+            *channel = channel.clamp(0.0, 1.0);
+        }
+    }
 }
 
 /// A stroke in progress.
@@ -1006,6 +1084,36 @@ impl SmsEditorApp {
         self.commit_terrain_targets(targets, label, true);
     }
 
+    /// Blends every vertex toward the average of its edge neighbours.
+    pub(super) fn smooth_terrain_vertex_colors(&mut self) {
+        let amount = self.vertex_paint_strength.clamp(0.0, 1.0);
+        let iterations = self.vertex_paint_smooth_iterations.clamp(1, 20);
+        let mut targets = self.terrain_paint_targets_scoped(true);
+        if targets.is_empty() {
+            self.log.push(
+                "No terrain to paint: set a model instance to 'Bake as map terrain' first."
+                    .to_string(),
+            );
+            return;
+        }
+        for target in &mut targets {
+            for mesh in &mut target.document.meshes {
+                for primitive in &mut mesh.primitives {
+                    let welds = weld_positions(&primitive.positions);
+                    let adjacency = primitive_adjacency(&primitive.indices, &welds);
+                    let colors = primitive_colors_mut(primitive);
+                    // Repeated passes spread the blend further than one pass
+                    // at higher strength, which just overshoots.
+                    for _ in 0..iterations {
+                        let smoothed = smoothed_colors(colors, &welds, &adjacency, amount);
+                        colors.copy_from_slice(&smoothed);
+                    }
+                }
+            }
+        }
+        self.commit_terrain_targets(targets, "Smoothed vertex paint", true);
+    }
+
     /// Resets every terrain vertex to opaque white.
     pub(super) fn clear_terrain_vertex_colors(&mut self) {
         self.edit_terrain_vertex_colors_scoped("Cleared vertex paint", true, |_, color| {
@@ -1215,89 +1323,6 @@ impl SmsEditorApp {
             }
         }
         self.commit_terrain_targets(targets, "Smoothed normals for baking", false);
-    }
-
-    /// Lays a gradient along a world axis over the terrain's bounds.
-    pub(super) fn bake_terrain_ramp(&mut self) {
-        let axis = self.vertex_paint_ramp_axis.min(2);
-        let start = self.vertex_paint_ramp_start;
-        let end = self.vertex_paint_ramp_end;
-        let curve = self.vertex_paint_ramp_curve.clamp(0.05, 8.0);
-        let invert = self.vertex_paint_ramp_invert;
-        let color = self.vertex_paint_color;
-        let strength = self.vertex_paint_strength.clamp(0.0, 1.0);
-
-        // Bounds first, so start and end read as fractions of the terrain
-        // rather than raw world coordinates the user would have to look up.
-        let mut minimum = f32::INFINITY;
-        let mut maximum = f32::NEG_INFINITY;
-        for target in &self.terrain_paint_targets_scoped(true) {
-            for primitive in Self::target_world_vertex_occurrences(target) {
-                for occurrence in primitive {
-                    for vertex in occurrence {
-                        minimum = minimum.min(vertex.position[axis]);
-                        maximum = maximum.max(vertex.position[axis]);
-                    }
-                }
-            }
-        }
-        if !minimum.is_finite() || maximum <= minimum {
-            self.log
-                .push("Ramp needs terrain with a measurable extent.".to_string());
-            return;
-        }
-        let span = maximum - minimum;
-        self.edit_terrain_vertex_colors_scoped(
-            "Baked ramp into vertex paint",
-            true,
-            |vertices, value| {
-                let normalised = vertices
-                    .iter()
-                    .map(|vertex| ((vertex.position[axis] - minimum) / span).clamp(0.0, 1.0))
-                    .sum::<f32>()
-                    / vertices.len() as f32;
-                let range = (end - start).abs().max(1e-4);
-                let mut t = ((normalised - start.min(end)) / range).clamp(0.0, 1.0);
-                if invert {
-                    t = 1.0 - t;
-                }
-                let amount = t.powf(curve) * strength;
-                for axis in 0..3 {
-                    value[axis] += (color[axis] - value[axis]) * amount;
-                    value[axis] = value[axis].clamp(0.0, 1.0);
-                }
-            },
-        );
-    }
-
-    /// Blends every vertex toward the average of its edge neighbours.
-    pub(super) fn smooth_terrain_vertex_colors(&mut self) {
-        let amount = self.vertex_paint_strength.clamp(0.0, 1.0);
-        let iterations = self.vertex_paint_smooth_iterations.clamp(1, 20);
-        let mut targets = self.terrain_paint_targets_scoped(true);
-        if targets.is_empty() {
-            self.log.push(
-                "No terrain to paint: set a model instance to 'Bake as map terrain' first."
-                    .to_string(),
-            );
-            return;
-        }
-        for target in &mut targets {
-            for mesh in &mut target.document.meshes {
-                for primitive in &mut mesh.primitives {
-                    let welds = weld_positions(&primitive.positions);
-                    let adjacency = primitive_adjacency(&primitive.indices, &welds);
-                    let colors = primitive_colors_mut(primitive);
-                    // Repeated passes spread the blend further than one pass
-                    // at higher strength, which just overshoots.
-                    for _ in 0..iterations {
-                        let smoothed = smoothed_colors(colors, &welds, &adjacency, amount);
-                        colors.copy_from_slice(&smoothed);
-                    }
-                }
-            }
-        }
-        self.commit_terrain_targets(targets, "Smoothed vertex paint", true);
     }
 }
 
@@ -1849,6 +1874,84 @@ impl SmsEditorApp {
         painter.add(egui::Shape::line(ring, egui::Stroke::new(2.0, color)));
     }
 
+    /// Re-grades from the baseline and shows it, without touching the catalog.
+    fn refresh_vertex_paint_grade(&mut self) {
+        let settings = self.vertex_paint_grade_settings;
+        let asset = self
+            .selected_model_instance()
+            .map(|instance| instance.placement.asset_id);
+
+        // A session belongs to the terrain it opened on. Grading whatever got
+        // selected later against a stale baseline would write one mesh's
+        // colours onto another.
+        if self
+            .vertex_paint_grade
+            .as_ref()
+            .is_some_and(|grade| grade.baseline.first().map(|entry| entry.id) != asset)
+        {
+            self.vertex_paint_grade = None;
+        }
+        if self.vertex_paint_grade.is_none() {
+            if settings.is_neutral() {
+                return;
+            }
+            let targets = self.terrain_paint_targets_scoped(true);
+            if targets.is_empty() {
+                self.log
+                    .push("Select a terrain instance in the hierarchy before grading.".to_string());
+                return;
+            }
+            let baseline = targets
+                .iter()
+                .map(|target| snapshot_paint_state(target.id, &target.document))
+                .collect();
+            self.vertex_paint_grade = Some(VertexPaintGrade { targets, baseline });
+        }
+
+        let Some(mut grade) = self.vertex_paint_grade.take() else {
+            return;
+        };
+        for (target, baseline) in grade.targets.iter_mut().zip(grade.baseline.iter()) {
+            restore_paint_state(&mut target.document, baseline);
+            for mesh in &mut target.document.meshes {
+                for primitive in &mut mesh.primitives {
+                    for color in primitive_colors_mut(primitive) {
+                        settings.apply(color);
+                    }
+                }
+            }
+        }
+        for target in &grade.targets {
+            self.cache_model_previews_for_document(target.id, &target.document);
+        }
+        self.vertex_paint_grade = Some(grade);
+    }
+
+    /// Writes the grade to the catalog as one undo step.
+    fn apply_vertex_paint_grade(&mut self) {
+        let Some(grade) = self.vertex_paint_grade.take() else {
+            return;
+        };
+        self.commit_terrain_targets(grade.targets, "Graded vertex colour", true);
+        // The grade is in the asset now, so the sliders start again from
+        // neutral rather than re-applying themselves on the next nudge.
+        self.vertex_paint_grade_settings = VertexPaintGradeSettings::default();
+    }
+
+    /// Puts the terrain back as it was before the sliders moved.
+    fn revert_vertex_paint_grade(&mut self) {
+        self.vertex_paint_grade_settings = VertexPaintGradeSettings::default();
+        let Some(mut grade) = self.vertex_paint_grade.take() else {
+            return;
+        };
+        for (target, baseline) in grade.targets.iter_mut().zip(grade.baseline.iter()) {
+            restore_paint_state(&mut target.document, baseline);
+        }
+        for target in &grade.targets {
+            self.cache_model_previews_for_document(target.id, &target.document);
+        }
+    }
+
     pub(super) fn vertex_paint_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Vertex Paint");
         let terrain = self
@@ -1960,27 +2063,60 @@ impl SmsEditorApp {
         }
 
         ui.separator();
-        ui.strong("Ramp");
+        ui.strong("Grade");
+        ui.label("Adjusts the colours already on the terrain. Nothing is written until Apply.");
+        let mut changed = false;
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.vertex_paint_grade_settings.exposure, -3.0..=3.0)
+                    .text("Exposure"),
+            )
+            .on_hover_text("Stops, so each one doubles or halves the light")
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.vertex_paint_grade_settings.contrast, -1.0..=1.0)
+                    .text("Contrast"),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.vertex_paint_grade_settings.vibrance, -1.0..=1.0)
+                    .text("Vibrance"),
+            )
+            .on_hover_text("Leans on the duller colours, so painted patches do not blow out first")
+            .changed();
         ui.horizontal(|ui| {
-            for (index, label) in ["X", "Y", "Z"].into_iter().enumerate() {
-                ui.selectable_value(&mut self.vertex_paint_ramp_axis, index, label);
-            }
-            ui.checkbox(&mut self.vertex_paint_ramp_invert, "Invert");
+            changed |= ui
+                .color_edit_button_rgb(&mut self.vertex_paint_grade_settings.tint)
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut self.vertex_paint_grade_settings.tint_amount, 0.0..=1.0)
+                        .text("Tint"),
+                )
+                .changed();
         });
-        ui.add(egui::Slider::new(&mut self.vertex_paint_ramp_start, 0.0..=1.0).text("Start"));
-        ui.add(egui::Slider::new(&mut self.vertex_paint_ramp_end, 0.0..=1.0).text("End"));
-        ui.add(
-            egui::Slider::new(&mut self.vertex_paint_ramp_curve, 0.05..=8.0)
-                .logarithmic(true)
-                .text("Curve"),
-        );
-        if ui
-            .button("Bake Ramp")
-            .on_hover_text("Blend the brush colour along an axis across the terrain bounds")
-            .clicked()
-        {
-            self.bake_terrain_ramp();
+        if changed {
+            self.refresh_vertex_paint_grade();
         }
+        ui.horizontal(|ui| {
+            let open = self.vertex_paint_grade.is_some();
+            if ui
+                .add_enabled(open, egui::Button::new("Apply"))
+                .on_hover_text("Write the graded colours to the asset")
+                .clicked()
+            {
+                self.apply_vertex_paint_grade();
+            }
+            if ui
+                .add_enabled(open, egui::Button::new("Revert"))
+                .on_hover_text("Put the colours back and reset the sliders")
+                .clicked()
+            {
+                self.revert_vertex_paint_grade();
+            }
+        });
 
         ui.separator();
         ui.strong("Sun (directional light bake)");
