@@ -1,4 +1,5 @@
 use super::*;
+use sms_authoring::{AssetId, ModelInstanceExportMode, ModelInstancePlacement};
 
 #[test]
 fn content_dock_window_clamp_does_not_replace_the_preferred_height() {
@@ -350,6 +351,17 @@ fn viewport_focus_allows_world_edit_shortcuts_while_text_edit_focus_owns_them() 
         app.document.as_ref().unwrap().objects,
         std::slice::from_ref(&object)
     );
+    let _ = context.run_ui(keyboard_input(egui::Key::Y, egui::Modifiers::CTRL), |ui| {
+        app.handle_editor_shortcuts(ui.ctx())
+    });
+    assert!(app.document.as_ref().unwrap().objects.is_empty());
+    let _ = context.run_ui(keyboard_input(egui::Key::Z, egui::Modifiers::CTRL), |ui| {
+        app.handle_editor_shortcuts(ui.ctx())
+    });
+    assert_eq!(
+        app.document.as_ref().unwrap().objects,
+        std::slice::from_ref(&object)
+    );
 
     app.selected_object_id = Some(object.id.clone());
     let copy_output = context.run_ui(clipboard_input(egui::Event::Copy), |ui| {
@@ -388,6 +400,35 @@ fn viewport_focus_allows_world_edit_shortcuts_while_text_edit_focus_owns_them() 
         ui.text_edit_singleline(&mut text).request_focus();
     });
     assert!(text_editor_owns_shortcuts(&text_context));
+}
+
+#[test]
+fn modal_grab_suppresses_global_edit_shortcuts() {
+    let context = egui::Context::default();
+    let object = SceneObject::new("grabbed-object", "FixtureEnemy");
+    let mut app = SmsEditorApp {
+        selected_object_id: Some(object.id.clone()),
+        document: Some(shortcut_test_document(object.clone())),
+        grab_drag: Some(GrabDrag {
+            target: GrabTarget::Object,
+            start_transform: object.transform,
+            start_pointer: egui::Pos2::ZERO,
+            axis: None,
+            world_units_per_pixel: 1.0,
+        }),
+        ..SmsEditorApp::default()
+    };
+
+    let _ = context.run_ui(
+        keyboard_input(egui::Key::Delete, egui::Modifiers::NONE),
+        |ui| app.handle_editor_shortcuts(ui.ctx()),
+    );
+
+    assert_eq!(
+        app.document.as_ref().unwrap().objects,
+        std::slice::from_ref(&object)
+    );
+    assert!(app.undo_stack.is_empty());
 }
 
 #[test]
@@ -913,6 +954,64 @@ fn viewport_picking_keeps_an_object_in_front_of_stage_geometry_selectable() {
             .as_deref(),
         Some("visible-object")
     );
+}
+
+#[test]
+fn world_selection_prefers_an_actor_already_proven_in_front_of_authored_terrain() {
+    let terrain_id = uuid::Uuid::new_v4();
+
+    assert_eq!(
+        crate::viewport_ui::resolve_world_selection_hits(
+            Some("front-actor".to_string()),
+            Some(terrain_id),
+            Some(terrain_id),
+        ),
+        (None, Some("front-actor".to_string()))
+    );
+    assert_eq!(
+        crate::viewport_ui::resolve_world_selection_hits(None, Some(terrain_id), None),
+        (Some(terrain_id), None)
+    );
+}
+
+#[test]
+fn viewport_focus_prefers_an_actor_in_front_of_authored_terrain() {
+    let mut object = SceneObject::new("front-actor", "Coin");
+    object.transform.translation = [0.0, 0.0, 500.0];
+    let mut preview = preview_for_texture_alpha(false, false);
+    preview.object_model_indices.insert(object.id.clone(), 2);
+    let mut placement = ModelInstancePlacement::new(AssetId::new(), "terrain");
+    placement.export_mode = ModelInstanceExportMode::MapTerrain;
+    let terrain_id = placement.instance_id;
+    preview.instance_model_indices.insert(terrain_id, 1);
+    for (model_index, depth, extent) in [(1, 1000.0, 200.0), (2, 500.0, 150.0)] {
+        let mut triangle = textured_blended_triangle();
+        triangle.vertices = [
+            [-extent, -extent, depth],
+            [extent, -extent, depth],
+            [0.0, extent, depth],
+        ];
+        triangle.model_index = model_index;
+        triangle.texture_index = None;
+        triangle.tex_coords = None;
+        preview.triangles.push(triangle);
+    }
+    let mut app = SmsEditorApp {
+        document: Some(test_document(vec![object])),
+        model_preview: Some(preview),
+        model_instances: vec![EditorModelInstance {
+            stage_id: String::new(),
+            placement,
+            local_bounds: [[-200.0, -200.0, 1000.0], [200.0, 200.0, 1000.0]],
+        }],
+        ..camera_app()
+    };
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
+
+    assert!(app.focus_camera_on_viewport_position(rect, rect.center()));
+
+    let focus = app.camera_focus_animation.expect("focus animation");
+    assert_eq!(focus.target_focus, [0.0, 0.0, 500.0]);
 }
 
 #[test]
@@ -5056,6 +5155,13 @@ fn the_tools_menu_toggles_goop_off_again() {
         EditorTool::Goop.after_toolbar_click(EditorTool::Goop),
         EditorTool::Select
     );
+}
+
+#[test]
+fn terrain_asset_tools_share_their_undo_history() {
+    assert!(EditorTool::VertexPaint.uses_terrain_asset_undo());
+    assert!(EditorTool::Boolean.uses_terrain_asset_undo());
+    assert!(!EditorTool::Move.uses_terrain_asset_undo());
 }
 
 #[test]

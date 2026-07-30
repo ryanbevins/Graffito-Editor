@@ -3752,7 +3752,7 @@ impl SmsEditorApp {
         if self.tool == EditorTool::Goop && self.undo_goop() {
             return;
         }
-        if self.tool == EditorTool::VertexPaint && self.undo_vertex_paint() {
+        if self.tool.uses_terrain_asset_undo() && self.undo_vertex_paint() {
             return;
         }
         if (self.selected_model_instance_id.is_some()
@@ -3807,7 +3807,7 @@ impl SmsEditorApp {
         if self.tool == EditorTool::Goop && self.redo_goop() {
             return;
         }
-        if self.tool == EditorTool::VertexPaint && self.redo_vertex_paint() {
+        if self.tool.uses_terrain_asset_undo() && self.redo_vertex_paint() {
             return;
         }
         if (self.selected_model_instance_id.is_some()

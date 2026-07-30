@@ -2331,17 +2331,21 @@ impl SmsEditorApp {
     /// on a background thread and declines while another one is in flight, in
     /// which case the stale banner stays up for a manual rebuild.
     pub(super) fn rebuild_generated_goop_layers_if_stale(&mut self) {
-        if self.background_receiver.is_some() {
-            return;
-        }
         let stale = self
             .document
             .as_ref()
             .and_then(|document| document.goop_authoring.as_ref())
             .is_some_and(|goop| goop.stale);
-        if stale {
-            self.rebuild_generated_goop_layers();
+        if !stale {
+            self.goop_rebuild_requested = false;
+            return;
         }
+        if self.background_receiver.is_some() {
+            self.goop_rebuild_requested = true;
+            return;
+        }
+        self.goop_rebuild_requested = false;
+        self.rebuild_generated_goop_layers();
     }
 
     fn rebuild_generated_goop_layers(&mut self) {
@@ -4305,6 +4309,44 @@ mod tests {
         authoring.format_version = GOOP_AUTHORING_FORMAT_VERSION - 1;
         authoring.layers[0].origin = GoopLayerOrigin::Imported;
         assert!(!generated_goop_requires_upgrade(&authoring));
+    }
+
+    #[test]
+    fn stale_goop_rebuild_is_queued_while_the_background_slot_is_busy() {
+        let document = StageDocument {
+            stage_id: "custom0".to_string(),
+            base_root: PathBuf::new(),
+            assets: Vec::new(),
+            objects: Vec::new(),
+            changed_files: BTreeMap::new(),
+            stage_archive: None,
+            stage_archive_source_path: None,
+            archive_edits: StageArchiveEdits::default(),
+            registry: None,
+            route_authoring: None,
+            goop_authoring: Some(GoopAuthoringDocument {
+                stale: true,
+                ..Default::default()
+            }),
+            dialogue_authoring: None,
+            dialogue_library: Default::default(),
+            load_issues: Vec::new(),
+            lighting: Default::default(),
+            death_barrier: None,
+            actor_previews: BTreeMap::new(),
+            loaded_project: None,
+        };
+        let (_sender, receiver) = mpsc::channel();
+        let mut app = SmsEditorApp {
+            document: Some(document),
+            background_receiver: Some(receiver),
+            ..SmsEditorApp::default()
+        };
+
+        app.rebuild_generated_goop_layers_if_stale();
+
+        assert!(app.goop_rebuild_requested);
+        assert!(app.background_receiver.is_some());
     }
 
     #[test]

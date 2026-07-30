@@ -228,6 +228,33 @@ impl SmsEditorApp {
                     },
                 );
 
+                ui.separator();
+                let selected_sound = self.selected_audio_helper_sound_id();
+                if ui
+                    .add_enabled(
+                        selected_sound.is_some()
+                            && !self.audio_preview_is_active()
+                            && !self.audio_preview_is_loading(),
+                        egui::Button::new("Preview Selected Sound"),
+                    )
+                    .on_hover_text(
+                        "Preview the effective sound assigned to the selected point or rail helper",
+                    )
+                    .clicked()
+                {
+                    self.preview_sound_now(
+                        selected_sound.expect("preview button requires a selected sound"),
+                    );
+                }
+                if ui
+                    .add_enabled(
+                        self.audio_preview_is_active() || self.audio_preview_is_loading(),
+                        egui::Button::new("Stop Preview"),
+                    )
+                    .clicked()
+                {
+                    self.stop_audio_preview();
+                }
             });
             ui.menu_button("View", |ui| {
                 ui.menu_button("Viewport Mode", |ui| {

@@ -149,6 +149,7 @@ fn preview_triangle_writes_opaque_depth(
 
 /// Height of `triangle` directly above or below `(x, z)`, if it covers that
 /// column. Barycentric in the XZ plane, so vertical faces simply miss.
+#[cfg(test)]
 pub(super) fn triangle_height_at_xz(vertices: [[f32; 3]; 3], x: f32, z: f32) -> Option<f32> {
     let [a, b, c] = vertices;
     let area = (b[0] - a[0]) * (c[2] - a[2]) - (c[0] - a[0]) * (b[2] - a[2]);
@@ -537,21 +538,21 @@ impl SmsEditorApp {
                 // standing on the model, so clicking an actor sat on top of a
                 // large glb would otherwise select the glb underneath it.
                 let hit_object = self.object_at_screen_position(rect, pos);
-                let model_instance_id = self
-                    .stage_geometry_clickable()
-                    .then(|| {
-                        self.model_instance_mesh_hit_at_screen_position(rect, pos)
-                            .or_else(|| {
-                                hit_object
-                                    .is_none()
-                                    .then(|| {
-                                        self.model_instance_bounds_hit_at_screen_position(rect, pos)
-                                    })
-                                    .flatten()
-                            })
-                    })
-                    .flatten();
-                let object_id = model_instance_id.is_none().then_some(hit_object).flatten();
+                let include_stage_geometry = self.stage_geometry_clickable();
+                let mesh_hit = self.model_instance_mesh_hit_at_screen_position_filtered(
+                    rect,
+                    pos,
+                    include_stage_geometry,
+                );
+                let bounds_hit = hit_object.is_none().then(|| {
+                    self.model_instance_bounds_hit_at_screen_position_filtered(
+                        rect,
+                        pos,
+                        include_stage_geometry,
+                    )
+                });
+                let (model_instance_id, object_id) =
+                    resolve_world_selection_hits(hit_object, mesh_hit, bounds_hit.flatten());
                 let leaving_helper_for_world_selection = self.selected_audio_helper_id.is_some()
                     && (model_instance_id.is_some() || object_id.is_some());
                 if !leaving_helper_for_world_selection
@@ -676,6 +677,9 @@ impl SmsEditorApp {
                     self.selected_object()
                         .map_or_else(Transform::default, |object| object.transform)
                 };
+                if route_origin.is_none() {
+                    self.prepare_content_snap_surface();
+                }
                 self.gizmo_drag = Some(GizmoDrag {
                     axis,
                     tool: self.tool,
@@ -719,6 +723,7 @@ impl SmsEditorApp {
         let primary_released = ui.input(|input| input.pointer.primary_released());
         if primary_released {
             if let Some(drag) = self.gizmo_drag.take() {
+                self.content_snap_surface = None;
                 if self.route_undo_transaction.is_some() {
                     self.commit_route_undo_transaction("Moved route control point");
                     return true;
@@ -1284,6 +1289,7 @@ impl SmsEditorApp {
                 // Instances record their own undo when the drag lands.
                 self.begin_undo_transaction();
             }
+            self.prepare_content_snap_surface();
             self.grab_drag = Some(GrabDrag {
                 target,
                 start_transform,
@@ -1308,6 +1314,7 @@ impl SmsEditorApp {
         if escape || response.secondary_clicked() {
             self.revert_grab(drag);
             self.grab_drag = None;
+            self.content_snap_surface = None;
             return true;
         }
 
@@ -1322,6 +1329,7 @@ impl SmsEditorApp {
             let end = moved.unwrap_or(drag.start_transform);
             self.apply_grab_commit(drag.target, drag.start_transform, end, "Moved object");
             self.grab_drag = None;
+            self.content_snap_surface = None;
         }
         true
     }
@@ -1369,32 +1377,35 @@ impl SmsEditorApp {
         }
     }
 
-    /// Highest placement surface under `(x, z)` that sits at or below
-    /// `ceiling`.
-    ///
-    /// `ceiling` is the height the grab started from, so an item keeps to the
-    /// floor it was already above rather than catching on a roof it was under.
-    fn ground_height_below(
-        &self,
-        x: f32,
-        z: f32,
-        ceiling: f32,
-        ignore_model: Option<usize>,
-    ) -> Option<f32> {
-        let preview = self.model_preview.as_ref()?;
-        let mut best = f32::NEG_INFINITY;
-        for triangle in preview.triangles.iter().filter(|triangle| {
-            preview_triangle_is_placement_surface(triangle)
-                && ignore_model.is_none_or(|model| triangle.model_index != model)
-        }) {
-            let Some(height) = triangle_height_at_xz(triangle.vertices, x, z) else {
-                continue;
-            };
-            if height <= ceiling && height > best {
-                best = height;
-            }
+    fn prepare_content_snap_surface(&mut self) {
+        self.content_snap_surface = None;
+        if !self.content_aware_snap {
+            return;
         }
-        best.is_finite().then_some(best)
+        let Some(preview) = self.model_preview.as_ref() else {
+            return;
+        };
+        let ignored = self.selected_model_index();
+        let triangles = preview
+            .triangles
+            .iter()
+            .filter(|triangle| {
+                preview_triangle_is_placement_surface(triangle)
+                    && ignored.is_none_or(|model| triangle.model_index != model)
+            })
+            .map(|triangle| triangle.vertices)
+            .collect();
+        self.content_snap_surface = Some(crate::triangle_bvh::TriangleBvh::build(triangles));
+    }
+
+    /// Highest indexed placement surface under `(x, z)` that sits below
+    /// `ceiling`.
+    fn ground_height_below(&self, x: f32, z: f32, ceiling: f32) -> Option<f32> {
+        const FLOOR_RAY_REACH: f32 = 1.0e9;
+        self.content_snap_surface
+            .as_ref()?
+            .nearest_ray_hit([x, ceiling, z], [0.0, -1.0, 0.0], FLOOR_RAY_REACH)
+            .map(|distance| ceiling - distance)
     }
 
     fn grab_transform(&self, rect: egui::Rect, drag: GrabDrag, pointer: egui::Pos2) -> Transform {
@@ -1472,7 +1483,6 @@ impl SmsEditorApp {
             transform.translation[0],
             transform.translation[2],
             reference + STEP_ALLOWANCE,
-            self.selected_model_index(),
         ) {
             transform.translation[1] = transform.translation[1].max(ground);
         }
@@ -1597,13 +1607,15 @@ impl SmsEditorApp {
         pos: egui::Pos2,
     ) -> bool {
         let target = self
-            .stage_geometry_clickable()
-            .then(|| self.model_instance_at_screen_position(rect, pos))
-            .flatten()
-            .and_then(|id| self.model_instance_focus_target(id))
+            .object_at_screen_position(rect, pos)
+            .and_then(|id| self.object_focus_target(&id))
             .or_else(|| {
-                self.object_at_screen_position(rect, pos)
-                    .and_then(|id| self.object_focus_target(&id))
+                self.model_instance_at_screen_position_filtered(
+                    rect,
+                    pos,
+                    self.stage_geometry_clickable(),
+                )
+                .and_then(|id| self.model_instance_focus_target(id))
             });
         let Some((focus, distance)) = target else {
             return false;
@@ -3304,6 +3316,17 @@ pub(super) fn positioned_viewport_drag_triangle(
         .billboard
         .and_then(|billboard| transform_j3d_billboard(billboard, transform, triangle.normals));
     triangle
+}
+
+pub(super) fn resolve_world_selection_hits(
+    object_hit: Option<String>,
+    model_mesh_hit: Option<uuid::Uuid>,
+    model_bounds_hit: Option<uuid::Uuid>,
+) -> (Option<uuid::Uuid>, Option<String>) {
+    match object_hit {
+        Some(object_id) => (None, Some(object_id)),
+        None => (model_mesh_hit.or(model_bounds_hit), None),
+    }
 }
 
 pub(super) fn transform_from_gizmo_drag(

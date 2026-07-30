@@ -284,6 +284,38 @@ fn geometry_updates_touch_only_requested_triangle_batches() {
 }
 
 #[test]
+fn surface_updates_refresh_vertex_colors_without_repacking_geometry() {
+    let mut preview = geometry_update_preview();
+    let mut scene = GpuSceneData::from_preview(&preview);
+    let location = scene.triangle_vertices[1].unwrap();
+    let original_position =
+        scene.batches[location.batch_index].vertices[location.vertex_offset].position;
+    preview.triangles[1].color_channels[0] =
+        Some([[10, 20, 30, 255], [40, 50, 60, 255], [70, 80, 90, 255]]);
+    let mut dirty_vertex_ranges = vec![None; scene.batches.len()];
+
+    assert!(scene.update_surfaces(
+        &preview,
+        std::slice::from_ref(&(1..2)),
+        &mut dirty_vertex_ranges,
+    ));
+
+    let repacked = GpuSceneData::from_preview(&preview);
+    assert_eq!(
+        gpu_triangle_vertex_bytes(&scene, 1),
+        gpu_triangle_vertex_bytes(&repacked, 1)
+    );
+    assert_eq!(
+        scene.batches[location.batch_index].vertices[location.vertex_offset].position,
+        original_position
+    );
+    assert_eq!(
+        dirty_vertex_ranges[location.batch_index],
+        Some(location.vertex_offset..location.vertex_offset + 3)
+    );
+}
+
+#[test]
 fn transient_drag_preview_geometry_remains_updateable_after_gpu_batch_packing() {
     let mut preview = shared_static_quad_preview();
     preview.object_model_indices.insert(

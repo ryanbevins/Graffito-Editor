@@ -321,6 +321,10 @@ impl EditorTool {
             _ => self,
         }
     }
+
+    fn uses_terrain_asset_undo(self) -> bool {
+        matches!(self, Self::VertexPaint | Self::Boolean)
+    }
 }
 
 /// Tools with a top-level toolbar button. `Select` is deliberately absent: it
@@ -1288,6 +1292,9 @@ struct SmsEditorApp {
     confirm_delete_generated_goop: bool,
     goop_undo_stack: VecDeque<GoopUndoRecord>,
     goop_redo_stack: VecDeque<GoopUndoRecord>,
+    /// A terrain change arrived while another background task owned the
+    /// worker slot. Retried once that task releases it.
+    goop_rebuild_requested: bool,
     view_mode: ViewMode,
     bottom_tab: BottomTab,
     show_project_settings: bool,
@@ -1308,7 +1315,9 @@ struct SmsEditorApp {
     vertex_paint_ao_strength: f32,
     vertex_paint_ao_distance: f32,
     vertex_paint_ao_rays: u32,
-    boolean_cutter: Option<sms_authoring::AssetId>,
+    /// Exact stage placement used as Boolean cutter. Asset identity is not
+    /// enough because the same mesh can be placed more than once.
+    boolean_cutter: Option<uuid::Uuid>,
     boolean_cut_hole: bool,
     boolean_cut_axis: usize,
     vertex_paint_smooth_iterations: u32,
@@ -1332,6 +1341,9 @@ struct SmsEditorApp {
     vertex_paint_rect: Option<egui::Rect>,
     /// Keeps a moved item from sinking through the geometry under it.
     content_aware_snap: bool,
+    /// Placement surfaces indexed once at drag start rather than scanned every
+    /// pointer frame.
+    content_snap_surface: Option<triangle_bvh::TriangleBvh>,
     snap_translation: f32,
     snap_rotation: f32,
     snap_scale: f32,
@@ -1596,6 +1608,7 @@ impl Default for SmsEditorApp {
             confirm_delete_generated_goop: false,
             goop_undo_stack: VecDeque::new(),
             goop_redo_stack: VecDeque::new(),
+            goop_rebuild_requested: false,
             view_mode: ViewMode::Lit,
             bottom_tab: BottomTab::Content,
             show_project_settings: false,
@@ -1635,6 +1648,7 @@ impl Default for SmsEditorApp {
             vertex_paint_cursor: None,
             vertex_paint_rect: None,
             content_aware_snap: false,
+            content_snap_surface: None,
             snap_translation: 50.0,
             snap_rotation: 15.0,
             snap_scale: 0.1,
@@ -1745,8 +1759,29 @@ impl SmsEditorApp {
         true
     }
 
+    fn apply_tool_keyboard_shortcut(&mut self, key: egui::Key) {
+        let next = self.tool.after_keyboard_shortcut(key);
+        if next == self.tool {
+            return;
+        }
+        if self.tool == EditorTool::VertexPaint
+            && (self.vertex_paint_live.is_some() || !self.vertex_paint_stroke.is_empty())
+        {
+            self.finish_vertex_paint_live_stroke();
+        }
+        self.tool = next;
+    }
+
     fn handle_editor_shortcuts(&mut self, ctx: &egui::Context) {
         if text_editor_owns_shortcuts(ctx) {
+            return;
+        }
+
+        // A modal grab owns the keyboard until it commits or cancels. Letting
+        // undo, delete, duplicate, or paste run here would mutate the document
+        // underneath the open transform transaction before the viewport gets
+        // its Enter/Escape/axis input.
+        if self.grab_drag.is_some() {
             return;
         }
 
@@ -1764,6 +1799,9 @@ impl SmsEditorApp {
             self.undo();
         }
         if ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::Z)) {
+            self.redo();
+        }
+        if ctx.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::Y)) {
             self.redo();
         }
         let copy_requested = ctx.input(|input| {
@@ -1796,16 +1834,16 @@ impl SmsEditorApp {
             return;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Q)) {
-            self.tool = self.tool.after_keyboard_shortcut(egui::Key::Q);
+            self.apply_tool_keyboard_shortcut(egui::Key::Q);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::W)) {
-            self.tool = self.tool.after_keyboard_shortcut(egui::Key::W);
+            self.apply_tool_keyboard_shortcut(egui::Key::W);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::E)) {
-            self.tool = self.tool.after_keyboard_shortcut(egui::Key::E);
+            self.apply_tool_keyboard_shortcut(egui::Key::E);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::R)) {
-            self.tool = self.tool.after_keyboard_shortcut(egui::Key::R);
+            self.apply_tool_keyboard_shortcut(egui::Key::R);
         }
     }
 }
@@ -2639,6 +2677,9 @@ impl SmsEditorApp {
             }
             None => {}
         }
+        if self.goop_rebuild_requested && self.background_receiver.is_none() {
+            self.rebuild_generated_goop_layers_if_stale();
+        }
     }
 
     fn apply_loaded_stage(&mut self, loaded: LoadedStage) {
@@ -2757,6 +2798,7 @@ impl SmsEditorApp {
         self.confirm_delete_generated_goop = false;
         self.goop_undo_stack.clear();
         self.goop_redo_stack.clear();
+        self.goop_rebuild_requested = false;
         self.vertex_paint_undo_stack.clear();
         self.vertex_paint_redo_stack.clear();
         self.vertex_paint_undo_group = None;

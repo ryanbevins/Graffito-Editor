@@ -520,9 +520,17 @@ impl RouteGraph {
             return false;
         };
         std::mem::swap(&mut link.from, &mut link.to);
-        std::mem::swap(&mut link.forward, &mut link.reverse);
         if let Some(handles) = &mut link.bezier {
             std::mem::swap(&mut handles.from, &mut handles.to);
+        }
+        // Source slots belong to the old source controls. Keeping them after
+        // reversing the endpoints could overwrite an unrelated connection or
+        // introduce empty slots in the compiled RAL graph.
+        if let Some(direction) = &mut link.forward {
+            direction.source_slot = None;
+        }
+        if let Some(direction) = &mut link.reverse {
+            direction.source_slot = None;
         }
         self.dirty = true;
         true
@@ -1082,6 +1090,28 @@ mod tests {
             index = nodes[index].connections[0] as usize;
         }
         assert!((total - 240.0).abs() < 0.01, "{total}");
+    }
+
+    #[test]
+    fn reversing_a_one_way_link_reverses_runtime_traversal() {
+        let source = document();
+        let mut routes = RouteAuthoringDocument::lift(ROUTE_RESOURCE_PATH, &source);
+        let graph = &mut routes.graphs[0];
+        let link_id = graph.links[0].id.clone();
+        let original_from = graph.links[0].from.clone();
+        let original_to = graph.links[0].to.clone();
+        graph.set_link_direction(&link_id, true, false);
+
+        assert!(graph.reverse_link(&link_id));
+        let reversed = graph.links.iter().find(|link| link.id == link_id).unwrap();
+        assert_eq!(reversed.from, original_to);
+        assert_eq!(reversed.to, original_from);
+        assert_eq!(reversed.forward.as_ref().unwrap().source_slot, None);
+
+        let compiled = routes.compile().unwrap();
+        assert_eq!(compiled.graphs[0].nodes[0].connection_count, 0);
+        assert_eq!(compiled.graphs[0].nodes[1].connection_count, 1);
+        assert_eq!(compiled.graphs[0].nodes[1].connections[0], 0);
     }
 
     #[test]

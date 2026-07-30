@@ -125,6 +125,13 @@ fn model_instance_preview_key(
     })
 }
 
+fn model_instance_is_pickable(
+    instance: &EditorModelInstance,
+    include_stage_geometry: bool,
+) -> bool {
+    include_stage_geometry || instance.placement.export_mode != ModelInstanceExportMode::MapTerrain
+}
+
 fn should_default_to_map_terrain(
     authored_blank_stage: bool,
     asset_has_collision: bool,
@@ -611,9 +618,9 @@ impl SmsEditorApp {
         if !self.content_catalog_mutation_allowed("replace a model source") {
             return;
         }
-        if self.selected_model_asset == Some(id) && self.asset_dirty {
+        if self.asset_dirty {
             let message =
-                "Save or revert the open model asset before replacing its source.".to_string();
+                "Save or revert the open model asset before replacing a model source.".to_string();
             self.model_editor_error = Some(message.clone());
             self.log.push(message);
             return;
@@ -684,7 +691,7 @@ impl SmsEditorApp {
         }
         // The import is asynchronous. The asset may have become dirty after
         // the file picker closed, so protect it again at the actual write.
-        if self.selected_model_asset == Some(id) && self.asset_dirty {
+        if self.asset_dirty {
             let message =
                 "Model replacement was not committed because the open asset has unsaved edits."
                     .to_string();
@@ -715,21 +722,22 @@ impl SmsEditorApp {
         // a swap does not rename what the hierarchy and the browser show.
         let mut document = prepared.document;
         document.name = entry.name.clone();
+        let before = match catalog.load_asset(id) {
+            Ok(document) => document,
+            Err(error) => {
+                self.log.push(format!(
+                    "Model replacement was not committed because the existing asset could not be loaded: {error}"
+                ));
+                return;
+            }
+        };
 
         match catalog.save_asset(id, &document) {
             Ok(_) => {
                 self.model_asset_preview_cache
                     .retain(|key, _| key.asset_id != id);
                 self.force_refresh_model_catalog();
-                if self.selected_model_asset == Some(id) {
-                    // Reload the open editor so it is not still showing the
-                    // geometry that was just overwritten.
-                    self.selected_model_document = Some(document.clone());
-                    self.saved_model_document = Some(document);
-                    self.asset_dirty = false;
-                    self.selected_model_material = 0;
-                    self.selected_model_texture = 0;
-                }
+                self.install_replaced_model_asset(id, &entry, before, document);
                 self.rebuild_model_preview_cache();
                 // New geometry under the same asset means any goop generated
                 // from the old terrain no longer matches it.
@@ -1085,25 +1093,68 @@ impl SmsEditorApp {
         let Some(before) = self.selected_model_document.clone() else {
             return;
         };
-        let Some(document) = self.selected_model_document.as_mut() else {
-            return;
+        let after = {
+            let Some(document) = self.selected_model_document.as_mut() else {
+                return;
+            };
+            mutate(document);
+            if *document == before {
+                return;
+            }
+            document.clone()
         };
-        mutate(document);
-        if *document == before {
-            return;
-        }
-        let after = document.clone();
-        self.asset_undo_stack.push_back(ModelAssetUndoRecord {
+        self.invalidate_terrain_asset_undo_history("the model asset was edited directly");
+        self.push_model_asset_undo(ModelAssetUndoRecord {
             label: label.into(),
             before,
-            after,
+            after: after.clone(),
         });
+        self.asset_dirty = self.saved_model_document.as_ref() != Some(&after);
+        self.sync_gx_json_draft();
+    }
+
+    fn push_model_asset_undo(&mut self, record: ModelAssetUndoRecord) {
+        self.asset_undo_stack.push_back(record);
         if self.asset_undo_stack.len() > MAX_MODEL_UNDO_RECORDS {
             self.asset_undo_stack.pop_front();
         }
         self.asset_redo_stack.clear();
-        self.asset_dirty = self.saved_model_document.as_ref() != Some(document);
+    }
+
+    fn install_replaced_model_asset(
+        &mut self,
+        id: AssetId,
+        entry: &CatalogAssetEntry,
+        before: ModelAssetDocument,
+        after: ModelAssetDocument,
+    ) {
+        self.invalidate_terrain_asset_undo_history("the model source was replaced");
+        self.content_browser.inspector_active = false;
+        self.model_asset_rename_draft = entry.name.clone();
+        self.model_asset_move_draft = entry
+            .relative_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_string_lossy()
+            .replace('\\', "/");
+        self.selected_model_asset = Some(id);
+        self.selected_model_document = Some(after.clone());
+        self.saved_model_document = Some(after.clone());
+        self.selected_model_material = 0;
+        self.selected_model_texture = 0;
+        self.selected_model_instance_id = None;
+        self.selected_object_id = None;
+        self.selected_world_member = None;
+        self.asset_dirty = false;
+        self.asset_undo_stack.clear();
+        self.asset_redo_stack.clear();
+        self.push_model_asset_undo(ModelAssetUndoRecord {
+            label: "Replaced model source".to_string(),
+            before,
+            after,
+        });
         self.sync_gx_json_draft();
+        self.sync_texture_json_draft();
     }
 
     pub(super) fn undo_model_asset(&mut self) -> bool {
@@ -1570,6 +1621,7 @@ impl SmsEditorApp {
         }
         self.ensure_model_instance_selection_exists();
         self.rebuild_model_preview_cache();
+        self.rebuild_generated_goop_layers_if_stale();
         true
     }
 
@@ -1587,6 +1639,7 @@ impl SmsEditorApp {
         }
         self.ensure_model_instance_selection_exists();
         self.rebuild_model_preview_cache();
+        self.rebuild_generated_goop_layers_if_stale();
         true
     }
 
@@ -1601,16 +1654,27 @@ impl SmsEditorApp {
         }
     }
 
-    pub(super) fn model_instance_at_screen_position(
+    pub(super) fn model_instance_at_screen_position_filtered(
         &self,
         rect: egui::Rect,
         position: egui::Pos2,
+        include_stage_geometry: bool,
     ) -> Option<uuid::Uuid> {
         // Prefer the mesh, matching how placed world objects are picked. The
         // origin radius alone only selected an instance when the part of the
         // model under the cursor happened to sit near its origin.
-        self.model_instance_mesh_hit_at_screen_position(rect, position)
-            .or_else(|| self.model_instance_bounds_hit_at_screen_position(rect, position))
+        self.model_instance_mesh_hit_at_screen_position_filtered(
+            rect,
+            position,
+            include_stage_geometry,
+        )
+        .or_else(|| {
+            self.model_instance_bounds_hit_at_screen_position_filtered(
+                rect,
+                position,
+                include_stage_geometry,
+            )
+        })
     }
 
     /// Coarse hit test against the bounding box the viewport outlines.
@@ -1618,10 +1682,11 @@ impl SmsEditorApp {
     /// Kept separate from the mesh test because the box encloses everything
     /// standing on the model, so callers that can also hit a placed object
     /// need to rank this below one.
-    pub(super) fn model_instance_bounds_hit_at_screen_position(
+    pub(super) fn model_instance_bounds_hit_at_screen_position_filtered(
         &self,
         rect: egui::Rect,
         position: egui::Pos2,
+        include_stage_geometry: bool,
     ) -> Option<uuid::Uuid> {
         // Falling back to the drawn bounding box. The mesh test only works
         // once an instance's geometry is in the stage preview, which needs a
@@ -1634,6 +1699,7 @@ impl SmsEditorApp {
         self.model_instances
             .iter()
             .filter(|instance| instance.stage_id.eq_ignore_ascii_case(&self.stage_id))
+            .filter(|instance| model_instance_is_pickable(instance, include_stage_geometry))
             .filter_map(|instance| {
                 let corners = transformed_bounds_corners(instance);
                 let mut minimum = egui::Pos2::new(f32::INFINITY, f32::INFINITY);
@@ -1681,10 +1747,11 @@ impl SmsEditorApp {
     ///
     /// Instances without cached preview geometry are absent from
     /// `instance_model_indices`, so they fall back to the origin radius.
-    pub(super) fn model_instance_mesh_hit_at_screen_position(
+    pub(super) fn model_instance_mesh_hit_at_screen_position_filtered(
         &self,
         rect: egui::Rect,
         position: egui::Pos2,
+        include_stage_geometry: bool,
     ) -> Option<uuid::Uuid> {
         if !rect.contains(position) {
             return None;
@@ -1697,6 +1764,7 @@ impl SmsEditorApp {
             .model_instances
             .iter()
             .filter(|instance| instance.stage_id.eq_ignore_ascii_case(&self.stage_id))
+            .filter(|instance| model_instance_is_pickable(instance, include_stage_geometry))
             .map(|instance| instance.placement.instance_id)
             .collect::<BTreeSet<_>>();
         let instances_by_model = preview
@@ -1938,6 +2006,23 @@ impl SmsEditorApp {
             &self.stage_id,
             self.registry.as_ref(),
         );
+    }
+
+    pub(super) fn refresh_authored_model_instance_preview_surfaces(&mut self) {
+        self.sync_authored_model_instance_preview();
+        let Some(base) = self.authored_model_preview_base.as_ref() else {
+            return;
+        };
+        let Some(preview) = self.model_preview.as_ref() else {
+            return;
+        };
+        let triangle_range = base.triangle_count..preview.triangles.len();
+        let material_indices = (base.material_count..preview.materials.len()).collect::<Vec<_>>();
+        if let Some(gpu_viewport) = self.gpu_viewport.as_ref() {
+            gpu_viewport.update_surfaces(preview, std::slice::from_ref(&triangle_range));
+            gpu_viewport.update_materials(preview, &material_indices);
+        }
+        self.clear_viewport_preview_cache();
     }
 
     fn remove_authored_model_instance_preview(&mut self) {
@@ -4702,6 +4787,135 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacing_a_model_source_installs_a_recoverable_asset_edit() {
+        let id = AssetId::new();
+        let entry = CatalogAssetEntry {
+            id,
+            name: "terrain".to_string(),
+            relative_path: PathBuf::from("Geometry/terrain.smsmodel"),
+            mesh_count: 0,
+            material_count: 0,
+            texture_count: 0,
+            has_collision: false,
+        };
+        let before = ModelAssetDocument::new("terrain");
+        let mut after = before.clone();
+        after.diagnostics.push(sms_authoring::Diagnostic {
+            code: sms_authoring::DiagnosticCode::EmptyPrimitive,
+            severity: sms_authoring::Severity::Info,
+            message: "replacement geometry".to_string(),
+            context: None,
+            acknowledgement_required: false,
+        });
+        let mut app = SmsEditorApp::default();
+        app.content_browser.inspector_active = true;
+
+        app.install_replaced_model_asset(id, &entry, before.clone(), after.clone());
+
+        assert_eq!(app.selected_model_asset, Some(id));
+        assert_eq!(app.selected_model_document.as_ref(), Some(&after));
+        assert_eq!(app.saved_model_document.as_ref(), Some(&after));
+        assert!(!app.asset_dirty);
+        assert!(!app.content_browser.inspector_active);
+        assert_eq!(app.asset_undo_stack.len(), 1);
+        assert!(app.asset_redo_stack.is_empty());
+
+        assert!(app.undo_model_asset());
+        assert_eq!(app.selected_model_document.as_ref(), Some(&before));
+        assert!(app.asset_dirty);
+
+        assert!(app.redo_model_asset());
+        assert_eq!(app.selected_model_document.as_ref(), Some(&after));
+        assert!(!app.asset_dirty);
+    }
+
+    #[test]
+    fn model_instance_undo_and_redo_queue_stale_goop_regeneration() {
+        let asset_id = AssetId::new();
+        let mut placement = ModelInstancePlacement::new(asset_id, "terrain");
+        placement.export_mode = ModelInstanceExportMode::MapTerrain;
+        let before = EditorModelInstance {
+            stage_id: "custom0".to_string(),
+            placement: placement.clone(),
+            local_bounds: [[-1.0; 3], [1.0; 3]],
+        };
+        placement.transform[3][0] = 100.0;
+        let after = EditorModelInstance {
+            stage_id: "custom0".to_string(),
+            placement,
+            local_bounds: [[-1.0; 3], [1.0; 3]],
+        };
+        let document = StageDocument {
+            stage_id: "custom0".to_string(),
+            base_root: PathBuf::new(),
+            assets: Vec::new(),
+            objects: Vec::new(),
+            changed_files: BTreeMap::new(),
+            stage_archive: None,
+            stage_archive_source_path: None,
+            archive_edits: sms_scene::StageArchiveEdits::default(),
+            registry: None,
+            route_authoring: None,
+            goop_authoring: Some(sms_scene::GoopAuthoringDocument {
+                stale: true,
+                ..Default::default()
+            }),
+            dialogue_authoring: None,
+            dialogue_library: Default::default(),
+            load_issues: Vec::new(),
+            lighting: sms_scene::StageLighting::default(),
+            death_barrier: None,
+            actor_previews: BTreeMap::new(),
+            loaded_project: None,
+        };
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut app = SmsEditorApp {
+            stage_id: "custom0".to_string(),
+            project_root: String::new(),
+            document: Some(document),
+            model_instances: vec![after.clone()],
+            background_receiver: Some(receiver),
+            ..SmsEditorApp::default()
+        };
+        app.model_instance_undo_stack
+            .push_back(ModelInstanceUndoRecord {
+                label: "Moved terrain".to_string(),
+                before: vec![before],
+                after: vec![after],
+            });
+
+        assert!(app.undo_model_instance());
+        assert!(app.goop_rebuild_requested);
+
+        app.goop_rebuild_requested = false;
+        assert!(app.redo_model_instance());
+        assert!(app.goop_rebuild_requested);
+    }
+
+    #[test]
+    fn disabling_stage_geometry_picking_only_excludes_map_terrain() {
+        let mut placement = ModelInstancePlacement::new(AssetId::new(), "model");
+        let mut instance = EditorModelInstance {
+            stage_id: "custom0".to_string(),
+            placement: placement.clone(),
+            local_bounds: [[-1.0; 3], [1.0; 3]],
+        };
+
+        for export_mode in [
+            ModelInstanceExportMode::SeparateRuntimeObject,
+            ModelInstanceExportMode::StockMapObjBase,
+            ModelInstanceExportMode::Skybox,
+        ] {
+            instance.placement.export_mode = export_mode;
+            assert!(model_instance_is_pickable(&instance, false));
+        }
+        placement.export_mode = ModelInstanceExportMode::MapTerrain;
+        instance.placement = placement;
+        assert!(!model_instance_is_pickable(&instance, false));
+        assert!(model_instance_is_pickable(&instance, true));
+    }
 
     #[test]
     fn first_collision_model_defaults_to_authored_map_terrain_only_once() {

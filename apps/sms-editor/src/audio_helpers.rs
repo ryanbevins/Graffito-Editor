@@ -25,6 +25,17 @@ pub(super) struct AudioHelper {
     pub(super) kind: AudioHelperKind,
 }
 
+impl AudioHelper {
+    pub(super) fn preview_sound_id(&self) -> Option<u32> {
+        match &self.kind {
+            AudioHelperKind::Point { sound_id, .. } | AudioHelperKind::Rail { sound_id, .. } => {
+                Some(*sound_id)
+            }
+            AudioHelperKind::Cube { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum AudioHelperKind {
     Point {
@@ -321,6 +332,10 @@ impl SmsEditorApp {
         self.audio_helpers()
             .into_iter()
             .find(|helper| helper.id == selected)
+    }
+
+    pub(super) fn selected_audio_helper_sound_id(&self) -> Option<u32> {
+        self.selected_audio_helper()?.preview_sound_id()
     }
 
     pub(super) fn audio_helper_inspector(&mut self, ui: &mut egui::Ui) -> bool {
@@ -1210,6 +1225,7 @@ mod tests {
             app.selected_audio_helper_id.as_deref(),
             Some("audio:point:fixture")
         );
+        assert_eq!(helper.preview_sound_id(), Some(0x5678));
     }
 
     #[test]

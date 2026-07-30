@@ -105,12 +105,48 @@ impl TriangleBvh {
             }
             for slot in node.start..node.start + node.count {
                 let triangle = &self.triangles[self.order[slot as usize] as usize];
-                if ray_hits_triangle(origin, direction, triangle, reach) {
+                if ray_triangle_hit_distance(origin, direction, triangle, reach).is_some() {
                     return true;
                 }
             }
         }
         false
+    }
+
+    /// Distance to the nearest triangle along a ray within `reach`.
+    pub(super) fn nearest_ray_hit(
+        &self,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        reach: f32,
+    ) -> Option<f32> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+        let mut nearest = reach;
+        let mut found = false;
+        let mut stack = vec![0usize];
+        while let Some(index) = stack.pop() {
+            let node = &self.nodes[index];
+            if !slab_hit(node.min, node.max, origin, direction, nearest) {
+                continue;
+            }
+            if node.count == 0 {
+                stack.push(node.right as usize);
+                stack.push(index + 1);
+                continue;
+            }
+            for slot in node.start..node.start + node.count {
+                let triangle = &self.triangles[self.order[slot as usize] as usize];
+                if let Some(distance) =
+                    ray_triangle_hit_distance(origin, direction, triangle, nearest)
+                {
+                    nearest = distance;
+                    found = true;
+                }
+            }
+        }
+        found.then_some(nearest)
     }
 
     /// Every triangle whose box overlaps the given one.
@@ -146,6 +182,91 @@ impl TriangleBvh {
         // has already passed.
         found.sort_unstable();
     }
+
+    /// Every triangle whose bounds overlap the query after both are projected
+    /// along `axis`.
+    ///
+    /// Boolean-hole cutters may sit far above the target while their projected
+    /// footprints still overlap it. Two perpendicular projected intervals
+    /// provide a BVH-accelerated broad phase for that extrusion.
+    pub(super) fn overlapping_projection(
+        &self,
+        min: [f32; 3],
+        max: [f32; 3],
+        axis: [f32; 3],
+        found: &mut Vec<u32>,
+    ) {
+        found.clear();
+        if self.nodes.is_empty() {
+            return;
+        }
+        let Some((first, second)) = projection_basis(axis) else {
+            return;
+        };
+        let query = [project_box(min, max, first), project_box(min, max, second)];
+        let overlaps = |low: [f32; 3], high: [f32; 3]| {
+            [first, second]
+                .into_iter()
+                .zip(query)
+                .all(|(direction, query)| {
+                    let projected = project_box(low, high, direction);
+                    projected.0 <= query.1 && projected.1 >= query.0
+                })
+        };
+
+        let mut stack = vec![0usize];
+        while let Some(index) = stack.pop() {
+            let node = &self.nodes[index];
+            if !overlaps(node.min, node.max) {
+                continue;
+            }
+            if node.count == 0 {
+                stack.push(node.right as usize);
+                stack.push(index + 1);
+                continue;
+            }
+            found.extend(
+                self.order[node.start as usize..(node.start + node.count) as usize]
+                    .iter()
+                    .copied()
+                    .filter(|triangle| {
+                        let (low, high) = self.boxes[*triangle as usize];
+                        overlaps(low, high)
+                    }),
+            );
+        }
+        found.sort_unstable();
+    }
+}
+
+fn projection_basis(axis: [f32; 3]) -> Option<([f32; 3], [f32; 3])> {
+    let length = vec3_dot(axis, axis).sqrt();
+    if length <= f32::EPSILON {
+        return None;
+    }
+    let axis = axis.map(|component| component / length);
+    let reference = if axis[1].abs() > 0.9 {
+        [1.0, 0.0, 0.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let first = vec3_cross(reference, axis);
+    let first_length = vec3_dot(first, first).sqrt();
+    if first_length <= f32::EPSILON {
+        return None;
+    }
+    let first = first.map(|component| component / first_length);
+    Some((first, vec3_cross(axis, first)))
+}
+
+fn project_box(min: [f32; 3], max: [f32; 3], direction: [f32; 3]) -> (f32, f32) {
+    let center = std::array::from_fn::<_, 3, _>(|axis| (min[axis] + max[axis]) * 0.5);
+    let extent = std::array::from_fn::<_, 3, _>(|axis| (max[axis] - min[axis]) * 0.5);
+    let middle = vec3_dot(center, direction);
+    let radius = (0..3)
+        .map(|axis| extent[axis] * direction[axis].abs())
+        .sum::<f32>();
+    (middle - radius, middle + radius)
 }
 
 fn build_range(
@@ -238,32 +359,42 @@ fn slab_hit(
 
 /// Any-hit ray/triangle test, Moller-Trumbore. Stops at the first blocker
 /// rather than finding the nearest, which is all occlusion needs.
+#[cfg(test)]
 pub(super) fn ray_hits_triangle(
     origin: [f32; 3],
     direction: [f32; 3],
     triangle: &[[f32; 3]; 3],
     reach: f32,
 ) -> bool {
+    ray_triangle_hit_distance(origin, direction, triangle, reach).is_some()
+}
+
+fn ray_triangle_hit_distance(
+    origin: [f32; 3],
+    direction: [f32; 3],
+    triangle: &[[f32; 3]; 3],
+    reach: f32,
+) -> Option<f32> {
     let edge_a = vec3_sub(triangle[1], triangle[0]);
     let edge_b = vec3_sub(triangle[2], triangle[0]);
     let pvec = vec3_cross(direction, edge_b);
     let determinant = vec3_dot(edge_a, pvec);
     if determinant.abs() < 1e-8 {
-        return false;
+        return None;
     }
     let inverse = 1.0 / determinant;
     let tvec = vec3_sub(origin, triangle[0]);
     let u = vec3_dot(tvec, pvec) * inverse;
     if !(0.0..=1.0).contains(&u) {
-        return false;
+        return None;
     }
     let qvec = vec3_cross(tvec, edge_a);
     let v = vec3_dot(direction, qvec) * inverse;
     if v < 0.0 || u + v > 1.0 {
-        return false;
+        return None;
     }
     let distance = vec3_dot(edge_b, qvec) * inverse;
-    distance > 1e-3 && distance < reach
+    (distance > 1e-3 && distance < reach).then_some(distance)
 }
 
 #[cfg(test)]
@@ -321,6 +452,23 @@ mod tests {
         let origin = [15.0, 100.0, 15.0];
         assert!(bvh.ray_hits(origin, [0.0, -1.0, 0.0], 500.0));
         assert!(!bvh.ray_hits(origin, [0.0, -1.0, 0.0], 50.0));
+        assert_eq!(
+            bvh.nearest_ray_hit(origin, [0.0, -1.0, 0.0], 500.0),
+            Some(100.0)
+        );
+    }
+
+    #[test]
+    fn nearest_ray_hit_returns_the_frontmost_stacked_surface() {
+        let bvh = TriangleBvh::build(vec![
+            [[-10.0, 0.0, -10.0], [10.0, 0.0, -10.0], [0.0, 0.0, 10.0]],
+            [[-10.0, 20.0, -10.0], [10.0, 20.0, -10.0], [0.0, 20.0, 10.0]],
+        ]);
+
+        assert_eq!(
+            bvh.nearest_ray_hit([0.0, 50.0, 0.0], [0.0, -1.0, 0.0], 100.0),
+            Some(30.0)
+        );
     }
 
     #[test]
@@ -349,6 +497,28 @@ mod tests {
         assert_eq!(found.len(), expected);
         // Callers rely on the order to avoid revisiting a blade they passed.
         assert!(found.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn projected_overlap_ignores_distance_along_the_extrusion_axis() {
+        let bvh = TriangleBvh::build(vec![
+            [[0.0, 1000.0, 0.0], [4.0, 1000.0, 0.0], [0.0, 1000.0, 4.0]],
+            [
+                [20.0, 1000.0, 0.0],
+                [24.0, 1000.0, 0.0],
+                [20.0, 1000.0, 4.0],
+            ],
+        ]);
+        let mut found = Vec::new();
+
+        bvh.overlapping_projection(
+            [-1.0, 0.0, -1.0],
+            [5.0, 0.0, 5.0],
+            [0.0, 1.0, 0.0],
+            &mut found,
+        );
+
+        assert_eq!(found, vec![0]);
     }
 
     #[test]

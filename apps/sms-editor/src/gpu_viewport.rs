@@ -124,6 +124,24 @@ impl GpuViewportScene {
         }
     }
 
+    pub fn update_surfaces(
+        &self,
+        preview: &ModelPreview,
+        triangle_ranges: &[std::ops::Range<usize>],
+    ) {
+        if let Ok(mut shared) = self.shared.lock() {
+            let GpuViewportShared {
+                scene,
+                geometry_generation,
+                dirty_vertex_ranges,
+                ..
+            } = &mut *shared;
+            if scene.update_surfaces(preview, triangle_ranges, dirty_vertex_ranges) {
+                *geometry_generation = (*geometry_generation).wrapping_add(1);
+            }
+        }
+    }
+
     pub fn update_materials(&self, preview: &ModelPreview, material_indices: &[usize]) {
         if let Ok(mut shared) = self.shared.lock() {
             for index in material_indices.iter().copied() {
@@ -900,6 +918,45 @@ impl GpuSceneData {
                 .and_then(|position| active_mirror_slot_for_cubes(&self.mirror_cubes, position));
         }
         geometry_changed
+    }
+
+    fn update_surfaces(
+        &mut self,
+        preview: &ModelPreview,
+        triangle_ranges: &[std::ops::Range<usize>],
+        dirty_vertex_ranges: &mut [Option<std::ops::Range<usize>>],
+    ) -> bool {
+        let mut changed = false;
+        for triangle_index in triangle_ranges.iter().flat_map(|range| range.clone()) {
+            let Some(triangle) = preview.triangles.get(triangle_index) else {
+                continue;
+            };
+            let Some(location) = self
+                .triangle_vertices
+                .get(triangle_index)
+                .copied()
+                .flatten()
+            else {
+                continue;
+            };
+            let Some(dirty_range) = dirty_vertex_ranges.get_mut(location.batch_index) else {
+                continue;
+            };
+            let Some(batch) = self.batches.get_mut(location.batch_index) else {
+                continue;
+            };
+            let Some(vertex_end) = location.vertex_offset.checked_add(3) else {
+                continue;
+            };
+            let Some(vertices) = batch.vertices.get_mut(location.vertex_offset..vertex_end) else {
+                continue;
+            };
+            let face_normal = preview_triangle_normal(triangle);
+            update_gpu_triangle_surface(vertices, triangle, face_normal);
+            extend_dirty_vertex_range(dirty_range, location.vertex_offset..vertex_end);
+            changed = true;
+        }
+        changed
     }
 
     fn replace_material_from_preview(

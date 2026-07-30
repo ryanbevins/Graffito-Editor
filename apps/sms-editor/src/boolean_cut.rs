@@ -435,29 +435,88 @@ fn split_triangle_along_segment(
     Some(pieces)
 }
 
+/// Intersection of `triangle` with the infinite strip made by extruding one
+/// cutter edge along `axis`.
+///
+/// Hole coverage is an axis projection, so a cutter hovering above the target
+/// still needs its silhouette inserted into the target topology. The strip is
+/// finite along the edge and unbounded only along the extrusion axis.
+fn triangle_extruded_edge_segment(
+    triangle: &[[f32; 3]; 3],
+    edge_start: [f32; 3],
+    edge_end: [f32; 3],
+    axis: [f32; 3],
+) -> Option<([f32; 3], [f32; 3])> {
+    let axis = vec3_normalize(axis);
+    let edge = vec3_sub(edge_end, edge_start);
+    let lateral = vec3_sub(edge, vec3_scale(axis, vec3_dot(edge, axis)));
+    let lateral_length_squared = vec3_dot(lateral, lateral);
+    if lateral_length_squared <= f32::EPSILON {
+        // This edge projects to a point, so it contributes no footprint side.
+        return None;
+    }
+    let plane_normal = vec3_normalize(vec3_cross(edge, axis));
+    let plane_offset = vec3_dot(plane_normal, edge_start);
+    let (start, end) = triangle_plane_segment(triangle, plane_normal, plane_offset)?;
+    let direction = vec3_sub(end, start);
+    let edge_parameter =
+        |point: [f32; 3]| vec3_dot(vec3_sub(point, edge_start), lateral) / lateral_length_squared;
+    let at_start = edge_parameter(start);
+    let along = edge_parameter(end) - at_start;
+    let (mut low, mut high) = (0.0f32, 1.0f32);
+    if along.abs() <= f32::EPSILON {
+        if !(-PLANE_EPSILON..=1.0 + PLANE_EPSILON).contains(&at_start) {
+            return None;
+        }
+    } else {
+        let first = (0.0 - at_start) / along;
+        let second = (1.0 - at_start) / along;
+        low = low.max(first.min(second));
+        high = high.min(first.max(second));
+    }
+    if high - low <= PLANE_EPSILON {
+        return None;
+    }
+    Some((
+        vec3_add(start, vec3_scale(direction, low.clamp(0.0, 1.0))),
+        vec3_add(start, vec3_scale(direction, high.clamp(0.0, 1.0))),
+    ))
+}
+
+fn terrain_document_changed(
+    before: &sms_authoring::ModelAssetDocument,
+    after: &sms_authoring::ModelAssetDocument,
+) -> bool {
+    before != after
+}
+
 impl SmsEditorApp {
-    /// Every world-space triangle of a terrain asset, across all its placements.
-    fn asset_world_triangles(&self, id: AssetId) -> Vec<[[f32; 3]; 3]> {
+    /// Every world-space triangle of one exact terrain placement.
+    fn instance_world_triangles(&self, instance_id: uuid::Uuid) -> Vec<[[f32; 3]; 3]> {
+        let Some((asset_id, placement)) = self
+            .model_instances
+            .iter()
+            .find(|instance| {
+                instance.stage_id.eq_ignore_ascii_case(&self.stage_id)
+                    && instance.placement.instance_id == instance_id
+            })
+            .map(|instance| (instance.placement.asset_id, instance.placement.transform))
+        else {
+            return Vec::new();
+        };
         let Ok(catalog) = self.model_catalog() else {
             return Vec::new();
         };
-        let Ok(document) = catalog.load_asset(id) else {
+        let Ok(document) = catalog.load_asset(asset_id) else {
             return Vec::new();
         };
         let nodes = mesh_node_transforms(&document);
-        let placements = self
-            .model_instances
-            .iter()
-            .filter(|instance| instance.stage_id.eq_ignore_ascii_case(&self.stage_id))
-            .filter(|instance| instance.placement.asset_id == id)
-            .map(|instance| instance.placement.transform)
-            .collect::<Vec<_>>();
 
         let mut triangles = Vec::new();
-        for placement in &placements {
-            for (index, mesh) in document.meshes.iter().enumerate() {
-                let node = nodes.get(&(index as u32)).copied().unwrap_or(IDENTITY);
-                let matrix = multiply_matrix(*placement, node);
+        for (index, mesh) in document.meshes.iter().enumerate() {
+            let node_transforms = nodes.get(&(index as u32)).cloned().unwrap_or_default();
+            for node in node_transforms {
+                let matrix = multiply_matrix(placement, node);
                 for primitive in &mesh.primitives {
                     for face in primitive.indices.chunks_exact(3) {
                         let corners: Option<Vec<[f32; 3]>> = face
@@ -480,44 +539,61 @@ impl SmsEditorApp {
     }
 
     /// Terrain instances in this stage that could act as a cutter.
-    pub(super) fn boolean_cut_candidates(&self) -> Vec<(AssetId, String)> {
-        let mut seen: BTreeMap<AssetId, String> = BTreeMap::new();
-        for instance in self
+    pub(super) fn boolean_cut_candidates(&self) -> Vec<(uuid::Uuid, String)> {
+        let instances = self
             .model_instances
             .iter()
             .filter(|instance| instance.stage_id.eq_ignore_ascii_case(&self.stage_id))
             .filter(|instance| {
                 instance.placement.export_mode == ModelInstanceExportMode::MapTerrain
             })
-        {
-            let name = self
-                .model_catalog_entries
-                .iter()
-                .find(|entry| entry.id == instance.placement.asset_id)
-                .map(|entry| entry.name.clone())
-                .unwrap_or_else(|| instance.placement.asset_id.to_string());
-            seen.insert(instance.placement.asset_id, name);
+            .collect::<Vec<_>>();
+        let mut totals = BTreeMap::<AssetId, usize>::new();
+        for instance in &instances {
+            *totals.entry(instance.placement.asset_id).or_default() += 1;
         }
-        seen.into_iter().collect()
+        let mut ordinals = BTreeMap::<AssetId, usize>::new();
+        instances
+            .into_iter()
+            .map(|instance| {
+                let asset_id = instance.placement.asset_id;
+                let ordinal = ordinals.entry(asset_id).or_default();
+                *ordinal += 1;
+                let total = totals.get(&asset_id).copied().unwrap_or(1);
+                let mut name = self
+                    .model_catalog_entries
+                    .iter()
+                    .find(|entry| entry.id == asset_id)
+                    .map(|entry| entry.name.clone())
+                    .unwrap_or_else(|| asset_id.to_string());
+                if total > 1 {
+                    name.push_str(&format!(" ({ordinal}/{total})"));
+                }
+                (instance.placement.instance_id, name)
+            })
+            .collect()
     }
 
     /// Cuts the selected terrain along everywhere the chosen cutter crosses it.
     pub(super) fn cut_terrain_with_selected_cutter(&mut self) {
-        let Some(cutter_id) = self.boolean_cutter else {
+        let Some(cutter_instance_id) = self.boolean_cutter else {
             self.log.push("Pick a cutter mesh first.".to_string());
             return;
         };
-        let Some(selected) = self.selected_model_instance() else {
+        let Some(selected_instance_id) = self
+            .selected_model_instance()
+            .map(|instance| instance.placement.instance_id)
+        else {
             self.log
                 .push("Select the terrain instance to cut first.".to_string());
             return;
         };
-        if selected.placement.asset_id == cutter_id {
+        if selected_instance_id == cutter_instance_id {
             self.log
                 .push("A mesh cannot cut itself; pick a different cutter.".to_string());
             return;
         }
-        let cutter = self.asset_world_triangles(cutter_id);
+        let cutter = self.instance_world_triangles(cutter_instance_id);
         if cutter.is_empty() {
             self.log
                 .push("That cutter has no geometry placed in this stage.".to_string());
@@ -534,55 +610,87 @@ impl SmsEditorApp {
         let mut added = 0usize;
         let mut removed = 0usize;
         let mut total = 0usize;
+        let mut changed = false;
         for target in &mut targets {
+            let before_document = target.document.clone();
             let placement = target.transform;
             let nodes = mesh_node_transforms(&target.document);
             for (mesh_index, mesh) in target.document.meshes.iter_mut().enumerate() {
-                let node = nodes.get(&(mesh_index as u32)).copied().unwrap_or(IDENTITY);
-                // The cut runs in the target's own space, so the split
-                // positions can be written straight back into the primitive.
-                let Some(to_local) = invert_affine(multiply_matrix(placement, node)) else {
-                    continue;
-                };
-                let local_cutter = TriangleBvh::build(
-                    cutter
-                        .iter()
-                        .map(|triangle| {
-                            [
-                                transform_point(to_local, triangle[0]),
-                                transform_point(to_local, triangle[1]),
-                                transform_point(to_local, triangle[2]),
-                            ]
-                        })
-                        .collect(),
-                );
-
-                // The axis is a world direction, and the cut runs in the
-                // mesh's own space, so it has to travel there too.
-                let hole = self.boolean_cut_hole.then(|| {
-                    let mut axis = [0.0f32; 3];
-                    axis[self.boolean_cut_axis.min(2)] = 1.0;
-                    vec3_normalize(transform_direction(to_local, axis))
-                });
+                let node_transforms = nodes.get(&(mesh_index as u32)).cloned().unwrap_or_default();
+                let cutters = node_transforms
+                    .into_iter()
+                    .filter_map(|node| {
+                        let to_local = invert_affine(multiply_matrix(placement, node))?;
+                        let local_cutter = TriangleBvh::build(
+                            cutter
+                                .iter()
+                                .map(|triangle| {
+                                    [
+                                        transform_point(to_local, triangle[0]),
+                                        transform_point(to_local, triangle[1]),
+                                        transform_point(to_local, triangle[2]),
+                                    ]
+                                })
+                                .collect(),
+                        );
+                        // The axis is a world direction, and the cut runs in
+                        // the mesh's own space, so it has to travel there too.
+                        let hole = self.boolean_cut_hole.then(|| {
+                            let mut axis = [0.0f32; 3];
+                            axis[self.boolean_cut_axis.min(2)] = 1.0;
+                            vec3_normalize(transform_direction(to_local, axis))
+                        });
+                        Some((local_cutter, hole))
+                    })
+                    .collect::<Vec<_>>();
                 for primitive in &mut mesh.primitives {
                     let before = primitive.indices.len() / 3;
-                    match cut_primitive(primitive, &local_cutter, hole) {
-                        Ok(()) => {
-                            let after = primitive.indices.len() / 3;
-                            added += after.saturating_sub(before);
-                            removed += before.saturating_sub(after);
-                            total += after;
-                        }
-                        Err(error) => {
+                    for (local_cutter, hole) in &cutters {
+                        if let Err(error) = cut_primitive(primitive, local_cutter, *hole) {
                             self.log.push(error);
                             return;
                         }
                     }
+                    let after = primitive.indices.len() / 3;
+                    added += after.saturating_sub(before);
+                    removed += before.saturating_sub(after);
+                    total += after;
                 }
             }
+            if self.boolean_cut_hole {
+                let Some(to_local) = invert_affine(placement) else {
+                    self.log.push(
+                        "Cut abandoned: the selected terrain transform is degenerate.".into(),
+                    );
+                    return;
+                };
+                if let Some(collision) = target.document.collision.as_mut() {
+                    let local_cutter = TriangleBvh::build(
+                        cutter
+                            .iter()
+                            .map(|triangle| {
+                                [
+                                    transform_point(to_local, triangle[0]),
+                                    transform_point(to_local, triangle[1]),
+                                    transform_point(to_local, triangle[2]),
+                                ]
+                            })
+                            .collect(),
+                    );
+                    let mut axis = [0.0f32; 3];
+                    axis[self.boolean_cut_axis.min(2)] = 1.0;
+                    let local_axis = vec3_normalize(transform_direction(to_local, axis));
+                    if let Err(error) = cut_collision_document(collision, &local_cutter, local_axis)
+                    {
+                        self.log.push(error);
+                        return;
+                    }
+                }
+            }
+            changed |= terrain_document_changed(&before_document, &target.document);
         }
 
-        if added == 0 && removed == 0 {
+        if !changed {
             self.log.push(
                 "Nothing was cut: the two meshes do not cross anywhere. Move them so they \
                  intersect, or pick a different cutter."
@@ -603,19 +711,12 @@ impl SmsEditorApp {
     }
 }
 
-const IDENTITY: [[f32; 4]; 4] = [
-    [1.0, 0.0, 0.0, 0.0],
-    [0.0, 1.0, 0.0, 0.0],
-    [0.0, 0.0, 1.0, 0.0],
-    [0.0, 0.0, 0.0, 1.0],
-];
-
 /// Splits every triangle of a primitive that a cutter triangle crosses.
 fn cut_primitive(
     primitive: &mut sms_authoring::ModelPrimitive,
     cutter: &TriangleBvh,
     hole: Option<[f32; 3]>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let vertex = |index: usize| CutVertex {
         position: primitive.positions.get(index).copied().unwrap_or_default(),
         normal: primitive
@@ -650,12 +751,15 @@ fn cut_primitive(
                     vertex(face[1] as usize),
                     vertex(face[2] as usize),
                 ],
-                0u32,
+                0usize,
             )
         })
         .collect::<Vec<_>>();
     let mut done: Vec<[CutVertex; 3]> = Vec::with_capacity(pending.len());
     let mut candidates = Vec::new();
+    let mut projected_candidates = Vec::new();
+    let mut tokens = Vec::new();
+    let mut topology_changed = false;
 
     while let Some((triangle, resume)) = pending.pop() {
         let corners = [
@@ -670,30 +774,67 @@ fn cut_primitive(
             corners[0][axis].max(corners[1][axis]).max(corners[2][axis]) + PLANE_EPSILON
         });
         cutter.overlapping(low, high, &mut candidates);
+        tokens.clear();
+        match hole {
+            None => tokens.extend(candidates.iter().map(|index| *index as usize)),
+            Some(axis) => {
+                // Token zero for a cutter triangle is its real surface.
+                // Tokens one through three are the sides made by extruding
+                // each edge along the selected hole axis.
+                tokens.extend(candidates.iter().map(|index| *index as usize * 4));
+                cutter.overlapping_projection(low, high, axis, &mut projected_candidates);
+                for triangle_index in projected_candidates.iter().map(|index| *index as usize) {
+                    tokens.extend([
+                        triangle_index * 4 + 1,
+                        triangle_index * 4 + 2,
+                        triangle_index * 4 + 3,
+                    ]);
+                }
+                tokens.sort_unstable();
+                tokens.dedup();
+            }
+        }
 
         let mut split = None;
-        for blade_index in candidates.iter().copied().filter(|index| *index >= resume) {
-            let blade = cutter.triangle(blade_index as usize);
-            let Some((normal, offset)) = triangle_plane(blade) else {
-                continue;
+        for token in tokens.iter().copied().filter(|token| *token >= resume) {
+            let (blade_index, blade_kind) = match hole {
+                Some(_) => (token / 4, token % 4),
+                None => (token, 0),
             };
-            // The plane is unbounded but the blade is not, so the crossing has
-            // to land inside it. Without this a blade would slice the whole
-            // mesh along its plane instead of only where the surfaces meet.
-            let Some((start, end)) = triangle_plane_segment(&corners, normal, offset) else {
-                continue;
+            let blade = cutter.triangle(blade_index);
+            let segment = match (blade_kind, hole) {
+                (0, _) => triangle_plane(blade).and_then(|(normal, offset)| {
+                    // The plane is unbounded but the blade is not, so the
+                    // crossing has to land inside it.
+                    triangle_plane_segment(&corners, normal, offset).and_then(|(start, end)| {
+                        clip_segment_to_triangle(start, end, blade, normal)
+                    })
+                }),
+                (edge, Some(axis)) => {
+                    let start = edge - 1;
+                    triangle_extruded_edge_segment(
+                        &corners,
+                        blade[start],
+                        blade[(start + 1) % 3],
+                        axis,
+                    )
+                }
+                _ => None,
             };
-            let Some((start, end)) = clip_segment_to_triangle(start, end, blade, normal) else {
+            let Some((start, end)) = segment else {
                 continue;
             };
             if let Some(pieces) = split_triangle_along_segment(&triangle, start, end) {
-                split = Some((pieces, blade_index + 1));
+                split = Some((pieces, token + 1));
                 break;
             }
         }
 
         match split {
-            Some((pieces, next)) => pending.extend(pieces.into_iter().map(|piece| (piece, next))),
+            Some((pieces, next)) => {
+                topology_changed = true;
+                pending.extend(pieces.into_iter().map(|piece| (piece, next)));
+            }
             None => done.push(triangle),
         }
         if done.len() + pending.len() > TRIANGLE_CEILING {
@@ -709,6 +850,7 @@ fn cut_primitive(
     // makes a centroid enough to decide, and why the hole comes out with a
     // clean edge instead of a staircase.
     if let Some(axis) = hole {
+        let before = done.len();
         done.retain(|triangle| {
             let centroid: [f32; 3] = std::array::from_fn(|component| {
                 (triangle[0].position[component]
@@ -722,6 +864,11 @@ fn cut_primitive(
                 || cutter.ray_hits(centroid, vec3_scale(axis, -1.0), COVER_REACH);
             !covered
         });
+        topology_changed |= done.len() != before;
+    }
+
+    if !topology_changed {
+        return Ok(false);
     }
 
     let mut positions = Vec::with_capacity(done.len() * 3);
@@ -764,6 +911,55 @@ fn cut_primitive(
         slot.values = set;
     }
     primitive.indices = indices;
+    Ok(true)
+}
+
+/// Applies a hole cut to every collision surface without losing its material
+/// metadata. Collision and render geometry are stored independently, so a
+/// visible hole must be repeated here or the exported stage remains solid.
+fn cut_collision_document(
+    collision: &mut sms_authoring::CollisionDocument,
+    cutter: &TriangleBvh,
+    axis: [f32; 3],
+) -> Result<(), String> {
+    collision
+        .validate()
+        .map_err(|error| format!("Collision cut abandoned: {error}"))?;
+
+    let mut vertices = Vec::new();
+    let mut groups = Vec::with_capacity(collision.groups.len());
+    for group in &collision.groups {
+        let mut primitive = sms_authoring::ModelPrimitive {
+            positions: collision.vertices.clone(),
+            normals: vec![[0.0, 1.0, 0.0]; collision.vertices.len()],
+            tangents: Vec::new(),
+            tex_coords: Vec::new(),
+            colors: Vec::new(),
+            indices: group.triangles.iter().flatten().copied().collect(),
+            material: None,
+        };
+        cut_primitive(&mut primitive, cutter, Some(axis))?;
+
+        let base = u32::try_from(vertices.len())
+            .map_err(|_| "Collision cut abandoned: vertex count exceeds u32.".to_string())?;
+        let triangles = primitive
+            .indices
+            .chunks_exact(3)
+            .map(|triangle| [triangle[0] + base, triangle[1] + base, triangle[2] + base])
+            .collect();
+        vertices.extend(primitive.positions);
+        groups.push(sms_authoring::CollisionGroup {
+            name: group.name.clone(),
+            surface: group.surface.clone(),
+            triangles,
+        });
+    }
+
+    collision.vertices = vertices;
+    collision.groups = groups;
+    collision
+        .cleanup_exact()
+        .map_err(|error| format!("Collision cut abandoned: {error}"))?;
     Ok(())
 }
 
@@ -778,7 +974,7 @@ impl SmsEditorApp {
 
         let selected = self
             .selected_model_instance()
-            .map(|instance| instance.placement.asset_id);
+            .map(|instance| (instance.placement.instance_id, instance.placement.asset_id));
         let name_of = |editor: &Self, id: sms_authoring::AssetId| {
             editor
                 .model_catalog_entries
@@ -788,7 +984,7 @@ impl SmsEditorApp {
                 .unwrap_or_else(|| id.to_string())
         };
         match selected {
-            Some(id) => ui.label(format!("Cutting: {}", name_of(self, id))),
+            Some((_, id)) => ui.label(format!("Cutting: {}", name_of(self, id))),
             None => ui.colored_label(
                 egui::Color32::from_rgb(220, 170, 90),
                 "Select the terrain instance to cut in the hierarchy.",
@@ -800,11 +996,16 @@ impl SmsEditorApp {
             .into_iter()
             // A mesh cutting itself would split every triangle against its own
             // plane and gain nothing.
-            .filter(|(id, _)| Some(*id) != selected)
+            .filter(|(id, _)| selected.is_none_or(|(selected_id, _)| *id != selected_id))
             .collect::<Vec<_>>();
         let current = self
             .boolean_cutter
-            .map(|id| name_of(self, id))
+            .and_then(|id| {
+                candidates
+                    .iter()
+                    .find(|(candidate_id, _)| *candidate_id == id)
+                    .map(|(_, name)| name.clone())
+            })
             .unwrap_or_else(|| "None".to_string());
         egui::ComboBox::from_label("Cutter")
             .selected_text(current)
@@ -860,6 +1061,7 @@ impl SmsEditorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sms_authoring::{CollisionDocument, CollisionGroup, CollisionSurface};
 
     fn flat_vertex(position: [f32; 3]) -> CutVertex {
         CutVertex {
@@ -963,5 +1165,163 @@ mod tests {
                 .all(|z| (10.0 - PLANE_EPSILON..=20.0 + PLANE_EPSILON).contains(z)),
             "finite seam escaped the blade: {seam_points:?}"
         );
+    }
+
+    #[test]
+    fn a_hole_cut_removes_covered_collision_and_preserves_its_surface() {
+        let surface = CollisionSurface {
+            surface_type: 7,
+            attribute_0: 2,
+            attribute_1: 3,
+            data: Some(11),
+        };
+        let mut collision = CollisionDocument {
+            vertices: vec![[-10.0, 0.0, -10.0], [10.0, 0.0, -10.0], [0.0, 0.0, 10.0]],
+            groups: vec![CollisionGroup {
+                name: "floor".to_string(),
+                surface: surface.clone(),
+                triangles: vec![[0, 1, 2]],
+            }],
+        };
+        let cutter = TriangleBvh::build(vec![[
+            [-100.0, 1.0, -100.0],
+            [100.0, 1.0, -100.0],
+            [0.0, 1.0, 100.0],
+        ]]);
+
+        cut_collision_document(&mut collision, &cutter, [0.0, 1.0, 0.0]).expect("collision cut");
+
+        assert!(collision.vertices.is_empty());
+        assert!(collision.groups[0].triangles.is_empty());
+        assert_eq!(collision.groups[0].surface, surface);
+    }
+
+    #[test]
+    fn a_missed_cut_preserves_the_indexed_primitive_exactly() {
+        let mut primitive = sms_authoring::ModelPrimitive {
+            positions: vec![
+                [0.0, 0.0, 0.0],
+                [10.0, 0.0, 0.0],
+                [10.0, 0.0, 10.0],
+                [0.0, 0.0, 10.0],
+            ],
+            normals: vec![[0.0, 1.0, 0.0]; 4],
+            tangents: Vec::new(),
+            tex_coords: Vec::new(),
+            colors: Vec::new(),
+            indices: vec![0, 1, 2, 0, 2, 3],
+            material: None,
+        };
+        let before = primitive.clone();
+        let cutter = TriangleBvh::build(vec![[
+            [100.0, -10.0, 100.0],
+            [100.0, 10.0, 100.0],
+            [100.0, 0.0, 110.0],
+        ]]);
+
+        assert!(!cut_primitive(&mut primitive, &cutter, None).expect("cut"));
+        assert_eq!(primitive, before);
+    }
+
+    #[test]
+    fn a_floating_partial_cutter_inserts_its_projected_hole_boundary() {
+        let mut primitive = sms_authoring::ModelPrimitive {
+            positions: vec![[-10.0, 0.0, -10.0], [10.0, 0.0, -10.0], [0.0, 0.0, 10.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 3],
+            tangents: Vec::new(),
+            tex_coords: Vec::new(),
+            colors: Vec::new(),
+            indices: vec![0, 1, 2],
+            material: None,
+        };
+        let cutter =
+            TriangleBvh::build(vec![[[-2.0, 5.0, -2.0], [2.0, 5.0, -2.0], [0.0, 5.0, 2.0]]]);
+
+        assert!(cut_primitive(&mut primitive, &cutter, Some([0.0, 1.0, 0.0])).expect("cut"));
+
+        let remaining_area = primitive
+            .indices
+            .chunks_exact(3)
+            .map(|face| {
+                let a = primitive.positions[face[0] as usize];
+                let b = primitive.positions[face[1] as usize];
+                let c = primitive.positions[face[2] as usize];
+                vec3_dot(vec3_cross(vec3_sub(b, a), vec3_sub(c, a)), [0.0, 1.0, 0.0]).abs() * 0.5
+            })
+            .sum::<f32>();
+        // Original area is 200; the projected cutter area is 8.
+        assert!((remaining_area - 192.0).abs() < 1e-3, "{remaining_area}");
+    }
+
+    #[test]
+    fn collision_only_change_counts_even_when_render_triangle_count_is_equal() {
+        let mut before = sms_authoring::ModelAssetDocument::new("terrain");
+        before.collision = Some(CollisionDocument {
+            vertices: vec![[-10.0, 0.0, -10.0], [10.0, 0.0, -10.0], [0.0, 0.0, 10.0]],
+            groups: vec![CollisionGroup {
+                name: "floor".to_string(),
+                surface: CollisionSurface::default(),
+                triangles: vec![[0, 1, 2]],
+            }],
+        });
+        let mut after = before.clone();
+        after.collision.as_mut().expect("collision").groups[0]
+            .triangles
+            .clear();
+
+        assert!(terrain_document_changed(&before, &after));
+        assert_eq!(
+            before
+                .meshes
+                .iter()
+                .flat_map(|mesh| &mesh.primitives)
+                .map(|primitive| primitive.indices.len() / 3)
+                .sum::<usize>(),
+            after
+                .meshes
+                .iter()
+                .flat_map(|mesh| &mesh.primitives)
+                .map(|primitive| primitive.indices.len() / 3)
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn repeated_asset_placements_remain_distinct_boolean_cutters() {
+        let asset_id = AssetId::new();
+        let mut first = sms_authoring::ModelInstancePlacement::new(asset_id, "terrain");
+        first.export_mode = ModelInstanceExportMode::MapTerrain;
+        let mut second = sms_authoring::ModelInstancePlacement::new(asset_id, "terrain");
+        second.export_mode = ModelInstanceExportMode::MapTerrain;
+        let expected = [first.instance_id, second.instance_id];
+        let app = SmsEditorApp {
+            stage_id: "stage".to_string(),
+            model_instances: vec![
+                EditorModelInstance {
+                    stage_id: "stage".to_string(),
+                    placement: first,
+                    local_bounds: [[0.0; 3]; 2],
+                },
+                EditorModelInstance {
+                    stage_id: "stage".to_string(),
+                    placement: second,
+                    local_bounds: [[0.0; 3]; 2],
+                },
+            ],
+            ..SmsEditorApp::default()
+        };
+
+        let candidates = app.boolean_cut_candidates();
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|(instance_id, _)| *instance_id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(candidates[0].1.ends_with("(1/2)"));
+        assert!(candidates[1].1.ends_with("(2/2)"));
     }
 }
