@@ -46,15 +46,39 @@ const PLANE_EPSILON: f32 = 1e-3;
 struct CutVertex {
     position: [f32; 3],
     normal: [f32; 3],
+    tangent: Option<[f32; 4]>,
     tex: Vec<[f32; 2]>,
     colors: Vec<[f32; 4]>,
 }
 
+fn normalize_tangent(mut tangent: [f32; 4], fallback_handedness: f32) -> [f32; 4] {
+    let length =
+        (tangent[0] * tangent[0] + tangent[1] * tangent[1] + tangent[2] * tangent[2]).sqrt();
+    if length > f32::EPSILON {
+        for component in tangent.iter_mut().take(3) {
+            *component /= length;
+        }
+    }
+    tangent[3] = if tangent[3].abs() > f32::EPSILON {
+        tangent[3].signum()
+    } else {
+        fallback_handedness
+    };
+    tangent
+}
+
+#[cfg(test)]
 fn lerp_vertex(a: &CutVertex, b: &CutVertex, t: f32) -> CutVertex {
     let mix = |x: f32, y: f32| x + (y - x) * t;
     CutVertex {
         position: std::array::from_fn(|axis| mix(a.position[axis], b.position[axis])),
         normal: std::array::from_fn(|axis| mix(a.normal[axis], b.normal[axis])),
+        tangent: a.tangent.zip(b.tangent).map(|(a, b)| {
+            normalize_tangent(
+                std::array::from_fn(|axis| mix(a[axis], b[axis])),
+                a[3].signum(),
+            )
+        }),
         tex: a
             .tex
             .iter()
@@ -122,16 +146,16 @@ fn triangle_plane_segment(
     }
 }
 
-/// Whether any part of a segment lying in a triangle's plane falls inside it.
+/// Clips a segment lying in a triangle's plane to the finite triangle.
 ///
 /// Parametric clipping against the triangle's three edges, each treated as an
 /// inward half-plane.
-fn segment_touches_triangle(
+fn clip_segment_to_triangle(
     start: [f32; 3],
     end: [f32; 3],
     triangle: &[[f32; 3]; 3],
     normal: [f32; 3],
-) -> bool {
+) -> Option<([f32; 3], [f32; 3])> {
     let direction = vec3_sub(end, start);
     let (mut low, mut high) = (0.0f32, 1.0f32);
     for corner in 0..3 {
@@ -150,7 +174,7 @@ fn segment_touches_triangle(
         let along = vec3_dot(inward, direction);
         if along.abs() <= f32::EPSILON {
             if at_start < -PLANE_EPSILON {
-                return false;
+                return None;
             }
             continue;
         }
@@ -160,16 +184,33 @@ fn segment_touches_triangle(
             false => high = high.min(crossing),
         }
         if low > high {
-            return false;
+            return None;
         }
     }
-    true
+    if high - low <= PLANE_EPSILON {
+        return None;
+    }
+    Some((
+        vec3_add(start, vec3_scale(direction, low.clamp(0.0, 1.0))),
+        vec3_add(start, vec3_scale(direction, high.clamp(0.0, 1.0))),
+    ))
+}
+
+#[cfg(test)]
+fn segment_touches_triangle(
+    start: [f32; 3],
+    end: [f32; 3],
+    triangle: &[[f32; 3]; 3],
+    normal: [f32; 3],
+) -> bool {
+    clip_segment_to_triangle(start, end, triangle, normal).is_some()
 }
 
 /// Splits a triangle along a plane, keeping both halves.
 ///
 /// The surface is unchanged: every new vertex sits on an edge of the triangle
 /// it came from. Only the topology gets denser.
+#[cfg(test)]
 fn split_triangle(
     triangle: &[CutVertex; 3],
     normal: [f32; 3],
@@ -216,6 +257,182 @@ fn split_triangle(
         [near.clone(), triangle[next].clone(), triangle[last].clone()],
         [near, triangle[last].clone(), far],
     ])
+}
+
+fn barycentric_weights(point: [f32; 3], triangle: &[[f32; 3]; 3]) -> Option<[f32; 3]> {
+    let edge_a = vec3_sub(triangle[1], triangle[0]);
+    let edge_b = vec3_sub(triangle[2], triangle[0]);
+    let offset = vec3_sub(point, triangle[0]);
+    let aa = vec3_dot(edge_a, edge_a);
+    let ab = vec3_dot(edge_a, edge_b);
+    let bb = vec3_dot(edge_b, edge_b);
+    let oa = vec3_dot(offset, edge_a);
+    let ob = vec3_dot(offset, edge_b);
+    let denominator = aa * bb - ab * ab;
+    if denominator.abs() <= f32::EPSILON {
+        return None;
+    }
+    let second = (bb * oa - ab * ob) / denominator;
+    let third = (aa * ob - ab * oa) / denominator;
+    Some([1.0 - second - third, second, third])
+}
+
+fn interpolate_cut_vertex(triangle: &[CutVertex; 3], point: [f32; 3]) -> Option<CutVertex> {
+    let positions = [
+        triangle[0].position,
+        triangle[1].position,
+        triangle[2].position,
+    ];
+    let weights = barycentric_weights(point, &positions)?;
+    let blend = |values: [[f32; 3]; 3]| {
+        std::array::from_fn(|axis| {
+            values[0][axis] * weights[0]
+                + values[1][axis] * weights[1]
+                + values[2][axis] * weights[2]
+        })
+    };
+    let normal = blend([triangle[0].normal, triangle[1].normal, triangle[2].normal]);
+    let tangent = triangle[0]
+        .tangent
+        .zip(triangle[1].tangent)
+        .zip(triangle[2].tangent)
+        .map(|((a, b), c)| {
+            normalize_tangent(
+                std::array::from_fn(|axis| {
+                    a[axis] * weights[0] + b[axis] * weights[1] + c[axis] * weights[2]
+                }),
+                a[3].signum(),
+            )
+        });
+    let tex = (0..triangle[0].tex.len())
+        .map(|set| {
+            std::array::from_fn(|axis| {
+                triangle[0].tex[set][axis] * weights[0]
+                    + triangle[1].tex[set][axis] * weights[1]
+                    + triangle[2].tex[set][axis] * weights[2]
+            })
+        })
+        .collect();
+    let colors = (0..triangle[0].colors.len())
+        .map(|set| {
+            std::array::from_fn(|axis| {
+                triangle[0].colors[set][axis] * weights[0]
+                    + triangle[1].colors[set][axis] * weights[1]
+                    + triangle[2].colors[set][axis] * weights[2]
+            })
+        })
+        .collect();
+    Some(CutVertex {
+        position: point,
+        normal,
+        tangent,
+        tex,
+        colors,
+    })
+}
+
+fn positions_match(a: [f32; 3], b: [f32; 3]) -> bool {
+    vec3_dot(vec3_sub(a, b), vec3_sub(a, b)) <= PLANE_EPSILON * PLANE_EPSILON
+}
+
+fn point_on_segment(point: [f32; 3], start: [f32; 3], end: [f32; 3]) -> bool {
+    let segment = vec3_sub(end, start);
+    let length_squared = vec3_dot(segment, segment);
+    if length_squared <= f32::EPSILON {
+        return positions_match(point, start);
+    }
+    let t = vec3_dot(vec3_sub(point, start), segment) / length_squared;
+    if !(0.0..=1.0).contains(&t) {
+        return false;
+    }
+    positions_match(point, vec3_add(start, vec3_scale(segment, t)))
+}
+
+/// Inserts a constrained point into an existing triangulation of `original`.
+///
+/// Splitting every triangle that shares a hit edge keeps the result watertight.
+/// Inserting the segment's first endpoint also ensures every region that can
+/// contain the second endpoint has the first as a corner, so the constrained
+/// segment itself becomes a real edge.
+fn insert_cut_point(
+    pieces: &mut Vec<[CutVertex; 3]>,
+    original: &[CutVertex; 3],
+    point: [f32; 3],
+) -> bool {
+    if pieces
+        .iter()
+        .flatten()
+        .any(|vertex| positions_match(vertex.position, point))
+    {
+        return true;
+    }
+    let Some(vertex) = interpolate_cut_vertex(original, point) else {
+        return false;
+    };
+
+    let mut split_edge = false;
+    let mut edge_pieces = Vec::with_capacity(pieces.len() + 2);
+    for triangle in pieces.drain(..) {
+        let mut replacement = None;
+        for (a, b, c) in [(0usize, 1usize, 2usize), (1, 2, 0), (2, 0, 1)] {
+            if point_on_segment(point, triangle[a].position, triangle[b].position) {
+                replacement = Some([
+                    [triangle[a].clone(), vertex.clone(), triangle[c].clone()],
+                    [vertex.clone(), triangle[b].clone(), triangle[c].clone()],
+                ]);
+                break;
+            }
+        }
+        match replacement {
+            Some(replacement) => {
+                edge_pieces.extend(replacement);
+                split_edge = true;
+            }
+            None => edge_pieces.push(triangle),
+        }
+    }
+    *pieces = edge_pieces;
+    if split_edge {
+        return true;
+    }
+
+    let containing = pieces.iter().position(|triangle| {
+        let positions = [
+            triangle[0].position,
+            triangle[1].position,
+            triangle[2].position,
+        ];
+        barycentric_weights(point, &positions)
+            .is_some_and(|weights| weights.iter().all(|weight| *weight >= -PLANE_EPSILON))
+    });
+    let Some(index) = containing else {
+        return false;
+    };
+    let triangle = pieces.swap_remove(index);
+    pieces.extend([
+        [triangle[0].clone(), triangle[1].clone(), vertex.clone()],
+        [triangle[1].clone(), triangle[2].clone(), vertex.clone()],
+        [triangle[2].clone(), triangle[0].clone(), vertex],
+    ]);
+    true
+}
+
+fn split_triangle_along_segment(
+    triangle: &[CutVertex; 3],
+    start: [f32; 3],
+    end: [f32; 3],
+) -> Option<Vec<[CutVertex; 3]>> {
+    if positions_match(start, end) {
+        return None;
+    }
+    let mut pieces = vec![triangle.clone()];
+    if !insert_cut_point(&mut pieces, triangle, start)
+        || !insert_cut_point(&mut pieces, triangle, end)
+        || pieces.len() == 1
+    {
+        return None;
+    }
+    Some(pieces)
 }
 
 impl SmsEditorApp {
@@ -318,7 +535,7 @@ impl SmsEditorApp {
         let mut removed = 0usize;
         let mut total = 0usize;
         for target in &mut targets {
-            let placement = target.transforms.first().copied().unwrap_or(IDENTITY);
+            let placement = target.transform;
             let nodes = mesh_node_transforms(&target.document);
             for (mesh_index, mesh) in target.document.meshes.iter_mut().enumerate() {
                 let node = nodes.get(&(mesh_index as u32)).copied().unwrap_or(IDENTITY);
@@ -373,7 +590,7 @@ impl SmsEditorApp {
             );
             return;
         }
-        self.commit_paint_targets(targets, "Cut terrain along intersection");
+        self.commit_terrain_targets(targets, "Cut terrain along intersection", false);
         match self.boolean_cut_hole {
             true => self.log.push(format!(
                 "Cut the covered area out: {removed} triangle(s) removed, {added} added along \
@@ -406,6 +623,7 @@ fn cut_primitive(
             .get(index)
             .copied()
             .unwrap_or([0.0, 1.0, 0.0]),
+        tangent: primitive.tangents.get(index).copied(),
         tex: primitive
             .tex_coords
             .iter()
@@ -462,12 +680,13 @@ fn cut_primitive(
             // The plane is unbounded but the blade is not, so the crossing has
             // to land inside it. Without this a blade would slice the whole
             // mesh along its plane instead of only where the surfaces meet.
-            if !triangle_plane_segment(&corners, normal, offset)
-                .is_some_and(|(start, end)| segment_touches_triangle(start, end, blade, normal))
-            {
+            let Some((start, end)) = triangle_plane_segment(&corners, normal, offset) else {
                 continue;
-            }
-            if let Some(pieces) = split_triangle(&triangle, normal, offset) {
+            };
+            let Some((start, end)) = clip_segment_to_triangle(start, end, blade, normal) else {
+                continue;
+            };
+            if let Some(pieces) = split_triangle_along_segment(&triangle, start, end) {
                 split = Some((pieces, blade_index + 1));
                 break;
             }
@@ -507,6 +726,11 @@ fn cut_primitive(
 
     let mut positions = Vec::with_capacity(done.len() * 3);
     let mut normals = Vec::with_capacity(done.len() * 3);
+    let mut tangents = primitive
+        .tangents
+        .is_empty()
+        .then(Vec::new)
+        .unwrap_or_else(|| Vec::with_capacity(done.len() * 3));
     let mut tex = vec![Vec::with_capacity(done.len() * 3); primitive.tex_coords.len()];
     let mut colors = vec![Vec::with_capacity(done.len() * 3); primitive.colors.len()];
     let mut indices = Vec::with_capacity(done.len() * 3);
@@ -515,6 +739,9 @@ fn cut_primitive(
             indices.push(positions.len() as u32);
             positions.push(corner.position);
             normals.push(corner.normal);
+            if let Some(tangent) = corner.tangent {
+                tangents.push(tangent);
+            }
             for (slot, value) in tex.iter_mut().zip(corner.tex.iter()) {
                 slot.push(*value);
             }
@@ -529,7 +756,7 @@ fn cut_primitive(
     // compiler builds its own index buffer.
     primitive.positions = positions;
     primitive.normals = normals;
-    primitive.tangents.clear();
+    primitive.tangents = tangents;
     for (slot, set) in primitive.tex_coords.iter_mut().zip(tex) {
         slot.values = set;
     }
@@ -638,6 +865,7 @@ mod tests {
         CutVertex {
             position,
             normal: [0.0, 1.0, 0.0],
+            tangent: None,
             tex: Vec::new(),
             colors: Vec::new(),
         }
@@ -704,5 +932,36 @@ mod tests {
                 .is_some_and(|(start, end)| segment_touches_triangle(start, end, &blade, normal));
             assert_eq!(reached, expected, "triangle {triangle:?}");
         }
+    }
+
+    #[test]
+    fn a_finite_blade_does_not_extend_its_seam_to_the_target_edges() {
+        let target = [
+            flat_vertex([-100.0, 0.0, 0.0]),
+            flat_vertex([100.0, 0.0, 0.0]),
+            flat_vertex([100.0, 0.0, 100.0]),
+        ];
+        let blade = [[0.0, -10.0, 10.0], [0.0, 10.0, 10.0], [0.0, 0.0, 20.0]];
+        let (normal, offset) = triangle_plane(&blade).expect("a plane");
+        let target_positions = [target[0].position, target[1].position, target[2].position];
+        let (start, end) =
+            triangle_plane_segment(&target_positions, normal, offset).expect("a crossing");
+        let (start, end) =
+            clip_segment_to_triangle(start, end, &blade, normal).expect("finite overlap");
+        let pieces = split_triangle_along_segment(&target, start, end).expect("a constrained seam");
+
+        let seam_points = pieces
+            .iter()
+            .flatten()
+            .filter(|vertex| vertex.position[0].abs() <= PLANE_EPSILON)
+            .map(|vertex| vertex.position[2])
+            .collect::<Vec<_>>();
+        assert!(!seam_points.is_empty());
+        assert!(
+            seam_points
+                .iter()
+                .all(|z| (10.0 - PLANE_EPSILON..=20.0 + PLANE_EPSILON).contains(z)),
+            "finite seam escaped the blade: {seam_points:?}"
+        );
     }
 }

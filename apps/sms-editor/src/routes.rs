@@ -189,10 +189,14 @@ impl SmsEditorApp {
         }
         // Ctrl-clicking the viewport also extends a route, but nothing said so,
         // which left a custom graph stuck at the points it was created with.
-        let anchor = self
+        let link_from = self
             .selected_route_controls
             .iter()
             .next()
+            .filter(|id| graph.control(id).is_some())
+            .cloned();
+        let anchor = link_from
+            .as_deref()
             .and_then(|id| graph.control(id))
             .map(|control| control.node.position);
         if ui
@@ -220,7 +224,6 @@ impl SmsEditorApp {
                     position
                 },
             );
-            let link_from = self.selected_route_controls.iter().next().cloned();
             let graph_id = graph_id.clone();
             let mut new_id = None;
             self.apply_route_edit("Added route control point", |document| {
@@ -293,12 +296,11 @@ impl SmsEditorApp {
                     } else {
                         &link.from
                     };
-                    let arrow = match (link.forward.is_some(), link.reverse.is_some()) {
-                        (true, true) => "<->",
-                        (true, false) => "->",
-                        (false, true) => "<-",
-                        (false, false) => "--",
-                    };
+                    let arrow = connection_arrow(
+                        link.forward.is_some(),
+                        link.reverse.is_some(),
+                        link.from == control_id,
+                    );
                     if ui
                         .selectable_label(
                             self.selected_route_link.as_deref() == Some(link.id.as_str()),
@@ -567,6 +569,10 @@ impl SmsEditorApp {
                     .and_then(|document| document.route_authoring.as_ref())
                     .and_then(|routes| routes.graph_by_name(current))
                 {
+                    if self.active_route_graph.as_deref() != Some(graph.id.as_str()) {
+                        self.selected_route_controls.clear();
+                        self.selected_route_link = None;
+                    }
                     self.active_route_graph = Some(graph.id.clone());
                     self.route_mode = true;
                 }
@@ -578,6 +584,10 @@ impl SmsEditorApp {
                     .and_then(|document| document.route_authoring.as_ref())
                     .and_then(|routes| routes.graph_by_name(current))
                 {
+                    if self.active_route_graph.as_deref() != Some(graph.id.as_str()) {
+                        self.selected_route_controls.clear();
+                        self.selected_route_link = None;
+                    }
                     self.active_route_graph = Some(graph.id.clone());
                     self.route_mode = true;
                     self.selected_route_controls.clear();
@@ -1174,6 +1184,20 @@ enum RouteViewportHit {
     Link(String),
 }
 
+fn connection_arrow(forward: bool, reverse: bool, selected_is_from: bool) -> &'static str {
+    let directions = if selected_is_from {
+        (forward, reverse)
+    } else {
+        (reverse, forward)
+    };
+    match directions {
+        (true, true) => "<->",
+        (true, false) => "->",
+        (false, true) => "<-",
+        (false, false) => "--",
+    }
+}
+
 fn cubic_bezier(p0: [f32; 3], p1: [f32; 3], p2: [f32; 3], p3: [f32; 3], t: f32) -> [f32; 3] {
     let u = 1.0 - t;
     std::array::from_fn(|axis| {
@@ -1196,7 +1220,7 @@ fn screen_segment_distance(point: egui::Pos2, start: egui::Pos2, end: egui::Pos2
 
 #[cfg(test)]
 mod tests {
-    use super::{cubic_bezier, screen_segment_distance};
+    use super::{connection_arrow, cubic_bezier, screen_segment_distance};
 
     #[test]
     fn cubic_curve_preserves_endpoints_and_expected_midpoint() {
@@ -1224,5 +1248,12 @@ mod tests {
             screen_segment_distance(egui::pos2(5.0, 10.0), start, end),
             5.0
         );
+    }
+
+    #[test]
+    fn connection_arrow_is_relative_to_the_selected_control() {
+        assert_eq!(connection_arrow(true, false, true), "->");
+        assert_eq!(connection_arrow(true, false, false), "<-");
+        assert_eq!(connection_arrow(true, true, false), "<->");
     }
 }

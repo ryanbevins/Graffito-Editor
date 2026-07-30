@@ -25,17 +25,15 @@ impl VertexPaintMode {
     }
 }
 
-/// Colour and normal state of one asset, captured for vertex paint undo.
+/// Complete state of one asset before or after a terrain edit.
 ///
-/// Normals ride along because the sun bake can smooth them; restoring only the
-/// colours would leave the shading permanently changed.
+/// Vertex-paint tools also expose topology-changing operations such as
+/// subdivision and Boolean Cut. Keeping only colours and normals made those
+/// operations impossible to undo and could leave mismatched vertex streams.
 #[derive(Clone)]
 pub(super) struct VertexPaintSnapshot {
     id: AssetId,
-    /// Flattened over meshes then primitives, matching the iteration order
-    /// every paint operation uses.
-    colors: Vec<Vec<sms_authoring::ColorSet>>,
-    normals: Vec<Vec<[f32; 3]>>,
+    document: ModelAssetDocument,
 }
 
 /// One undoable vertex paint operation, however many assets it touched.
@@ -46,34 +44,14 @@ pub(super) struct VertexPaintUndoRecord {
 }
 
 fn snapshot_paint_state(id: AssetId, document: &ModelAssetDocument) -> VertexPaintSnapshot {
-    let mut colors = Vec::new();
-    let mut normals = Vec::new();
-    for mesh in &document.meshes {
-        for primitive in &mesh.primitives {
-            colors.push(primitive.colors.clone());
-            normals.push(primitive.normals.clone());
-        }
-    }
     VertexPaintSnapshot {
         id,
-        colors,
-        normals,
+        document: document.clone(),
     }
 }
 
 fn restore_paint_state(document: &mut ModelAssetDocument, snapshot: &VertexPaintSnapshot) {
-    let mut index = 0usize;
-    for mesh in &mut document.meshes {
-        for primitive in &mut mesh.primitives {
-            if let Some(colors) = snapshot.colors.get(index) {
-                primitive.colors.clone_from(colors);
-            }
-            if let Some(normals) = snapshot.normals.get(index) {
-                primitive.normals.clone_from(normals);
-            }
-            index += 1;
-        }
-    }
+    document.clone_from(&snapshot.document);
 }
 
 /// A stroke in progress.
@@ -82,6 +60,8 @@ fn restore_paint_state(document: &mut ModelAssetDocument, snapshot: &VertexPaint
 /// show the paint going down. Only the release writes to disk.
 pub(super) struct VertexPaintLiveStroke {
     targets: Vec<PaintTarget>,
+    visibility: crate::triangle_bvh::TriangleBvh,
+    camera_position: [f32; 3],
     /// How many stroke samples are already folded in, so each frame applies
     /// only what arrived since the last one.
     applied: usize,
@@ -96,6 +76,9 @@ pub(super) struct PaintTarget {
     /// One asset can be placed several times; a stroke has to consider each
     /// placement, and every placement writes back to the same vertices.
     pub(super) transforms: Vec<[[f32; 4]; 4]>,
+    /// Placement the user actually selected. Asset edits are shared, but their
+    /// world-space brush, bake, and cut calculations must use this transform.
+    pub(super) transform: [[f32; 4]; 4],
     /// State as loaded, so the commit can record an undo step without a second
     /// read from disk.
     baseline: VertexPaintSnapshot,
@@ -105,6 +88,16 @@ pub(super) struct PaintTarget {
 pub(super) struct WorldVertex {
     pub(super) position: [f32; 3],
     pub(super) normal: [f32; 3],
+}
+
+struct StrokeApplication<'a> {
+    projection: &'a crate::camera::CameraProjection,
+    radius: f32,
+    strength: f32,
+    color: [f32; 3],
+    mode: VertexPaintMode,
+    visibility: &'a crate::triangle_bvh::TriangleBvh,
+    camera_position: [f32; 3],
 }
 
 pub(super) fn transform_point(matrix: [[f32; 4]; 4], point: [f32; 3]) -> [f32; 3] {
@@ -214,16 +207,21 @@ fn enable_vertex_colors(document: &mut ModelAssetDocument) {
     // with no material compiles against a default channel that reads the
     // register. Painting such a mesh stored colour that nothing could ever
     // sample, so give it a material first and point the primitives at it.
-    if document.materials.is_empty() {
+    let needs_fallback = document
+        .meshes
+        .iter()
+        .flat_map(|mesh| &mesh.primitives)
+        .any(|primitive| primitive.material.is_none());
+    let fallback = needs_fallback.then(|| {
         document
             .materials
             .push(vertex_color_material(&document.name));
-    }
-    let fallback = (document.materials.len() - 1) as u32;
+        (document.materials.len() - 1) as u32
+    });
     for mesh in &mut document.meshes {
         for primitive in &mut mesh.primitives {
             if primitive.material.is_none() {
-                primitive.material = Some(fallback);
+                primitive.material = fallback;
             }
         }
     }
@@ -311,6 +309,22 @@ fn nearest_surface_hit(
         }
     }
     best.map(|(_, position, normal)| (position, normal))
+}
+
+fn vertex_visible_from(
+    camera_position: [f32; 3],
+    vertex_position: [f32; 3],
+    visibility: &crate::triangle_bvh::TriangleBvh,
+) -> bool {
+    let camera_to_vertex = vec3_sub(vertex_position, camera_position);
+    let distance = vec3_dot(camera_to_vertex, camera_to_vertex).sqrt();
+    let tolerance = (distance * 1e-4).max(0.05);
+    distance <= tolerance
+        || !visibility.ray_hits(
+            camera_position,
+            vec3_scale(camera_to_vertex, 1.0 / distance),
+            distance - tolerance,
+        )
 }
 
 const IDENTITY_MATRIX: [[f32; 4]; 4] = [
@@ -474,7 +488,7 @@ impl SmsEditorApp {
         // floor. Scoped operations now require a selection outright.
         let selected = match selection_only {
             true => match self.selected_model_instance() {
-                Some(instance) => Some(instance.placement.asset_id),
+                Some(instance) => Some((instance.placement.asset_id, instance.placement.transform)),
                 None => return Vec::new(),
             },
             false => None,
@@ -487,7 +501,9 @@ impl SmsEditorApp {
             .filter(|instance| {
                 instance.placement.export_mode == ModelInstanceExportMode::MapTerrain
             })
-            .filter(|instance| selected.is_none_or(|asset| instance.placement.asset_id == asset))
+            .filter(|instance| {
+                selected.is_none_or(|(asset, _)| instance.placement.asset_id == asset)
+            })
         {
             by_asset
                 .entry(instance.placement.asset_id)
@@ -497,26 +513,32 @@ impl SmsEditorApp {
         by_asset
             .into_iter()
             .filter_map(|(id, transforms)| {
+                let transform = selected
+                    .filter(|(asset, _)| *asset == id)
+                    .map(|(_, transform)| transform)
+                    .or_else(|| transforms.first().copied())
+                    .unwrap_or(IDENTITY_MATRIX);
                 catalog.load_asset(id).ok().map(|document| PaintTarget {
                     id,
                     baseline: snapshot_paint_state(id, &document),
                     document,
                     transforms,
+                    transform,
                 })
             })
             .collect()
     }
 
-    /// World-space position and normal of every vertex in a target, using its
-    /// first placement. Repeated placements share vertices, so the first is the
-    /// one a world-space operation is resolved against.
+    /// World-space position and normal of every vertex in the selected
+    /// placement of a target.
     fn target_world_vertices(target: &PaintTarget) -> Vec<Vec<WorldVertex>> {
-        let transform = target.transforms.first().copied().unwrap_or([
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ]);
+        Self::target_world_vertices_with_transform(target, target.transform)
+    }
+
+    fn target_world_vertices_with_transform(
+        target: &PaintTarget,
+        transform: [[f32; 4]; 4],
+    ) -> Vec<Vec<WorldVertex>> {
         let nodes = mesh_node_transforms(&target.document);
         target
             .document
@@ -626,8 +648,11 @@ impl SmsEditorApp {
         let label = format!("Undo {}", record.label.to_lowercase());
         if self.apply_vertex_paint_snapshots(&record.before, &label) {
             self.vertex_paint_redo_stack.push_back(record);
+            true
+        } else {
+            self.vertex_paint_undo_stack.push_back(record);
+            false
         }
-        true
     }
 
     pub(super) fn redo_vertex_paint(&mut self) -> bool {
@@ -637,8 +662,11 @@ impl SmsEditorApp {
         let label = format!("Redo {}", record.label.to_lowercase());
         if self.apply_vertex_paint_snapshots(&record.after, &label) {
             self.vertex_paint_undo_stack.push_back(record);
+            true
+        } else {
+            self.vertex_paint_redo_stack.push_back(record);
+            false
         }
-        true
     }
 
     /// Writes snapshots back to their assets and refreshes the preview.
@@ -670,7 +698,11 @@ impl SmsEditorApp {
                     .push(format!("Could not restore painted asset: {error}")),
             }
         }
-        if restored == 0 {
+        if restored != snapshots.len() {
+            self.log.push(format!(
+                "{label} restored {restored} of {} terrain asset(s); the undo record was retained for another attempt.",
+                snapshots.len()
+            ));
             return false;
         }
         self.force_refresh_model_catalog();
@@ -681,7 +713,15 @@ impl SmsEditorApp {
     }
 
     /// Writes every modified target back to the catalog.
-    pub(super) fn commit_paint_targets(&mut self, targets: Vec<PaintTarget>, label: &str) {
+    ///
+    /// Topology-only callers must leave `enable_colors` false so a cut or
+    /// subdivision does not silently rewrite the asset's GX materials.
+    pub(super) fn commit_terrain_targets(
+        &mut self,
+        targets: Vec<PaintTarget>,
+        label: &str,
+        enable_colors: bool,
+    ) {
         if targets.is_empty() {
             return;
         }
@@ -695,9 +735,9 @@ impl SmsEditorApp {
         let mut before = Vec::new();
         let mut after = Vec::new();
         for mut target in targets {
-            // Every path that writes colour lands here, so the material switch
-            // is flipped in one place rather than per operation.
-            enable_vertex_colors(&mut target.document);
+            if enable_colors {
+                enable_vertex_colors(&mut target.document);
+            }
             match catalog.save_asset(target.id, &target.document) {
                 Ok(_) => {
                     saved += 1;
@@ -753,7 +793,7 @@ impl SmsEditorApp {
                 }
             }
         }
-        self.commit_paint_targets(targets, label);
+        self.commit_terrain_targets(targets, label, true);
     }
 
     /// Resets every terrain vertex to opaque white.
@@ -827,22 +867,24 @@ impl SmsEditorApp {
         // Every terrain triangle in the stage, in world space.
         let mut occluders: Vec<[[f32; 3]; 3]> = Vec::new();
         for target in &self.terrain_paint_targets_scoped(false) {
-            let world = Self::target_world_vertices(target);
-            let mut primitive_index = 0usize;
-            for mesh in &target.document.meshes {
-                for primitive in &mesh.primitives {
-                    let Some(vertices) = world.get(primitive_index) else {
-                        continue;
-                    };
-                    primitive_index += 1;
-                    for triangle in primitive.indices.chunks_exact(3) {
-                        let corners = [
-                            vertices.get(triangle[0] as usize),
-                            vertices.get(triangle[1] as usize),
-                            vertices.get(triangle[2] as usize),
-                        ];
-                        if let [Some(a), Some(b), Some(c)] = corners {
-                            occluders.push([a.position, b.position, c.position]);
+            for transform in &target.transforms {
+                let world = Self::target_world_vertices_with_transform(target, *transform);
+                let mut primitive_index = 0usize;
+                for mesh in &target.document.meshes {
+                    for primitive in &mesh.primitives {
+                        let Some(vertices) = world.get(primitive_index) else {
+                            continue;
+                        };
+                        primitive_index += 1;
+                        for triangle in primitive.indices.chunks_exact(3) {
+                            let corners = [
+                                vertices.get(triangle[0] as usize),
+                                vertices.get(triangle[1] as usize),
+                                vertices.get(triangle[2] as usize),
+                            ];
+                            if let [Some(a), Some(b), Some(c)] = corners {
+                                occluders.push([a.position, b.position, c.position]);
+                            }
                         }
                     }
                 }
@@ -901,7 +943,7 @@ impl SmsEditorApp {
                 }
             }
         }
-        self.commit_paint_targets(targets, "Subdivided terrain");
+        self.commit_terrain_targets(targets, "Subdivided terrain", false);
         self.log
             .push(format!("Terrain now has {triangles} triangle(s)."));
     }
@@ -946,7 +988,7 @@ impl SmsEditorApp {
                 }
             }
         }
-        self.commit_paint_targets(targets, "Smoothed normals for baking");
+        self.commit_terrain_targets(targets, "Smoothed normals for baking", false);
     }
 
     /// Lays a gradient along a world axis over the terrain's bounds.
@@ -1023,7 +1065,7 @@ impl SmsEditorApp {
                 }
             }
         }
-        self.commit_paint_targets(targets, "Smoothed vertex paint");
+        self.commit_terrain_targets(targets, "Smoothed vertex paint", true);
     }
 }
 
@@ -1062,6 +1104,25 @@ fn subdivide_primitive(primitive: &mut sms_authoring::ModelPrimitive) {
                 } else {
                     normal
                 });
+            }
+            if let (Some(first), Some(second)) = (
+                primitive.tangents.get(x as usize),
+                primitive.tangents.get(y as usize),
+            ) {
+                let mut tangent = std::array::from_fn(|axis| (first[axis] + second[axis]) * 0.5);
+                let direction = [tangent[0], tangent[1], tangent[2]];
+                let length = vec3_dot(direction, direction).sqrt();
+                if length > f32::EPSILON {
+                    for component in tangent.iter_mut().take(3) {
+                        *component /= length;
+                    }
+                }
+                tangent[3] = if first[3].signum() == second[3].signum() {
+                    first[3].signum()
+                } else {
+                    first[3]
+                };
+                primitive.tangents.push(tangent);
             }
             for set in &mut primitive.tex_coords {
                 if let (Some(first), Some(second)) =
@@ -1231,8 +1292,23 @@ impl SmsEditorApp {
         for target in &mut targets {
             enable_vertex_colors(&mut target.document);
         }
+        let visibility = crate::triangle_bvh::TriangleBvh::build(
+            self.model_preview
+                .as_ref()
+                .map(|preview| {
+                    preview
+                        .triangles
+                        .iter()
+                        .filter(|triangle| preview_triangle_frames_object(triangle))
+                        .map(|triangle| triangle.vertices)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
         self.vertex_paint_live = Some(VertexPaintLiveStroke {
             targets,
+            visibility,
+            camera_position: self.camera_frame().position,
             applied: 0,
             mode,
         });
@@ -1256,11 +1332,15 @@ impl SmsEditorApp {
         Self::apply_stroke_to_targets(
             &mut live.targets,
             &samples,
-            &self.camera_projection(rect),
-            self.vertex_paint_radius.max(1.0),
-            self.vertex_paint_strength.clamp(0.0, 1.0),
-            self.vertex_paint_color,
-            live.mode,
+            StrokeApplication {
+                projection: &self.camera_projection(rect),
+                radius: self.vertex_paint_radius.max(1.0),
+                strength: self.vertex_paint_strength.clamp(0.0, 1.0),
+                color: self.vertex_paint_color,
+                mode: live.mode,
+                visibility: &live.visibility,
+                camera_position: live.camera_position,
+            },
         );
 
         // Rebuilt from memory. The catalog is not touched until the stroke
@@ -1282,7 +1362,7 @@ impl SmsEditorApp {
             VertexPaintMode::Eraser => "Erased vertex colour",
             VertexPaintMode::Smooth => "Softened vertex colour",
         };
-        self.commit_paint_targets(live.targets, label);
+        self.commit_terrain_targets(live.targets, label, true);
     }
 
     /// Applies stroke samples to already-loaded assets.
@@ -1294,11 +1374,7 @@ impl SmsEditorApp {
     fn apply_stroke_to_targets(
         targets: &mut [PaintTarget],
         samples: &[egui::Pos2],
-        projection: &crate::camera::CameraProjection,
-        radius: f32,
-        strength: f32,
-        color: [f32; 3],
-        mode: VertexPaintMode,
+        application: StrokeApplication<'_>,
     ) {
         for target in targets {
             let world = Self::target_world_vertices(target);
@@ -1315,14 +1391,16 @@ impl SmsEditorApp {
                     // The neighbourhood average is taken before the brush
                     // touches anything, so a slow drag cannot chase its own
                     // output across the surface.
-                    let smoothed = matches!(mode, VertexPaintMode::Smooth)
+                    let smoothed = matches!(application.mode, VertexPaintMode::Smooth)
                         .then(|| smoothed_colors(colors, &welds, &adjacency, 1.0));
 
                     for (index, value) in colors.iter_mut().enumerate() {
                         let Some(vertex) = vertices.get(index) else {
                             continue;
                         };
-                        let Some((screen, _)) = projection.project_world_to_screen(vertex.position)
+                        let Some((screen, _)) = application
+                            .projection
+                            .project_world_to_screen(vertex.position)
                         else {
                             continue;
                         };
@@ -1330,15 +1408,22 @@ impl SmsEditorApp {
                             .iter()
                             .map(|sample| screen.distance(*sample))
                             .fold(f32::INFINITY, f32::min);
-                        if nearest >= radius {
+                        if nearest >= application.radius {
                             continue;
                         }
-                        let falloff = 1.0 - (nearest / radius).clamp(0.0, 1.0);
-                        let amount = (falloff * falloff * strength).clamp(0.0, 1.0);
+                        if !vertex_visible_from(
+                            application.camera_position,
+                            vertex.position,
+                            application.visibility,
+                        ) {
+                            continue;
+                        }
+                        let falloff = 1.0 - (nearest / application.radius).clamp(0.0, 1.0);
+                        let amount = (falloff * falloff * application.strength).clamp(0.0, 1.0);
                         // White is the identity for a vertex-lit surface, so
                         // erasing blends back toward it rather than to black.
-                        let goal = match mode {
-                            VertexPaintMode::Brush => color,
+                        let goal = match application.mode {
+                            VertexPaintMode::Brush => application.color,
                             VertexPaintMode::Eraser => [1.0, 1.0, 1.0],
                             VertexPaintMode::Smooth => smoothed
                                 .as_ref()
@@ -1373,14 +1458,21 @@ impl SmsEditorApp {
             .hovered()
             .then(|| pointer.and_then(|pointer| self.vertex_paint_surface_hit(rect, pointer)))
             .flatten();
-        let (down, shift, ctrl) = ui.input(|input| {
+        let (down, shift, ctrl, alt) = ui.input(|input| {
             (
                 input.pointer.primary_down(),
                 input.modifiers.shift,
                 input.modifiers.command,
+                input.modifiers.alt,
             )
         });
         self.vertex_paint_modifier_mode = Self::vertex_paint_modifier_mode(shift, ctrl);
+        if alt {
+            if self.vertex_paint_live.is_some() || !self.vertex_paint_stroke.is_empty() {
+                self.finish_vertex_paint_live_stroke();
+            }
+            return false;
+        }
         if down && response.hovered() {
             if self.vertex_paint_live.is_none() {
                 // Latched at the start of the stroke: letting a modifier go
@@ -1501,26 +1593,6 @@ impl SmsEditorApp {
         painter.add(egui::Shape::line(ring, egui::Stroke::new(2.0, color)));
     }
 
-    /// Gives every terrain asset a white colour set and a material that reads
-    /// it, the first time the tool is opened for a stage.
-    ///
-    /// Doing this on open rather than on first stroke means paint shows
-    /// immediately. White is the identity for a vertex-lit surface, so the
-    /// stage looks unchanged until something is actually painted.
-    fn prepare_terrain_for_vertex_paint(&mut self) {
-        if self.vertex_paint_prepared.as_deref() == Some(self.stage_id.as_str()) {
-            return;
-        }
-        self.vertex_paint_prepared = Some(self.stage_id.clone());
-        // Unscoped on purpose: every terrain asset needs its colour set and
-        // material before anything is selected.
-        self.edit_terrain_vertex_colors_scoped(
-            "Prepared terrain for vertex paint",
-            false,
-            |_, _| {},
-        );
-    }
-
     pub(super) fn vertex_paint_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Vertex Paint");
         let terrain = self
@@ -1538,7 +1610,6 @@ impl SmsEditorApp {
             );
             return;
         }
-        self.prepare_terrain_for_vertex_paint();
         // Says which asset a stroke will hit, since that differs from what the
         // whole-stage bakes below cover.
         match self.selected_model_instance() {
@@ -1676,5 +1747,126 @@ impl SmsEditorApp {
         {
             self.bake_terrain_sun();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sms_authoring::{ModelMesh, ModelPrimitive};
+
+    fn test_document() -> ModelAssetDocument {
+        let mut document = ModelAssetDocument::new("terrain");
+        document.meshes.push(ModelMesh {
+            name: "terrain".to_string(),
+            primitives: vec![ModelPrimitive {
+                positions: vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 0.0, 2.0]],
+                normals: vec![[0.0, 1.0, 0.0]; 3],
+                tangents: vec![[1.0, 0.0, 0.0, 1.0]; 3],
+                tex_coords: Vec::new(),
+                colors: Vec::new(),
+                indices: vec![0, 1, 2],
+                material: None,
+            }],
+        });
+        document
+    }
+
+    #[test]
+    fn topology_snapshot_restores_the_complete_asset() {
+        let id = AssetId::new();
+        let original = test_document();
+        let snapshot = snapshot_paint_state(id, &original);
+        let mut changed = original.clone();
+        subdivide_primitive(&mut changed.meshes[0].primitives[0]);
+        enable_vertex_colors(&mut changed);
+        assert_ne!(changed, original);
+
+        restore_paint_state(&mut changed, &snapshot);
+        assert_eq!(changed, original);
+    }
+
+    #[test]
+    fn subdivision_keeps_every_vertex_stream_aligned() {
+        let mut primitive = test_document().meshes.remove(0).primitives.remove(0);
+        subdivide_primitive(&mut primitive);
+
+        assert_eq!(primitive.positions.len(), 6);
+        assert_eq!(primitive.normals.len(), primitive.positions.len());
+        assert_eq!(primitive.tangents.len(), primitive.positions.len());
+        assert_eq!(primitive.indices.len(), 12);
+        assert!(primitive
+            .tangents
+            .iter()
+            .all(|tangent| (tangent[0] - 1.0).abs() < 1e-5 && tangent[3] == 1.0));
+    }
+
+    #[test]
+    fn materialless_primitives_get_a_dedicated_fallback() {
+        let mut document = test_document();
+        document.materials.push(vertex_color_material("unrelated"));
+        let previous_materials = document.materials.len();
+        enable_vertex_colors(&mut document);
+
+        assert_eq!(document.materials.len(), previous_materials + 1);
+        assert_eq!(
+            document.meshes[0].primitives[0].material,
+            Some(previous_materials as u32)
+        );
+    }
+
+    #[test]
+    fn selected_transform_drives_world_space_edits() {
+        let id = AssetId::new();
+        let document = test_document();
+        let mut selected_transform = IDENTITY_MATRIX;
+        selected_transform[3][0] = 100.0;
+        let target = PaintTarget {
+            id,
+            baseline: snapshot_paint_state(id, &document),
+            document,
+            transforms: vec![IDENTITY_MATRIX, selected_transform],
+            transform: selected_transform,
+        };
+
+        let world = SmsEditorApp::target_world_vertices(&target);
+        assert_eq!(world[0][0].position, [100.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn foreground_geometry_blocks_vertices_behind_it() {
+        let visibility = crate::triangle_bvh::TriangleBvh::build(vec![[
+            [-10.0, -10.0, 5.0],
+            [10.0, -10.0, 5.0],
+            [0.0, 10.0, 5.0],
+        ]]);
+        assert!(vertex_visible_from(
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 5.0],
+            &visibility
+        ));
+        assert!(!vertex_visible_from(
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 10.0],
+            &visibility
+        ));
+    }
+
+    #[test]
+    fn failed_undo_keeps_the_record_available() {
+        let id = AssetId::new();
+        let document = test_document();
+        let snapshot = snapshot_paint_state(id, &document);
+        let mut app = SmsEditorApp::default();
+        app.vertex_paint_undo_stack
+            .push_back(VertexPaintUndoRecord {
+                label: "test".to_string(),
+                before: vec![snapshot.clone()],
+                after: vec![snapshot],
+            });
+
+        assert!(!app.undo_vertex_paint());
+        assert_eq!(app.vertex_paint_undo_stack.len(), 1);
+        assert!(app.vertex_paint_redo_stack.is_empty());
     }
 }

@@ -1330,8 +1330,6 @@ struct SmsEditorApp {
     vertex_paint_undo_group: Option<VertexPaintUndoRecord>,
     vertex_paint_cursor: Option<([f32; 3], [f32; 3])>,
     vertex_paint_rect: Option<egui::Rect>,
-    /// Stage whose terrain has been given vertex-colour materials.
-    vertex_paint_prepared: Option<String>,
     /// Keeps a moved item from sinking through the geometry under it.
     content_aware_snap: bool,
     snap_translation: f32,
@@ -1636,7 +1634,6 @@ impl Default for SmsEditorApp {
             vertex_paint_undo_group: None,
             vertex_paint_cursor: None,
             vertex_paint_rect: None,
-            vertex_paint_prepared: None,
             content_aware_snap: false,
             snap_translation: 50.0,
             snap_rotation: 15.0,

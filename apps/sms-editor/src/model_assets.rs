@@ -611,6 +611,13 @@ impl SmsEditorApp {
         if !self.content_catalog_mutation_allowed("replace a model source") {
             return;
         }
+        if self.selected_model_asset == Some(id) && self.asset_dirty {
+            let message =
+                "Save or revert the open model asset before replacing its source.".to_string();
+            self.model_editor_error = Some(message.clone());
+            self.log.push(message);
+            return;
+        }
         if self.model_import_job.is_some() {
             self.log
                 .push("A model import is already running.".to_string());
@@ -673,6 +680,16 @@ impl SmsEditorApp {
 
     fn commit_model_source_replacement(&mut self, id: AssetId, prepared: PreparedModelImport) {
         if !self.content_catalog_mutation_allowed("commit the replaced model") {
+            return;
+        }
+        // The import is asynchronous. The asset may have become dirty after
+        // the file picker closed, so protect it again at the actual write.
+        if self.selected_model_asset == Some(id) && self.asset_dirty {
+            let message =
+                "Model replacement was not committed because the open asset has unsaved edits."
+                    .to_string();
+            self.model_editor_error = Some(message.clone());
+            self.log.push(message);
             return;
         }
         let catalog = match self.model_catalog() {
