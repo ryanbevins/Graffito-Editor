@@ -467,6 +467,10 @@ pub(super) struct PreparedModelImport {
     pub(super) relative_path: PathBuf,
     pub(super) source_path: PathBuf,
     pub(super) document: ModelAssetDocument,
+    /// Set when the import overwrites an existing asset rather than creating
+    /// one. Keeping the id is the point: every placement already refers to it,
+    /// so they all follow the swap without being touched.
+    pub(super) replaces: Option<AssetId>,
 }
 
 impl SmsEditorApp {
@@ -475,14 +479,14 @@ impl SmsEditorApp {
         (!root.is_empty()).then(|| PathBuf::from(root).join("Content"))
     }
 
-    fn model_catalog(&self) -> Result<ModelAssetCatalog, String> {
+    pub(super) fn model_catalog(&self) -> Result<ModelAssetCatalog, String> {
         let root = self
             .model_content_root()
             .ok_or_else(|| "Project data root is not configured".to_string())?;
         ModelAssetCatalog::open_content_root(root).map_err(|error| error.to_string())
     }
 
-    fn content_catalog_mutation_allowed(&mut self, action: &str) -> bool {
+    pub(super) fn content_catalog_mutation_allowed(&mut self, action: &str) -> bool {
         if self.background_receiver.is_none() {
             return true;
         }
@@ -585,6 +589,7 @@ impl SmsEditorApp {
                     relative_path,
                     source_path: task_source,
                     document: imported.asset,
+                    replaces: None,
                 })
                 .map_err(|error| error.to_string());
             if !worker_cancel.load(Ordering::Acquire) {
@@ -596,6 +601,134 @@ impl SmsEditorApp {
             "Importing model '{}' in the background...",
             source_path.display()
         ));
+    }
+
+    /// Re-imports an existing asset from a different glTF or GLB.
+    ///
+    /// The asset keeps its id, path and display name, so every instance placed
+    /// from it in every stage picks up the new geometry without being relinked.
+    pub(super) fn begin_model_source_replacement(&mut self, id: AssetId) {
+        if !self.content_catalog_mutation_allowed("replace a model source") {
+            return;
+        }
+        if self.model_import_job.is_some() {
+            self.log
+                .push("A model import is already running.".to_string());
+            return;
+        }
+        let Some(entry) = self
+            .model_catalog_entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+        else {
+            self.log
+                .push("That model is no longer in the catalog.".to_string());
+            return;
+        };
+        let Some(source_path) = rfd::FileDialog::new()
+            .set_title(format!("Replace '{}' with", entry.name))
+            .add_filter("glTF model", &["gltf", "glb"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        let mut options = self.model_import_options.clone();
+        if let CollisionSource::SeparateFile {
+            options: collision_options,
+            ..
+        } = &mut options.collision
+        {
+            collision_options.coordinate_conversion = options.coordinate_conversion;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let task_source = source_path.clone();
+        let relative_path = entry.relative_path.clone();
+        std::thread::spawn(move || {
+            if worker_cancel.load(Ordering::Acquire) {
+                return;
+            }
+            let result = sms_authoring::import_model(&task_source, &options)
+                .map(|imported| PreparedModelImport {
+                    relative_path,
+                    source_path: task_source,
+                    document: imported.asset,
+                    replaces: Some(id),
+                })
+                .map_err(|error| error.to_string());
+            if !worker_cancel.load(Ordering::Acquire) {
+                let _ = sender.send(result);
+            }
+        });
+        self.model_import_job = Some(ModelImportJob { cancel, receiver });
+        self.log.push(format!(
+            "Replacing '{}' with '{}' in the background...",
+            entry.name,
+            source_path.display()
+        ));
+    }
+
+    fn commit_model_source_replacement(&mut self, id: AssetId, prepared: PreparedModelImport) {
+        if !self.content_catalog_mutation_allowed("commit the replaced model") {
+            return;
+        }
+        let catalog = match self.model_catalog() {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                self.log
+                    .push(format!("Model replacement was not committed: {error}"));
+                return;
+            }
+        };
+        let Some(entry) = self
+            .model_catalog_entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+        else {
+            self.log
+                .push("That model is no longer in the catalog.".to_string());
+            return;
+        };
+
+        // The name comes from the asset, not the file that was just picked, so
+        // a swap does not rename what the hierarchy and the browser show.
+        let mut document = prepared.document;
+        document.name = entry.name.clone();
+
+        match catalog.save_asset(id, &document) {
+            Ok(_) => {
+                self.model_asset_preview_cache
+                    .retain(|key, _| key.asset_id != id);
+                self.force_refresh_model_catalog();
+                if self.selected_model_asset == Some(id) {
+                    // Reload the open editor so it is not still showing the
+                    // geometry that was just overwritten.
+                    self.selected_model_document = Some(document.clone());
+                    self.saved_model_document = Some(document);
+                    self.asset_dirty = false;
+                    self.selected_model_material = 0;
+                    self.selected_model_texture = 0;
+                }
+                self.rebuild_model_preview_cache();
+                // New geometry under the same asset means any goop generated
+                // from the old terrain no longer matches it.
+                self.refresh_goop_stale_from_final_terrain();
+                self.rebuild_generated_goop_layers_if_stale();
+                self.log.push(format!(
+                    "Replaced '{}' from '{}'. Vertex colours and materials came from the new \
+                     file, so any paint on the old geometry is gone.",
+                    entry.name,
+                    prepared.source_path.display()
+                ));
+            }
+            Err(error) => self
+                .log
+                .push(format!("Model replacement could not be committed: {error}")),
+        }
     }
 
     pub(super) fn cancel_model_import(&mut self) {
@@ -618,7 +751,10 @@ impl SmsEditorApp {
         match result {
             Some(Ok(Ok(prepared))) => {
                 self.model_import_job = None;
-                self.commit_prepared_model_import(prepared);
+                match prepared.replaces {
+                    Some(id) => self.commit_model_source_replacement(id, prepared),
+                    None => self.commit_prepared_model_import(prepared),
+                }
             }
             Some(Ok(Err(error))) => {
                 self.model_import_job = None;
@@ -1299,10 +1435,67 @@ impl SmsEditorApp {
             if previous_loader != updated_loader {
                 self.rebuild_model_preview_cache();
             } else {
+                // Moving an instance leaves its loader flags alone, so this is
+                // the branch a transform edit lands in. Goop is baked against
+                // the final terrain, so moved geometry leaves it behind at the
+                // old position: re-check, then regenerate rather than only
+                // flagging it for a manual rebuild.
+                self.refresh_goop_stale_from_final_terrain();
+                self.rebuild_generated_goop_layers_if_stale();
                 self.rebuild_gpu_viewport_scene();
                 self.clear_viewport_preview_cache();
             }
         }
+    }
+
+    /// Transform of the selected authored instance, if there is one.
+    pub(super) fn selected_instance_transform(&self) -> Option<Transform> {
+        self.selected_model_instance()
+            .map(|instance| matrix_to_transform(instance.placement.transform))
+    }
+
+    /// Writes a transform straight onto the selected instance for live drag
+    /// feedback, with no undo record and no save. Pair with
+    /// [`Self::commit_selected_instance_transform`] to land the edit.
+    pub(super) fn preview_selected_instance_transform(&mut self, transform: Transform) {
+        let Some(id) = self.selected_model_instance_id else {
+            return;
+        };
+        let Some(index) = self
+            .model_instances
+            .iter()
+            .position(|instance| instance.placement.instance_id == id)
+        else {
+            return;
+        };
+        self.model_instances[index].placement.transform = transform_to_matrix(transform);
+        // Deliberately no preview re-sync here. Re-baking the instance's world
+        // vertices every frame tore the geometry down and rebuilt it while the
+        // pointer moved, which read as flicker. The outlined bounds follow the
+        // transform on their own, so a drag shows the box moving and the mesh
+        // catches up when the edit lands.
+    }
+
+    /// Lands a dragged instance as a single undo step.
+    ///
+    /// The live preview has already moved the instance, so it is put back
+    /// first and the edit replayed through the normal update path, which owns
+    /// the undo record, the save and the goop re-check.
+    pub(super) fn commit_selected_instance_transform(&mut self, start: Transform, end: Transform) {
+        let Some(id) = self.selected_model_instance_id else {
+            return;
+        };
+        let Some(index) = self
+            .model_instances
+            .iter()
+            .position(|instance| instance.placement.instance_id == id)
+        else {
+            return;
+        };
+        self.model_instances[index].placement.transform = transform_to_matrix(start);
+        let mut updated = self.model_instances[index].clone();
+        updated.placement.transform = transform_to_matrix(end);
+        self.update_selected_model_instance(updated);
     }
 
     pub(super) fn delete_selected_model_instance(&mut self) -> bool {
@@ -1399,29 +1592,69 @@ impl SmsEditorApp {
         // Prefer the mesh, matching how placed world objects are picked. The
         // origin radius alone only selected an instance when the part of the
         // model under the cursor happened to sit near its origin.
-        if let Some(hit) = self.model_instance_mesh_hit_at_screen_position(rect, position) {
-            return Some(hit);
-        }
+        self.model_instance_mesh_hit_at_screen_position(rect, position)
+            .or_else(|| self.model_instance_bounds_hit_at_screen_position(rect, position))
+    }
 
-        // The origin radius only covers instances with no preview mesh to test.
-        // Applying it to meshed instances too would let a click on bare terrain
-        // near an instance's origin select and frame it.
-        let meshed = self
-            .model_preview
-            .as_ref()
-            .map(|preview| &preview.instance_model_indices);
+    /// Coarse hit test against the bounding box the viewport outlines.
+    ///
+    /// Kept separate from the mesh test because the box encloses everything
+    /// standing on the model, so callers that can also hit a placed object
+    /// need to rank this below one.
+    pub(super) fn model_instance_bounds_hit_at_screen_position(
+        &self,
+        rect: egui::Rect,
+        position: egui::Pos2,
+    ) -> Option<uuid::Uuid> {
+        // Falling back to the drawn bounding box. The mesh test only works
+        // once an instance's geometry is in the stage preview, which needs a
+        // cached asset preview, and the old origin-radius fallback only
+        // covered a 28px dot that is nowhere near the visible model for
+        // anything but a tiny prop. The box is what the viewport already
+        // outlines for a selected instance, so clicking inside it is the
+        // behaviour the drawing implies.
         let projection = self.camera_projection(rect);
         self.model_instances
             .iter()
             .filter(|instance| instance.stage_id.eq_ignore_ascii_case(&self.stage_id))
-            .filter(|instance| {
-                meshed.is_none_or(|meshed| !meshed.contains_key(&instance.placement.instance_id))
-            })
             .filter_map(|instance| {
-                let transform = matrix_to_transform(instance.placement.transform);
-                let (screen, depth) = projection.project_world_to_screen(transform.translation)?;
-                (screen.distance(position) <= 28.0)
-                    .then_some((depth, instance.placement.instance_id))
+                let corners = transformed_bounds_corners(instance);
+                let mut minimum = egui::Pos2::new(f32::INFINITY, f32::INFINITY);
+                let mut maximum = egui::Pos2::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+                let mut visible = false;
+                // Clip each edge to the near plane rather than projecting the
+                // corners outright. A corner behind the camera has no screen
+                // position, so requiring all eight meant a large model became
+                // unpickable as soon as it was close enough to straddle the
+                // near plane, which is exactly when it fills the viewport.
+                for [a, b] in MODEL_INSTANCE_BOX_EDGES {
+                    let Some([start, end]) =
+                        projection.project_world_segment_to_screen(corners[a], corners[b])
+                    else {
+                        continue;
+                    };
+                    minimum = minimum.min(start).min(end);
+                    maximum = maximum.max(start).max(end);
+                    visible = true;
+                }
+                if !visible {
+                    return None;
+                }
+                // A degenerate or edge-on box still deserves a grab margin.
+                let bounds = egui::Rect::from_min_max(minimum, maximum).expand(4.0);
+                if !bounds.contains(position) {
+                    return None;
+                }
+                // Depth of the box centre orders overlapping instances. A
+                // centre behind the near plane means the camera is inside the
+                // box, which should sort ahead of everything else.
+                let centre = std::array::from_fn(|axis| {
+                    corners.iter().map(|corner| corner[axis]).sum::<f32>() / corners.len() as f32
+                });
+                let depth = projection
+                    .project_world_to_screen(centre)
+                    .map_or(0.0, |(_, depth)| depth);
+                Some((depth, instance.placement.instance_id))
             })
             .min_by(|left, right| left.0.total_cmp(&right.0))
             .map(|(_, id)| id)
@@ -1431,7 +1664,7 @@ impl SmsEditorApp {
     ///
     /// Instances without cached preview geometry are absent from
     /// `instance_model_indices`, so they fall back to the origin radius.
-    fn model_instance_mesh_hit_at_screen_position(
+    pub(super) fn model_instance_mesh_hit_at_screen_position(
         &self,
         rect: egui::Rect,
         position: egui::Pos2,
@@ -1495,21 +1728,7 @@ impl SmsEditorApp {
                 egui::Color32::from_rgb(90, 188, 242)
             };
             let corners = transformed_bounds_corners(instance);
-            const EDGES: [[usize; 2]; 12] = [
-                [0, 1],
-                [0, 2],
-                [0, 4],
-                [1, 3],
-                [1, 5],
-                [2, 3],
-                [2, 6],
-                [3, 7],
-                [4, 5],
-                [4, 6],
-                [5, 7],
-                [6, 7],
-            ];
-            for [a, b] in EDGES {
+            for [a, b] in MODEL_INSTANCE_BOX_EDGES {
                 if let (Some((a, _)), Some((b, _))) = (
                     projection.project_world_to_screen(corners[a]),
                     projection.project_world_to_screen(corners[b]),
@@ -1612,7 +1831,11 @@ impl SmsEditorApp {
         }
     }
 
-    fn cache_model_previews_for_document(&mut self, id: AssetId, document: &ModelAssetDocument) {
+    pub(super) fn cache_model_previews_for_document(
+        &mut self,
+        id: AssetId,
+        document: &ModelAssetDocument,
+    ) {
         let flags = self
             .model_instances
             .iter()
@@ -4299,7 +4522,24 @@ fn transformed_bounds_corners(instance: &EditorModelInstance) -> [[f32; 3]; 8] {
     })
 }
 
-fn transform_to_matrix(transform: Transform) -> [[f32; 4]; 4] {
+/// Edges of a model instance's bounding box, as index pairs into
+/// [`transformed_bounds_corners`].
+const MODEL_INSTANCE_BOX_EDGES: [[usize; 2]; 12] = [
+    [0, 1],
+    [0, 2],
+    [0, 4],
+    [1, 3],
+    [1, 5],
+    [2, 3],
+    [2, 6],
+    [3, 7],
+    [4, 5],
+    [4, 6],
+    [5, 7],
+    [6, 7],
+];
+
+pub(super) fn transform_to_matrix(transform: Transform) -> [[f32; 4]; 4] {
     let origin = transform.translation;
     let linear_transform = Transform {
         translation: [0.0; 3],
@@ -4318,7 +4558,7 @@ fn transform_to_matrix(transform: Transform) -> [[f32; 4]; 4] {
     ]
 }
 
-fn matrix_to_transform(matrix: [[f32; 4]; 4]) -> Transform {
+pub(super) fn matrix_to_transform(matrix: [[f32; 4]; 4]) -> Transform {
     let mut scale = [0.0; 3];
     for column in 0..3 {
         scale[column] =

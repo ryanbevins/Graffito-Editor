@@ -184,14 +184,6 @@ impl SmsEditorApp {
                     self.show_project_settings = true;
                 }
                 ui.separator();
-                if ui
-                    .selectable_label(self.tool == EditorTool::Goop, "Goop Tool    G")
-                    .on_hover_text("Paint and edit goop surfaces")
-                    .clicked()
-                {
-                    ui.close();
-                    self.tool = EditorTool::Goop;
-                }
                 ui.menu_button("Routes", |ui| {
                     let mut route_mode = self.route_mode;
                     if ui.checkbox(&mut route_mode, "Edit Routes").changed() {
@@ -261,6 +253,60 @@ impl SmsEditorApp {
                     } else if self.bottom_tab == BottomTab::Console {
                         self.bottom_tab = BottomTab::Content;
                     }
+                }
+            });
+
+            ui.menu_button("Tools", |ui| {
+                let goop_active = self.tool == EditorTool::Goop;
+                if ui
+                    .selectable_label(goop_active, "Goop Tool")
+                    .on_hover_text(if goop_active {
+                        "Leave the goop tool"
+                    } else {
+                        "Paint and edit goop surfaces"
+                    })
+                    .clicked()
+                {
+                    ui.close();
+                    // Same toggle rule as the viewport toolbar: picking the
+                    // active tool again drops back to Select.
+                    self.tool = self.tool.after_toolbar_click(EditorTool::Goop);
+                }
+
+                let vertex_active = self.tool == EditorTool::VertexPaint;
+                if ui
+                    .selectable_label(vertex_active, "Vertex Paint Tool")
+                    .on_hover_text("Paint per-vertex colour across the stage terrain")
+                    .clicked()
+                {
+                    ui.close();
+                    self.tool = self.tool.after_toolbar_click(EditorTool::VertexPaint);
+                }
+
+                let boolean_active = self.tool == EditorTool::Boolean;
+                if ui
+                    .selectable_label(boolean_active, "Boolean Cut Tool")
+                    .on_hover_text("Cut terrain along where another mesh crosses it")
+                    .clicked()
+                {
+                    ui.close();
+                    self.tool = self.tool.after_toolbar_click(EditorTool::Boolean);
+                }
+
+                ui.separator();
+                // Placeholders for tools that do not exist yet. Deliberately
+                // disabled rather than inert-but-clickable, so the menu cannot
+                // imply behaviour the editor does not have.
+                for (label, hint) in [
+                    (
+                        "Route Tool",
+                        "Not implemented yet. Routes are edited from the Edit menu.",
+                    ),
+                    ("Sound Instance Tool", "Not implemented yet."),
+                    ("Camera Tool", "Not implemented yet."),
+                ] {
+                    ui.add_enabled(false, egui::Button::new(label))
+                        .on_disabled_hover_text(hint);
                 }
             });
 
@@ -342,7 +388,7 @@ impl SmsEditorApp {
             }
 
             ui.separator();
-            if ui
+            let snapping = ui
                 .selectable_label(
                     self.snap_enabled,
                     if self.snap_enabled {
@@ -351,11 +397,20 @@ impl SmsEditorApp {
                         "Snapping Off"
                     },
                 )
-                .on_hover_text("Enable or disable transform snapping")
-                .clicked()
-            {
+                .on_hover_text("Enable or disable transform snapping. Right-click for more");
+            if snapping.clicked() {
                 self.snap_enabled = !self.snap_enabled;
             }
+            // Written back after the menu closes over `ui`.
+            let mut content_aware = self.content_aware_snap;
+            snapping.context_menu(|ui| {
+                ui.checkbox(&mut content_aware, "Content aware snap")
+                    .on_hover_text(
+                        "Let moved items ride over the geometry beneath them instead of \
+                         sinking through it",
+                    );
+            });
+            self.content_aware_snap = content_aware;
             ui.add_enabled_ui(self.snap_enabled, |ui| {
                 ui.add(
                     egui::DragValue::new(&mut self.snap_translation)
@@ -584,6 +639,23 @@ impl SmsEditorApp {
         }
         if save_name {
             self.persist_project_settings(true);
+        }
+
+        if self.current_project.is_some() {
+            let mut clickable = self.stage_geometry_clickable();
+            if ui
+                .checkbox(&mut clickable, "Stage glb/bmd clickable in viewport")
+                .on_hover_text(
+                    "Let authored stage models answer viewport clicks. Turn this off to click \
+                     straight through the stage to the actors standing on it.",
+                )
+                .changed()
+            {
+                if let Some(project) = self.current_project.as_mut() {
+                    project.descriptor.stage_geometry_clickable = clickable;
+                }
+                self.persist_project_settings(false);
+            }
         }
 
         ui.add_space(8.0);
@@ -1373,6 +1445,14 @@ impl SmsEditorApp {
     }
 
     pub(super) fn inspector_panel(&mut self, ui: &mut egui::Ui) {
+        if self.tool == EditorTool::VertexPaint {
+            self.vertex_paint_panel(ui);
+            return;
+        }
+        if self.tool == EditorTool::Boolean {
+            self.boolean_cut_panel(ui);
+            return;
+        }
         if self.tool == EditorTool::Goop {
             self.goop_inspector_panel(ui);
             return;
@@ -2598,10 +2678,11 @@ fn is_palette_service_type(type_name: &str) -> bool {
 fn tool_shortcut(tool: EditorTool) -> &'static str {
     match tool {
         EditorTool::Select => "Q",
+        EditorTool::VertexPaint | EditorTool::Boolean => "Tools menu",
         EditorTool::Move => "W",
         EditorTool::Rotate => "E",
         EditorTool::Scale => "R",
-        EditorTool::Goop => "G",
+        EditorTool::Goop => "Tools menu",
         EditorTool::Place => "Content Browser",
     }
 }

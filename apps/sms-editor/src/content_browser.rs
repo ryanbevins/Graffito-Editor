@@ -370,6 +370,7 @@ enum ContentBrowserCommand {
     ArmModel(sms_authoring::AssetId),
     SpawnModel(sms_authoring::AssetId),
     EditModel(sms_authoring::AssetId),
+    ReplaceModelSource(sms_authoring::AssetId),
     ApplySkybox(RetailSkyboxEntry),
     ApplySkyboxPath(String),
     PreviewMusic(u32),
@@ -2425,6 +2426,9 @@ impl SmsEditorApp {
                 self.spawn_model_instance_at(asset_id, self.default_spawn_position());
                 self.content_browser.inspector_active = false;
             }
+            ContentBrowserCommand::ReplaceModelSource(asset_id) => {
+                self.begin_model_source_replacement(asset_id);
+            }
             ContentBrowserCommand::EditModel(asset_id) => {
                 self.select_model_asset(asset_id);
                 self.content_browser.inspector_active = false;
@@ -2607,6 +2611,16 @@ impl SmsEditorApp {
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Edit Asset").clicked() {
                         command = Some(ContentBrowserCommand::EditModel(*asset_id));
+                    }
+                    if ui
+                        .add_enabled(item.capabilities.editable, egui::Button::new("Replace GLB"))
+                        .on_hover_text(
+                            "Re-import this asset from another glTF or GLB. Every instance \
+                             already placed keeps pointing at it.",
+                        )
+                        .clicked()
+                    {
+                        command = Some(ContentBrowserCommand::ReplaceModelSource(*asset_id));
                     }
                     if ui
                         .add_enabled(item.capabilities.place, egui::Button::new("Place"))

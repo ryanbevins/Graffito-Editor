@@ -39,6 +39,7 @@ use sms_schema::{
 mod active_placement;
 mod audio_helpers;
 mod audio_preview;
+mod boolean_cut;
 mod browser_settings;
 mod camera;
 mod content_browser;
@@ -62,7 +63,9 @@ mod routes;
 mod scene_labels;
 mod skybox_library;
 mod stage_creation;
+mod triangle_bvh;
 mod ui_panels;
+mod vertex_paint;
 mod viewport_ui;
 
 use active_placement::*;
@@ -83,6 +86,7 @@ use project_ui::{path_display_row, NewProjectDraft};
 use scene_labels::*;
 use skybox_library::*;
 use stage_creation::{insert_authored_scene_archive, NewStageDraft};
+use vertex_paint::*;
 
 const VIEWPORT_NEAR_CLIP: f32 = 8.0;
 const FULL_DELFINO_PROGRESSION: f32 = 1.0;
@@ -123,6 +127,10 @@ pub fn run() -> eframe::Result<()> {
 enum EditorTool {
     /// Selection only: picks and highlights without raising a transform gizmo.
     Select,
+    /// Paints per-vertex colour into the stage terrain assets.
+    VertexPaint,
+    /// Cuts stage terrain along where another mesh crosses it.
+    Boolean,
     Move,
     Rotate,
     Scale,
@@ -166,6 +174,26 @@ impl GizmoAxis {
             Self::Z => [0.0, 0.0, 1.0],
         }
     }
+}
+
+/// What a grab is moving. Authored instances keep their own undo stack and
+/// save path, so they cannot share the scene-object transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrabTarget {
+    Object,
+    ModelInstance,
+}
+
+/// A Blender-style modal grab: `G` starts it, `X`/`Y`/`Z` constrain it to a
+/// world axis, a click or Enter commits, Escape or right-click reverts.
+#[derive(Debug, Clone, Copy)]
+struct GrabDrag {
+    target: GrabTarget,
+    start_transform: Transform,
+    start_pointer: egui::Pos2,
+    /// `None` moves in the camera plane, as Blender's unconstrained grab does.
+    axis: Option<GizmoAxis>,
+    world_units_per_pixel: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -257,6 +285,8 @@ impl EditorTool {
     fn label(self) -> &'static str {
         match self {
             Self::Select => "Select",
+            Self::VertexPaint => "Vertex Paint",
+            Self::Boolean => "Boolean Cut",
             Self::Move => "Move",
             Self::Rotate => "Rotate",
             Self::Scale => "Scale",
@@ -276,7 +306,10 @@ impl EditorTool {
     }
 
     fn after_keyboard_shortcut(self, key: egui::Key) -> Self {
-        if self == Self::Goop && key != egui::Key::G {
+        // Goop is reached from the Tools menu now. `G` starts a viewport grab,
+        // so it can no longer double as a tool switch, and Goop keeps owning
+        // the keyboard while it is active so a grab cannot fire mid-paint.
+        if self == Self::Goop {
             return self;
         }
 
@@ -285,7 +318,6 @@ impl EditorTool {
             egui::Key::W => Self::Move,
             egui::Key::E => Self::Rotate,
             egui::Key::R => Self::Scale,
-            egui::Key::G => Self::Goop,
             _ => self,
         }
     }
@@ -1265,6 +1297,43 @@ struct SmsEditorApp {
     show_fps: bool,
     applied_window_title: String,
     snap_enabled: bool,
+    vertex_paint_mode: VertexPaintMode,
+    vertex_paint_color: [f32; 3],
+    vertex_paint_radius: f32,
+    vertex_paint_strength: f32,
+    vertex_paint_sun_yaw: f32,
+    vertex_paint_sun_pitch: f32,
+    vertex_paint_sun_softness: f32,
+    vertex_paint_sun_shadow: f32,
+    vertex_paint_ao_strength: f32,
+    vertex_paint_ao_distance: f32,
+    vertex_paint_ao_rays: u32,
+    boolean_cutter: Option<sms_authoring::AssetId>,
+    boolean_cut_hole: bool,
+    boolean_cut_axis: usize,
+    vertex_paint_smooth_iterations: u32,
+    vertex_paint_sun_smooth_normals: bool,
+    vertex_paint_ramp_axis: usize,
+    vertex_paint_ramp_start: f32,
+    vertex_paint_ramp_end: f32,
+    vertex_paint_ramp_curve: f32,
+    vertex_paint_ramp_invert: bool,
+    vertex_paint_stroke: Vec<egui::Pos2>,
+    /// The stroke in progress, held in memory so the viewport can show paint
+    /// going down before anything reaches the catalog.
+    vertex_paint_live: Option<VertexPaintLiveStroke>,
+    /// What the held modifiers would paint, used to colour the brush ring and
+    /// to pick the mode a new stroke latches.
+    vertex_paint_modifier_mode: Option<VertexPaintMode>,
+    vertex_paint_undo_stack: VecDeque<VertexPaintUndoRecord>,
+    vertex_paint_redo_stack: VecDeque<VertexPaintUndoRecord>,
+    vertex_paint_undo_group: Option<VertexPaintUndoRecord>,
+    vertex_paint_cursor: Option<([f32; 3], [f32; 3])>,
+    vertex_paint_rect: Option<egui::Rect>,
+    /// Stage whose terrain has been given vertex-colour materials.
+    vertex_paint_prepared: Option<String>,
+    /// Keeps a moved item from sinking through the geometry under it.
+    content_aware_snap: bool,
     snap_translation: f32,
     snap_rotation: f32,
     snap_scale: f32,
@@ -1321,6 +1390,7 @@ struct SmsEditorApp {
     camera_state_changed_at: Instant,
     hovered_gizmo_axis: Option<GizmoAxis>,
     gizmo_drag: Option<GizmoDrag>,
+    grab_drag: Option<GrabDrag>,
     next_object_serial: u32,
     saved_objects: Vec<SceneObject>,
     saved_lighting: StageLighting,
@@ -1537,6 +1607,37 @@ impl Default for SmsEditorApp {
             show_fps: false,
             applied_window_title: String::new(),
             snap_enabled: true,
+            vertex_paint_mode: VertexPaintMode::default(),
+            vertex_paint_color: [1.0, 0.25, 0.25],
+            vertex_paint_radius: 28.0,
+            vertex_paint_strength: 0.75,
+            vertex_paint_sun_yaw: 34.0,
+            vertex_paint_sun_pitch: 46.0,
+            vertex_paint_sun_softness: 0.5,
+            vertex_paint_sun_shadow: 0.6,
+            vertex_paint_ao_strength: 0.7,
+            vertex_paint_ao_distance: 400.0,
+            vertex_paint_ao_rays: 64,
+            boolean_cutter: None,
+            boolean_cut_hole: true,
+            boolean_cut_axis: 1,
+            vertex_paint_smooth_iterations: 1,
+            vertex_paint_sun_smooth_normals: true,
+            vertex_paint_ramp_axis: 1,
+            vertex_paint_ramp_start: 0.0,
+            vertex_paint_ramp_end: 1.0,
+            vertex_paint_ramp_curve: 1.0,
+            vertex_paint_ramp_invert: false,
+            vertex_paint_stroke: Vec::new(),
+            vertex_paint_live: None,
+            vertex_paint_modifier_mode: None,
+            vertex_paint_undo_stack: VecDeque::new(),
+            vertex_paint_redo_stack: VecDeque::new(),
+            vertex_paint_undo_group: None,
+            vertex_paint_cursor: None,
+            vertex_paint_rect: None,
+            vertex_paint_prepared: None,
+            content_aware_snap: false,
             snap_translation: 50.0,
             snap_rotation: 15.0,
             snap_scale: 0.1,
@@ -1585,6 +1686,7 @@ impl Default for SmsEditorApp {
             camera_state_changed_at: Instant::now(),
             hovered_gizmo_axis: None,
             gizmo_drag: None,
+            grab_drag: None,
             next_object_serial: 1,
             saved_objects: Vec::new(),
             saved_lighting: StageLighting::default(),
@@ -1684,9 +1786,6 @@ impl SmsEditorApp {
         }
         if ctx.input(|i| i.key_pressed(egui::Key::R)) {
             self.tool = self.tool.after_keyboard_shortcut(egui::Key::R);
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::G)) {
-            self.tool = self.tool.after_keyboard_shortcut(egui::Key::G);
         }
     }
 }
@@ -2638,6 +2737,9 @@ impl SmsEditorApp {
         self.confirm_delete_generated_goop = false;
         self.goop_undo_stack.clear();
         self.goop_redo_stack.clear();
+        self.vertex_paint_undo_stack.clear();
+        self.vertex_paint_redo_stack.clear();
+        self.vertex_paint_undo_group = None;
         if has_scene_index {
             self.scene_labels = scene_labels;
             self.retail_skyboxes = retail_skyboxes;

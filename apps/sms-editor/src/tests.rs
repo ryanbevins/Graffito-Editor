@@ -267,9 +267,11 @@ fn transform_shortcuts_do_not_exit_goop_mode() {
         EditorTool::Move.after_keyboard_shortcut(egui::Key::E),
         EditorTool::Rotate
     );
+    // G no longer switches tools: it starts a viewport grab, and Goop is
+    // reached from the Tools menu.
     assert_eq!(
         EditorTool::Move.after_keyboard_shortcut(egui::Key::G),
-        EditorTool::Goop
+        EditorTool::Move
     );
 }
 
@@ -4837,7 +4839,7 @@ fn select_tool_is_reachable_and_raises_no_gizmo() {
     );
     assert_eq!(
         EditorTool::Select.after_keyboard_shortcut(egui::Key::G),
-        EditorTool::Goop
+        EditorTool::Select
     );
     // Goop keeps owning its own shortcuts.
     assert_eq!(
@@ -5040,4 +5042,61 @@ fn k_keeps_a_downward_camera_angle_alone() {
     app.renderer.camera_mut().pitch_degrees = -45.0;
     app.frame_world_origin();
     assert_eq!(app.renderer.camera().pitch_degrees, -45.0);
+}
+
+#[test]
+fn the_tools_menu_toggles_goop_off_again() {
+    // Picking the active tool a second time drops back to Select, so the goop
+    // tool can be left without hunting for another one.
+    assert_eq!(
+        EditorTool::Move.after_toolbar_click(EditorTool::Goop),
+        EditorTool::Goop
+    );
+    assert_eq!(
+        EditorTool::Goop.after_toolbar_click(EditorTool::Goop),
+        EditorTool::Select
+    );
+}
+
+#[test]
+fn goop_keeps_its_keys_while_active() {
+    // Goop owns the keyboard while it is the active tool, so a grab or a tool
+    // switch cannot fire underneath it mid-paint.
+    for key in [
+        egui::Key::Q,
+        egui::Key::W,
+        egui::Key::E,
+        egui::Key::R,
+        egui::Key::G,
+    ] {
+        assert_eq!(
+            EditorTool::Goop.after_keyboard_shortcut(key),
+            EditorTool::Goop
+        );
+    }
+}
+
+#[test]
+fn triangle_height_lookup_covers_its_own_column() {
+    // Flat quad corner at y = 40 spanning the origin.
+    let flat = [[0.0, 40.0, 0.0], [100.0, 40.0, 0.0], [0.0, 40.0, 100.0]];
+    assert_eq!(
+        crate::viewport_ui::triangle_height_at_xz(flat, 10.0, 10.0),
+        Some(40.0)
+    );
+    // Outside the triangle, so nothing underfoot.
+    assert_eq!(
+        crate::viewport_ui::triangle_height_at_xz(flat, 90.0, 90.0),
+        None
+    );
+    // A ramp interpolates rather than picking a corner.
+    let ramp = [[0.0, 0.0, 0.0], [100.0, 100.0, 0.0], [0.0, 0.0, 100.0]];
+    let height = crate::viewport_ui::triangle_height_at_xz(ramp, 50.0, 10.0).expect("on the ramp");
+    assert!((height - 50.0).abs() < 0.001, "got {height}");
+    // A vertical face has no column to stand on.
+    let wall = [[0.0, 0.0, 0.0], [0.0, 100.0, 0.0], [0.0, 0.0, 100.0]];
+    assert_eq!(
+        crate::viewport_ui::triangle_height_at_xz(wall, 10.0, 10.0),
+        None
+    );
 }

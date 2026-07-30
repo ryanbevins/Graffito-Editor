@@ -147,6 +147,23 @@ fn preview_triangle_writes_opaque_depth(
     ) && !preview_triangle_is_translucent(preview, triangle)
 }
 
+/// Height of `triangle` directly above or below `(x, z)`, if it covers that
+/// column. Barycentric in the XZ plane, so vertical faces simply miss.
+pub(super) fn triangle_height_at_xz(vertices: [[f32; 3]; 3], x: f32, z: f32) -> Option<f32> {
+    let [a, b, c] = vertices;
+    let area = (b[0] - a[0]) * (c[2] - a[2]) - (c[0] - a[0]) * (b[2] - a[2]);
+    if area.abs() < f32::EPSILON {
+        return None;
+    }
+    let u = ((b[0] - x) * (c[2] - z) - (c[0] - x) * (b[2] - z)) / area;
+    let v = ((c[0] - x) * (a[2] - z) - (a[0] - x) * (c[2] - z)) / area;
+    let w = 1.0 - u - v;
+    let inside = (-1e-4..=1.0 + 1e-4).contains(&u)
+        && (-1e-4..=1.0 + 1e-4).contains(&v)
+        && (-1e-4..=1.0 + 1e-4).contains(&w);
+    inside.then(|| a[1] * u + b[1] * v + c[1] * w)
+}
+
 fn preview_triangle_is_placement_surface(triangle: &PreviewTriangle) -> bool {
     matches!(
         triangle.render_layer,
@@ -461,6 +478,15 @@ impl SmsEditorApp {
             self.mark_viewport_interaction(ui);
         }
 
+        // A grab owns the viewport while it runs. Returning here keeps the
+        // click that commits it from falling through to the selection code,
+        // which would otherwise re-pick whatever sits under the pointer and
+        // drop the selection the grab was just moving.
+        if self.handle_grab_input(ui, rect, response) {
+            self.mark_viewport_interaction(ui);
+            return;
+        }
+
         if self.handle_viewport_keyboard_fly(ui, fly_navigation_active) {
             self.mark_viewport_interaction(ui);
         }
@@ -493,6 +519,11 @@ impl SmsEditorApp {
             }
         }
 
+        if self.handle_vertex_paint_input(ui, rect, response) {
+            self.mark_viewport_interaction(ui);
+            return;
+        }
+
         if self.handle_goop_viewport_input(ui, rect, response) {
             self.mark_viewport_interaction(ui);
             return;
@@ -501,11 +532,26 @@ impl SmsEditorApp {
         if response.clicked() && self.hovered_gizmo_axis.is_none() && !gizmo_using_pointer {
             self.content_browser.inspector_active = false;
             if let Some(pos) = response.interact_pointer_pos() {
-                let model_instance_id = self.model_instance_at_screen_position(rect, pos);
-                let object_id = model_instance_id
-                    .is_none()
-                    .then(|| self.object_at_screen_position(rect, pos))
+                // A precise mesh hit on an authored instance wins outright.
+                // Its bounding box does not: the box encloses everything
+                // standing on the model, so clicking an actor sat on top of a
+                // large glb would otherwise select the glb underneath it.
+                let hit_object = self.object_at_screen_position(rect, pos);
+                let model_instance_id = self
+                    .stage_geometry_clickable()
+                    .then(|| {
+                        self.model_instance_mesh_hit_at_screen_position(rect, pos)
+                            .or_else(|| {
+                                hit_object
+                                    .is_none()
+                                    .then(|| {
+                                        self.model_instance_bounds_hit_at_screen_position(rect, pos)
+                                    })
+                                    .flatten()
+                            })
+                    })
                     .flatten();
+                let object_id = model_instance_id.is_none().then_some(hit_object).flatten();
                 let leaving_helper_for_world_selection = self.selected_audio_helper_id.is_some()
                     && (model_instance_id.is_some() || object_id.is_some());
                 if !leaving_helper_for_world_selection
@@ -654,6 +700,14 @@ impl SmsEditorApp {
                     self.snap_rotation,
                     self.snap_scale,
                 );
+                // Dragging the gizmo moves an item just as a grab does, so it
+                // has to respect the same floor. Rotate and scale leave the
+                // translation alone, so the clamp only applies to a move.
+                let transform = if drag.tool == EditorTool::Move {
+                    self.apply_content_aware_floor(drag.start_transform, transform)
+                } else {
+                    transform
+                };
                 if self.route_undo_transaction.is_some() {
                     self.update_selected_route_control_position(transform.translation);
                 } else {
@@ -1167,6 +1221,299 @@ impl SmsEditorApp {
         self.camera_focus_animation = None;
     }
 
+    /// Blender-style modal grab. Returns whether it consumed anything.
+    ///
+    /// `G` starts moving the selection with the pointer, `X`/`Y`/`Z` constrain
+    /// it to a world axis and toggle off when pressed again, a click or Enter
+    /// commits, and Escape or right-click puts it back. `Alt+G` snaps the
+    /// selection to the origin outright. Placed objects and authored model
+    /// instances are both grabbable; they differ only in how the edit lands.
+    fn handle_grab_input(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        response: &egui::Response,
+    ) -> bool {
+        let (grab_pressed, alt, escape, enter, axis_key) = ui.input(|input| {
+            (
+                input.key_pressed(egui::Key::G),
+                input.modifiers.alt,
+                input.key_pressed(egui::Key::Escape),
+                input.key_pressed(egui::Key::Enter),
+                [
+                    (egui::Key::X, GizmoAxis::X),
+                    (egui::Key::Y, GizmoAxis::Y),
+                    (egui::Key::Z, GizmoAxis::Z),
+                ]
+                .into_iter()
+                .find(|(key, _)| input.key_pressed(*key))
+                .map(|(_, axis)| axis),
+            )
+        });
+
+        if self.grab_drag.is_none() {
+            if !response.hovered() || !grab_pressed || self.tool == EditorTool::Goop {
+                return false;
+            }
+            // An authored instance wins when one is selected, matching how the
+            // viewport click path prefers instances over placed objects.
+            let (target, start_transform) =
+                if let Some(transform) = self.selected_instance_transform() {
+                    (GrabTarget::ModelInstance, transform)
+                } else if let Some(object) = self.selected_object() {
+                    (GrabTarget::Object, object.transform)
+                } else {
+                    return false;
+                };
+
+            if alt {
+                // Snap home. A discrete edit, so it lands immediately.
+                let mut transform = start_transform;
+                transform.translation = [0.0; 3];
+                self.apply_grab_commit(target, start_transform, transform, "Moved to origin");
+                return true;
+            }
+
+            let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) else {
+                return false;
+            };
+            let world_units_per_pixel = self
+                .gizmo_geometry(rect, start_transform.translation)
+                .map_or(1.0, |geometry| geometry.world_units_per_pixel);
+            if target == GrabTarget::Object {
+                // Instances record their own undo when the drag lands.
+                self.begin_undo_transaction();
+            }
+            self.grab_drag = Some(GrabDrag {
+                target,
+                start_transform,
+                start_pointer: pointer,
+                axis: None,
+                world_units_per_pixel,
+            });
+            return true;
+        }
+
+        let Some(mut drag) = self.grab_drag else {
+            return false;
+        };
+
+        // Pressing the active axis again releases the constraint, matching
+        // Blender, so a mistaken lock does not need cancelling outright.
+        if let Some(axis) = axis_key {
+            drag.axis = (drag.axis != Some(axis)).then_some(axis);
+            self.grab_drag = Some(drag);
+        }
+
+        if escape || response.secondary_clicked() {
+            self.revert_grab(drag);
+            self.grab_drag = None;
+            return true;
+        }
+
+        let moved = ui
+            .input(|input| input.pointer.interact_pos())
+            .map(|pointer| self.grab_transform(rect, drag, pointer));
+        if let Some(transform) = moved {
+            self.preview_grab(drag.target, transform);
+        }
+
+        if enter || response.clicked() {
+            let end = moved.unwrap_or(drag.start_transform);
+            self.apply_grab_commit(drag.target, drag.start_transform, end, "Moved object");
+            self.grab_drag = None;
+        }
+        true
+    }
+
+    /// Live feedback while dragging, without touching undo.
+    fn preview_grab(&mut self, target: GrabTarget, transform: Transform) {
+        match target {
+            GrabTarget::Object => self.update_selected_transform(transform),
+            GrabTarget::ModelInstance => self.preview_selected_instance_transform(transform),
+        }
+    }
+
+    fn revert_grab(&mut self, drag: GrabDrag) {
+        match drag.target {
+            GrabTarget::Object => {
+                self.update_selected_transform(drag.start_transform);
+                // Back where it began, so the transaction records no delta.
+                self.commit_undo_transaction("Moved object");
+            }
+            GrabTarget::ModelInstance => {
+                self.preview_selected_instance_transform(drag.start_transform)
+            }
+        }
+    }
+
+    fn apply_grab_commit(
+        &mut self,
+        target: GrabTarget,
+        start: Transform,
+        end: Transform,
+        label: &str,
+    ) {
+        match target {
+            GrabTarget::Object => {
+                if self.grab_drag.is_none() {
+                    // Alt+G never opened a transaction.
+                    self.begin_undo_transaction();
+                }
+                self.update_selected_transform(end);
+                self.commit_undo_transaction(label);
+            }
+            // Routes through the instance update path, which owns the undo
+            // record, the save, and the goop re-check for moved terrain.
+            GrabTarget::ModelInstance => self.commit_selected_instance_transform(start, end),
+        }
+    }
+
+    /// Highest placement surface under `(x, z)` that sits at or below
+    /// `ceiling`.
+    ///
+    /// `ceiling` is the height the grab started from, so an item keeps to the
+    /// floor it was already above rather than catching on a roof it was under.
+    fn ground_height_below(
+        &self,
+        x: f32,
+        z: f32,
+        ceiling: f32,
+        ignore_model: Option<usize>,
+    ) -> Option<f32> {
+        let preview = self.model_preview.as_ref()?;
+        let mut best = f32::NEG_INFINITY;
+        for triangle in preview.triangles.iter().filter(|triangle| {
+            preview_triangle_is_placement_surface(triangle)
+                && ignore_model.is_none_or(|model| triangle.model_index != model)
+        }) {
+            let Some(height) = triangle_height_at_xz(triangle.vertices, x, z) else {
+                continue;
+            };
+            if height <= ceiling && height > best {
+                best = height;
+            }
+        }
+        best.is_finite().then_some(best)
+    }
+
+    fn grab_transform(&self, rect: egui::Rect, drag: GrabDrag, pointer: egui::Pos2) -> Transform {
+        let mut transform = drag.start_transform;
+        let delta = pointer - drag.start_pointer;
+        match drag.axis {
+            Some(axis) => {
+                let direction = self
+                    .gizmo_geometry(rect, drag.start_transform.translation)
+                    .map_or(egui::Vec2::ZERO, |geometry| {
+                        geometry.axes[axis.index()].direction
+                    });
+                let pixels = delta.x * direction.x + delta.y * direction.y;
+                let index = axis.index();
+                let mut value =
+                    drag.start_transform.translation[index] + pixels * drag.world_units_per_pixel;
+                if self.snap_enabled && self.snap_translation > f32::EPSILON {
+                    value = snap_value(value, self.snap_translation);
+                }
+                transform.translation[index] = value;
+            }
+            None => {
+                // Unconstrained grab slides across the camera plane.
+                let frame = self.camera_frame();
+                let world = vec3_add(
+                    vec3_scale(frame.right, delta.x * drag.world_units_per_pixel),
+                    vec3_scale(frame.up, -delta.y * drag.world_units_per_pixel),
+                );
+                transform.translation = vec3_add(drag.start_transform.translation, world);
+                if self.snap_enabled && self.snap_translation > f32::EPSILON {
+                    for value in &mut transform.translation {
+                        *value = snap_value(*value, self.snap_translation);
+                    }
+                }
+            }
+        }
+        self.apply_content_aware_floor(drag.start_transform, transform)
+    }
+
+    /// Preview model index of the current selection, so a move can exclude the
+    /// item's own geometry from tests against the scene.
+    fn selected_model_index(&self) -> Option<usize> {
+        let preview = self.model_preview.as_ref()?;
+        if let Some(id) = self.selected_model_instance_id {
+            return preview.instance_model_indices.get(&id).copied();
+        }
+        let object_id = self.selected_object_id.as_deref()?;
+        preview.object_model_indices.get(object_id).copied()
+    }
+
+    /// Stops a moved item dropping through the geometry it was standing over.
+    ///
+    /// Not a magnet: the item moves freely and is only prevented from sinking
+    /// below the surface under it, so it rides along instead of snapping onto
+    /// it.
+    ///
+    /// The ceiling follows the item's live height rather than where the drag
+    /// began. Anchoring it to the start meant moving onto ground higher than
+    /// that start dropped the constraint entirely, and it re-engaged a frame
+    /// later once the column changed again, which read as the item fighting
+    /// its own position. Tracking the live height instead lets it climb a step
+    /// at a time, and keeps the allowance too small to catch a distant roof.
+    fn apply_content_aware_floor(&self, start: Transform, mut transform: Transform) -> Transform {
+        if !self.content_aware_snap {
+            return transform;
+        }
+        const STEP_ALLOWANCE: f32 = 200.0;
+        // Both inputs, never the clamped output. Feeding the result back in
+        // let each frame raise the ceiling for the next one, so the item
+        // ratcheted upwards on its own.
+        let reference = transform.translation[1].max(start.translation[1]);
+        // Skipping its own mesh: the item's geometry is a placement surface
+        // like any other, so without this it stands on itself and climbs.
+        if let Some(ground) = self.ground_height_below(
+            transform.translation[0],
+            transform.translation[2],
+            reference + STEP_ALLOWANCE,
+            self.selected_model_index(),
+        ) {
+            transform.translation[1] = transform.translation[1].max(ground);
+        }
+        transform
+    }
+
+    /// Draws the constraint guide through the grabbed item, in the same axis
+    /// colours the transform gizmo uses.
+    fn paint_grab_axis_guide(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let Some(drag) = self.grab_drag else {
+            return;
+        };
+        let Some(axis) = drag.axis else {
+            return;
+        };
+        let origin = match drag.target {
+            GrabTarget::Object => self
+                .selected_object()
+                .map(|object| object.transform.translation),
+            GrabTarget::ModelInstance => self
+                .selected_instance_transform()
+                .map(|transform| transform.translation),
+        };
+        let Some(origin) = origin else {
+            return;
+        };
+        // Long enough to read as an infinite constraint line at any zoom.
+        let reach = (self.renderer.camera().distance * 40.0).max(100_000.0);
+        let offset = vec3_scale(axis.world_direction(), reach);
+        let projection = self.camera_projection(rect);
+        let Some([start, end]) = projection
+            .project_world_segment_to_screen(vec3_sub(origin, offset), vec3_add(origin, offset))
+        else {
+            return;
+        };
+        painter.line_segment(
+            [start, end],
+            egui::Stroke::new(1.4, gizmo_axis_color(axis, false)),
+        );
+    }
+
     /// Glides the camera onto the world origin grid.
     ///
     /// Pitch is forced downward only when the camera is level or looking up,
@@ -1234,6 +1581,14 @@ impl SmsEditorApp {
         true
     }
 
+    /// Whether authored stage geometry answers viewport clicks. Sessions with
+    /// no project behave as if it is on.
+    pub(super) fn stage_geometry_clickable(&self) -> bool {
+        self.current_project
+            .as_ref()
+            .is_none_or(|project| project.descriptor.stage_geometry_clickable)
+    }
+
     /// Glides onto the object or model instance under `pos`. Returns false
     /// when the pointer is over bare terrain.
     pub(super) fn focus_camera_on_viewport_position(
@@ -1242,7 +1597,9 @@ impl SmsEditorApp {
         pos: egui::Pos2,
     ) -> bool {
         let target = self
-            .model_instance_at_screen_position(rect, pos)
+            .stage_geometry_clickable()
+            .then(|| self.model_instance_at_screen_position(rect, pos))
+            .flatten()
             .and_then(|id| self.model_instance_focus_target(id))
             .or_else(|| {
                 self.object_at_screen_position(rect, pos)
@@ -1399,6 +1756,8 @@ impl SmsEditorApp {
         if self.renderer.config().show_grid && !grid_is_depth_rendered {
             self.paint_grid(painter, rect);
         }
+        self.paint_vertex_paint_overlay(painter, rect);
+        self.paint_grab_axis_guide(painter, rect);
         self.paint_model_instances(painter, rect);
         self.paint_routes(painter, rect);
         self.paint_audio_helpers(painter, rect);
@@ -2997,7 +3356,11 @@ pub(super) fn transform_from_gizmo_drag(
             transform.scale[axis] = value.max(0.001);
         }
         // These tools raise no gizmo, so they never open a drag to resolve.
-        EditorTool::Select | EditorTool::Goop | EditorTool::Place => {}
+        EditorTool::Select
+        | EditorTool::VertexPaint
+        | EditorTool::Boolean
+        | EditorTool::Goop
+        | EditorTool::Place => {}
     }
     transform
 }

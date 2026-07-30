@@ -3752,6 +3752,9 @@ impl SmsEditorApp {
         if self.tool == EditorTool::Goop && self.undo_goop() {
             return;
         }
+        if self.tool == EditorTool::VertexPaint && self.undo_vertex_paint() {
+            return;
+        }
         if (self.selected_model_instance_id.is_some()
             || (self.selected_object_id.is_none()
                 && self.selected_model_document.is_none()
@@ -3802,6 +3805,9 @@ impl SmsEditorApp {
     pub(super) fn redo(&mut self) {
         self.commit_dialogue_undo_transaction("Updated dialogue text");
         if self.tool == EditorTool::Goop && self.redo_goop() {
+            return;
+        }
+        if self.tool == EditorTool::VertexPaint && self.redo_vertex_paint() {
             return;
         }
         if (self.selected_model_instance_id.is_some()
