@@ -654,54 +654,72 @@ fn build_from_sources_with_common(
                 .or_default()
                 .push(candidate);
         }
-        let mut winner: Option<(usize, Candidate)> = None;
+        // Every variant, best first, rather than one winner. A candidate can
+        // fail to resolve for reasons particular to the stage it was learned
+        // from -- HamuKuri censused from a stage with no goop in it has no
+        // pollution texture to bind, though the same enemy authors cleanly
+        // from any stage that does. Taking the first that resolves keeps the
+        // preference order intact while stopping one unlucky source from
+        // withdrawing the factory altogether.
+        let mut ranked: Vec<(usize, Candidate)> = Vec::new();
         for (_, mut variant) in variants {
             variant.sort_by(compare_candidate);
             let count = variant.len();
-            let candidate = variant.remove(0);
-            if winner.as_ref().is_none_or(|(best_count, best)| {
-                count > *best_count
-                    || (count == *best_count && compare_candidate(&candidate, best).is_lt())
-            }) {
-                winner = Some((count, candidate));
-            }
+            ranked.push((count, variant.remove(0)));
         }
-        let Some((_, candidate)) = winner else {
+        ranked.sort_by(|(left_count, left), (right_count, right)| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| compare_candidate(left, right))
+        });
+
+        let mut resolved: Option<(Candidate, _, _)> = None;
+        let mut rejections: Vec<ObjectAuthoringCatalogWarning> = Vec::new();
+        for (_, candidate) in ranked {
+            let resources = match resolve_resources(&candidate, &sources, registry) {
+                Ok(resources) => resources,
+                Err(reason) => {
+                    rejections.push(ObjectAuthoringCatalogWarning {
+                        source_stage: candidate.source_stage.clone(),
+                        source_asset_path: Some(candidate.source_asset_path.clone()),
+                        message: format!(
+                            "Omitted unsafe authoring candidate '{}': {reason}",
+                            candidate.factory_name
+                        ),
+                    });
+                    continue;
+                }
+            };
+            let table_dependencies = match resolve_runtime_table_dependencies(
+                &candidate.factory_name,
+                &candidate.source_stage,
+                &sources,
+                registry,
+            ) {
+                Ok(dependencies) => dependencies,
+                Err(reason) => {
+                    rejections.push(ObjectAuthoringCatalogWarning {
+                        source_stage: candidate.source_stage.clone(),
+                        source_asset_path: Some(candidate.source_asset_path.clone()),
+                        message: format!(
+                            "Omitted unsafe authoring candidate '{}': {reason}",
+                            candidate.factory_name
+                        ),
+                    });
+                    continue;
+                }
+            };
+            resolved = Some((candidate, resources, table_dependencies));
+            break;
+        }
+
+        let Some((candidate, resources, table_dependencies)) = resolved else {
+            // Only report when nothing worked; a rejection that another stage
+            // covered is noise, not a problem with the factory.
+            warnings.extend(rejections);
             continue;
         };
-        let resources = match resolve_resources(&candidate, &sources, registry) {
-            Ok(resources) => resources,
-            Err(reason) => {
-                warnings.push(ObjectAuthoringCatalogWarning {
-                    source_stage: candidate.source_stage.clone(),
-                    source_asset_path: Some(candidate.source_asset_path.clone()),
-                    message: format!(
-                        "Omitted unsafe authoring candidate '{}': {reason}",
-                        candidate.factory_name
-                    ),
-                });
-                continue;
-            }
-        };
-        let table_dependencies = match resolve_runtime_table_dependencies(
-            &candidate.factory_name,
-            &candidate.source_stage,
-            &sources,
-            registry,
-        ) {
-            Ok(dependencies) => dependencies,
-            Err(reason) => {
-                warnings.push(ObjectAuthoringCatalogWarning {
-                    source_stage: candidate.source_stage.clone(),
-                    source_asset_path: Some(candidate.source_asset_path.clone()),
-                    message: format!(
-                        "Omitted unsafe authoring candidate '{}': {reason}",
-                        candidate.factory_name
-                    ),
-                });
-                continue;
-            }
-        };
+
         let runtime_actor_references = runtime_actor_references(&candidate.factory_name, registry);
         let preview_resource_path = preview_resource_path(&candidate, &resources, registry);
         templates.insert(
@@ -1231,7 +1249,7 @@ fn resolve_resources(
         }
     }
     for replacement in registry.runtime_texture_replacements_for(&candidate.factory_name) {
-        add_stage_reference(
+        add_shared_stage_reference(
             &mut out,
             sources,
             &candidate.source_stage,
@@ -1705,6 +1723,57 @@ fn add_stage_reference(
     description: &str,
     required_stage_local: bool,
 ) -> Result<(), String> {
+    add_stage_reference_inner(
+        out,
+        sources,
+        stage,
+        reference,
+        description,
+        required_stage_local,
+        false,
+    )
+}
+
+/// As [`add_stage_reference`], but a fully qualified reference missing from the
+/// source stage may be taken from any stage that has it.
+///
+/// Only correct for resources whose path is a global identity. A graph is
+/// stage-local data that happens to share a path between stages, so borrowing
+/// one would bind the wrong object -- there is a test for that. An absolute
+/// asset path like "/scene/map/pollution/H_ma_rak.bti" names one file, and
+/// requiring it in the stage a candidate was censused from rejects the actor
+/// for where it was learned: Stus censused from a stage with no goop in it have
+/// no pollution texture to bind, though they author cleanly from a stage that
+/// does.
+fn add_shared_stage_reference(
+    out: &mut BTreeSet<ObjectAuthoringResource>,
+    sources: &[&CatalogSource],
+    stage: &str,
+    reference: &str,
+    description: &str,
+    required_stage_local: bool,
+) -> Result<(), String> {
+    add_stage_reference_inner(
+        out,
+        sources,
+        stage,
+        reference,
+        description,
+        required_stage_local,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_stage_reference_inner(
+    out: &mut BTreeSet<ObjectAuthoringResource>,
+    sources: &[&CatalogSource],
+    stage: &str,
+    reference: &str,
+    description: &str,
+    required_stage_local: bool,
+    allow_shared: bool,
+) -> Result<(), String> {
     let expected = normalize_runtime_reference(reference);
     let exact = expected.contains('/');
     let matches = stage_resources(sources, stage)
@@ -1719,6 +1788,35 @@ fn add_stage_reference(
         })
         .collect::<Vec<_>>();
     match matches.len() {
+        0 if required_stage_local && exact && allow_shared => {
+            // A fully qualified reference names one file, and shared assets
+            // like "/scene/map/pollution/H_ma_rak.bti" live in whichever stages
+            // happen to use them. Requiring it in the stage the candidate was
+            // censused from rejects the enemy for where it was learned rather
+            // than for anything about the enemy: Stus censused from a stage
+            // with no goop in it have no pollution texture to bind.
+            let shared = sources
+                .iter()
+                .flat_map(|source| source.resources.iter())
+                .filter(|resource| {
+                    let path = normalized_path(&resource.raw_resource_path);
+                    path == expected || path.ends_with(&format!("/{expected}"))
+                })
+                .collect::<Vec<_>>();
+            let distinct = shared
+                .iter()
+                .map(|resource| normalized_path(&resource.raw_resource_path))
+                .collect::<BTreeSet<_>>();
+            match distinct.len() {
+                1 => {
+                    out.insert(shared[0].clone());
+                    Ok(())
+                }
+                _ => Err(format!(
+                    "required stage-local {description} {reference:?} was not found in source stage {stage}"
+                )),
+            }
+        }
         0 if required_stage_local => Err(format!(
             "required stage-local {description} {reference:?} was not found in source stage {stage}"
         )),

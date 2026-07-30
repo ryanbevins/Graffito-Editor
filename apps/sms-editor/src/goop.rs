@@ -702,11 +702,12 @@ impl SmsEditorApp {
         if generator_upgrade_pending && generator_upgrade_available {
             self.rebuild_generated_goop_layers();
         }
+        ui.heading("Goop");
+        self.gooble_spawn_section(ui);
         let document = self
             .document
             .as_mut()
             .expect("stage document remains open while drawing goop inspector");
-        ui.heading("Goop");
         ui.horizontal(|ui| {
             ui.selectable_value(
                 &mut self.goop_authoring_mode,
