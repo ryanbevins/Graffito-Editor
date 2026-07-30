@@ -61,6 +61,21 @@ fn restore_paint_state(document: &mut ModelAssetDocument, snapshot: &VertexPaint
     document.clone_from(&snapshot.document);
 }
 
+/// Hue rotation, split into its constant, cosine and sine parts so a rotation
+/// is three dot products rather than a conversion out to HSV and back.
+const HUE_LUMA: [f32; 3] = [0.213, 0.715, 0.072];
+const HUE_ROTATION: [[f32; 3]; 3] = [HUE_LUMA, HUE_LUMA, HUE_LUMA];
+const HUE_COSINE: [[f32; 3]; 3] = [
+    [1.0 - HUE_LUMA[0], -HUE_LUMA[1], -HUE_LUMA[2]],
+    [-HUE_LUMA[0], 1.0 - HUE_LUMA[1], -HUE_LUMA[2]],
+    [-HUE_LUMA[0], -HUE_LUMA[1], 1.0 - HUE_LUMA[2]],
+];
+const HUE_SINE: [[f32; 3]; 3] = [
+    [-HUE_LUMA[0], -HUE_LUMA[1], 1.0 - HUE_LUMA[2]],
+    [0.143, 0.140, -0.283],
+    [-(1.0 - HUE_LUMA[0]), HUE_LUMA[1], HUE_LUMA[2]],
+];
+
 /// A non-destructive grade over vertex colours.
 ///
 /// Held open while the sliders are being moved so every change re-grades the
@@ -81,6 +96,8 @@ pub(super) struct VertexPaintGradeSettings {
     pub(super) exposure: f32,
     pub(super) contrast: f32,
     pub(super) vibrance: f32,
+    /// Degrees around the colour wheel.
+    pub(super) hue: f32,
     /// Positive deepens the dark end, negative lifts it. Weighted by how dark
     /// a vertex already is, so it reaches shadow without touching highlights
     /// the way exposure would.
@@ -95,6 +112,7 @@ impl Default for VertexPaintGradeSettings {
             exposure: 0.0,
             contrast: 0.0,
             vibrance: 0.0,
+            hue: 0.0,
             shadow: 0.0,
             tint: [1.0, 1.0, 1.0],
             tint_amount: 0.0,
@@ -108,11 +126,12 @@ impl VertexPaintGradeSettings {
         self.exposure == 0.0
             && self.contrast == 0.0
             && self.vibrance == 0.0
+            && self.hue == 0.0
             && self.shadow == 0.0
             && self.tint_amount == 0.0
     }
 
-    fn apply(self, color: &mut [f32; 4]) {
+    pub(super) fn apply(self, color: &mut [f32; 4]) {
         let exposure = self.exposure.exp2();
         for channel in color.iter_mut().take(3) {
             *channel *= exposure;
@@ -134,6 +153,28 @@ impl VertexPaintGradeSettings {
         let reach = 1.0 + self.vibrance * (1.0 - (high - low).clamp(0.0, 1.0));
         for channel in color.iter_mut().take(3) {
             *channel = luma + (*channel - luma) * reach;
+        }
+
+        // Rotation about the grey axis, which keeps luminance where it is:
+        // spinning hue should recolour a bake, not relight it. The constants
+        // are the usual luma weights carried through the rotation.
+        if self.hue != 0.0 {
+            let (sin, cos) = self.hue.to_radians().sin_cos();
+            let rotated: [f32; 3] = std::array::from_fn(|channel| {
+                let weights = HUE_ROTATION[channel];
+                weights[0] * color[0]
+                    + weights[1] * color[1]
+                    + weights[2] * color[2]
+                    + cos
+                        * (HUE_COSINE[channel][0] * color[0]
+                            + HUE_COSINE[channel][1] * color[1]
+                            + HUE_COSINE[channel][2] * color[2])
+                    + sin
+                        * (HUE_SINE[channel][0] * color[0]
+                            + HUE_SINE[channel][1] * color[1]
+                            + HUE_SINE[channel][2] * color[2])
+            });
+            color[..3].copy_from_slice(&rotated);
         }
 
         // Shadow after vibrance, before tint. The weight is how dark the
@@ -1135,6 +1176,76 @@ impl SmsEditorApp {
     }
 
     /// Resets every terrain vertex to opaque white.
+    /// Rewinds triangles whose winding disagrees with their own vertex normals.
+    ///
+    /// A mesh can arrive with its faces wound against its normals, and baking
+    /// as terrain is where it shows: the surface is drawn from the other side
+    /// and reads as inside out. The normals are the intent, so the winding is
+    /// what gets corrected, and only on the triangles that actually disagree.
+    /// A mesh that is already consistent is left exactly as it was.
+    pub(super) fn repair_terrain_winding(&mut self) {
+        let mut targets = self.terrain_paint_targets_scoped(true);
+        if targets.is_empty() {
+            self.log.push(
+                "Select a terrain instance in the hierarchy before repairing winding.".to_string(),
+            );
+            return;
+        }
+        let mut flipped = 0usize;
+        let mut checked = 0usize;
+        for target in &mut targets {
+            for mesh in &mut target.document.meshes {
+                for primitive in &mut mesh.primitives {
+                    let positions = primitive.positions.clone();
+                    let normals = primitive.normals.clone();
+                    for face in primitive.indices.chunks_exact_mut(3) {
+                        let corners = [face[0] as usize, face[1] as usize, face[2] as usize];
+                        let Some(corner_positions) = corners
+                            .iter()
+                            .map(|index| positions.get(*index).copied())
+                            .collect::<Option<Vec<_>>>()
+                        else {
+                            continue;
+                        };
+                        let geometric = vec3_cross(
+                            vec3_sub(corner_positions[1], corner_positions[0]),
+                            vec3_sub(corner_positions[2], corner_positions[0]),
+                        );
+                        // A sliver has no reliable facing, so leave it rather
+                        // than flip it on rounding noise.
+                        if vec3_dot(geometric, geometric) <= 1e-8 {
+                            continue;
+                        }
+                        let intended = corners
+                            .iter()
+                            .filter_map(|index| normals.get(*index))
+                            .fold([0.0f32; 3], |sum, normal| vec3_add(sum, *normal));
+                        if vec3_dot(intended, intended) <= 1e-8 {
+                            continue;
+                        }
+                        checked += 1;
+                        if vec3_dot(geometric, intended) < 0.0 {
+                            face.swap(1, 2);
+                            flipped += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if flipped == 0 {
+            self.log.push(format!(
+                "Winding already agrees with the normals across {checked} triangle(s); nothing                  to repair."
+            ));
+            return;
+        }
+        // Geometry only, so the colour channel switch is left alone.
+        self.commit_terrain_targets(targets, "Repaired terrain winding", false);
+        self.log.push(format!(
+            "Rewound {flipped} of {checked} triangle(s) to face the way their normals point."
+        ));
+    }
+
     pub(super) fn clear_terrain_vertex_colors(&mut self) {
         let mut targets = self.terrain_paint_targets_scoped(true);
         if targets.is_empty() {
@@ -2076,6 +2187,15 @@ impl SmsEditorApp {
                 self.smooth_terrain_vertex_colors();
             }
             if ui
+                .button("Fix Facing")
+                .on_hover_text(
+                    "Rewind triangles that face away from their own normals, which is what                      makes a mesh look inside out once it bakes as terrain",
+                )
+                .clicked()
+            {
+                self.repair_terrain_winding();
+            }
+            if ui
                 .button("Clear Paint")
                 .on_hover_text(
                     "Reset the terrain to its material diffuse, dropping paint and bakes",
@@ -2137,6 +2257,13 @@ impl SmsEditorApp {
                     .text("Vibrance"),
             )
             .on_hover_text("Leans on the duller colours, so painted patches do not blow out first")
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.vertex_paint_grade_settings.hue, -180.0..=180.0)
+                    .text("Hue"),
+            )
+            .on_hover_text("Rotates the colours without changing how light they are")
             .changed();
         changed |= ui
             .add(

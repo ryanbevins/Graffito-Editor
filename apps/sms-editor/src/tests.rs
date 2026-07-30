@@ -5225,3 +5225,45 @@ fn escape_leaves_placement_mode() {
     // Nothing to cancel, so Escape stays available to whatever else wants it.
     assert!(!app.cancel_active_placement());
 }
+
+/// Hue rotation recolours without relighting.
+///
+/// The matrix constants are written out by hand rather than derived, so the
+/// property that justifies them is worth pinning: spinning hue must leave
+/// luminance where it was, or grading a bake would quietly change its shading.
+#[test]
+fn rotating_hue_holds_luminance_and_leaves_grey_alone() {
+    let luma = |color: [f32; 4]| 0.213 * color[0] + 0.715 * color[1] + 0.072 * color[2];
+    let mut settings = crate::vertex_paint::VertexPaintGradeSettings::default();
+
+    for degrees in [-180.0, -90.0, -33.0, 0.0, 45.0, 120.0, 180.0] {
+        settings.hue = degrees;
+
+        // Kept away from the edge of the gamut on purpose. A saturated colour
+        // rotates to a negative channel, and clamping that back into range is
+        // what moves its luminance -- the rotation is exact, staying in gamut
+        // is not.
+        for start in [
+            [0.60, 0.45, 0.50, 1.0],
+            [0.45, 0.55, 0.50, 1.0],
+            [0.35, 0.35, 0.35, 1.0],
+        ] {
+            let mut color = start;
+            settings.apply(&mut color);
+            assert!(
+                (luma(color) - luma(start)).abs() < 0.005,
+                "hue {degrees} moved luminance of {start:?} to {color:?}"
+            );
+        }
+
+        // Grey has no hue to turn, so it has to come back untouched.
+        let mut grey = [0.5, 0.5, 0.5, 1.0];
+        settings.apply(&mut grey);
+        for channel in grey.iter().take(3) {
+            assert!(
+                (channel - 0.5).abs() < 0.01,
+                "hue {degrees} tinted grey: {grey:?}"
+            );
+        }
+    }
+}
