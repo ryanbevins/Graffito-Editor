@@ -486,6 +486,45 @@ fn primitive_colors_mut(
     values
 }
 
+/// The vertex colour that means "unshaded", per primitive, as a luma level.
+///
+/// This is decided by the TEV program the importer writes, not by taste:
+///
+/// - A textured material gets `out = RASC * TEXC`, so the vertex colour
+///   multiplies the texture. White leaves it alone and nothing above white
+///   exists, so neutral is 1.0 and the colour can only ever darken.
+/// - An untextured material gets `out = RASC`, so the vertex colour is the
+///   surface. Neutral is the material's own base colour, and white is not
+///   neutral at all -- it is a white surface.
+///
+/// Measuring shade against the brightest vertex a mesh happens to carry looks
+/// similar until something is baked, at which point no vertex sits at neutral
+/// any more and the reference sinks with the bake, so a lift can never restore
+/// what the bake took.
+fn document_primitive_unshaded(document: &ModelAssetDocument) -> Vec<f32> {
+    let luma = |value: [f32; 4]| 0.299 * value[0] + 0.587 * value[1] + 0.114 * value[2];
+    let levels = document
+        .materials
+        .iter()
+        .map(|material| match material.base_color_texture.is_some() {
+            true => 1.0,
+            false => luma(material.source_base_color),
+        })
+        .collect::<Vec<_>>();
+    document
+        .meshes
+        .iter()
+        .flat_map(|mesh| &mesh.primitives)
+        .map(|primitive| {
+            primitive
+                .material
+                .and_then(|index| levels.get(index as usize))
+                .copied()
+                .unwrap_or(1.0)
+        })
+        .collect()
+}
+
 /// The material diffuse each primitive of a document should fall back to.
 fn document_primitive_diffuse(document: &ModelAssetDocument) -> Vec<[f32; 4]> {
     let materials = document
@@ -2379,24 +2418,14 @@ impl SmsEditorApp {
         for (target, baseline) in grade.targets.iter_mut().zip(grade.baseline.iter()) {
             restore_paint_state(&mut target.document, baseline);
             let diffuse = document_primitive_diffuse(&target.document);
+            let neutral = document_primitive_unshaded(&target.document);
             let mut primitive_index = 0usize;
             for mesh in &mut target.document.meshes {
                 for primitive in &mut mesh.primitives {
                     let base = diffuse.get(primitive_index).copied().unwrap_or([1.0; 4]);
                     primitive_index += 1;
+                    let unshaded = neutral.get(primitive_index - 1).copied().unwrap_or(1.0);
                     let colors = primitive_colors_mut(primitive, base);
-                    // The unshaded level comes from the mesh, not the
-                    // material. A material's base colour is often plain white
-                    // with the real colour living in a texture, and measuring
-                    // shade against white makes every mid-bright surface read
-                    // as half shadowed -- which is how a lit green wall ended
-                    // up being lifted and tinted along with the shadows. The
-                    // brightest vertex a primitive already has is the one the
-                    // bake left unshaded, so that is the reference.
-                    let unshaded = colors
-                        .iter()
-                        .map(|color| 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2])
-                        .fold(0.0f32, f32::max);
                     for color in colors.iter_mut() {
                         settings.apply(color, unshaded);
                     }
