@@ -666,19 +666,20 @@ fn enable_vertex_colors(document: &mut ModelAssetDocument) {
     // factor into COLOR0 once so untouched vertices retain the imported tint
     // and alpha. Existing imported vertex colours are multiplied by the same
     // factor, matching their appearance before the source switch.
-    let diffuse = document_primitive_diffuse(document);
-    let mut primitive_index = 0usize;
     for mesh in &mut document.meshes {
         for primitive in &mut mesh.primitives {
-            let base = diffuse.get(primitive_index).copied().unwrap_or([1.0; 4]);
-            primitive_index += 1;
             let Some(factor) = primitive
                 .material
                 .and_then(|index| seed_colors.get(&index).copied())
             else {
                 continue;
             };
-            for color in primitive_colors_mut(primitive, base) {
+            // White is the right seed *here*, and only here: the fold below
+            // multiplies by the register colour immediately, so white is its
+            // identity and a set created now comes out at the material colour.
+            // Seeding the diffuse instead would apply it twice and land the
+            // mesh at its colour squared.
+            for color in primitive_colors_mut(primitive, [1.0; 4]) {
                 for channel in 0..4 {
                     color[channel] = (color[channel] * factor[channel]).clamp(0.0, 1.0);
                 }
@@ -2702,6 +2703,53 @@ impl SmsEditorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Switching a mesh to vertex colour must not change how it looks.
+    ///
+    /// GX picks either the material register or the vertex array for a
+    /// channel, never both, so enabling vertex colour folds the register
+    /// colour into the vertices once. A primitive with no colour set yet is
+    /// where that is easy to get wrong: seed it with the material colour and
+    /// the fold applies that colour a second time, landing the mesh at its
+    /// colour squared.
+    #[test]
+    fn enabling_vertex_colors_lands_on_the_material_colour_once() {
+        let green = [0.05f32, 0.53, 0.05, 1.0];
+        let mut document = ModelAssetDocument::new("test");
+        let mut material = vertex_color_material("test");
+        material.source_base_color = green;
+        material.gx.material_colors[0] = Some(green.map(|value| (value * 255.0).round() as u8));
+        document.materials.push(material);
+        document.meshes.push(sms_authoring::ModelMesh {
+            name: "test".to_string(),
+            primitives: vec![sms_authoring::ModelPrimitive {
+                positions: vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                normals: vec![[0.0, 1.0, 0.0]; 3],
+                tangents: Vec::new(),
+                tex_coords: Vec::new(),
+                colors: Vec::new(),
+                indices: vec![0, 1, 2],
+                material: Some(0),
+            }],
+        });
+
+        enable_vertex_colors(&mut document);
+
+        let colors = &document.meshes[0].primitives[0]
+            .colors
+            .iter()
+            .find(|set| set.set == 0)
+            .expect("a colour set")
+            .values;
+        for color in colors.iter() {
+            for (channel, expected) in color.iter().take(3).zip(green.iter()) {
+                assert!(
+                    (channel - expected).abs() < 0.01,
+                    "expected the material colour once, got {color:?} against {green:?}"
+                );
+            }
+        }
+    }
     use sms_authoring::{ModelMesh, ModelNode, ModelPrimitive};
 
     fn test_document() -> ModelAssetDocument {
