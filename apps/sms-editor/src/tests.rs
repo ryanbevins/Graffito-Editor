@@ -5156,7 +5156,8 @@ fn cavity_does_not_lean_along_the_triangulation() {
         })
         .collect::<Vec<_>>();
 
-    let cavity = crate::vertex_paint::primitive_cavity(&primitive, &world, [0.0, 1.0, 0.0], 0.0, 2);
+    let cavity =
+        crate::vertex_paint::primitive_cavity(&primitive, &world, [0.0, 1.0, 0.0], 0.0, 2, 0.0);
     let middle = SIDE / 2;
     let ring = [
         cavity[middle * SIDE + middle - 1],
@@ -5213,8 +5214,9 @@ fn probe_cavity_on_a_real_asset() {
                 ("+x", [1.0, 0.0, 0.0], 1.0),
                 ("-x", [-1.0, 0.0, 0.0], 1.0),
             ] {
-                let cavity =
-                    crate::vertex_paint::primitive_cavity(primitive, &world, direction, bias, 2);
+                let cavity = crate::vertex_paint::primitive_cavity(
+                    primitive, &world, direction, bias, 2, 0.0,
+                );
                 let nonzero = cavity.iter().filter(|value| **value > 0.001).count();
                 let high = cavity.iter().copied().fold(0.0f32, f32::max);
                 let sum: f32 = cavity.iter().sum();
@@ -5226,9 +5228,50 @@ fn probe_cavity_on_a_real_asset() {
                     sum / cavity.len().max(1) as f32
                 );
             }
-            let cavity =
-                crate::vertex_paint::primitive_cavity(primitive, &world, [0.0, 1.0, 0.0], 0.0, 2);
-            for (index, value) in cavity.iter().enumerate().take(60) {
+            let cavity = crate::vertex_paint::primitive_cavity(
+                primitive,
+                &world,
+                [0.0, 1.0, 0.0],
+                0.0,
+                12,
+                1.0,
+            );
+            let mut buckets = [0usize; 10];
+            for value in &cavity {
+                buckets[((value * 9.999) as usize).min(9)] += 1;
+            }
+            let mut sorted = cavity.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!("    histogram in tenths: {buckets:?}");
+            println!(
+                "    min {:.3} p25 {:.3} median {:.3} p75 {:.3} max {:.3}",
+                sorted[0],
+                sorted[sorted.len() / 4],
+                sorted[sorted.len() / 2],
+                sorted[sorted.len() * 3 / 4],
+                sorted[sorted.len() - 1]
+            );
+            let mid = primitive
+                .positions
+                .iter()
+                .map(|position| position[0])
+                .sum::<f32>()
+                / primitive.positions.len() as f32;
+            for (label, keep) in [("x<mid", true), ("x>mid", false)] {
+                let side = cavity
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| (primitive.positions[*index][0] < mid) == keep)
+                    .map(|(_, value)| *value)
+                    .collect::<Vec<_>>();
+                println!(
+                    "    {label}: n {} mean {:.3} max {:.3}",
+                    side.len(),
+                    side.iter().sum::<f32>() / side.len().max(1) as f32,
+                    side.iter().copied().fold(0.0f32, f32::max)
+                );
+            }
+            for (index, value) in cavity.iter().enumerate().take(0) {
                 println!(
                     "    v{index:>3} pos {:>9.1} {:>9.1} {:>9.1}  n {:>6.2} {:>6.2} {:>6.2}  \
                      cavity {value:.4}",

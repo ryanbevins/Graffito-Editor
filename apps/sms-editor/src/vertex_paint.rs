@@ -747,6 +747,7 @@ impl SmsEditorApp {
         ];
         let bias = self.vertex_paint_dirt_bias.clamp(0.0, 1.0);
         let spread = self.vertex_paint_dirt_spread;
+        let even = self.vertex_paint_dirt_even.clamp(0.0, 1.0);
         let mut targets = self.terrain_paint_targets_scoped(true);
         if targets.is_empty() {
             self.log.push(
@@ -766,6 +767,7 @@ impl SmsEditorApp {
                         direction,
                         bias,
                         spread,
+                        even,
                     );
                     primitive_index += 1;
                     let colors = primitive_colors_mut(primitive);
@@ -1114,6 +1116,7 @@ pub(super) fn primitive_cavity(
     direction: [f32; 3],
     bias: f32,
     spread: u32,
+    even: f32,
 ) -> Vec<f32> {
     // World space, because a non-uniform scale on the node or the placement
     // would otherwise skew the result along an axis.
@@ -1259,6 +1262,35 @@ pub(super) fn primitive_cavity(
             .map(|(weld, value)| (weld, (value / peak).clamp(0.0, 1.0)))
             .collect(),
         false => BTreeMap::new(),
+    };
+
+    // Even grades a vertex by where it ranks among the rest rather than by how
+    // deep its crease measures. Two folds on one model are rarely equally
+    // sharp -- on this ramp the arms measure mean 0.38 and 0.61 -- and depth
+    // grading is honest about that, which reads as one side taking all the
+    // dirt. Ranking spends the full range across the mesh instead of leaving
+    // most of it on whichever fold happens to be sharpest.
+    //
+    // Grading against a local neighbourhood would even the two folds properly,
+    // but terrain this coarse has no locality to work with: four graph steps
+    // reach the whole 76 vertex ramp, so every local peak is the global one.
+    // That wants more vertices, not a different formula.
+    let even = even.clamp(0.0, 1.0);
+    let graded: BTreeMap<usize, f32> = match even > 0.0 {
+        false => graded,
+        true => {
+            let mut ordered = graded
+                .iter()
+                .map(|(weld, value)| (*value, *weld))
+                .collect::<Vec<_>>();
+            ordered.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let last = ordered.len().saturating_sub(1).max(1) as f32;
+            ordered
+                .iter()
+                .enumerate()
+                .map(|(rank, (value, weld))| (*weld, value + (rank as f32 / last - value) * even))
+                .collect()
+        }
     };
 
     // Spread walks the dirt outward from the creases it was measured on.
@@ -1718,6 +1750,10 @@ impl SmsEditorApp {
                 .text("Ramp"),
         )
         .on_hover_text("Above 1 tightens dirt into deep creases; below 1 spreads it wider");
+        ui.add(egui::Slider::new(&mut self.vertex_paint_dirt_even, 0.0..=1.0).text("Even"))
+            .on_hover_text(
+                "Grade creases by rank instead of depth, so a shallow fold dirties as much as a                  sharp one",
+            );
         ui.add(egui::Slider::new(&mut self.vertex_paint_dirt_spread, 0..=12).text("Spread"))
             .on_hover_text("How far the dirt travels out from the creases it was measured on");
         ui.add(egui::Slider::new(&mut self.vertex_paint_dirt_bias, 0.0..=1.0).text("Direction"))
