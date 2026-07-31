@@ -8,10 +8,11 @@
 //! the flag lives in `map/tables.bin`, and the actor pool is an ordinary
 //! `NameKuriManager` record in `map/scene.bin`.
 //!
-//! The toggle therefore edits two things and invents nothing. It flips bit
-//! `0x1` on the Gooble entry in the enemy table, creating the table the way
-//! retail stages carry it when a custom stage has none, and it ensures the
-//! manager record exists in the scene's manager group. Measured ground truth:
+//! The selector therefore edits two things and invents nothing. It flips bit
+//! `0x1` on the selected manager's enemy-table entry and, when necessary,
+//! copies an exact retail-backed manager/resource bundle discovered through
+//! the decomp schema and object-authoring census. The backing actor is marked
+//! pool-only, so only its manager reaches the exported world. Measured ground truth:
 //! bianco0's only flagged entry is ナメクリマネージャー, flags 1, weight 100,
 //! and its manager record is `character_name`/`capacity 20`/`manager_load_value
 //! 3` — those exact values are reproduced here.
@@ -70,8 +71,11 @@ fn record_field<'a>(
     record: &'a sms_formats::JDramaRecord,
     name: &str,
 ) -> Option<&'a sms_formats::JDramaFieldValue> {
-    let sms_formats::JDramaRecordPayload::Fields { fields } = &record.payload else {
-        return None;
+    let fields = match &record.payload {
+        sms_formats::JDramaRecordPayload::Actor { fields, .. }
+        | sms_formats::JDramaRecordPayload::Fields { fields }
+        | sms_formats::JDramaRecordPayload::Group { fields, .. } => fields,
+        sms_formats::JDramaRecordPayload::Empty => return None,
     };
     fields
         .iter()
@@ -256,6 +260,27 @@ fn manager_factory_matches_actor(
         .any(|expected| semantic_factory_name(expected) == manager_factory)
 }
 
+fn manager_has_editor_pollution_support(
+    registry: &ObjectRegistry,
+    manager: &sms_schema::EnemyManagerDefinition,
+    manager_name: &str,
+) -> bool {
+    if registry.enemy_manager_has_native_pollution_pool(&manager.factory_name, manager_name) {
+        return true;
+    }
+    match semantic_factory_name(&manager.factory_name) {
+        "PoiHanaManager" => registry
+            .conditional_enemy_manager_factories
+            .iter()
+            .any(|factory| semantic_factory_name(factory) == "PoiHanaManager"),
+        "HinoKuri2Manager" => registry
+            .conductor_pool_excluded_manager_names
+            .iter()
+            .any(|excluded| excluded == manager_name),
+        _ => false,
+    }
+}
+
 fn actor_uses_stu_stain(
     registry: &ObjectRegistry,
     actor: &sms_schema::EnemyActorDefinition,
@@ -270,6 +295,63 @@ fn actor_uses_stu_stain(
                     .replace('\\', "/")
                     .ends_with("/Enemy/hamukuri.cpp")
         })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CatalogEnemyManagerChoice {
+    actor_factory: String,
+    manager_factory: String,
+    manager_name: String,
+    display_name: String,
+}
+
+fn catalog_enemy_manager_choice(
+    template: &sms_scene::ObjectAuthoringTemplate,
+    registry: &ObjectRegistry,
+) -> Option<CatalogEnemyManagerChoice> {
+    if registry
+        .find_object(&template.factory_name)
+        .is_some_and(|definition| definition.unsafe_to_edit)
+    {
+        return None;
+    }
+    let actor = enemy_actor_definition(registry, &template.factory_name)?;
+    let sms_formats::JDramaFieldValue::String(manager_name) =
+        record_field(&template.record, "manager_name")?
+    else {
+        return None;
+    };
+    let dependency = template.dependencies.iter().find(|dependency| {
+        dependency.record.name == *manager_name
+            && enemy_manager_definition(registry, &dependency.record.type_name)
+                .is_some_and(|manager| manager_factory_matches_actor(actor, &manager.factory_name))
+    })?;
+    let manager = enemy_manager_definition(registry, &dependency.record.type_name)?;
+    if manager.spawned_actor_class.as_deref() != Some(actor.class_name.as_str())
+        || !manager_has_editor_pollution_support(registry, manager, manager_name)
+    {
+        return None;
+    }
+    Some(CatalogEnemyManagerChoice {
+        actor_factory: actor.factory_name.clone(),
+        manager_factory: manager.factory_name.clone(),
+        manager_name: manager_name.clone(),
+        display_name: actor.factory_name.clone(),
+    })
+}
+
+fn catalog_enemy_manager_choices(
+    catalog: &ObjectAuthoringCatalog,
+    registry: &ObjectRegistry,
+) -> BTreeMap<String, CatalogEnemyManagerChoice> {
+    let mut choices = BTreeMap::new();
+    for (_, template) in catalog.iter() {
+        let Some(choice) = catalog_enemy_manager_choice(template, registry) else {
+            continue;
+        };
+        choices.entry(choice.manager_name.clone()).or_insert(choice);
+    }
+    choices
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,11 +388,13 @@ fn collect_enemy_manager_records(
     out: &mut BTreeMap<String, EnemyManagerInstance>,
 ) {
     if let Some(manager) = enemy_manager_definition(registry, &record.type_name) {
-        out.entry(record.name.clone())
-            .or_insert_with(|| EnemyManagerInstance {
-                factory_name: manager.factory_name.clone(),
-                display_name: enemy_manager_display_name(registry, manager),
-            });
+        if manager_has_editor_pollution_support(registry, manager, &record.name) {
+            out.entry(record.name.clone())
+                .or_insert_with(|| EnemyManagerInstance {
+                    factory_name: manager.factory_name.clone(),
+                    display_name: enemy_manager_display_name(registry, manager),
+                });
+        }
     }
     if let sms_formats::JDramaRecordPayload::Group { children, .. } = &record.payload {
         for child in children {
@@ -338,6 +422,9 @@ fn enemy_manager_instances(
             else {
                 continue;
             };
+            if !manager_has_editor_pollution_support(registry, manager, &dependency.record.name) {
+                continue;
+            }
             managers
                 .entry(dependency.record.name.clone())
                 .or_insert_with(|| EnemyManagerInstance {
@@ -349,7 +436,7 @@ fn enemy_manager_instances(
     managers
 }
 
-fn goop_flagged_managers(document: &StageDocument) -> BTreeSet<String> {
+pub(super) fn goop_flagged_managers(document: &StageDocument) -> BTreeSet<String> {
     let Ok(Some(StageResourceDocument::Placement(tables))) =
         document.effective_resource_clone(TABLES_PATH)
     else {
@@ -378,43 +465,72 @@ fn goop_flagged_managers(document: &StageDocument) -> BTreeSet<String> {
 struct GoopSpawnEntity {
     display_name: String,
     manager_name: String,
+    manager_factory: Option<String>,
     manager_present: bool,
+    catalog_actor_factory: Option<String>,
 }
 
 impl SmsEditorApp {
     /// Whether the effective enemy table flags Goobles to generate from goop.
-    /// Enemy managers this stage could spawn from goop, derived from what is
-    /// actually in the scene.
+    /// Enemy managers this stage could spawn from goop. Existing scene
+    /// managers and complete retail-backed manager bundles are both included.
     ///
-    /// A placed enemy actor names its manager in its `manager_name` parameter,
-    /// and export inserts that manager alongside the actor; a retail-derived
-    /// stage additionally carries managers in its effective scene. Either way
-    /// the conductor can only spawn from managers that exist, so the list is
-    /// built from presence rather than from a registry of everything.
+    /// Catalog candidates are accepted only when the decomp-derived schema
+    /// identifies the actor/manager relationship and the retail census has an
+    /// exact dependency plus resource closure. Enabling an absent candidate
+    /// creates a pool-only authoring handle, so no actor is placed in the
+    /// exported world.
     fn goop_spawnable_entities(&self) -> Vec<GoopSpawnEntity> {
         let (Some(document), Some(registry)) = (self.document.as_ref(), self.registry.as_ref())
         else {
             return Vec::new();
         };
         let managers = enemy_manager_instances(document, registry);
+        let catalog_choices =
+            catalog_enemy_manager_choices(&self.object_authoring_catalog, registry);
         let mut entities = managers
             .iter()
-            .map(|(manager_name, manager)| GoopSpawnEntity {
-                display_name: manager.display_name.clone(),
-                manager_name: manager_name.clone(),
-                manager_present: true,
+            .map(|(manager_name, manager)| {
+                let catalog_choice = catalog_choices.get(manager_name);
+                (
+                    manager_name.clone(),
+                    GoopSpawnEntity {
+                        display_name: manager.display_name.clone(),
+                        manager_name: manager_name.clone(),
+                        manager_factory: Some(manager.factory_name.clone()),
+                        manager_present: true,
+                        catalog_actor_factory: catalog_choice
+                            .map(|choice| choice.actor_factory.clone()),
+                    },
+                )
             })
-            .collect::<Vec<_>>();
-        for manager_name in goop_flagged_managers(document) {
-            if !managers.contains_key(&manager_name) {
-                entities.push(GoopSpawnEntity {
-                    display_name: "Missing enemy manager".to_string(),
+            .collect::<BTreeMap<_, _>>();
+        for (manager_name, choice) in catalog_choices {
+            entities
+                .entry(manager_name.clone())
+                .or_insert(GoopSpawnEntity {
+                    display_name: choice.display_name,
                     manager_name,
+                    manager_factory: Some(choice.manager_factory),
                     manager_present: false,
+                    catalog_actor_factory: Some(choice.actor_factory),
                 });
+        }
+        for manager_name in goop_flagged_managers(document) {
+            if !entities.contains_key(&manager_name) {
+                entities.insert(
+                    manager_name.clone(),
+                    GoopSpawnEntity {
+                        display_name: "Missing enemy manager".to_string(),
+                        manager_name,
+                        manager_factory: None,
+                        manager_present: false,
+                        catalog_actor_factory: None,
+                    },
+                );
             }
         }
-        entities
+        entities.into_values().collect()
     }
 
     pub(super) fn object_uses_enemy_pool(&self, object: &SceneObject) -> bool {
@@ -480,28 +596,65 @@ impl SmsEditorApp {
         })
     }
 
-    /// Flips a manager's spawn flag in the enemy table. One undo step.
-    pub(super) fn set_manager_spawns_from_goop(&mut self, manager: &str, enabled: bool) {
+    /// Flips a manager's spawn flag in the enemy table. If the manager is a
+    /// catalog-backed candidate rather than an existing stage record, its
+    /// complete pool-only authoring bundle is added in the same undo step.
+    fn set_manager_spawns_from_goop(&mut self, entity: &GoopSpawnEntity, enabled: bool) {
         let Some(document) = self.document.as_ref() else {
             return;
         };
-        let before = document.archive_edits.clone();
+        let before_objects = document.objects.clone();
+        let before_archive_edits = document.archive_edits.clone();
+        let before_object_serial = self.next_object_serial;
+        let mut pool_log = Vec::new();
 
-        if let Err(error) = self.apply_manager_spawn(manager, enabled) {
+        let result: Result<(), String> = (|| {
+            if enabled && !entity.manager_present {
+                let actor_factory = entity.catalog_actor_factory.as_deref().ok_or_else(|| {
+                    format!(
+                        "manager {:?} has no safe retail-backed pool bundle",
+                        entity.manager_name
+                    )
+                })?;
+                let manager_factory = entity.manager_factory.as_deref().ok_or_else(|| {
+                    format!(
+                        "manager {:?} has no decomp-derived factory",
+                        entity.manager_name
+                    )
+                })?;
+                pool_log.push(self.ensure_catalog_enemy_manager_pool(
+                    actor_factory,
+                    manager_factory,
+                    &entity.manager_name,
+                )?);
+            }
+            self.apply_manager_spawn(&entity.manager_name, enabled)?;
+            if !enabled {
+                pool_log.extend(self.cleanup_unused_goop_manager_pools());
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            if let Some(document) = self.document.as_mut() {
+                document.objects = before_objects;
+                document.archive_edits = before_archive_edits;
+            }
+            self.next_object_serial = before_object_serial;
             self.log
                 .push(format!("Could not update goop spawning: {error}"));
             return;
         }
 
-        let (record, dirty) = {
+        let (record, dirty, added_pool) = {
             let Some(document) = self.document.as_ref() else {
                 return;
             };
             (
                 ObjectUndoRecord::between(
+                    &before_objects,
                     &document.objects,
-                    &document.objects,
-                    &before,
+                    &before_archive_edits,
                     &document.archive_edits,
                 ),
                 stage_document_differs_from_saved(
@@ -513,6 +666,7 @@ impl SmsEditorApp {
                     &self.saved_dialogue_authoring,
                     &self.saved_dialogue_library,
                 ),
+                document.objects.len() != before_objects.len(),
             )
         };
         if !record.is_empty() {
@@ -520,9 +674,18 @@ impl SmsEditorApp {
         }
         self.document_dirty = dirty;
         self.flush_document_change();
+        if added_pool {
+            self.rebuild_model_preview_from_document_async();
+        }
+        for message in pool_log {
+            self.log.push(message);
+        }
         self.log.push(match enabled {
-            true => format!("{manager} now spawns its enemies from painted goop."),
-            false => format!("{manager} no longer spawns from goop."),
+            true => format!(
+                "{} now spawns its enemies from painted goop.",
+                entity.manager_name
+            ),
+            false => format!("{} no longer spawns from goop.", entity.manager_name),
         });
     }
 
@@ -795,17 +958,21 @@ impl SmsEditorApp {
     /// The Spawning section of the goop inspector.
     pub(super) fn gooble_spawn_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
-        ui.strong("Spawnable entities (TConductor)");
+        ui.strong("Goop enemy managers (TConductor)");
         let entities = self.goop_spawnable_entities();
         if entities.is_empty() {
             ui.label(
-                "Place an enemy from the content browser first; its decomp-identified enemy \
-                 manager can be flagged to emerge from painted goop. Goobles are NameKuri.",
+                "No safe enemy-manager bundles were found in the decomp-derived retail catalog.",
             );
             return;
         }
         for entity in entities {
-            let mut enabled = self.manager_spawns_from_goop(&entity.manager_name);
+            let flagged = self.manager_spawns_from_goop(&entity.manager_name);
+            let catalog_available = entity.catalog_actor_factory.is_some();
+            let stale = !entity.manager_present && !catalog_available;
+            // A flagged entry with a missing but repairable manager is shown
+            // unchecked so selecting it performs the missing bundle import.
+            let mut enabled = flagged && (entity.manager_present || stale);
             if ui
                 .checkbox(
                     &mut enabled,
@@ -815,6 +982,8 @@ impl SmsEditorApp {
                         entity.manager_name,
                         if entity.manager_present {
                             ""
+                        } else if catalog_available {
+                            " (add manager pool)"
                         } else {
                             " (remove stale flag)"
                         }
@@ -824,14 +993,18 @@ impl SmsEditorApp {
                     "Writes the retail enemy table: the conductor periodically picks a spot \
                          near Mario and, if that spot is goop, relocates one of this manager's \
                          enemies there."
+                } else if catalog_available {
+                    "Adds this decomp-identified manager with its exact retail dependency and \
+                         resource bundle, but no placed enemy instance, then enables it in the \
+                         retail enemy table. The whole change is one undo step."
                 } else {
                     "This flagged table entry no longer has a TEnemyManager in map/scene.bin. \
                          Uncheck it; export also clears stale entries defensively."
                 })
                 .changed()
-                && (entity.manager_present || !enabled)
+                && (entity.manager_present || catalog_available || !enabled)
             {
-                self.set_manager_spawns_from_goop(&entity.manager_name, enabled);
+                self.set_manager_spawns_from_goop(&entity, enabled);
             }
         }
     }
@@ -875,6 +1048,48 @@ mod tests {
         .unwrap()
     }
 
+    fn enemy_template(
+        actor_factory: &str,
+        manager_factory: &str,
+        manager_name: &str,
+    ) -> sms_scene::ObjectAuthoringTemplate {
+        sms_scene::ObjectAuthoringTemplate {
+            factory_name: actor_factory.to_string(),
+            group_index: 4,
+            record: sms_formats::JDramaRecord {
+                type_name: actor_factory.to_string(),
+                name: "retail enemy".to_string(),
+                payload: sms_formats::JDramaRecordPayload::Actor {
+                    transform: sms_formats::JDramaTransform {
+                        translation: [0.0; 3],
+                        rotation: [0.0; 3],
+                        scale: [1.0; 3],
+                    },
+                    character_name: "EnemyChara".to_string(),
+                    light_map: sms_formats::JDramaLightMap::default(),
+                    fields: vec![jdrama_field(
+                        "manager_name",
+                        sms_formats::JDramaFieldValue::String(manager_name.to_string()),
+                    )],
+                },
+            },
+            dependencies: vec![sms_scene::ObjectAuthoringDependency {
+                group_index: 2,
+                target: sms_scene::AuthoredPlacementDependencyTarget::IndexedGroup {
+                    group_index: 2,
+                },
+                record: manager_record(manager_factory, manager_name),
+            }],
+            character_records: Vec::new(),
+            table_dependencies: Vec::new(),
+            runtime_actor_references: Vec::new(),
+            required_graph_names: Vec::new(),
+            resources: Vec::new(),
+            preview_resource_path: None,
+            source_stage: "retail0".to_string(),
+        }
+    }
+
     #[test]
     fn manager_census_includes_manager_only_enemies_and_excludes_live_managers() {
         let registry = enemy_registry();
@@ -902,6 +1117,26 @@ mod tests {
             })
         );
         assert!(!managers.contains_key("board manager"));
+    }
+
+    #[test]
+    fn catalog_exposes_a_decomp_compatible_manager_without_stage_presence() {
+        let registry = enemy_registry();
+        let choice = catalog_enemy_manager_choice(
+            &enemy_template("NameKuri", "NameKuriManager", GOOBLE_MANAGER_NAME),
+            &registry,
+        )
+        .expect("the exact actor-manager dependency should be selectable");
+
+        assert_eq!(choice.actor_factory, "NameKuri");
+        assert_eq!(choice.manager_factory, "NameKuriManager");
+        assert_eq!(choice.manager_name, GOOBLE_MANAGER_NAME);
+
+        assert!(catalog_enemy_manager_choice(
+            &enemy_template("NameKuri", "BoardNpcManager", "board manager"),
+            &registry,
+        )
+        .is_none());
     }
 
     #[test]

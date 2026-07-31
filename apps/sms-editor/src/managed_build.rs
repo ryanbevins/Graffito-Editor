@@ -18,10 +18,11 @@ use sms_scene::{
 use sms_schema::ObjectRegistry;
 
 use crate::direct_boot::{
-    patch_sms_dialogue_dol, patch_sms_direct_boot_dol, patch_sms_sound_assignments_dol,
-    patch_sms_stage_music_dol, RuntimeBalloonOverride, RuntimeDialogueOverride,
-    RuntimeMusicRoleOverride, RuntimeSoundAssignment, RuntimeSoundAssignmentKind,
-    RuntimeStageMusicOverride, RuntimeStageMusicTransition, RuntimeStageTarget,
+    patch_sms_dialogue_dol, patch_sms_direct_boot_dol, patch_sms_goop_enemy_managers_dol,
+    patch_sms_sound_assignments_dol, patch_sms_stage_music_dol, RuntimeBalloonOverride,
+    RuntimeDialogueOverride, RuntimeGoopManagerPatch, RuntimeMusicRoleOverride,
+    RuntimeSoundAssignment, RuntimeSoundAssignmentKind, RuntimeStageMusicOverride,
+    RuntimeStageMusicTransition, RuntimeStageTarget,
 };
 #[cfg(test)]
 use crate::project::ProjectSoundAssignment;
@@ -449,13 +450,22 @@ fn build_managed_game_with_compiled_dialogue_inner(
         let direct_boot = include_direct_boot
             .then(|| resolve_managed_direct_boot_target(&run, cancelled))
             .transpose()?;
+        let goop_manager_patches = document
+            .registry
+            .as_ref()
+            .map(|registry| required_goop_manager_runtime_patches(document, registry))
+            .transpose()?
+            .unwrap_or_default();
         let direct_boot = install_managed_runtime_patches(
             project,
             &run,
-            document.registry.as_ref(),
-            &runtime.talk,
-            &runtime.balloon,
-            direct_boot,
+            ManagedRuntimePatchInputs {
+                registry: document.registry.as_ref(),
+                goop_manager_patches: &goop_manager_patches,
+                dialogue_overrides: &runtime.talk,
+                balloon_overrides: &runtime.balloon,
+                direct_boot,
+            },
             cancelled,
         )?;
         Ok((ManagedGameBuildOutcome { run }, direct_boot))
@@ -1205,15 +1215,122 @@ fn validate_authored_stage_music_transitions(
     Ok(())
 }
 
+fn required_goop_manager_runtime_patches(
+    document: &StageDocument,
+    registry: &ObjectRegistry,
+) -> Result<BTreeSet<RuntimeGoopManagerPatch>, String> {
+    fn collect_managers(
+        record: &JDramaRecord,
+        registry: &ObjectRegistry,
+        managers: &mut BTreeMap<String, String>,
+    ) {
+        let semantic_type = record
+            .type_name
+            .rsplit("::")
+            .next()
+            .unwrap_or(&record.type_name);
+        if let Some(manager) = registry.find_enemy_manager(semantic_type) {
+            managers
+                .entry(record.name.clone())
+                .or_insert_with(|| manager.factory_name.clone());
+        }
+        if let JDramaRecordPayload::Group { children, .. } = &record.payload {
+            for child in children {
+                collect_managers(child, registry, managers);
+            }
+        }
+    }
+
+    fn collect_flagged(record: &JDramaRecord, flagged: &mut BTreeSet<String>) {
+        if record.type_name.rsplit("::").next() == Some("StageEnemyInfo") {
+            let fields = match &record.payload {
+                JDramaRecordPayload::Actor { fields, .. }
+                | JDramaRecordPayload::Fields { fields }
+                | JDramaRecordPayload::Group { fields, .. } => Some(fields.as_slice()),
+                JDramaRecordPayload::Empty => None,
+            };
+            if let Some(fields) = fields {
+                let manager_name = fields.iter().find_map(|field| match &field.value {
+                    JDramaFieldValue::String(value) if field.name == "manager_name" => Some(value),
+                    _ => None,
+                });
+                let enabled = fields.iter().any(|field| {
+                    field.name == "flags"
+                        && matches!(field.value, JDramaFieldValue::I32(flags) if flags & 1 != 0)
+                });
+                if enabled {
+                    if let Some(manager_name) = manager_name {
+                        flagged.insert(manager_name.clone());
+                    }
+                }
+            }
+        }
+        if let JDramaRecordPayload::Group { children, .. } = &record.payload {
+            for child in children {
+                collect_flagged(child, flagged);
+            }
+        }
+    }
+
+    let mut managers = BTreeMap::new();
+    if let Some(StageResourceDocument::Placement(scene)) = document
+        .effective_resource_clone(b"map/scene.bin")
+        .map_err(|error| format!("Could not inspect goop manager scene data: {error}"))?
+    {
+        collect_managers(&scene.root, registry, &mut managers);
+    }
+    for object in &document.objects {
+        let Some(sms_scene::PlacementBinding::Authored(placement)) = &object.placement else {
+            continue;
+        };
+        for dependency in &placement.dependencies {
+            collect_managers(&dependency.record, registry, &mut managers);
+        }
+    }
+
+    let mut flagged = BTreeSet::new();
+    if let Some(StageResourceDocument::Placement(tables)) = document
+        .effective_resource_clone(b"map/tables.bin")
+        .map_err(|error| format!("Could not inspect goop enemy table: {error}"))?
+    {
+        collect_flagged(&tables.root, &mut flagged);
+    }
+
+    let mut patches = BTreeSet::new();
+    if managers.values().any(|factory| factory == "PoiHanaManager") {
+        patches.insert(RuntimeGoopManagerPatch::PoiHanaAnyArea);
+    }
+    if flagged.iter().any(|manager_name| {
+        managers
+            .get(manager_name)
+            .is_some_and(|factory| factory == "HinoKuri2Manager")
+    }) {
+        patches.insert(RuntimeGoopManagerPatch::HinoKuri2Pool);
+    }
+    Ok(patches)
+}
+
+struct ManagedRuntimePatchInputs<'a> {
+    registry: Option<&'a ObjectRegistry>,
+    goop_manager_patches: &'a BTreeSet<RuntimeGoopManagerPatch>,
+    dialogue_overrides: &'a [RuntimeDialogueOverride],
+    balloon_overrides: &'a [RuntimeBalloonOverride],
+    direct_boot: Option<(RuntimeStageTarget, usize)>,
+}
+
 fn install_managed_runtime_patches(
     project: &OpenProject,
     run: &ManagedRunMirrorOutcome,
-    registry: Option<&ObjectRegistry>,
-    dialogue_overrides: &[RuntimeDialogueOverride],
-    balloon_overrides: &[RuntimeBalloonOverride],
-    direct_boot: Option<(RuntimeStageTarget, usize)>,
+    inputs: ManagedRuntimePatchInputs<'_>,
     cancelled: &AtomicBool,
 ) -> Result<Option<ManagedDirectBootOutcome>, String> {
+    let ManagedRuntimePatchInputs {
+        registry,
+        goop_manager_patches,
+        dialogue_overrides,
+        balloon_overrides,
+        direct_boot,
+    } = inputs;
     check_cancelled(cancelled)?;
     validate_authored_stage_music_transitions(project, run, registry)?;
     let mut overrides = Vec::new();
@@ -1306,6 +1423,13 @@ fn install_managed_runtime_patches(
         .map_err(|error| {
             format!(
                 "Could not install packaged sound helper assignments into '{}': {error}",
+                run.run_main_dol.display()
+            )
+        })?;
+    patched_bytes = patch_sms_goop_enemy_managers_dol(&patched_bytes, goop_manager_patches)
+        .map_err(|error| {
+            format!(
+                "Could not install packaged goop enemy-manager support into '{}': {error}",
                 run.run_main_dol.display()
             )
         })?;
@@ -1421,7 +1545,19 @@ fn install_managed_stage_music(
     run: &ManagedRunMirrorOutcome,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
-    install_managed_runtime_patches(project, run, None, &[], &[], None, cancelled).map(|_| ())
+    install_managed_runtime_patches(
+        project,
+        run,
+        ManagedRuntimePatchInputs {
+            registry: None,
+            goop_manager_patches: &BTreeSet::new(),
+            dialogue_overrides: &[],
+            balloon_overrides: &[],
+            direct_boot: None,
+        },
+        cancelled,
+    )
+    .map(|_| ())
 }
 
 fn resolve_managed_direct_boot_target(
@@ -3382,10 +3518,13 @@ mod tests {
         let error = install_managed_runtime_patches(
             &fixture.project,
             &run,
-            None,
-            &[override_],
-            &[],
-            None,
+            ManagedRuntimePatchInputs {
+                registry: None,
+                goop_manager_patches: &BTreeSet::new(),
+                dialogue_overrides: &[override_],
+                balloon_overrides: &[],
+                direct_boot: None,
+            },
             &AtomicBool::new(false),
         )
         .unwrap_err();
@@ -3449,10 +3588,13 @@ mod tests {
         install_managed_runtime_patches(
             &fixture.project,
             &run,
-            None,
-            &[],
-            &[],
-            None,
+            ManagedRuntimePatchInputs {
+                registry: None,
+                goop_manager_patches: &BTreeSet::new(),
+                dialogue_overrides: &[],
+                balloon_overrides: &[],
+                direct_boot: None,
+            },
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -4033,10 +4175,13 @@ mod tests {
         install_managed_runtime_patches(
             &fixture.project,
             &outcome,
-            None,
-            &[],
-            &[],
-            None,
+            ManagedRuntimePatchInputs {
+                registry: None,
+                goop_manager_patches: &BTreeSet::new(),
+                dialogue_overrides: &[],
+                balloon_overrides: &[],
+                direct_boot: None,
+            },
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -4111,10 +4256,13 @@ mod tests {
         install_managed_runtime_patches(
             &fixture.project,
             &second,
-            None,
-            &[],
-            &[],
-            None,
+            ManagedRuntimePatchInputs {
+                registry: None,
+                goop_manager_patches: &BTreeSet::new(),
+                dialogue_overrides: &[],
+                balloon_overrides: &[],
+                direct_boot: None,
+            },
             &AtomicBool::new(false),
         )
         .unwrap();

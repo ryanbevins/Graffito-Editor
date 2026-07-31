@@ -128,22 +128,34 @@ bugs and are the next thing to look at:
 
 Either would probably land `HamuKuri`; both would land the family.
 
-## The plan for a "spawn Goobles" toggle
+## Manager selection in Graffito
 
-Agreed shape: the stage always carries the manager, and the flag decides whether
-it spawns. That is the runtime's own model — `getManagerByName` simply returns
-nothing if the manager is absent, so presence and spawning are already separate
-concerns.
+The goop inspector lists both compatible managers already in the stage and
+manager bundles that Graffito can add safely. An absent manager is offered only
+when the decomp-derived schema proves the actor/`TEnemyManager` relationship and
+the retail authoring census provides an exact manager dependency with its full
+resource closure.
 
-1. Load `tables.bin` into the document and round-trip it untouched. Write the
-   test for that first; getting it wrong corrupts stages.
-2. Toggle on the Goop Manager inspector: a manager picker plus a checkbox
-   writing bit `0x1` of the matching `StageEnemyInfo`, and `weight` if relative
-   frequency is wanted.
-3. Ensure the named manager exists in the scene when the flag is on. For a
-   custom stage that means placing `HamuKuriManager`, which needs the census
-   fixes above so it is a genuine retail-backed template rather than a
-   hand-written entry with no resources.
+Checking an absent manager imports that retail-backed bundle and creates a
+pool-only editor handle. The handle owns the manager, character registrations,
+runtime table dependencies, graphs, and resources, but its actor record is
+omitted from export. The same undo step writes bit `0x1` on the matching
+`StageEnemyInfo`. No enemy instance has to be placed in the world first.
+
+Existing managers are reused. Unchecking a manager clears the goop-spawn flag;
+if its pool-only handle has no other level dependency, Graffito removes the
+handle and prunes only catalog-managed resources that no remaining authored
+object needs. Imported managers and still-referenced pools are preserved.
+Legacy projects receive the same reconciliation when opened. Export also clears
+stale flags whose named manager no longer exists.
+
+The decomp identifies two otherwise compatible managers with extra runtime
+gates. `TPoiHanaManager::createEnemyInstance` returns null outside area `0x38`,
+and `TConductor::init` excludes HinoKuri2 from ordinary reusable pool creation.
+When either is actually needed, the managed build finds the corresponding PPC
+instruction sequence in the selected game DOL and removes only that gate. This
+keeps the manager picker data-driven while making the selected pool valid in a
+custom stage.
 
 ## Which stages actually place Kuri objects
 

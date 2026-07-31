@@ -13,7 +13,6 @@ const DOL_BSS_ADDRESS: usize = 0xd8;
 const DOL_BSS_SIZE: usize = 0xdc;
 const DOL_ENTRY_POINT: usize = 0xe0;
 
-#[cfg(test)]
 const PPC_NOP: u32 = 0x6000_0000;
 const PPC_BLR: u32 = 0x4e80_0020;
 const DIRECT_BOOT_FLAG: u16 = 0x534d;
@@ -181,6 +180,16 @@ pub(super) struct RuntimeSoundAssignment {
     pub(super) source_name: String,
     pub(super) original_sound_id: u32,
     pub(super) sound_id: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum RuntimeGoopManagerPatch {
+    /// `TPoiHanaManager::createEnemyInstance` normally returns null outside
+    /// area 0x38, after which `initSetEnemies` dereferences `getObj(0)`.
+    PoiHanaAnyArea,
+    /// `TConductor::init` deliberately skips HinoKuri2 while constructing
+    /// ordinary reusable manager pools.
+    HinoKuri2Pool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,6 +425,94 @@ pub(super) fn patch_sms_sound_assignments_dol(
     for (offset, sound_id) in patches {
         write_be_u32(&mut bytes, offset, sound_id)?;
     }
+    parse_dol(&bytes)?;
+    Ok(bytes)
+}
+
+pub(super) fn patch_sms_goop_enemy_managers_dol(
+    source: &[u8],
+    requested: &BTreeSet<RuntimeGoopManagerPatch>,
+) -> Result<Vec<u8>, String> {
+    if requested.is_empty() {
+        return Ok(source.to_vec());
+    }
+    let image = parse_dol(source)?;
+    let mut bytes = source.to_vec();
+
+    if requested.contains(&RuntimeGoopManagerPatch::PoiHanaAnyArea) {
+        let mut candidates = Vec::new();
+        for section in image
+            .sections
+            .iter()
+            .copied()
+            .filter(|section| section.text)
+        {
+            let words = section_words(source, section)?;
+            for word_index in 0..words.len().saturating_sub(6) {
+                let sequence = &words[word_index..word_index + 7];
+                if sequence[0] == 0x8803_000e
+                    && sequence[1] == 0x2800_0038
+                    && (sequence[2] == 0x4082_002c || sequence[2] == PPC_NOP)
+                    && sequence[3] == 0x3860_01cc
+                    && is_relative_bl(sequence[4])
+                    && sequence[5] == 0x7c7f_1b79
+                    && sequence[6] == 0x4182_0014
+                {
+                    candidates.push(WordAnchor {
+                        section,
+                        word_index: word_index + 2,
+                    });
+                }
+            }
+        }
+        let anchor = require_unique_anchor(
+            candidates,
+            "TPoiHanaManager area-gated createEnemyInstance branch",
+        )?;
+        write_be_u32(&mut bytes, anchor.file_offset()?, PPC_NOP)?;
+    }
+
+    if requested.contains(&RuntimeGoopManagerPatch::HinoKuri2Pool) {
+        let mut candidates = Vec::new();
+        for section in image
+            .sections
+            .iter()
+            .copied()
+            .filter(|section| section.text)
+        {
+            let words = section_words(source, section)?;
+            for word_index in 0..words.len().saturating_sub(14) {
+                let sequence = &words[word_index..word_index + 15];
+                if sequence[0] == 0x2803_0000
+                    && (sequence[1] == 0x4082_0058 || sequence[1] == PPC_NOP)
+                    && sequence[2] == 0x8081_0068
+                    && sequence[3] == 0x387e_0114
+                    && sequence[4] == 0x83a4_0008
+                    && is_relative_bl(sequence[5])
+                    && sequence[6] == 0x819d_0000
+                    && sequence[7] == 0x3883_0000
+                    && sequence[8] == 0x387d_0000
+                    && sequence[9] == 0x818c_001c
+                    && sequence[10] == 0x38be_0114
+                    && sequence[11] == 0x7d88_03a6
+                    && sequence[12] == 0x4e80_0021
+                    && sequence[13] == 0x2803_0000
+                    && sequence[14] == 0x4082_0024
+                {
+                    candidates.push(WordAnchor {
+                        section,
+                        word_index: word_index + 1,
+                    });
+                }
+            }
+        }
+        let anchor = require_unique_anchor(
+            candidates,
+            "TConductor HinoKuri2 reusable-pool exclusion branch",
+        )?;
+        write_be_u32(&mut bytes, anchor.file_offset()?, PPC_NOP)?;
+    }
+
     parse_dol(&bytes)?;
     Ok(bytes)
 }
@@ -3817,6 +3914,79 @@ mod tests {
         assert_eq!(decode_lwz_from_r13(sequence[11]), Some(0));
         assert!(is_ori(sequence[12], 0, 0, 1));
         assert_eq!(decode_d_form(sequence[13], 36), Some((0, 13, -0x6800)));
+    }
+
+    #[test]
+    fn goop_manager_patches_remove_only_the_decomp_proven_runtime_gates() {
+        let layout = SyntheticLayout {
+            text_address: 0x8000_4000,
+            hook_word: 0x80,
+            movie_word: 0xc0,
+            setter_word: 0xe0,
+        };
+        let mut source = synthetic_dol(layout);
+        let poi_word = 0x100;
+        let poi_sequence = [
+            0x8803_000e,
+            0x2800_0038,
+            0x4082_002c,
+            0x3860_01cc,
+            0x4800_0001,
+            0x7c7f_1b79,
+            0x4182_0014,
+        ];
+        for (index, word) in poi_sequence.into_iter().enumerate() {
+            write_be_u32(
+                &mut source,
+                SYNTHETIC_TEXT_OFFSET + (poi_word + index) * 4,
+                word,
+            )
+            .unwrap();
+        }
+        let hino_word = 0x120;
+        let hino_sequence = [
+            0x2803_0000,
+            0x4082_0058,
+            0x8081_0068,
+            0x387e_0114,
+            0x83a4_0008,
+            0x4800_0001,
+            0x819d_0000,
+            0x3883_0000,
+            0x387d_0000,
+            0x818c_001c,
+            0x38be_0114,
+            0x7d88_03a6,
+            0x4e80_0021,
+            0x2803_0000,
+            0x4082_0024,
+        ];
+        for (index, word) in hino_sequence.into_iter().enumerate() {
+            write_be_u32(
+                &mut source,
+                SYNTHETIC_TEXT_OFFSET + (hino_word + index) * 4,
+                word,
+            )
+            .unwrap();
+        }
+
+        let requested = BTreeSet::from([
+            RuntimeGoopManagerPatch::PoiHanaAnyArea,
+            RuntimeGoopManagerPatch::HinoKuri2Pool,
+        ]);
+        let patched = patch_sms_goop_enemy_managers_dol(&source, &requested).unwrap();
+        assert_eq!(
+            read_be_u32(&patched, SYNTHETIC_TEXT_OFFSET + (poi_word + 2) * 4).unwrap(),
+            PPC_NOP
+        );
+        assert_eq!(
+            read_be_u32(&patched, SYNTHETIC_TEXT_OFFSET + (hino_word + 1) * 4).unwrap(),
+            PPC_NOP
+        );
+        assert_eq!(
+            patch_sms_goop_enemy_managers_dol(&patched, &requested).unwrap(),
+            patched
+        );
     }
 
     #[test]

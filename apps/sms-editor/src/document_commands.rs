@@ -618,6 +618,63 @@ fn catalog_resource_maintenance(
     catalog_resource_maintenance_from_templates(document, &templates, active_factories)
 }
 
+fn pool_only_manager_name(object: &SceneObject) -> Option<&str> {
+    let Some(sms_scene::PlacementBinding::Authored(placement)) = &object.placement else {
+        return None;
+    };
+    placement
+        .pool_only
+        .then(|| object.raw_param("manager_name"))
+        .flatten()
+}
+
+fn object_depends_on_manager(object: &SceneObject, manager_name: &str) -> bool {
+    if object.raw_param("manager_name") == Some(manager_name) {
+        return true;
+    }
+    matches!(
+        &object.placement,
+        Some(sms_scene::PlacementBinding::Authored(placement))
+            if placement.dependencies.iter().any(|dependency| dependency.record.name == manager_name)
+    )
+}
+
+/// Removes editor-authored pool carriers for inactive goop managers, but only
+/// when no non-pool object still references that exact runtime manager name.
+/// Imported scene managers are never touched.
+fn remove_unused_inactive_enemy_manager_pools(
+    document: &mut StageDocument,
+    active_manager_names: &BTreeSet<String>,
+) -> Vec<(String, String)> {
+    let pool_managers = document
+        .objects
+        .iter()
+        .filter_map(|object| pool_only_manager_name(object).map(str::to_owned))
+        .filter(|manager_name| !active_manager_names.contains(manager_name))
+        .collect::<BTreeSet<_>>();
+    let removable_managers = pool_managers
+        .into_iter()
+        .filter(|manager_name| {
+            !document.objects.iter().any(|object| {
+                pool_only_manager_name(object) != Some(manager_name.as_str())
+                    && object_depends_on_manager(object, manager_name)
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    let mut removed = Vec::new();
+    document.objects.retain(|object| {
+        let Some(manager_name) = pool_only_manager_name(object) else {
+            return true;
+        };
+        if !removable_managers.contains(manager_name) {
+            return true;
+        }
+        removed.push((manager_name.to_string(), object.factory_name.clone()));
+        false
+    });
+    removed
+}
+
 fn catalog_resource_maintenance_from_templates(
     document: &StageDocument,
     templates: &[&sms_scene::ObjectAuthoringTemplate],
@@ -1591,6 +1648,116 @@ fn object_from_catalog_template(
     Ok(object)
 }
 
+struct PreparedCatalogEnemyManagerPool {
+    object: SceneObject,
+    resource_deltas: Vec<ResourceEditDelta>,
+    resource_writes: usize,
+    reused_resources: usize,
+    upgraded_bootstrap_proxies: usize,
+}
+
+fn prepare_catalog_enemy_manager_pool(
+    document: &StageDocument,
+    registry: &ObjectRegistry,
+    template: &sms_scene::ObjectAuthoringTemplate,
+    actor_factory: &str,
+    manager_factory: &str,
+    manager_name: &str,
+    id: String,
+) -> Result<PreparedCatalogEnemyManagerPool, String> {
+    if semantic_record_type(&template.factory_name) != semantic_record_type(actor_factory) {
+        return Err(format!(
+            "catalog template '{}' does not match requested enemy actor '{actor_factory}'",
+            template.factory_name
+        ));
+    }
+    let actor = registry
+        .find_enemy_actor(actor_factory)
+        .or_else(|| registry.find_enemy_actor(semantic_record_type(actor_factory)))
+        .ok_or_else(|| format!("'{actor_factory}' is not a decomp-identified enemy actor"))?;
+    let manager = registry
+        .find_enemy_manager(manager_factory)
+        .or_else(|| registry.find_enemy_manager(semantic_record_type(manager_factory)))
+        .ok_or_else(|| format!("'{manager_factory}' is not a decomp-identified TEnemyManager"))?;
+    if !actor.manager_factories.iter().any(|expected| {
+        semantic_record_type(expected) == semantic_record_type(&manager.factory_name)
+    }) {
+        return Err(format!(
+            "enemy actor '{actor_factory}' is not compatible with manager '{manager_factory}'"
+        ));
+    }
+    if manager.spawned_actor_class.as_deref() != Some(actor.class_name.as_str()) {
+        return Err(format!(
+            "manager '{manager_factory}' creates {}, not {}",
+            manager
+                .spawned_actor_class
+                .as_deref()
+                .unwrap_or("an unknown actor class"),
+            actor.class_name
+        ));
+    }
+    let native_pool =
+        registry.enemy_manager_has_native_pollution_pool(&manager.factory_name, manager_name);
+    let managed_patch = match semantic_record_type(&manager.factory_name) {
+        "PoiHanaManager" => registry
+            .conditional_enemy_manager_factories
+            .iter()
+            .any(|factory| semantic_record_type(factory) == "PoiHanaManager"),
+        "HinoKuri2Manager" => registry
+            .conductor_pool_excluded_manager_names
+            .iter()
+            .any(|excluded| excluded == manager_name),
+        _ => false,
+    };
+    if !native_pool && !managed_patch {
+        return Err(format!(
+            "manager '{manager_factory}' cannot provide a decomp-proven pollution spawn pool"
+        ));
+    }
+    if !template.dependencies.iter().any(|dependency| {
+        dependency.record.name == manager_name
+            && semantic_record_type(&dependency.record.type_name)
+                == semantic_record_type(&manager.factory_name)
+    }) {
+        return Err(format!(
+            "retail template '{}' has no exact {manager_factory} dependency named {manager_name:?}",
+            template.factory_name
+        ));
+    }
+
+    let preflight = preflight_catalog_resources(document, template)?;
+    let resource_writes = preflight.writes.len();
+    let reused_resources = preflight.reused_existing_resources;
+    let upgraded_bootstrap_proxies = preflight.upgraded_bootstrap_proxies;
+    let mut object = object_from_catalog_template(
+        id,
+        actor_factory.to_string(),
+        [0.0; 3],
+        template,
+        &preflight.graph_name_rewrites,
+    )?;
+    if object.raw_param("manager_name") != Some(manager_name) {
+        return Err(format!(
+            "retail template '{}' does not bind its actor to manager {manager_name:?}",
+            template.factory_name
+        ));
+    }
+    let Some(sms_scene::PlacementBinding::Authored(placement)) = &mut object.placement else {
+        return Err("catalog enemy did not produce an authored placement".to_string());
+    };
+    placement.pool_only = true;
+    add_catalog_preview_hint(&mut object, document, template);
+    document.refresh_registry_derived_object_fields(std::slice::from_mut(&mut object), registry);
+    let resource_deltas = catalog_resource_edit_deltas(document, preflight.writes);
+    Ok(PreparedCatalogEnemyManagerPool {
+        object,
+        resource_deltas,
+        resource_writes,
+        reused_resources,
+        upgraded_bootstrap_proxies,
+    })
+}
+
 fn is_shine_object(object: &SceneObject) -> bool {
     object.factory_name == "Shine"
         || object.class_name.as_deref() == Some("TShine")
@@ -2389,6 +2556,18 @@ impl SmsEditorApp {
                 }
             }
         }
+        let active_goop_managers = self
+            .document
+            .as_ref()
+            .map(crate::goop_spawn::goop_flagged_managers)
+            .unwrap_or_default();
+        let removed_inactive_manager_pools = self
+            .document
+            .as_mut()
+            .map(|document| {
+                remove_unused_inactive_enemy_manager_pools(document, &active_goop_managers)
+            })
+            .unwrap_or_default();
         let authored_factories = self
             .document
             .as_ref()
@@ -2496,6 +2675,7 @@ impl SmsEditorApp {
             && maintenance.pruned_resources == 0
             && runtime_goop_writes == 0
             && migrated_shines.is_empty()
+            && removed_inactive_manager_pools.is_empty()
         {
             return;
         }
@@ -2539,6 +2719,19 @@ impl SmsEditorApp {
             self.log.push(format!(
                 "Removed {} unused retail catalog resource(s) left by deleted authored objects. Save the project before launching.",
                 maintenance.pruned_resources
+            ));
+        }
+        if !removed_inactive_manager_pools.is_empty() {
+            let managers = removed_inactive_manager_pools
+                .iter()
+                .map(|(manager_name, _)| manager_name.as_str())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.log.push(format!(
+                "Removed {} inactive goop manager pool(s) with no remaining level dependencies: {managers}. Save the project before launching.",
+                removed_inactive_manager_pools.len()
             ));
         }
         if runtime_goop_writes > 0 {
@@ -3440,6 +3633,131 @@ impl SmsEditorApp {
             },
         );
     }
+    /// Adds a retail-backed manager bundle without placing its actor in the
+    /// exported world. The caller owns the surrounding undo transaction so it
+    /// can combine this with the StageEnemyInfo flag change atomically.
+    pub(super) fn ensure_catalog_enemy_manager_pool(
+        &mut self,
+        actor_factory: &str,
+        manager_factory: &str,
+        manager_name: &str,
+    ) -> Result<String, String> {
+        let template = self
+            .object_authoring_catalog
+            .find(actor_factory)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "the retail authoring catalog has no complete template for '{actor_factory}'"
+                )
+            })?;
+        let registry = self
+            .registry
+            .as_ref()
+            .ok_or_else(|| "enemy schema is unavailable".to_string())?;
+        let document = self
+            .document
+            .as_ref()
+            .ok_or_else(|| "no stage is open".to_string())?;
+        let (id, next_object_serial) = self.next_available_object_id().ok_or_else(|| {
+            format!("no unique editor object id is available for manager {manager_name:?}")
+        })?;
+        let prepared = prepare_catalog_enemy_manager_pool(
+            document,
+            registry,
+            &template,
+            actor_factory,
+            manager_factory,
+            manager_name,
+            id,
+        )?;
+        let index = document.objects.len();
+        ObjectUndoRecord {
+            deltas: vec![ObjectDelta::Insert {
+                index,
+                object: prepared.object,
+            }],
+            resource_deltas: prepared.resource_deltas,
+            route_delta: None,
+            dialogue_delta: None,
+        }
+        .apply_forward(
+            self.document
+                .as_mut()
+                .expect("the document was checked before preparing the manager pool"),
+        );
+        self.next_object_serial = next_object_serial;
+        Ok(format!(
+            "Added {manager_factory} from retail stage '{}' as a pool-only manager: {} resource write(s), {} existing resource(s) reused, {} bootstrap proxy resource(s) upgraded.",
+            template.source_stage,
+            prepared.resource_writes,
+            prepared.reused_resources,
+            prepared.upgraded_bootstrap_proxies
+        ))
+    }
+
+    /// Removes pool-only catalog objects made solely to support goop spawning
+    /// after their manager is disabled. The caller owns the surrounding undo
+    /// transaction so the flag, object, and resource changes remain atomic.
+    pub(super) fn cleanup_unused_goop_manager_pools(&mut self) -> Vec<String> {
+        let active_manager_names = self
+            .document
+            .as_ref()
+            .map(crate::goop_spawn::goop_flagged_managers)
+            .unwrap_or_default();
+        let removed = self
+            .document
+            .as_mut()
+            .map(|document| {
+                remove_unused_inactive_enemy_manager_pools(document, &active_manager_names)
+            })
+            .unwrap_or_default();
+        if removed.is_empty() {
+            return Vec::new();
+        }
+
+        let maintenance = self
+            .document
+            .as_ref()
+            .map(|document| {
+                let remaining_factories = authored_catalog_factories(document, None);
+                catalog_resource_maintenance(
+                    document,
+                    self.object_authoring_catalog.as_ref(),
+                    &remaining_factories,
+                )
+            })
+            .unwrap_or_default();
+        if !maintenance.resource_deltas.is_empty() {
+            if let Some(document) = &mut self.document {
+                ObjectUndoRecord {
+                    deltas: Vec::new(),
+                    resource_deltas: maintenance.resource_deltas.clone(),
+                    route_delta: None,
+                    dialogue_delta: None,
+                }
+                .apply_forward(document);
+            }
+        }
+
+        let mut messages = removed
+            .into_iter()
+            .map(|(manager_name, factory_name)| {
+                format!("Removed unused {factory_name} pool for disabled manager {manager_name:?}.")
+            })
+            .collect::<Vec<_>>();
+        if maintenance.pruned_resources > 0 {
+            messages.push(format!(
+                "Removed {} catalog resource(s) no longer used by any authored object.",
+                maintenance.pruned_resources
+            ));
+        }
+        messages.extend(maintenance.errors.into_iter().map(|error| {
+            format!("Could not clean up every unused manager-pool resource: {error}")
+        }));
+        messages
+    }
+
     /// Marks the selected authored enemy as pool-only: export carries its
     /// manager and resources but not the actor record, so nothing stands in
     /// the world and the manager's pool supplies every spawn.
@@ -4671,6 +4989,65 @@ mod tests {
         object
     }
 
+    fn pool_only_fixture_object(id: &str, manager_name: &str) -> SceneObject {
+        let mut object = authored_fixture_object(id, "FixtureEnemy");
+        object.insert_source_raw_param("manager_name", manager_name);
+        let Some(sms_scene::PlacementBinding::Authored(placement)) = &mut object.placement else {
+            unreachable!()
+        };
+        placement.pool_only = true;
+        placement
+            .dependencies
+            .push(sms_scene::AuthoredPlacementDependency {
+                target: None,
+                target_group_index: 2,
+                record: JDramaRecord::new(
+                    "FixtureManager",
+                    manager_name,
+                    JDramaRecordPayload::Empty,
+                )
+                .unwrap(),
+            });
+        object
+    }
+
+    #[test]
+    fn inactive_pool_cleanup_removes_only_unreferenced_manager_carriers() {
+        let unused_manager = "unused manager";
+        let shared_manager = "shared manager";
+        let active_manager = "active manager";
+        let mut dependent = authored_fixture_object("dependent", "FixtureEnemy");
+        dependent.insert_source_raw_param("manager_name", shared_manager);
+        let mut document = command_test_document(vec![
+            pool_only_fixture_object("unused-pool", unused_manager),
+            pool_only_fixture_object("shared-pool", shared_manager),
+            pool_only_fixture_object("active-pool", active_manager),
+            dependent,
+        ]);
+
+        let removed = remove_unused_inactive_enemy_manager_pools(
+            &mut document,
+            &BTreeSet::from([active_manager.to_string()]),
+        );
+
+        assert_eq!(
+            removed,
+            vec![(unused_manager.to_string(), "FixtureEnemy".to_string())]
+        );
+        assert!(!document
+            .objects
+            .iter()
+            .any(|object| object.id == "unused-pool"));
+        assert!(document
+            .objects
+            .iter()
+            .any(|object| object.id == "shared-pool"));
+        assert!(document
+            .objects
+            .iter()
+            .any(|object| object.id == "active-pool"));
+    }
+
     fn built_in_proxy_document(raw_resource_path: &[u8]) -> StageResourceDocument {
         let requirement = sms_scene::BLANK_STAGE_BOOTSTRAP_REQUIREMENTS
             .iter()
@@ -5814,6 +6191,114 @@ mod tests {
             unreachable!()
         };
         assert_eq!(authored.prototype.name, "GraffitoClone_fixture-copy");
+    }
+
+    #[test]
+    fn catalog_manager_pool_adds_no_world_actor_and_is_one_undo_record() {
+        let manager_name = "fixture manager";
+        let template = sms_scene::ObjectAuthoringTemplate {
+            factory_name: "FixtureEnemy".to_string(),
+            group_index: 4,
+            record: JDramaRecord {
+                type_name: "FixtureEnemy".to_string(),
+                name: "retail fixture".to_string(),
+                payload: JDramaRecordPayload::Actor {
+                    transform: sms_formats::JDramaTransform {
+                        translation: [0.0; 3],
+                        rotation: [0.0; 3],
+                        scale: [1.0; 3],
+                    },
+                    character_name: "FixtureChara".to_string(),
+                    light_map: sms_formats::JDramaLightMap::default(),
+                    fields: vec![JDramaField {
+                        name: "manager_name".to_string(),
+                        value: JDramaFieldValue::String(manager_name.to_string()),
+                    }],
+                },
+            },
+            dependencies: vec![sms_scene::ObjectAuthoringDependency {
+                group_index: 2,
+                target: sms_scene::AuthoredPlacementDependencyTarget::IndexedGroup {
+                    group_index: 2,
+                },
+                record: JDramaRecord::new(
+                    "FixtureManager",
+                    manager_name,
+                    JDramaRecordPayload::Fields { fields: Vec::new() },
+                )
+                .unwrap(),
+            }],
+            character_records: Vec::new(),
+            table_dependencies: Vec::new(),
+            runtime_actor_references: Vec::new(),
+            required_graph_names: Vec::new(),
+            resources: Vec::new(),
+            preview_resource_path: None,
+            source_stage: "fixture0".to_string(),
+        };
+        let registry = ObjectRegistry {
+            enemy_managers: vec![sms_schema::EnemyManagerDefinition {
+                factory_name: "FixtureManager".to_string(),
+                class_name: "TFixtureManager".to_string(),
+                model_index: None,
+                spawned_actor_class: Some("TFixtureEnemy".to_string()),
+                parameter_path: None,
+                models: Vec::new(),
+            }],
+            enemy_actors: vec![sms_schema::EnemyActorDefinition {
+                factory_name: "FixtureEnemy".to_string(),
+                class_name: "TFixtureEnemy".to_string(),
+                model_index: None,
+                fallback_models: Vec::new(),
+                primary_model: None,
+                named_models: Vec::new(),
+                indexed_models: Vec::new(),
+                manager_factories: vec!["FixtureManager".to_string()],
+                runtime_uniform_scale: None,
+            }],
+            ..ObjectRegistry::default()
+        };
+        let mut document = command_test_document(Vec::new());
+        let prepared = prepare_catalog_enemy_manager_pool(
+            &document,
+            &registry,
+            &template,
+            "FixtureEnemy",
+            "FixtureManager",
+            manager_name,
+            "fixture0-obj-0001".to_string(),
+        )
+        .unwrap();
+        let Some(sms_scene::PlacementBinding::Authored(placement)) =
+            prepared.object.placement.as_ref()
+        else {
+            panic!("manager pool must use an authored placement");
+        };
+        assert!(placement.pool_only);
+        assert_eq!(placement.dependencies.len(), 1);
+        assert_eq!(placement.dependencies[0].record.name, manager_name);
+
+        let undo = ObjectUndoRecord {
+            deltas: vec![ObjectDelta::Insert {
+                index: 0,
+                object: prepared.object,
+            }],
+            resource_deltas: prepared.resource_deltas,
+            route_delta: None,
+            dialogue_delta: None,
+        };
+        undo.apply_forward(&mut document);
+        assert_eq!(document.objects.len(), 1);
+        let Some(sms_scene::PlacementBinding::Authored(placement)) =
+            document.objects[0].placement.as_ref()
+        else {
+            unreachable!()
+        };
+        assert!(placement.pool_only, "the actor record must not export");
+
+        undo.apply_reverse(&mut document);
+        assert!(document.objects.is_empty());
+        assert!(document.archive_edits.resources.is_empty());
     }
 
     #[test]

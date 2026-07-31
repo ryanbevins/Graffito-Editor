@@ -226,6 +226,14 @@ pub struct ObjectRegistry {
     pub npc_action_presets: Vec<NpcActionPresetDefinition>,
     #[serde(default)]
     pub enemy_managers: Vec<EnemyManagerDefinition>,
+    /// Exact manager object names which `TConductor::init` deliberately skips
+    /// when constructing the reusable enemy pools used by pollution spawning.
+    #[serde(default)]
+    pub conductor_pool_excluded_manager_names: Vec<String>,
+    /// Manager factories whose effective `createEnemyInstance` can return
+    /// null under a runtime condition such as the current area.
+    #[serde(default)]
+    pub conditional_enemy_manager_factories: Vec<String>,
     /// Stage-local animation folders opened directly by enemy manager
     /// createAnmData overrides instead of through registered character data.
     #[serde(default)]
@@ -321,6 +329,27 @@ impl ObjectRegistry {
         self.enemy_managers
             .iter()
             .find(|definition| definition.factory_name == factory_name)
+    }
+
+    /// Whether this exact manager record can provide a reusable actor pool to
+    /// `TConductor::genEnemyFromPollution`.
+    pub fn enemy_manager_has_native_pollution_pool(
+        &self,
+        manager_factory: &str,
+        manager_name: &str,
+    ) -> bool {
+        self.find_enemy_manager(manager_factory)
+            .is_some_and(|manager| {
+                manager.spawned_actor_class.is_some()
+                    && !self
+                        .conditional_enemy_manager_factories
+                        .iter()
+                        .any(|conditional| conditional == manager_factory)
+                    && !self
+                        .conductor_pool_excluded_manager_names
+                        .iter()
+                        .any(|excluded| excluded == manager_name)
+            })
     }
 
     pub fn find_enemy_actor(&self, factory_name: &str) -> Option<&EnemyActorDefinition> {
@@ -1451,6 +1480,7 @@ impl SchemaGenerator {
         let mut actor_root_parts = BTreeMap::<String, String>::new();
         let mut part_model_indices = BTreeMap::<String, usize>::new();
         let mut manager_actor_classes = BTreeMap::<String, String>::new();
+        let mut manager_unconditional_actor_creation = BTreeMap::<String, bool>::new();
         let mut manager_parameter_paths = BTreeMap::<String, String>::new();
         let mut manager_animation_folders = BTreeMap::<String, Vec<(String, String)>>::new();
         let mut runtime_map_obj_dependencies = BTreeMap::<String, Vec<(String, String)>>::new();
@@ -1521,7 +1551,11 @@ impl SchemaGenerator {
                 extract_owned_actor_classes(text, &mut owned_actor_classes);
                 extract_actor_root_parts(text, &mut actor_root_parts);
                 extract_part_model_indices(text, &mut part_model_indices);
-                extract_enemy_manager_actor_classes(text, &mut manager_actor_classes);
+                extract_enemy_manager_actor_classes(
+                    text,
+                    &mut manager_actor_classes,
+                    &mut manager_unconditional_actor_creation,
+                );
                 for (class_name, path) in extract_enemy_manager_parameter_paths(text) {
                     manager_parameter_paths.entry(class_name).or_insert(path);
                 }
@@ -1723,6 +1757,17 @@ impl SchemaGenerator {
             )
             .unwrap_or_default();
             let factory_name = object.factory_name;
+            let creates_actor_unconditionally = inherited_actor_value(
+                &object.class_name,
+                &manager_unconditional_actor_creation,
+                &inheritance,
+            )
+            .unwrap_or(false);
+            if !creates_actor_unconditionally {
+                registry
+                    .conditional_enemy_manager_factories
+                    .push(factory_name.clone());
+            }
             registry.enemy_managers.push(EnemyManagerDefinition {
                 factory_name: factory_name.clone(),
                 spawned_actor_class: inherited_actor_class(
@@ -1762,6 +1807,13 @@ impl SchemaGenerator {
             &init_tev_colors,
             &inheritance,
         );
+        if let Some(conductor) = sources
+            .files()
+            .find(|file| file.relative_path() == "src/Enemy/conductor.cpp")
+        {
+            registry.conductor_pool_excluded_manager_names =
+                extract_conductor_pool_excluded_manager_names(conductor.text());
+        }
         Ok(())
     }
 
@@ -3612,6 +3664,7 @@ fn inherited_enemy_init_color(
 fn extract_enemy_manager_actor_classes(
     text: &str,
     manager_actor_classes: &mut BTreeMap<String, String>,
+    manager_unconditional_actor_creation: &mut BTreeMap<String, bool>,
 ) {
     let method_re = Regex::new(
         r"[A-Za-z_][A-Za-z0-9_:]*\s*\*\s*([A-Za-z_][A-Za-z0-9_]*Manager)::createEnemyInstance\s*\([^)]*\)\s*\{",
@@ -3619,6 +3672,8 @@ fn extract_enemy_manager_actor_classes(
     .expect("valid enemy manager factory method regex");
     let return_re = Regex::new(r"return\s+new\s+([A-Za-z_][A-Za-z0-9_]*)\b")
         .expect("valid enemy manager actor return regex");
+    let null_return_re = Regex::new(r"return\s+(?:nullptr|NULL|0)\s*;")
+        .expect("valid enemy manager null return regex");
     for method in method_re.captures_iter(text) {
         let Some(whole_match) = method.get(0) else {
             continue;
@@ -3632,7 +3687,32 @@ fn extract_enemy_manager_actor_classes(
         manager_actor_classes
             .entry(method[1].to_string())
             .or_insert_with(|| actor[1].to_string());
+        manager_unconditional_actor_creation
+            .entry(method[1].to_string())
+            .or_insert_with(|| !null_return_re.is_match(body));
     }
+}
+
+fn extract_conductor_pool_excluded_manager_names(text: &str) -> Vec<String> {
+    let method_re = Regex::new(r"void\s+TConductor::init\s*\(\s*\)\s*\{")
+        .expect("valid conductor init method regex");
+    let Some(method) = method_re.find(text) else {
+        return Vec::new();
+    };
+    let Some(body) = braced_body(text, method.end() - 1) else {
+        return Vec::new();
+    };
+    let Some(create_enemies) = body.find("createEnemies") else {
+        return Vec::new();
+    };
+    let search_re = Regex::new(r#"->search\s*\(\s*"([^"]+)"\s*\)"#)
+        .expect("valid conductor manager search regex");
+    search_re
+        .captures_iter(&body[..create_enemies])
+        .map(|capture| capture[1].to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn inherited_actor_class(
@@ -5108,6 +5188,12 @@ fn dedup_registry(registry: &mut ObjectRegistry) -> Result<()> {
     registry
         .enemy_managers
         .dedup_by(|a, b| a.factory_name == b.factory_name);
+    registry
+        .conductor_pool_excluded_manager_names
+        .sort_unstable();
+    registry.conductor_pool_excluded_manager_names.dedup();
+    registry.conditional_enemy_manager_factories.sort_unstable();
+    registry.conditional_enemy_manager_factories.dedup();
     registry.enemy_actors.sort_by(|a, b| {
         a.factory_name
             .cmp(&b.factory_name)
@@ -5923,13 +6009,15 @@ mod tests {
             }
         "#;
         let mut spawned_classes = BTreeMap::new();
-        extract_enemy_manager_actor_classes(text, &mut spawned_classes);
+        let mut unconditional = BTreeMap::new();
+        extract_enemy_manager_actor_classes(text, &mut spawned_classes, &mut unconditional);
         assert_eq!(
             spawned_classes
                 .get("THaneHamuKuriManager")
                 .map(String::as_str),
             Some("THaneHamuKuri")
         );
+        assert_eq!(unconditional.get("THaneHamuKuriManager"), Some(&true));
 
         let inheritance = BTreeMap::from([
             ("THaneHamuKuri2".to_string(), "THaneHamuKuri".to_string()),
@@ -5969,6 +6057,40 @@ mod tests {
             compatible_enemy_managers(&actor, &managers, &inheritance),
             ["HaneHamuKuriManager", "HamuKuriManager"]
         );
+    }
+
+    #[test]
+    fn extracts_pollution_pool_blockers_from_manager_and_conductor_code() {
+        let mut spawned_classes = BTreeMap::new();
+        let mut unconditional = BTreeMap::new();
+        extract_enemy_manager_actor_classes(
+            r#"
+                TSmallEnemy* TPoiHanaManager::createEnemyInstance() {
+                    if (gpApplication.mCurrArea.unk0 == 0x38)
+                        return new TPoiHana;
+                    return nullptr;
+                }
+            "#,
+            &mut spawned_classes,
+            &mut unconditional,
+        );
+        assert_eq!(
+            spawned_classes.get("TPoiHanaManager").map(String::as_str),
+            Some("TPoiHana")
+        );
+        assert_eq!(unconditional.get("TPoiHanaManager"), Some(&false));
+
+        let excluded = extract_conductor_pool_excluded_manager_names(
+            r#"
+                void TConductor::init() {
+                    if (!(*it)->search("Hino manager")
+                        && !(*it)->search("Boss manager"))
+                        (*it)->createEnemies((*it)->getCapacity());
+                    unkF8 = (TAreaCylinderManager*)search("area manager");
+                }
+            "#,
+        );
+        assert_eq!(excluded, vec!["Boss manager", "Hino manager"]);
     }
 
     #[test]
