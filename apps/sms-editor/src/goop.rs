@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use sms_formats::{
     mount_scene_archive, read_stage_asset_bytes, BmpFile, J3dFile, J3dRebuildDocument,
-    J3dRebuildSectionData, JDramaDocument, StageAssetKind, YmpDocument, YmpLayer,
+    J3dRebuildSectionData, StageAssetKind, YmpDocument, YmpLayer,
 };
 use sms_scene::{
     automatic_goop_region, balanced_goop_expansion, carve_compatible_goop_overlap_depths,
@@ -38,6 +37,8 @@ pub(super) struct RetailGoopTemplate {
 }
 
 const GOOP_TEMPLATE_ANIMATION_EXTENSIONS: [&str; 6] = ["btk", "btp", "bpk", "brk", "bck", "bas"];
+const GOOP_STROKE_PREVIEW_SAMPLE_LIMIT: usize = 512;
+const GOOP_STROKE_PREVIEW_CIRCLE_SEGMENTS: usize = 12;
 
 fn semantic_goop_type(behavior: GoopBehavior, detail_texture_name: Option<&str>) -> String {
     let detail = detail_texture_name.unwrap_or_default().to_ascii_lowercase();
@@ -94,6 +95,21 @@ struct PendingGoopSample {
     brush: GoopBrush,
 }
 
+fn goop_stroke_preview_samples(stroke: &GoopStroke) -> Vec<PendingGoopSample> {
+    let pending = &stroke.pending;
+    if pending.len() <= GOOP_STROKE_PREVIEW_SAMPLE_LIMIT {
+        return pending.clone();
+    }
+
+    let last = pending.len() - 1;
+    (0..GOOP_STROKE_PREVIEW_SAMPLE_LIMIT)
+        .map(|slot| {
+            let index = slot * last / (GOOP_STROKE_PREVIEW_SAMPLE_LIMIT - 1);
+            pending[index]
+        })
+        .collect()
+}
+
 pub(super) struct GoopRebuildOutcome {
     base_root: String,
     stage_id: String,
@@ -106,10 +122,9 @@ pub(super) struct GoopRebuildOutcome {
 pub(super) struct GoopAdaptiveOutcome {
     base_root: String,
     stage_id: String,
-    terrain_fingerprint: u64,
-    before: Option<GoopAuthoringDocument>,
-    before_edits: StageArchiveEdits,
-    expected_fingerprint: u64,
+    terrain_instances: Vec<EditorModelInstance>,
+    indexed_templates: Option<(Vec<RetailGoopTemplate>, Vec<String>)>,
+    undo: GoopSnapshotUndo,
     heap_warning: Option<String>,
     document: StageDocument,
 }
@@ -351,146 +366,17 @@ fn clear_generated_goop_readiness_if_empty(authoring: &mut GoopAuthoringDocument
     authoring.format_version = GOOP_AUTHORING_FORMAT_VERSION;
 }
 
-fn adaptive_goop_guard_fingerprint(document: &StageDocument) -> Result<u64, String> {
-    let mut hasher = DefaultHasher::new();
-    let Some(authoring) = document.goop_authoring.as_ref() else {
-        0u8.hash(&mut hasher);
-        hash_stage_archive_edits(&document.archive_edits, &mut hasher)?;
-        return Ok(hasher.finish());
-    };
-    1u8.hash(&mut hasher);
-    authoring.format_version.hash(&mut hasher);
-    authoring.terrain_fingerprint.hash(&mut hasher);
-    authoring.stage_archive_resident_bytes.hash(&mut hasher);
-    authoring.stale.hash(&mut hasher);
-    authoring.layers.len().hash(&mut hasher);
-    for layer in &authoring.layers {
-        layer.id.hash(&mut hasher);
-        layer.runtime_index.hash(&mut hasher);
-        std::mem::discriminant(&layer.origin).hash(&mut hasher);
-        layer.plane.runtime_code().hash(&mut hasher);
-        layer.behavior.runtime_code().hash(&mut hasher);
-        layer.visible.hash(&mut hasher);
-        for value in [
-            layer.region.min_x,
-            layer.region.min_z,
-            layer.region.max_x,
-            layer.region.max_z,
-        ] {
-            value.to_bits().hash(&mut hasher);
-        }
-        YmpDocument::canonical(vec![layer.runtime.clone()])
-            .and_then(|ymp| ymp.encode())
-            .map_err(|error| {
-                format!(
-                    "could not fingerprint goop runtime layer {}: {error}",
-                    layer.id
-                )
-            })?
-            .hash(&mut hasher);
-        layer.bitmap.is_some().hash(&mut hasher);
-        if let Some(bitmap) = &layer.bitmap {
-            bitmap
-                .encode()
-                .map_err(|error| {
-                    format!("could not fingerprint goop bitmap {}: {error}", layer.id)
-                })?
-                .hash(&mut hasher);
-        }
-        layer.generated_model.is_some().hash(&mut hasher);
-        if let Some(model) = &layer.generated_model {
-            model
-                .to_bytes()
-                .map_err(|error| format!("could not fingerprint goop model {}: {error}", layer.id))?
-                .hash(&mut hasher);
-        }
-        layer.style_source.is_some().hash(&mut hasher);
-        if let Some(style) = &layer.style_source {
-            style.stage_id.hash(&mut hasher);
-            style.layer_index.hash(&mut hasher);
-            style.display_name.hash(&mut hasher);
-            style.behavior_code.hash(&mut hasher);
-            style.forced_incompatible.hash(&mut hasher);
-            style.resource_stem.hash(&mut hasher);
-        }
-        layer.resource_stem.hash(&mut hasher);
-        layer.metadata_dirty.hash(&mut hasher);
-        layer.surface_anchor.is_some().hash(&mut hasher);
-        if let Some(anchor) = layer.surface_anchor {
-            for value in anchor.world {
-                value.to_bits().hash(&mut hasher);
-            }
-        }
-    }
-    hash_stage_archive_edits(&document.archive_edits, &mut hasher)?;
-    Ok(hasher.finish())
-}
-
-fn hash_stage_archive_edits(
-    edits: &StageArchiveEdits,
-    hasher: &mut DefaultHasher,
-) -> Result<(), String> {
-    edits.resource_removals.hash(hasher);
-    edits.resources.len().hash(hasher);
-    for edit in &edits.resources {
-        edit.raw_resource_path.hash(hasher);
-        std::mem::discriminant(&edit.mode).hash(hasher);
-        edit.catalog_managed.hash(hasher);
-        edit.document
-            .to_bytes()
-            .map_err(|error| {
-                format!(
-                    "could not fingerprint resource {}: {error}",
-                    String::from_utf8_lossy(&edit.raw_resource_path)
-                )
-            })?
-            .hash(hasher);
-    }
-    edits.models.len().hash(hasher);
-    for edit in &edits.models {
-        edit.raw_resource_path.hash(hasher);
-        std::mem::discriminant(&edit.mode).hash(hasher);
-        edit.document
-            .to_bytes()
-            .map_err(|error| {
-                format!(
-                    "could not fingerprint model {}: {error}",
-                    String::from_utf8_lossy(&edit.raw_resource_path)
-                )
-            })?
-            .hash(hasher);
-    }
-    edits.collisions.len().hash(hasher);
-    for edit in &edits.collisions {
-        edit.raw_resource_path.hash(hasher);
-        std::mem::discriminant(&edit.mode).hash(hasher);
-        edit.document
-            .to_bytes()
-            .map_err(|error| {
-                format!(
-                    "could not fingerprint collision {}: {error}",
-                    String::from_utf8_lossy(&edit.raw_resource_path)
-                )
-            })?
-            .hash(hasher);
-    }
-    edits.placement_inserts.len().hash(hasher);
-    for insert in &edits.placement_inserts {
-        insert.raw_resource_path.hash(hasher);
-        insert.parent_record_path.hash(hasher);
-        JDramaDocument {
-            root: insert.record.clone(),
-        }
-        .to_bytes()
-        .map_err(|error| {
-            format!(
-                "could not fingerprint placement insert {}: {error}",
-                String::from_utf8_lossy(&insert.raw_resource_path)
-            )
-        })?
-        .hash(hasher);
-    }
-    Ok(())
+fn adaptive_goop_inputs_unchanged(
+    document: &StageDocument,
+    model_instances: &[EditorModelInstance],
+    outcome: &GoopAdaptiveOutcome,
+) -> bool {
+    document.goop_authoring == outcome.undo.before
+        && document.archive_edits == outcome.undo.before_edits
+        && model_instances
+            .iter()
+            .filter(|instance| instance.stage_id.eq_ignore_ascii_case(&outcome.stage_id))
+            .eq(outcome.terrain_instances.iter())
 }
 
 fn remove_generated_goop_map(document: &mut StageDocument) -> Result<usize, String> {
@@ -1298,7 +1184,7 @@ impl SmsEditorApp {
     }
 
     fn finalized_goop_terrain_document(&self) -> Result<StageDocument, String> {
-        let mut document = self
+        let document = self
             .document
             .clone()
             .ok_or_else(|| "no stage is open".to_string())?;
@@ -1308,80 +1194,19 @@ impl SmsEditorApp {
             .filter(|instance| instance.stage_id.eq_ignore_ascii_case(&document.stage_id))
             .cloned()
             .collect::<Vec<_>>();
-        let assets = if instances.is_empty() {
-            BTreeMap::new()
-        } else {
-            let content_root = self
-                .model_content_root()
-                .ok_or_else(|| "project Content root is unavailable".to_string())?;
-            Self::load_model_asset_snapshot(&content_root, &instances)?
-        };
+        let content_root = self.model_content_root();
         let not_cancelled = AtomicBool::new(false);
-        let archive_edits = Self::stage_edits_with_model_instances_from_snapshot_cancellable(
-            &assets,
+        finalized_goop_terrain_document_from_inputs(
+            document,
             &instances,
-            &document.archive_edits,
-            document.stage_archive.as_ref(),
-            document.registry.as_ref(),
+            content_root.as_deref(),
             &not_cancelled,
-        )?;
-        document.replace_archive_edits(archive_edits);
-        Ok(document)
+        )
     }
 
     fn final_goop_terrain_snapshot(&self) -> Result<FinalGoopTerrainSnapshot, String> {
         let document = self.finalized_goop_terrain_document()?;
-        let fingerprint = document
-            .effective_terrain_fingerprint()
-            .map_err(|error| error.to_string())?;
-
-        let collision = match document
-            .effective_resource_clone(b"map/map.col")
-            .map_err(|error| error.to_string())?
-        {
-            Some(resource) => Some(resource),
-            None => document
-                .effective_resource_clone(b"map/map/map.col")
-                .map_err(|error| error.to_string())?,
-        };
-        let collision = match collision {
-            Some(StageResourceDocument::Collision(collision)) => collision,
-            Some(_) => {
-                return Err("effective map collision resource is not COL data".to_string());
-            }
-            None => {
-                return Err(
-                    "final terrain has no map/map.col or map/map/map.col resource".to_string(),
-                );
-            }
-        };
-        let collision_triangles = goop_collision_triangles(&collision);
-        if collision_triangles.is_empty() {
-            return Err("final map collision contains no triangles".to_string());
-        }
-
-        let model = match document
-            .effective_resource_clone(b"map/map/map.bmd")
-            .map_err(|error| error.to_string())?
-        {
-            Some(StageResourceDocument::Model(model)) => model,
-            Some(_) => return Err("effective map/map/map.bmd is not model data".to_string()),
-            None => return Err("final terrain has no map/map/map.bmd resource".to_string()),
-        };
-        let model_bytes = model.to_bytes().map_err(|error| error.to_string())?;
-        let preview = J3dFile::parse(&model_bytes)
-            .and_then(|model| model.geometry_preview_with_loader_flags(SMS_MAP_MODEL_LOAD_FLAGS))
-            .map_err(|error| format!("could not decode final map render geometry: {error}"))?;
-        let render_triangles = goop_upward_render_triangles(&preview);
-        if render_triangles.is_empty() {
-            return Err("final map model contains no upward-facing render triangles".to_string());
-        }
-
-        Ok(FinalGoopTerrainSnapshot {
-            collision_triangles,
-            render_triangles,
-            fingerprint,
-        })
+        final_goop_terrain_snapshot_from_document(&document)
     }
 
     pub(super) fn final_goop_terrain_fingerprint(&self) -> Result<u64, String> {
@@ -1670,135 +1495,126 @@ impl SmsEditorApp {
     }
 
     fn start_adaptive_goop_job(&mut self, stroke: GoopStroke) {
-        let Some(mut working_document) = self.document.clone() else {
-            return;
-        };
-        let mut before_document = working_document.clone();
-        restore_goop_stroke_before(&mut before_document, &stroke);
         if self.background_receiver.is_some() {
-            self.document = Some(before_document);
-            for layer in stroke.changed.keys().copied() {
-                self.refresh_live_goop_preview_for_layer(layer);
-            }
             self.log
                 .push("Another background operation is already running.".to_string());
             return;
         }
-        self.ensure_goop_templates_indexed();
-        let terrain = match self.final_goop_terrain_snapshot() {
-            Ok(terrain) => terrain,
-            Err(error) => {
-                self.document = Some(before_document);
-                for layer in stroke.changed.keys().copied() {
-                    self.refresh_live_goop_preview_for_layer(layer);
-                }
-                self.log
-                    .push(format!("Could not prepare adaptive goop terrain: {error}"));
-                return;
-            }
+        let Some(mut working_document) = self.document.take() else {
+            return;
         };
-        let before = before_document.goop_authoring.clone();
-        let before_edits = before_document.archive_edits.clone();
-        let expected_fingerprint = match adaptive_goop_guard_fingerprint(&before_document) {
-            Ok(fingerprint) => fingerprint,
-            Err(error) => {
-                self.document = Some(before_document);
-                for layer in stroke.changed.keys().copied() {
-                    self.refresh_live_goop_preview_for_layer(layer);
-                }
-                self.log.push(format!(
-                    "Could not prepare adaptive goop edit guard: {error}"
-                ));
-                return;
-            }
-        };
+        let mut before_document = working_document.clone();
+        restore_goop_stroke_before(&mut before_document, &stroke);
         self.document = Some(before_document);
         for layer in stroke.changed.keys().copied() {
             self.refresh_live_goop_preview_for_layer(layer);
         }
 
-        let templates = self.retail_goop_templates.clone();
-        let pending = stroke.pending;
-        let selected_template = if self.goop_authoring_mode == GoopAuthoringMode::Simple
-            && self.goop_use_default_style
-        {
-            default_goop_template_for_stroke(&working_document, &templates, &pending)
+        let pending = stroke.pending.clone();
+        let templates_were_indexed = self.goop_templates_indexed;
+        let mut templates = if templates_were_indexed {
+            self.retail_goop_templates.clone()
         } else {
-            templates.get(self.selected_goop_template).cloned()
+            Vec::new()
         };
+        let scene_archives = (!templates_were_indexed).then(|| self.scene_archives.clone());
+        let use_default_style =
+            self.goop_authoring_mode == GoopAuthoringMode::Simple && self.goop_use_default_style;
+        let selected_template_index = self.selected_goop_template;
         let source_layer = stroke.source_layer;
         let base_root = self.base_root.trim().to_string();
         let stage_id = working_document.stage_id.clone();
-        let terrain_fingerprint = terrain.fingerprint;
+        let instances = self
+            .model_instances
+            .iter()
+            .filter(|instance| instance.stage_id.eq_ignore_ascii_case(&stage_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let content_root = self.model_content_root();
+        let task_stroke = stroke.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let task_cancel = Arc::clone(&cancel);
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let result = apply_adaptive_goop_samples(
-                &mut working_document,
-                &terrain,
-                &templates,
-                selected_template.as_ref(),
-                source_layer,
-                &pending,
-                &task_cancel,
-            )
-            .map(|heap_warning| {
-                Box::new(GoopAdaptiveOutcome {
+            let result = (|| {
+                let template_warnings = if let Some(scene_archives) = scene_archives.as_deref() {
+                    let (indexed, warnings) = index_retail_goop_templates(scene_archives);
+                    templates = indexed;
+                    warnings
+                } else {
+                    Vec::new()
+                };
+                let selected_template = if use_default_style {
+                    default_goop_template_for_stroke(&working_document, &templates, &pending)
+                } else {
+                    templates.get(selected_template_index).cloned()
+                };
+                let mut baseline_document = working_document.clone();
+                restore_goop_stroke_before(&mut baseline_document, &task_stroke);
+                let before = baseline_document.goop_authoring.clone();
+                let before_edits = baseline_document.archive_edits.clone();
+                let terrain_document = finalized_goop_terrain_document_from_inputs(
+                    baseline_document,
+                    &instances,
+                    content_root.as_deref(),
+                    &task_cancel,
+                )?;
+                let terrain = final_goop_terrain_snapshot_from_document(&terrain_document)?;
+                let heap_warning = apply_adaptive_goop_samples(
+                    &mut working_document,
+                    &terrain,
+                    &templates,
+                    selected_template.as_ref(),
+                    source_layer,
+                    &pending,
+                    &task_cancel,
+                )?;
+                let undo = GoopSnapshotUndo {
+                    before,
+                    after: working_document.goop_authoring.clone(),
+                    before_edits,
+                    after_edits: working_document.archive_edits.clone(),
+                };
+                Ok(Box::new(GoopAdaptiveOutcome {
                     base_root,
                     stage_id,
-                    terrain_fingerprint,
-                    before,
-                    before_edits,
-                    expected_fingerprint,
+                    terrain_instances: instances,
+                    indexed_templates: (!templates_were_indexed)
+                        .then_some((templates, template_warnings)),
+                    undo,
                     heap_warning,
                     document: working_document,
-                })
-            });
+                }))
+            })();
             let _ = sender.send(BackgroundResult::GoopAdaptive(result));
         });
         self.background_receiver = Some(receiver);
         self.active_build_cancel = Some(cancel);
         self.background_label = Some("Generating adaptive goop".to_string());
+        self.goop_stroke = Some(stroke);
         self.log
             .push("Creating or expanding the painted goop region...".to_string());
     }
 
     pub(super) fn apply_adaptive_goop(&mut self, mut outcome: GoopAdaptiveOutcome) {
+        let stroke_preview = self.goop_stroke.take();
         if self.base_root.trim() != outcome.base_root || self.stage_id != outcome.stage_id {
             self.log
                 .push("Discarded adaptive goop because the open stage changed.".to_string());
             return;
         }
-        let current_fingerprint = match self.final_goop_terrain_fingerprint() {
-            Ok(fingerprint) => fingerprint,
-            Err(error) => {
-                self.log.push(format!(
-                    "Discarded adaptive goop because the terrain could not be verified: {error}"
-                ));
-                return;
-            }
-        };
-        if current_fingerprint != outcome.terrain_fingerprint {
-            self.log.push(
-                "Discarded adaptive goop because the terrain changed during generation."
-                    .to_string(),
-            );
-            return;
+        if let Some((templates, warnings)) = outcome.indexed_templates.take() {
+            self.retail_goop_templates = templates;
+            self.goop_templates_indexed = true;
+            self.selected_goop_template = self
+                .selected_goop_template
+                .min(self.retail_goop_templates.len().saturating_sub(1));
+            self.log.extend(warnings);
         }
         let Some(current) = &self.document else {
             return;
         };
-        let current_fingerprint = match adaptive_goop_guard_fingerprint(current) {
-            Ok(fingerprint) => fingerprint,
-            Err(error) => {
-                self.log.push(format!(
-                    "Discarded adaptive goop because the current edit guard could not be verified: {error}"
-                ));
-                return;
-            }
-        };
-        if current_fingerprint != outcome.expected_fingerprint {
+        if !adaptive_goop_inputs_unchanged(current, &self.model_instances, &outcome) {
             self.log.push(
                 "Discarded adaptive goop because the stage was edited during generation."
                     .to_string(),
@@ -1817,18 +1633,14 @@ impl SmsEditorApp {
                     "Adaptive goop is ready but exceeds the conservative stage-heap threshold; waiting for confirmation."
                         .to_string(),
                 );
+                self.goop_stroke = stroke_preview;
                 self.pending_goop_heap_confirmation = Some(outcome);
                 return;
             }
         }
-        let after = outcome.document.goop_authoring.clone();
-        let after_edits = outcome.document.archive_edits.clone();
-        let record = GoopUndoRecord::Snapshot(Box::new(GoopSnapshotUndo {
-            before: outcome.before,
-            after: after.clone(),
-            before_edits: outcome.before_edits,
-            after_edits: after_edits.clone(),
-        }));
+        let after = outcome.document.goop_authoring.take();
+        let after_edits = std::mem::take(&mut outcome.document.archive_edits);
+        let record = GoopUndoRecord::Snapshot(Box::new(outcome.undo));
         let current = self
             .document
             .as_mut()
@@ -1903,6 +1715,7 @@ impl SmsEditorApp {
             }
             Some(HeapWarningAction::Cancel) => {
                 self.pending_goop_heap_confirmation = None;
+                self.goop_stroke = None;
                 self.log
                     .push("Cancelled adaptive goop because of stage-heap risk.".to_string());
             }
@@ -2573,6 +2386,14 @@ impl SmsEditorApp {
                 }
             }
         }
+        if let Some(stroke) = self.goop_stroke.as_ref() {
+            let template = self.retail_goop_templates.get(self.selected_goop_template);
+            let mesh =
+                goop_stroke_preview_mesh(projection, stroke, goop_stroke_preview_color(template));
+            if !mesh.vertices.is_empty() {
+                painter.add(egui::Shape::mesh(mesh));
+            }
+        }
         if let Some(hit) = self.goop_cursor_world {
             if let Some((center, _)) = self.project_world_to_screen(rect, hit) {
                 let active = layer.is_some_and(|layer| goop_layer_accepts_height(layer, hit));
@@ -2678,6 +2499,89 @@ fn restore_goop_stroke_before(document: &mut StageDocument, stroke: &GoopStroke)
         }
         let _ = layer.set_mask(&mask);
     }
+}
+
+fn finalized_goop_terrain_document_from_inputs(
+    mut document: StageDocument,
+    instances: &[EditorModelInstance],
+    content_root: Option<&Path>,
+    cancelled: &AtomicBool,
+) -> Result<StageDocument, String> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("goop rebuild cancelled".to_string());
+    }
+    let assets = if instances.is_empty() {
+        BTreeMap::new()
+    } else {
+        let content_root =
+            content_root.ok_or_else(|| "project Content root is unavailable".to_string())?;
+        SmsEditorApp::load_model_asset_snapshot(content_root, instances)?
+    };
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("goop rebuild cancelled".to_string());
+    }
+    let archive_edits = SmsEditorApp::stage_edits_with_model_instances_from_snapshot_cancellable(
+        &assets,
+        instances,
+        &document.archive_edits,
+        document.stage_archive.as_ref(),
+        document.registry.as_ref(),
+        cancelled,
+    )?;
+    document.replace_archive_edits(archive_edits);
+    Ok(document)
+}
+
+fn final_goop_terrain_snapshot_from_document(
+    document: &StageDocument,
+) -> Result<FinalGoopTerrainSnapshot, String> {
+    let fingerprint = document
+        .effective_terrain_fingerprint()
+        .map_err(|error| error.to_string())?;
+
+    let collision = match document
+        .effective_resource_clone(b"map/map.col")
+        .map_err(|error| error.to_string())?
+    {
+        Some(resource) => Some(resource),
+        None => document
+            .effective_resource_clone(b"map/map/map.col")
+            .map_err(|error| error.to_string())?,
+    };
+    let collision = match collision {
+        Some(StageResourceDocument::Collision(collision)) => collision,
+        Some(_) => return Err("effective map collision resource is not COL data".to_string()),
+        None => {
+            return Err("final terrain has no map/map.col or map/map/map.col resource".to_string());
+        }
+    };
+    let collision_triangles = goop_collision_triangles(&collision);
+    if collision_triangles.is_empty() {
+        return Err("final map collision contains no triangles".to_string());
+    }
+
+    let model = match document
+        .effective_resource_clone(b"map/map/map.bmd")
+        .map_err(|error| error.to_string())?
+    {
+        Some(StageResourceDocument::Model(model)) => model,
+        Some(_) => return Err("effective map/map/map.bmd is not model data".to_string()),
+        None => return Err("final terrain has no map/map/map.bmd resource".to_string()),
+    };
+    let model_bytes = model.to_bytes().map_err(|error| error.to_string())?;
+    let preview = J3dFile::parse(&model_bytes)
+        .and_then(|model| model.geometry_preview_with_loader_flags(SMS_MAP_MODEL_LOAD_FLAGS))
+        .map_err(|error| format!("could not decode final map render geometry: {error}"))?;
+    let render_triangles = goop_upward_render_triangles(&preview);
+    if render_triangles.is_empty() {
+        return Err("final map model contains no upward-facing render triangles".to_string());
+    }
+
+    Ok(FinalGoopTerrainSnapshot {
+        collision_triangles,
+        render_triangles,
+        fingerprint,
+    })
 }
 
 fn apply_adaptive_goop_samples(
@@ -3357,6 +3261,104 @@ fn paint_surface_polyline(
     }
 }
 
+fn goop_stroke_preview_color(template: Option<&RetailGoopTemplate>) -> egui::Color32 {
+    let semantic_type = template
+        .map(|template| template.semantic_type.to_ascii_lowercase())
+        .unwrap_or_default();
+    let [red, green, blue] = if semantic_type.contains("pink") {
+        [238, 86, 166]
+    } else if semantic_type.contains("oil") {
+        [42, 47, 52]
+    } else if semantic_type.contains("electric") {
+        [72, 211, 235]
+    } else if semantic_type.contains("fire") {
+        [238, 100, 42]
+    } else if semantic_type.contains("chocolate") {
+        [116, 72, 38]
+    } else {
+        [132, 92, 47]
+    };
+    egui::Color32::from_rgba_unmultiplied(red, green, blue, 190)
+}
+
+fn goop_stroke_preview_mesh(
+    projection: CameraProjection,
+    stroke: &GoopStroke,
+    color: egui::Color32,
+) -> egui::Mesh {
+    let samples = goop_stroke_preview_samples(stroke);
+    let projected = samples
+        .iter()
+        .filter_map(|sample| {
+            let (center, _) = projection.project_world_to_screen(sample.world)?;
+            let radius = sample.brush.radius.max(1.0);
+            let projected_x = projection
+                .project_world_to_screen([
+                    sample.world[0] + radius,
+                    sample.world[1],
+                    sample.world[2],
+                ])
+                .map(|(point, _)| center.distance(point));
+            let projected_z = projection
+                .project_world_to_screen([
+                    sample.world[0],
+                    sample.world[1],
+                    sample.world[2] + radius,
+                ])
+                .map(|(point, _)| center.distance(point));
+            let screen_radius = projected_x
+                .into_iter()
+                .chain(projected_z)
+                .filter(|value| value.is_finite())
+                .fold(0.0f32, f32::max)
+                .max(1.0);
+            Some((center, screen_radius))
+        })
+        .collect::<Vec<_>>();
+    let mut mesh = egui::Mesh::default();
+
+    for pair in projected.windows(2) {
+        let [(from, from_radius), (to, to_radius)] = pair else {
+            continue;
+        };
+        let delta = *to - *from;
+        let length = delta.length();
+        if length <= f32::EPSILON {
+            continue;
+        }
+        let normal = egui::vec2(-delta.y, delta.x) / length;
+        let start = mesh.vertices.len() as u32;
+        mesh.colored_vertex(*from + normal * *from_radius, color);
+        mesh.colored_vertex(*from - normal * *from_radius, color);
+        mesh.colored_vertex(*to - normal * *to_radius, color);
+        mesh.colored_vertex(*to + normal * *to_radius, color);
+        mesh.add_triangle(start, start + 1, start + 2);
+        mesh.add_triangle(start, start + 2, start + 3);
+    }
+
+    for (center, radius) in projected {
+        let center_index = mesh.vertices.len() as u32;
+        mesh.colored_vertex(center, color);
+        for segment in 0..GOOP_STROKE_PREVIEW_CIRCLE_SEGMENTS {
+            let angle =
+                std::f32::consts::TAU * segment as f32 / GOOP_STROKE_PREVIEW_CIRCLE_SEGMENTS as f32;
+            mesh.colored_vertex(
+                center + egui::vec2(angle.cos(), angle.sin()) * radius,
+                color,
+            );
+        }
+        for segment in 0..GOOP_STROKE_PREVIEW_CIRCLE_SEGMENTS {
+            let next = (segment + 1) % GOOP_STROKE_PREVIEW_CIRCLE_SEGMENTS;
+            mesh.add_triangle(
+                center_index,
+                center_index + 1 + segment as u32,
+                center_index + 1 + next as u32,
+            );
+        }
+    }
+    mesh
+}
+
 fn goop_collision_triangles(collision: &ColFile) -> Vec<GoopTerrainTriangle> {
     collision
         .groups()
@@ -3898,6 +3900,48 @@ fn ray_triangle_distance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_goopmap_stroke_has_an_immediate_bounded_render_preview() {
+        let brush = GoopBrush {
+            radius: 80.0,
+            hardness: 0.75,
+            opacity: 1.0,
+            erase: false,
+        };
+        let first_sample = PendingGoopSample {
+            world: [120.0, 40.0, 240.0],
+            brush,
+        };
+        let first_stroke = GoopStroke {
+            changed: BTreeMap::new(),
+            last_world: Some(first_sample.world),
+            pending: vec![first_sample],
+            source_layer: None,
+        };
+
+        let first_preview = goop_stroke_preview_samples(&first_stroke);
+        assert_eq!(first_preview.len(), 1);
+        assert_eq!(first_preview[0].world, first_sample.world);
+
+        let pending = (0..(GOOP_STROKE_PREVIEW_SAMPLE_LIMIT * 3))
+            .map(|index| PendingGoopSample {
+                world: [index as f32 * 20.0, 40.0, 240.0],
+                brush,
+            })
+            .collect::<Vec<_>>();
+        let last_world = pending.last().unwrap().world;
+        let long_stroke = GoopStroke {
+            changed: BTreeMap::new(),
+            last_world: Some(last_world),
+            pending,
+            source_layer: None,
+        };
+
+        let long_preview = goop_stroke_preview_samples(&long_stroke);
+        assert!(long_preview.len() <= GOOP_STROKE_PREVIEW_SAMPLE_LIMIT);
+        assert_eq!(long_preview.last().unwrap().world, last_world);
+    }
 
     fn editable_layer() -> GoopLayerAuthoring {
         GoopLayerAuthoring {
@@ -4517,29 +4561,41 @@ mod tests {
             b"map/pollution/pollution00.bmp".to_vec(),
             StageResourceDocument::Bitmap(BmpFile::new_pollution_mask(8, 4, vec![0; 32]).unwrap()),
         );
-        let expected = adaptive_goop_guard_fingerprint(&document).unwrap();
-        assert_eq!(
-            adaptive_goop_guard_fingerprint(&document.clone()).unwrap(),
-            expected
-        );
+        let outcome = GoopAdaptiveOutcome {
+            base_root: String::new(),
+            stage_id: document.stage_id.clone(),
+            terrain_instances: Vec::new(),
+            indexed_templates: None,
+            undo: GoopSnapshotUndo {
+                before: document.goop_authoring.clone(),
+                after: document.goop_authoring.clone(),
+                before_edits: document.archive_edits.clone(),
+                after_edits: document.archive_edits.clone(),
+            },
+            heap_warning: None,
+            document: document.clone(),
+        };
+        assert!(adaptive_goop_inputs_unchanged(
+            &document.clone(),
+            &[],
+            &outcome
+        ));
 
         let mut changed_mask = document.clone();
         changed_mask.goop_authoring.as_mut().unwrap().layers[0]
             .set_mask(&[1; 32])
             .unwrap();
-        assert_ne!(
-            adaptive_goop_guard_fingerprint(&changed_mask).unwrap(),
-            expected
-        );
+        assert!(!adaptive_goop_inputs_unchanged(
+            &changed_mask,
+            &[],
+            &outcome
+        ));
 
         document.upsert_authored_resource(
             b"map/pollution/pollution00.bmp".to_vec(),
             StageResourceDocument::Bitmap(BmpFile::new_pollution_mask(8, 4, vec![2; 32]).unwrap()),
         );
-        assert_ne!(
-            adaptive_goop_guard_fingerprint(&document).unwrap(),
-            expected
-        );
+        assert!(!adaptive_goop_inputs_unchanged(&document, &[], &outcome));
     }
 
     #[test]

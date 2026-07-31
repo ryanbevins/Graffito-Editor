@@ -2565,12 +2565,16 @@ impl SmsEditorApp {
                     },
                     BackgroundResult::GoopAdaptive(result) => match result {
                         Ok(outcome) => self.apply_adaptive_goop(*outcome),
-                        Err(err) if err == "goop rebuild cancelled" => self
-                            .log
-                            .push("Adaptive goop generation cancelled.".to_string()),
-                        Err(err) => self
-                            .log
-                            .push(format!("Adaptive goop generation failed: {err}")),
+                        Err(err) if err == "goop rebuild cancelled" => {
+                            self.goop_stroke = None;
+                            self.log
+                                .push("Adaptive goop generation cancelled.".to_string());
+                        }
+                        Err(err) => {
+                            self.goop_stroke = None;
+                            self.log
+                                .push(format!("Adaptive goop generation failed: {err}"));
+                        }
                     },
                     BackgroundResult::Build(result) => match result {
                         Ok(outcome) => {
@@ -2670,9 +2674,14 @@ impl SmsEditorApp {
                 ctx.request_repaint_after(std::time::Duration::from_millis(33));
             }
             Some(Err(TryRecvError::Disconnected)) => {
+                let was_generating_adaptive_goop =
+                    self.background_label.as_deref() == Some("Generating adaptive goop");
                 self.background_receiver = None;
                 self.background_label = None;
                 self.active_build_cancel = None;
+                if was_generating_adaptive_goop {
+                    self.goop_stroke = None;
+                }
                 self.log
                     .push("Background operation ended unexpectedly.".to_string());
             }
