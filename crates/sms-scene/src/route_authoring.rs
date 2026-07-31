@@ -181,6 +181,72 @@ impl RouteAuthoringDocument {
         Ok(result)
     }
 
+    /// Reconciles graphs appended to the runtime RAL by another authoring
+    /// surface, while preserving the richer controls and Bezier handles for
+    /// every graph already represented here.
+    ///
+    /// This deliberately accepts only a semantic prefix plus appended graphs.
+    /// Any changed, removed, or reordered existing graph remains a real
+    /// conflict for the caller to report instead of being silently replaced.
+    pub(crate) fn reconcile_appended_runtime_graphs(
+        &mut self,
+        runtime: &RalDocument,
+        referenced_graph_names: &BTreeSet<String>,
+    ) -> Result<bool, RouteAuthoringError> {
+        let compiled = self.compile()?;
+        if &compiled == runtime {
+            return Ok(false);
+        }
+        let existing_count = compiled.graphs.len();
+        if existing_count >= runtime.graphs.len()
+            || compiled
+                .graphs
+                .iter()
+                .zip(&runtime.graphs)
+                .any(|(authored, stored)| {
+                    authored.name != stored.name || authored.nodes != stored.nodes
+                })
+        {
+            return Ok(false);
+        }
+        if runtime
+            .graphs
+            .iter()
+            .skip(existing_count)
+            .any(|graph| !referenced_graph_names.contains(&graph.name))
+        {
+            return Ok(false);
+        }
+
+        let mut reconciled = self.clone();
+        for (graph, stored) in reconciled
+            .graphs
+            .iter_mut()
+            .zip(runtime.graphs.iter().take(existing_count))
+        {
+            graph.name_offset = stored.name_offset;
+            graph.nodes_offset = stored.nodes_offset;
+        }
+        for (index, stored) in runtime.graphs.iter().enumerate().skip(existing_count) {
+            let graph = RouteGraph::lift(index, stored);
+            if reconciled
+                .graphs
+                .iter()
+                .any(|existing| existing.id == graph.id)
+            {
+                return Ok(false);
+            }
+            reconciled.graphs.push(graph);
+        }
+        reconciled.file_size = runtime.file_size;
+        reconciled.padding = runtime.padding.clone();
+        if &reconciled.compile()? != runtime {
+            return Ok(false);
+        }
+        *self = reconciled;
+        Ok(true)
+    }
+
     pub fn graph(&self, id: &str) -> Option<&RouteGraph> {
         self.graphs.iter().find(|graph| graph.id == id)
     }
@@ -1016,6 +1082,54 @@ mod tests {
             RalDocument::parse(compiled.encode().unwrap()).unwrap(),
             compiled
         );
+    }
+
+    #[test]
+    fn appended_runtime_graphs_reconcile_without_losing_bezier_authoring() {
+        let mut authored = RouteAuthoringDocument::lift(ROUTE_RESOURCE_PATH, &document());
+        let link_id = authored.graphs[0].links[0].id.clone();
+        let handles = BezierHandles {
+            from: [25.0, 100.0, 0.0],
+            to: [75.0, 100.0, 0.0],
+        };
+        assert!(authored.graphs[0].set_link_bezier(&link_id, Some(handles)));
+
+        let mut runtime = authored.compile().unwrap();
+        let mut dependency = document();
+        dependency.graphs[0].name = "main".to_string();
+        dependency.canonicalize_layout().unwrap();
+        runtime
+            .merge_named_graphs(&dependency, &["main".to_string()])
+            .unwrap();
+
+        let referenced = BTreeSet::from(["main".to_string()]);
+        assert!(authored
+            .reconcile_appended_runtime_graphs(&runtime, &referenced)
+            .unwrap());
+        assert_eq!(authored.graphs.len(), 2);
+        assert_eq!(authored.graphs[0].links[0].bezier, Some(handles));
+        assert_eq!(authored.compile().unwrap(), runtime);
+        assert!(!authored
+            .reconcile_appended_runtime_graphs(&runtime, &referenced)
+            .unwrap());
+    }
+
+    #[test]
+    fn unreferenced_runtime_suffix_remains_a_real_conflict() {
+        let mut authored = RouteAuthoringDocument::lift(ROUTE_RESOURCE_PATH, &document());
+        let before = authored.clone();
+        let mut runtime = authored.compile().unwrap();
+        let mut dependency = document();
+        dependency.graphs[0].name = "unrelated".to_string();
+        dependency.canonicalize_layout().unwrap();
+        runtime
+            .merge_named_graphs(&dependency, &["unrelated".to_string()])
+            .unwrap();
+
+        assert!(!authored
+            .reconcile_appended_runtime_graphs(&runtime, &BTreeSet::new())
+            .unwrap());
+        assert_eq!(authored, before);
     }
 
     #[test]

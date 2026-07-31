@@ -2941,6 +2941,7 @@ impl SmsEditorApp {
         let instanced_model_paths = document
             .objects
             .iter()
+            .filter(|object| !object.is_pool_only())
             .flat_map(|object| object.asset_hints.iter())
             .filter(|hint| {
                 matches!(
@@ -3409,6 +3410,9 @@ impl SmsEditorApp {
             BTreeMap::<(String, u32, String), CachedObjectModelPreview>::new();
         let mut accessory_model_cache = BTreeMap::<String, CachedAccessoryModelPreview>::new();
         for object in &document.objects {
+            if object.is_pool_only() {
+                continue;
+            }
             let explicit_model_path = object_preview_model_path(object, &world_model_paths);
             let catalog_preview = explicit_model_path
                 .is_none()

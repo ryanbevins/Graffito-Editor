@@ -827,6 +827,48 @@ fn viewport_mesh_picking_selects_the_object_away_from_its_origin_marker() {
 }
 
 #[test]
+fn viewport_markers_exclude_pool_only_manager_carriers() {
+    let mut carrier = SceneObject::new("pool-carrier", "FixtureEnemy");
+    carrier.placement = Some(sms_scene::PlacementBinding::Authored(
+        sms_scene::AuthoredPlacement {
+            raw_resource_path: b"map/scene.bin".to_vec(),
+            target_group_index: 4,
+            prototype: sms_formats::JDramaRecord {
+                type_name: "FixtureEnemy".to_string(),
+                name: "pool carrier".to_string(),
+                payload: sms_formats::JDramaRecordPayload::Actor {
+                    transform: sms_formats::JDramaTransform {
+                        translation: [0.0; 3],
+                        rotation: [0.0; 3],
+                        scale: [1.0; 3],
+                    },
+                    character_name: String::new(),
+                    light_map: sms_formats::JDramaLightMap::default(),
+                    fields: Vec::new(),
+                },
+            },
+            dependencies: Vec::new(),
+            pool_only: true,
+        },
+    ));
+    let app = SmsEditorApp {
+        document: Some(test_document(vec![
+            carrier,
+            SceneObject::new("coin", "Coin"),
+        ])),
+        view_mode: ViewMode::Objects,
+        ..SmsEditorApp::default()
+    };
+
+    assert_eq!(
+        app.viewport_marker_objects()
+            .map(|object| object.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["coin"]
+    );
+}
+
+#[test]
 fn viewport_mesh_picking_prefers_the_nearest_overlapping_object() {
     let mut preview = preview_for_texture_alpha(false, false);
     preview
@@ -4632,7 +4674,32 @@ fn particle_only_actors_render_without_placeholder_models() {
 
     let mut object = SceneObject::new("bianco-fountain", "EffectBiancoFunsui");
     object.transform.translation = [100.0, 200.0, 300.0];
-    let mut document = test_document(vec![object.clone()]);
+    let mut pool_carrier = object.clone();
+    pool_carrier.id = "pool-only-fountain".to_string();
+    pool_carrier.transform.translation = [0.0; 3];
+    pool_carrier.placement = Some(sms_scene::PlacementBinding::Authored(
+        sms_scene::AuthoredPlacement {
+            raw_resource_path: b"map/scene.bin".to_vec(),
+            target_group_index: 4,
+            prototype: sms_formats::JDramaRecord {
+                type_name: pool_carrier.factory_name.clone(),
+                name: "pool carrier".to_string(),
+                payload: sms_formats::JDramaRecordPayload::Actor {
+                    transform: sms_formats::JDramaTransform {
+                        translation: [0.0; 3],
+                        rotation: [0.0; 3],
+                        scale: [1.0; 3],
+                    },
+                    character_name: String::new(),
+                    light_map: sms_formats::JDramaLightMap::default(),
+                    fields: Vec::new(),
+                },
+            },
+            dependencies: Vec::new(),
+            pool_only: true,
+        },
+    ));
+    let mut document = test_document(vec![object.clone(), pool_carrier.clone()]);
     document.base_root = root.clone();
     document.assets.push(StageAsset {
         path: particle_path,
@@ -4676,6 +4743,7 @@ fn particle_only_actors_render_without_placeholder_models() {
 
     assert_eq!(preview.loaded_models, 1);
     assert_eq!(preview.actor_particles.len(), 1);
+    assert!(!preview.object_model_indices.contains_key(&pool_carrier.id));
     assert_eq!(preview.actor_particles[0].model_index, Some(model_index));
     assert_eq!(
         preview.actor_particles[0].bind_transform.translation,

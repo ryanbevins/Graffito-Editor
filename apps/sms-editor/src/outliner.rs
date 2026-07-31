@@ -83,7 +83,11 @@ pub(super) fn build_outliner_tree(
     filter: &str,
     stage_music_detail: &str,
 ) -> OutlinerTree {
-    let total_objects = document.objects.len();
+    let total_objects = document
+        .objects
+        .iter()
+        .filter(|object| !object.is_pool_only())
+        .count();
     let mut builder = OutlinerBuilder::new(document);
     let mut stage_children = vec![OutlinerNode {
         key: "stage-member:music".to_string(),
@@ -154,6 +158,9 @@ impl<'a> OutlinerBuilder<'a> {
         let mut clones_by_parent = BTreeMap::<(Vec<u8>, Vec<usize>), Vec<usize>>::new();
 
         for (index, object) in document.objects.iter().enumerate() {
+            if object.is_pool_only() {
+                continue;
+            }
             if let Some(parent_id) = parent_ids.get(&object.id) {
                 related_children
                     .entry(parent_id.clone())
@@ -336,7 +343,10 @@ impl<'a> OutlinerBuilder<'a> {
             .map(|index| self.document.objects[*index].id.as_str())
             .collect::<BTreeSet<_>>();
         for (index, object) in self.document.objects.iter().enumerate() {
-            if self.consumed.contains(&object.id) || related_ids.contains(object.id.as_str()) {
+            if object.is_pool_only()
+                || self.consumed.contains(&object.id)
+                || related_ids.contains(object.id.as_str())
+            {
                 continue;
             }
             let key = match object.placement.as_ref() {
@@ -383,6 +393,9 @@ impl<'a> OutlinerBuilder<'a> {
 fn related_object_parent_ids(document: &StageDocument) -> BTreeMap<String, String> {
     let mut parents = BTreeMap::new();
     for object in &document.objects {
+        if object.is_pool_only() {
+            continue;
+        }
         let Some(preview) = document.actor_preview(object) else {
             continue;
         };
@@ -393,7 +406,9 @@ fn related_object_parent_ids(document: &StageDocument) -> BTreeMap<String, Strin
             .objects
             .iter()
             .filter(|candidate| {
-                candidate.id != object.id && candidate.factory_name == preview.manager_factory
+                !candidate.is_pool_only()
+                    && candidate.id != object.id
+                    && candidate.factory_name == preview.manager_factory
             })
             .min_by(|left, right| {
                 squared_distance(object, left)
@@ -829,6 +844,41 @@ mod tests {
             .expect("authored placement resource group");
         assert_eq!(resource.kind, OutlinerNodeKind::Resource);
         assert!(find_object(&resource.children, "authored").is_some());
+    }
+
+    #[test]
+    fn pool_only_manager_carriers_are_hidden_from_the_world_outliner() {
+        let mut carrier = SceneObject::new("pool-carrier", "FixtureEnemy");
+        carrier.placement = Some(PlacementBinding::Authored(sms_scene::AuthoredPlacement {
+            raw_resource_path: b"map/scene.bin".to_vec(),
+            target_group_index: 4,
+            prototype: JDramaRecord {
+                type_name: "FixtureEnemy".to_string(),
+                name: "pool carrier".to_string(),
+                payload: JDramaRecordPayload::Actor {
+                    transform: JDramaTransform {
+                        translation: [0.0; 3],
+                        rotation: [0.0; 3],
+                        scale: [1.0; 3],
+                    },
+                    character_name: String::new(),
+                    light_map: JDramaLightMap::default(),
+                    fields: Vec::new(),
+                },
+            },
+            dependencies: Vec::new(),
+            pool_only: true,
+        }));
+        let tree = build_outliner_tree(
+            &document(vec![carrier, SceneObject::new("coin", "Coin")]),
+            "",
+            "Game default",
+        );
+
+        assert_eq!(tree.total_objects, 1);
+        assert_eq!(tree.visible_objects, 1);
+        assert!(find_object(&tree.roots, "pool-carrier").is_none());
+        assert!(find_object(&tree.roots, "coin").is_some());
     }
 
     #[test]

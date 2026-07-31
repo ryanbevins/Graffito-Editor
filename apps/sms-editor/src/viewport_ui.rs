@@ -1821,6 +1821,7 @@ impl SmsEditorApp {
         self.document
             .iter()
             .flat_map(|document| document.objects.iter())
+            .filter(|object| !object.is_pool_only())
             .filter(move |object| show_all || selected_id == Some(object.id.as_str()))
     }
 

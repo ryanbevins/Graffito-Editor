@@ -839,6 +839,33 @@ impl StageDocument {
         Ok(())
     }
 
+    fn reconcile_appended_runtime_route_graphs(&mut self) -> bool {
+        let Some(raw_resource_path) = self
+            .route_authoring
+            .as_ref()
+            .map(|authoring| authoring.raw_resource_path.clone())
+        else {
+            return false;
+        };
+        let Ok(Some(resource)) = self.effective_resource_clone(&raw_resource_path) else {
+            return false;
+        };
+        let StageResourceDocument::Rail(runtime) = resource else {
+            return false;
+        };
+        let referenced_graph_names = runtime
+            .graphs
+            .iter()
+            .filter(|graph| self.route_reference_count(&graph.name) > 0)
+            .map(|graph| graph.name.clone())
+            .collect::<BTreeSet<_>>();
+        self.route_authoring
+            .as_mut()
+            .expect("route authoring was checked above")
+            .reconcile_appended_runtime_graphs(&runtime, &referenced_graph_names)
+            .unwrap_or(false)
+    }
+
     pub fn route_consumers(&self, graph_name: &str) -> Vec<&SceneObject> {
         self.objects
             .iter()
@@ -1498,6 +1525,7 @@ impl StageDocument {
         &mut self,
         project_root: impl AsRef<Path>,
     ) -> Result<ProjectSaveOutcome> {
+        self.reconcile_appended_runtime_route_graphs();
         self.queue_editor_overlay_change()?;
         self.queue_dialogue_library_change()?;
         self.queue_authored_stage_baseline_change()?;
@@ -1772,6 +1800,18 @@ impl SceneObject {
             authoring_defaults_version: 0,
             runtime_references: Vec::new(),
         }
+    }
+
+    /// Whether this object is only an editor-side carrier for an enemy
+    /// manager's dependencies and must not appear as a placed world actor.
+    pub fn is_pool_only(&self) -> bool {
+        matches!(
+            &self.placement,
+            Some(PlacementBinding::Authored(AuthoredPlacement {
+                pool_only: true,
+                ..
+            }))
+        )
     }
 
     pub fn insert_source_raw_param(
@@ -4782,6 +4822,77 @@ mod tests {
     }
 
     #[test]
+    fn project_save_reconciles_catalog_appended_route_graphs() {
+        let root = unique_test_project_root("save-appended-route");
+        let base = test_route_document("base");
+        let mut runtime = base.clone();
+        runtime
+            .merge_named_graphs(&test_route_document("main"), &["main".to_string()])
+            .unwrap();
+        let mut saved = empty_document("dolpic");
+        let mut consumer = SceneObject::new("boss-manta", "BossManta");
+        consumer.set_raw_param("graph_name", "main");
+        saved.objects.push(consumer);
+        saved.route_authoring = Some(RouteAuthoringDocument::lift(ROUTE_RESOURCE_PATH, &base));
+        saved.archive_edits.upsert_resource(
+            ROUTE_RESOURCE_PATH.to_vec(),
+            StageResourceDocument::Rail(runtime.clone()),
+        );
+
+        saved.save_project_folder(&root).unwrap();
+        assert_eq!(
+            saved.route_authoring.as_ref().unwrap().compile().unwrap(),
+            runtime
+        );
+
+        let mut reopened = empty_document("dolpic");
+        assert!(reopened.load_project_folder(&root).unwrap());
+        assert!(!reopened
+            .validate()
+            .iter()
+            .any(|issue| issue.code == "route-authoring-overlay-mismatch"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_load_repairs_legacy_catalog_appended_route_graphs() {
+        let root = unique_test_project_root("load-appended-route");
+        let base = test_route_document("base");
+        let mut runtime = base.clone();
+        runtime
+            .merge_named_graphs(&test_route_document("main"), &["main".to_string()])
+            .unwrap();
+        let mut legacy = empty_document("dolpic");
+        let mut consumer = SceneObject::new("boss-manta", "BossManta");
+        consumer.set_raw_param("graph_name", "main");
+        legacy.objects.push(consumer);
+        legacy.route_authoring = Some(RouteAuthoringDocument::lift(ROUTE_RESOURCE_PATH, &base));
+        legacy.archive_edits.upsert_resource(
+            ROUTE_RESOURCE_PATH.to_vec(),
+            StageResourceDocument::Rail(runtime.clone()),
+        );
+        legacy.queue_editor_overlay_change().unwrap();
+        project_store::save_project_folder(&legacy, &root).unwrap();
+
+        let mut reopened = empty_document("dolpic");
+        assert!(reopened.load_project_folder(&root).unwrap());
+        assert_eq!(
+            reopened
+                .route_authoring
+                .as_ref()
+                .unwrap()
+                .compile()
+                .unwrap(),
+            runtime
+        );
+        assert!(!reopened
+            .validate()
+            .iter()
+            .any(|issue| issue.code == "route-authoring-overlay-mismatch"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn project_export_rejects_base_directory_overlap() {
         let root = std::env::temp_dir().join(format!(
             "sms-editor-overlap-test-{}-{}",
@@ -4862,6 +4973,15 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn test_route_document(name: &str) -> sms_formats::RalDocument {
+        let mut routes = RouteAuthoringDocument::lift(
+            ROUTE_RESOURCE_PATH,
+            &sms_formats::RalDocument::empty_canonical(),
+        );
+        routes.add_graph(name, [0, 0, 0], [100, 0, 0]).unwrap();
+        routes.compile().unwrap()
     }
 
     fn authored_stage_archive(
