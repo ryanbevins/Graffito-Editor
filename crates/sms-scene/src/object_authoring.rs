@@ -645,6 +645,13 @@ fn build_from_sources_with_common(
         }
     }
 
+    synthesize_conductor_spawned_candidates(
+        &sources,
+        registry,
+        common_character_document,
+        &mut candidates,
+    );
+
     let mut templates = BTreeMap::new();
     for (factory_name, factory_candidates) in candidates {
         let mut variants: BTreeMap<(u32, Vec<u8>), Vec<Candidate>> = BTreeMap::new();
@@ -654,54 +661,82 @@ fn build_from_sources_with_common(
                 .or_default()
                 .push(candidate);
         }
-        let mut winner: Option<(usize, Candidate)> = None;
+        // Every variant, best first, rather than one winner. A candidate can
+        // fail to resolve for reasons particular to the stage it was learned
+        // from -- HamuKuri censused from a stage with no goop in it has no
+        // pollution texture to bind, though the same enemy authors cleanly
+        // from any stage that does. Taking the first that resolves keeps the
+        // preference order intact while stopping one unlucky source from
+        // withdrawing the factory altogether.
+        let mut ranked: Vec<(usize, Candidate)> = Vec::new();
         for (_, mut variant) in variants {
             variant.sort_by(compare_candidate);
             let count = variant.len();
-            let candidate = variant.remove(0);
-            if winner.as_ref().is_none_or(|(best_count, best)| {
-                count > *best_count
-                    || (count == *best_count && compare_candidate(&candidate, best).is_lt())
-            }) {
-                winner = Some((count, candidate));
+            ranked.push((count, variant.remove(0)));
+        }
+        ranked.sort_by(|(left_count, left), (right_count, right)| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| compare_candidate(left, right))
+        });
+
+        let mut resolved: Option<(Candidate, _, _)> = None;
+        let mut rejections: Vec<ObjectAuthoringCatalogWarning> = Vec::new();
+        // Strict resolution first, borrowing shared resources from another
+        // stage only when no candidate resolves natively. A stage that lacks a
+        // shared resource often lacks it for a reason -- Corona's Stu model
+        // has no goop hat, which is exactly why Corona ships no pollution
+        // texture -- and borrowing the file would mask that the candidate is
+        // the wrong variant of the enemy.
+        'passes: for allow_shared in [false, true] {
+            for (_, candidate) in &ranked {
+                let candidate = candidate.clone();
+                let resources =
+                    match resolve_resources(&candidate, &sources, registry, allow_shared) {
+                        Ok(resources) => resources,
+                        Err(reason) => {
+                            rejections.push(ObjectAuthoringCatalogWarning {
+                                source_stage: candidate.source_stage.clone(),
+                                source_asset_path: Some(candidate.source_asset_path.clone()),
+                                message: format!(
+                                    "Omitted unsafe authoring candidate '{}': {reason}",
+                                    candidate.factory_name
+                                ),
+                            });
+                            continue;
+                        }
+                    };
+                let table_dependencies = match resolve_runtime_table_dependencies(
+                    &candidate.factory_name,
+                    &candidate.source_stage,
+                    &sources,
+                    registry,
+                ) {
+                    Ok(dependencies) => dependencies,
+                    Err(reason) => {
+                        rejections.push(ObjectAuthoringCatalogWarning {
+                            source_stage: candidate.source_stage.clone(),
+                            source_asset_path: Some(candidate.source_asset_path.clone()),
+                            message: format!(
+                                "Omitted unsafe authoring candidate '{}': {reason}",
+                                candidate.factory_name
+                            ),
+                        });
+                        continue;
+                    }
+                };
+                resolved = Some((candidate, resources, table_dependencies));
+                break 'passes;
             }
         }
-        let Some((_, candidate)) = winner else {
+
+        let Some((candidate, resources, table_dependencies)) = resolved else {
+            // Only report when nothing worked; a rejection that another stage
+            // covered is noise, not a problem with the factory.
+            warnings.extend(rejections);
             continue;
         };
-        let resources = match resolve_resources(&candidate, &sources, registry) {
-            Ok(resources) => resources,
-            Err(reason) => {
-                warnings.push(ObjectAuthoringCatalogWarning {
-                    source_stage: candidate.source_stage.clone(),
-                    source_asset_path: Some(candidate.source_asset_path.clone()),
-                    message: format!(
-                        "Omitted unsafe authoring candidate '{}': {reason}",
-                        candidate.factory_name
-                    ),
-                });
-                continue;
-            }
-        };
-        let table_dependencies = match resolve_runtime_table_dependencies(
-            &candidate.factory_name,
-            &candidate.source_stage,
-            &sources,
-            registry,
-        ) {
-            Ok(dependencies) => dependencies,
-            Err(reason) => {
-                warnings.push(ObjectAuthoringCatalogWarning {
-                    source_stage: candidate.source_stage.clone(),
-                    source_asset_path: Some(candidate.source_asset_path.clone()),
-                    message: format!(
-                        "Omitted unsafe authoring candidate '{}': {reason}",
-                        candidate.factory_name
-                    ),
-                });
-                continue;
-            }
-        };
+
         let runtime_actor_references = runtime_actor_references(&candidate.factory_name, registry);
         let preview_resource_path = preview_resource_path(&candidate, &resources, registry);
         templates.insert(
@@ -819,6 +854,141 @@ fn record_group_index(record: &JDramaRecord) -> Option<u32> {
         JDramaFieldValue::U32(value) if field.name == "group_index" => Some(value),
         _ => None,
     })
+}
+
+/// An enemy the retail game only ever spawns through the conductor.
+struct ConductorSpawnedActor {
+    factory: &'static str,
+    /// Object name for the synthesized record.
+    object_name: &'static str,
+    /// The manager's JDrama object name, which `manager_name` references.
+    manager_name: &'static str,
+    /// The shared character resource the manager and its actors use.
+    character_name: &'static str,
+}
+
+/// ナメクリ (Gooble): spawned by `TConductor::genEnemyFromPollution`, never
+/// placed in any retail scene, so the census has no candidate to learn from
+/// even though every resource it needs is present wherever its manager is.
+const CONDUCTOR_SPAWNED_ACTORS: &[ConductorSpawnedActor] = &[ConductorSpawnedActor {
+    factory: "NameKuri",
+    object_name: "\u{30CA}\u{30E1}\u{30AF}\u{30EA} 0",
+    manager_name: "\u{30CA}\u{30E1}\u{30AF}\u{30EA}\u{30DE}\u{30CD}\u{30FC}\u{30B8}\u{30E3}\u{30FC}",
+    character_name: "\u{30CA}\u{30E1}\u{30AF}\u{30EA}\u{30DE}\u{30CD}\u{30FC}\u{30B8}\u{30E3}\u{30FC} \u{30AD}\u{30E3}\u{30E9}",
+}];
+
+/// Builds candidates for conductor-spawned enemies from a stage that places
+/// their manager.
+///
+/// The synthesized record mirrors a retail placed actor of the same family
+/// (measured on dolpic_ex0's HamuKuri): an Actor payload whose character is the
+/// manager's, with `manager_name`/`graph_name`/`coin_id` stream fields. The
+/// graph is empty on purpose -- `getGraphByName` misses to null, which is the
+/// state every conductor-spawned enemy already runs in. Everything else --
+/// manager record, character records, model resources -- resolves through the
+/// same dependency machinery placed actors use, so nothing is hand-provisioned.
+fn synthesize_conductor_spawned_candidates(
+    sources: &[&CatalogSource],
+    registry: &ObjectRegistry,
+    common_character_document: Option<&JDramaDocument>,
+    candidates: &mut BTreeMap<String, Vec<Candidate>>,
+) {
+    for spec in CONDUCTOR_SPAWNED_ACTORS {
+        if candidates.contains_key(spec.factory) {
+            continue;
+        }
+        for source in sources {
+            let Some(document) = source
+                .documents
+                .iter()
+                .find(|document| normalized_path(&document.raw_resource_path) == "map/scene.bin")
+            else {
+                continue;
+            };
+            let located = located_records(&document.document);
+            let has_manager = located_dependency_records(&document.document)
+                .iter()
+                .any(|item| item.record.name == spec.manager_name);
+            if !has_manager {
+                continue;
+            }
+            // Borrow the strategy group an ordinary enemy actor of this stage
+            // sits in, so placement lands the synthesized actor where retail
+            // puts enemies.
+            let Some(group_index) = located.iter().find_map(|item| {
+                let definition = authorable_definition(registry, item.record)?;
+                (definition.category == "Enemy").then_some(item.group_index)
+            }) else {
+                continue;
+            };
+
+            let record = JDramaRecord {
+                type_name: spec.factory.to_string(),
+                name: spec.object_name.to_string(),
+                payload: JDramaRecordPayload::Actor {
+                    transform: sms_formats::JDramaTransform {
+                        translation: [0.0; 3],
+                        rotation: [0.0; 3],
+                        scale: [1.0; 3],
+                    },
+                    character_name: spec.character_name.to_string(),
+                    light_map: sms_formats::JDramaLightMap {
+                        entries: Vec::new(),
+                    },
+                    fields: vec![
+                        JDramaField {
+                            name: "manager_name".to_string(),
+                            value: JDramaFieldValue::String(spec.manager_name.to_string()),
+                        },
+                        JDramaField {
+                            name: "graph_name".to_string(),
+                            value: JDramaFieldValue::String(String::new()),
+                        },
+                        JDramaField {
+                            name: "coin_id".to_string(),
+                            value: JDramaFieldValue::I32(-1),
+                        },
+                    ],
+                },
+            };
+            let Ok(dependencies) = resolve_dependencies(
+                &record,
+                spec.factory,
+                source,
+                &document.raw_resource_path,
+                registry,
+            ) else {
+                continue;
+            };
+            let Ok(character_records) = resolve_character_records(
+                &record,
+                &dependencies,
+                source,
+                common_character_document,
+                registry,
+            ) else {
+                continue;
+            };
+            candidates.insert(
+                spec.factory.to_string(),
+                vec![Candidate {
+                    factory_name: spec.factory.to_string(),
+                    group_index,
+                    record,
+                    dependencies,
+                    character_resource_records: character_records.resource_records,
+                    character_records: character_records.target_records,
+                    graph_names: BTreeSet::new(),
+                    source_stage: source.source_stage.clone(),
+                    sort_key: source.sort_key.clone(),
+                    raw_resource_path: document.raw_resource_path.clone(),
+                    source_asset_path: document.source_asset_path.clone(),
+                    record_path: Vec::new(),
+                }],
+            );
+            break;
+        }
+    }
 }
 
 fn authorable_definition<'a>(
@@ -1116,6 +1286,7 @@ fn resolve_resources(
     candidate: &Candidate,
     sources: &[&CatalogSource],
     registry: &ObjectRegistry,
+    allow_shared: bool,
 ) -> Result<Vec<ObjectAuthoringResource>, String> {
     let mut out = BTreeSet::new();
     for registration in &candidate.character_resource_records {
@@ -1216,22 +1387,69 @@ fn resolve_resources(
             )?;
         }
         if let Some(manager) = find_enemy_manager(registry, factory_name) {
+            // A bare model filename like "default.bmd" can match several
+            // resources in a stage that carries more than one variant of the
+            // family. The runtime resolves it inside the manager's character
+            // archive, so qualifying the reference with the candidate's own
+            // character folders reproduces that scoping: hamukuri/default.bmd
+            // rather than whichever default.bmd the filename scan met first.
+            let character_folders = candidate
+                .character_resource_records
+                .iter()
+                .filter_map(
+                    |registration| match semantic_type_name(&registration.type_name) {
+                        "ObjChara" => reference_field(registration, "resource_folder"),
+                        "SmplChara" => reference_field(registration, "archive_path"),
+                        _ => None,
+                    },
+                )
+                .map(|folder| {
+                    // Character folders are runtime-absolute ("/scene/hamukuri")
+                    // while archive paths are root-stripped ("hamukuri/...").
+                    let folder = normalize_text_path(folder);
+                    let folder = folder.trim_matches('/');
+                    folder.strip_prefix("scene/").unwrap_or(folder).to_string()
+                })
+                .collect::<BTreeSet<_>>();
             for model in &manager.models {
-                if !bound_names.contains(&normalize_text_path(&model.model_name)) {
-                    add_stage_reference(
-                        &mut out,
-                        sources,
-                        &candidate.source_stage,
-                        &model.model_name,
-                        &format!("{factory_name} manager model"),
-                        false,
-                    )?;
+                if bound_names.contains(&normalize_text_path(&model.model_name)) {
+                    continue;
                 }
+                let qualified = character_folders
+                    .iter()
+                    .map(|folder| format!("{folder}/{}", model.model_name))
+                    .filter(|reference| {
+                        stage_resources(sources, &candidate.source_stage)
+                            .into_iter()
+                            .any(|resource| {
+                                let path = normalized_path(&resource.raw_resource_path);
+                                path == normalize_text_path(reference)
+                                    || path
+                                        .ends_with(&format!("/{}", normalize_text_path(reference)))
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                let reference = match qualified.len() {
+                    1 => qualified[0].clone(),
+                    _ => model.model_name.clone(),
+                };
+                add_stage_reference(
+                    &mut out,
+                    sources,
+                    &candidate.source_stage,
+                    &reference,
+                    &format!("{factory_name} manager model"),
+                    false,
+                )?;
             }
         }
     }
     for replacement in registry.runtime_texture_replacements_for(&candidate.factory_name) {
-        add_stage_reference(
+        let add = match allow_shared {
+            true => add_shared_stage_reference,
+            false => add_stage_reference,
+        };
+        add(
             &mut out,
             sources,
             &candidate.source_stage,
@@ -1705,6 +1923,57 @@ fn add_stage_reference(
     description: &str,
     required_stage_local: bool,
 ) -> Result<(), String> {
+    add_stage_reference_inner(
+        out,
+        sources,
+        stage,
+        reference,
+        description,
+        required_stage_local,
+        false,
+    )
+}
+
+/// As [`add_stage_reference`], but a fully qualified reference missing from the
+/// source stage may be taken from any stage that has it.
+///
+/// Only correct for resources whose path is a global identity. A graph is
+/// stage-local data that happens to share a path between stages, so borrowing
+/// one would bind the wrong object -- there is a test for that. An absolute
+/// asset path like "/scene/map/pollution/H_ma_rak.bti" names one file, and
+/// requiring it in the stage a candidate was censused from rejects the actor
+/// for where it was learned: Stus censused from a stage with no goop in it have
+/// no pollution texture to bind, though they author cleanly from a stage that
+/// does.
+fn add_shared_stage_reference(
+    out: &mut BTreeSet<ObjectAuthoringResource>,
+    sources: &[&CatalogSource],
+    stage: &str,
+    reference: &str,
+    description: &str,
+    required_stage_local: bool,
+) -> Result<(), String> {
+    add_stage_reference_inner(
+        out,
+        sources,
+        stage,
+        reference,
+        description,
+        required_stage_local,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_stage_reference_inner(
+    out: &mut BTreeSet<ObjectAuthoringResource>,
+    sources: &[&CatalogSource],
+    stage: &str,
+    reference: &str,
+    description: &str,
+    required_stage_local: bool,
+    allow_shared: bool,
+) -> Result<(), String> {
     let expected = normalize_runtime_reference(reference);
     let exact = expected.contains('/');
     let matches = stage_resources(sources, stage)
@@ -1719,6 +1988,65 @@ fn add_stage_reference(
         })
         .collect::<Vec<_>>();
     match matches.len() {
+        0 if required_stage_local && exact && allow_shared => {
+            // A fully qualified reference names one file, and shared assets
+            // like "/scene/map/pollution/H_ma_rak.bti" live in whichever stages
+            // happen to use them. Requiring it in the stage the candidate was
+            // censused from rejects the enemy for where it was learned rather
+            // than for anything about the enemy: Stus censused from a stage
+            // with no goop in it have no pollution texture to bind.
+            let shared = sources
+                .iter()
+                .flat_map(|source| source.resources.iter())
+                .filter(|resource| {
+                    let path = normalized_path(&resource.raw_resource_path);
+                    path == expected || path.ends_with(&format!("/{expected}"))
+                })
+                .collect::<Vec<_>>();
+            let distinct = shared
+                .iter()
+                .map(|resource| normalized_path(&resource.raw_resource_path))
+                .collect::<BTreeSet<_>>();
+            match distinct.len() {
+                1 => {
+                    // The same path can carry different content per stage --
+                    // H_ma_rak.bti alone has at least two variants -- and the
+                    // first stage in sort order is an arbitrary choice of
+                    // variant. Take the majority content across retail, which
+                    // for the Stu stain is the classic bianco texture, and
+                    // fall back to first-in-order when nothing reads.
+                    let mut votes: Vec<(u64, usize)> = Vec::new();
+                    for (index, resource) in shared.iter().enumerate() {
+                        let Ok(bytes) = read_stage_asset_bytes(&resource.source_asset_path) else {
+                            continue;
+                        };
+                        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+                        for byte in &bytes {
+                            hash ^= u64::from(*byte);
+                            hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+                        }
+                        votes.push((hash, index));
+                    }
+                    let mut counts: BTreeMap<u64, (usize, usize)> = BTreeMap::new();
+                    for (hash, index) in votes {
+                        let entry = counts.entry(hash).or_insert((0, index));
+                        entry.0 += 1;
+                    }
+                    let chosen = counts
+                        .values()
+                        .max_by(|left, right| {
+                            left.0.cmp(&right.0).then(right.1.cmp(&left.1))
+                        })
+                        .map(|(_, index)| *index)
+                        .unwrap_or(0);
+                    out.insert(shared[chosen].clone());
+                    Ok(())
+                }
+                _ => Err(format!(
+                    "required stage-local {description} {reference:?} was not found in source stage {stage}"
+                )),
+            }
+        }
         0 if required_stage_local => Err(format!(
             "required stage-local {description} {reference:?} was not found in source stage {stage}"
         )),
@@ -3653,7 +3981,7 @@ mod tests {
                 "montemcommon/readme.txt",
             ],
         );
-        let selected = resolve_resources(&candidate, &[&source], &registry)
+        let selected = resolve_resources(&candidate, &[&source], &registry, true)
             .expect("complete NPC runtime resource closure");
 
         assert_eq!(

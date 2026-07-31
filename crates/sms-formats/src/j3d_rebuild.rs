@@ -611,6 +611,120 @@ impl J3dRebuildDocument {
         Ok(())
     }
 
+    /// Pins a material's KCOLOR0-alpha inputs to a constant.
+    ///
+    /// `K0_A` (0x1C) reads register KCOLOR0's alpha, which Sunshine rewrites
+    /// per frame for runtime-driven effects like the Stu's goop stain; whatever
+    /// the file says is overridden at run time. The stain's visible mix runs in
+    /// the colour channel -- measured on the Stu, colour selector stage 0 is
+    /// 0x1C -- so both selector arrays are pinned. The constant is 7/8 (0x01)
+    /// rather than the runtime's one-half because 0x04 already occurs in the
+    /// pristine colour selectors and the pin must stay unambiguous to reverse.
+    /// Returns how many selectors were pinned.
+    pub fn pin_material_konst_alpha_half(&mut self, material_name: &str) -> Result<usize> {
+        const KONST_K0_A: u8 = 0x1C;
+        const KONST_PINNED: u8 = 0x01;
+        let mut pinned = 0usize;
+        for section in &mut self.sections {
+            let J3dRebuildSectionData::Materials(materials) = &mut section.data else {
+                continue;
+            };
+            let Some(names) = &materials.names else {
+                continue;
+            };
+            let Some(name_index) = names
+                .entries
+                .iter()
+                .position(|entry| entry.name == material_name)
+            else {
+                continue;
+            };
+            let record_index = materials
+                .tables
+                .iter()
+                .find(|table| table.kind == J3dMaterialTableKind::MaterialRemap)
+                .and_then(|table| match &table.allocation {
+                    J3dScalarArray::Unsigned16(values) => {
+                        values.get(name_index).map(|value| *value as usize)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(name_index);
+            let Some(record) = materials.material_init_records.get_mut(record_index) else {
+                continue;
+            };
+            for selector in record
+                .tev_konst_alpha_selectors
+                .iter_mut()
+                .chain(record.tev_konst_color_selectors.iter_mut())
+            {
+                if *selector == KONST_K0_A {
+                    *selector = KONST_PINNED;
+                    pinned += 1;
+                }
+            }
+        }
+        Ok(pinned)
+    }
+
+    /// Reverses [`Self::pin_material_konst_alpha_half`], returning selectors
+    /// to the runtime-driven KCOLOR0 register.
+    ///
+    /// Lossless because 0x01 occurs nowhere in the pristine selectors of the
+    /// materials this is used on. 0x04 in the alpha array is also reversed for
+    /// stages baked by an earlier revision that used it as the pin. The dummy
+    /// texture is deliberately left as baked: with the selector back on the
+    /// register the runtime rewrites both the alpha and the texture whenever
+    /// it shows the effect, so the slot's content no longer affects anything.
+    pub fn unpin_material_konst_alpha_half(&mut self, material_name: &str) -> Result<usize> {
+        const KONST_K0_A: u8 = 0x1C;
+        const KONST_PINNED: u8 = 0x01;
+        const LEGACY_PINNED: u8 = 0x04;
+        let mut unpinned = 0usize;
+        for section in &mut self.sections {
+            let J3dRebuildSectionData::Materials(materials) = &mut section.data else {
+                continue;
+            };
+            let Some(names) = &materials.names else {
+                continue;
+            };
+            let Some(name_index) = names
+                .entries
+                .iter()
+                .position(|entry| entry.name == material_name)
+            else {
+                continue;
+            };
+            let record_index = materials
+                .tables
+                .iter()
+                .find(|table| table.kind == J3dMaterialTableKind::MaterialRemap)
+                .and_then(|table| match &table.allocation {
+                    J3dScalarArray::Unsigned16(values) => {
+                        values.get(name_index).map(|value| *value as usize)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(name_index);
+            let Some(record) = materials.material_init_records.get_mut(record_index) else {
+                continue;
+            };
+            for selector in &mut record.tev_konst_alpha_selectors {
+                if *selector == KONST_PINNED || *selector == LEGACY_PINNED {
+                    *selector = KONST_K0_A;
+                    unpinned += 1;
+                }
+            }
+            for selector in &mut record.tev_konst_color_selectors {
+                if *selector == KONST_PINNED {
+                    *selector = KONST_K0_A;
+                    unpinned += 1;
+                }
+            }
+        }
+        Ok(unpinned)
+    }
+
     /// Replaces every TEX1 texture with the requested name using a detached
     /// BTI and grows the texture section when the imported dummy allocation is
     /// smaller than the runtime texture. The name table is retained so the

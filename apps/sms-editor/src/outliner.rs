@@ -818,6 +818,7 @@ mod tests {
                 },
             },
             dependencies: Vec::new(),
+            pool_only: false,
         }));
         let tree = build_outliner_tree(&document(vec![authored]), "", "Game default");
         let stage = &tree.roots[0];

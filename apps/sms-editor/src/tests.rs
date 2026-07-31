@@ -5225,7 +5225,6 @@ fn escape_leaves_placement_mode() {
     // Nothing to cancel, so Escape stays available to whatever else wants it.
     assert!(!app.cancel_active_placement());
 }
-
 /// Hue rotation recolours without relighting.
 ///
 /// The matrix constants are written out by hand rather than derived, so the
@@ -5265,6 +5264,473 @@ fn rotating_hue_holds_luminance_and_leaves_grey_alone() {
             assert!(
                 (channel - 0.5).abs() < 0.01,
                 "hue {degrees} tinted grey: {grey:?}"
+            );
+        }
+    }
+}
+
+/// Reports why the retail census dropped a factory. Local diagnostic:
+/// `GRAFFITO_PROBE_BASE_ROOT=<extracted game> GRAFFITO_PROBE_FACTORY=kuri
+/// cargo test probe_authoring_census -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_authoring_census() {
+    let Ok(base_root) = std::env::var("GRAFFITO_PROBE_BASE_ROOT") else {
+        return;
+    };
+    let needle = std::env::var("GRAFFITO_PROBE_FACTORY")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let base_root = std::path::Path::new(&base_root);
+    let archives =
+        sms_formats::discover_scene_archives(base_root).expect("discover retail scene archives");
+    let retail = archives
+        .iter()
+        .filter(|archive| archive.size_bytes > 0)
+        .cloned()
+        .collect::<Vec<_>>();
+    println!("retail archives: {}", retail.len());
+
+    let registry = sms_schema::bundled_object_registry()
+        .expect("bundled registry")
+        .registry;
+    let build =
+        sms_scene::ObjectAuthoringCatalog::build_with_base_root(&retail, &registry, base_root);
+    println!("templates: {}", build.catalog.len());
+    println!("warnings: {}", build.warnings.len());
+
+    println!("\n--- templates matching {needle:?} ---");
+    for (name, template) in build.catalog.iter() {
+        if name.to_ascii_lowercase().contains(&needle) {
+            println!("  present: {name} (from {})", template.source_stage);
+            for resource in &template.resources {
+                println!("    resource: {}", resource.source_asset_path.display());
+            }
+        }
+    }
+
+    println!("\n--- warnings matching {needle:?} ---");
+    for warning in build.warnings.iter() {
+        if warning.message.to_ascii_lowercase().contains(&needle) {
+            println!("  [{}] {}", warning.source_stage, warning.message);
+        }
+    }
+}
+
+/// Lists which retail stages actually place a factory. Local diagnostic:
+/// `GRAFFITO_PROBE_BASE_ROOT=<extracted game> GRAFFITO_PROBE_FACTORY=kuri
+/// cargo test probe_factory_stages -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_factory_stages() {
+    let Ok(base_root) = std::env::var("GRAFFITO_PROBE_BASE_ROOT") else {
+        return;
+    };
+    let needle = std::env::var("GRAFFITO_PROBE_FACTORY")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let base_root = std::path::Path::new(&base_root);
+    let archives =
+        sms_formats::discover_scene_archives(base_root).expect("discover retail scene archives");
+
+    for archive in archives.iter().filter(|archive| archive.size_bytes > 0) {
+        let Ok(assets) = sms_formats::mount_scene_archive(&archive.path) else {
+            continue;
+        };
+        let mut hits: Vec<String> = Vec::new();
+        let mut asset_names: Vec<String> = Vec::new();
+        for asset in &assets {
+            let name = asset.path.to_string_lossy().to_ascii_lowercase();
+            if !name.ends_with(".bin") {
+                continue;
+            }
+            let Ok(bytes) = sms_formats::read_stage_asset_bytes(&asset.path) else {
+                continue;
+            };
+            let Ok(records) = sms_formats::parse_jdrama_object_records(&bytes) else {
+                continue;
+            };
+            for record in &records {
+                let matches = match std::env::var("GRAFFITO_PROBE_STAGE") {
+                    Ok(stage) => archive.stage_id.eq_ignore_ascii_case(&stage),
+                    Err(_) => record.type_name.to_ascii_lowercase().contains(&needle),
+                };
+                if matches && !hits.contains(&record.type_name) {
+                    hits.push(record.type_name.clone());
+                    let file = asset
+                        .path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if !asset_names.contains(&file) {
+                        asset_names.push(file);
+                    }
+                }
+            }
+        }
+        if !hits.is_empty() {
+            println!(
+                "{} [{}]: {}",
+                archive.stage_id,
+                asset_names.join(" "),
+                hits.join(", ")
+            );
+        }
+    }
+}
+
+/// Prints StageEnemyInfo entries from every retail tables.bin. Local
+/// diagnostic: `GRAFFITO_PROBE_BASE_ROOT=<extracted game> cargo test
+/// probe_enemy_tables -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_enemy_tables() {
+    fn walk(stage: &str, record: &sms_formats::JDramaRecord) {
+        if record.type_name == "StageEnemyInfo" {
+            let fields = match &record.payload {
+                sms_formats::JDramaRecordPayload::Fields { fields } => fields.as_slice(),
+                sms_formats::JDramaRecordPayload::Actor { fields, .. } => fields.as_slice(),
+                sms_formats::JDramaRecordPayload::Group { fields, .. } => fields.as_slice(),
+                sms_formats::JDramaRecordPayload::Empty => &[],
+            };
+            let read = |name: &str| {
+                fields
+                    .iter()
+                    .find(|field| field.name == name)
+                    .map(|field| format!("{:?}", field.value))
+                    .unwrap_or_default()
+            };
+            println!(
+                "{stage}: name={:?} manager={} flags={} weight={}",
+                record.name,
+                read("manager_name"),
+                read("flags"),
+                read("weight")
+            );
+        }
+        if let sms_formats::JDramaRecordPayload::Group { children, .. } = &record.payload {
+            for child in children {
+                walk(stage, child);
+            }
+        }
+    }
+
+    let Ok(base_root) = std::env::var("GRAFFITO_PROBE_BASE_ROOT") else {
+        return;
+    };
+    let base_root = std::path::Path::new(&base_root);
+    let archives = sms_formats::discover_scene_archives(base_root).expect("discover archives");
+    for archive in archives.iter().filter(|archive| archive.size_bytes > 0) {
+        let Ok(assets) = sms_formats::mount_scene_archive(&archive.path) else {
+            continue;
+        };
+        for asset in &assets {
+            if !asset
+                .path
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with("tables.bin")
+            {
+                continue;
+            }
+            let Ok(bytes) = sms_formats::read_stage_asset_bytes(&asset.path) else {
+                continue;
+            };
+            let Ok(document) = sms_formats::parse_jdrama_document(&bytes) else {
+                println!(
+                    "{}: tables.bin did not parse as a document",
+                    archive.stage_id
+                );
+                continue;
+            };
+            walk(&archive.stage_id, &document.root);
+        }
+    }
+}
+
+/// Dumps a named record from a stage's scene.bin as the editor parses it.
+/// `GRAFFITO_PROBE_BASE_ROOT=... GRAFFITO_PROBE_STAGE=bianco0
+/// GRAFFITO_PROBE_TYPE=NameKuriManager cargo test probe_scene_record --
+/// --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_scene_record() {
+    fn walk(record: &sms_formats::JDramaRecord, wanted: &str) {
+        if wanted == "*" {
+            println!("{} ({})", record.type_name, record.name);
+        } else if record.type_name == wanted {
+            println!("{:#?}", record);
+        }
+        if let sms_formats::JDramaRecordPayload::Group { children, .. } = &record.payload {
+            for child in children {
+                walk(child, wanted);
+            }
+        }
+    }
+    let Ok(base_root) = std::env::var("GRAFFITO_PROBE_BASE_ROOT") else {
+        return;
+    };
+    let stage = std::env::var("GRAFFITO_PROBE_STAGE").unwrap_or_default();
+    let wanted = std::env::var("GRAFFITO_PROBE_TYPE").unwrap_or_default();
+    let base_root = std::path::Path::new(&base_root);
+    let archives = sms_formats::discover_scene_archives(base_root).expect("discover archives");
+    for archive in archives
+        .iter()
+        .filter(|archive| archive.stage_id.eq_ignore_ascii_case(&stage))
+    {
+        let Ok(assets) = sms_formats::mount_scene_archive(&archive.path) else {
+            continue;
+        };
+        for asset in &assets {
+            let name = asset.path.to_string_lossy().to_ascii_lowercase();
+            let suffix =
+                std::env::var("GRAFFITO_PROBE_FILE").unwrap_or_else(|_| "scene.bin".to_string());
+            if !name.ends_with(&suffix) {
+                continue;
+            }
+            let Ok(bytes) = sms_formats::read_stage_asset_bytes(&asset.path) else {
+                continue;
+            };
+            let Ok(document) = sms_formats::parse_jdrama_document(&bytes) else {
+                continue;
+            };
+            walk(&document.root, &wanted);
+        }
+    }
+}
+
+/// Byte-compares encode(parse(tables.bin)) against retail for every stage.
+/// `GRAFFITO_PROBE_BASE_ROOT=... cargo test probe_tables_roundtrip -- --ignored
+/// --nocapture`
+#[test]
+#[ignore]
+fn probe_tables_roundtrip() {
+    let Ok(base_root) = std::env::var("GRAFFITO_PROBE_BASE_ROOT") else {
+        return;
+    };
+    let base_root = std::path::Path::new(&base_root);
+    let archives = sms_formats::discover_scene_archives(base_root).expect("discover archives");
+    let mut same = 0usize;
+    let mut different = 0usize;
+    for archive in archives.iter().filter(|archive| archive.size_bytes > 0) {
+        let Ok(assets) = sms_formats::mount_scene_archive(&archive.path) else {
+            continue;
+        };
+        for asset in &assets {
+            if !asset
+                .path
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with("tables.bin")
+            {
+                continue;
+            }
+            let Ok(bytes) = sms_formats::read_stage_asset_bytes(&asset.path) else {
+                continue;
+            };
+            let Ok(document) = sms_formats::parse_jdrama_document(&bytes) else {
+                println!("{}: parse failed", archive.stage_id);
+                continue;
+            };
+            match sms_formats::encode_jdrama_document(&document) {
+                Ok(encoded) if encoded == bytes => same += 1,
+                Ok(encoded) => {
+                    different += 1;
+                    if different <= 3 {
+                        println!(
+                            "{}: DIFFERENT ({} vs {} bytes); first divergence at {:?}",
+                            archive.stage_id,
+                            encoded.len(),
+                            bytes.len(),
+                            encoded
+                                .iter()
+                                .zip(bytes.iter())
+                                .position(|(left, right)| left != right)
+                        );
+                    }
+                }
+                Err(error) => {
+                    different += 1;
+                    println!("{}: encode failed: {error}", archive.stage_id);
+                }
+            }
+        }
+    }
+    println!("identical: {same}  different: {different}");
+}
+
+/// Lists resources in an exported stage archive matching a filter.
+/// `GRAFFITO_PROBE_SZS=<path> GRAFFITO_PROBE_MATCH=pollution cargo test
+/// probe_szs_contents -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_szs_contents() {
+    let Ok(path) = std::env::var("GRAFFITO_PROBE_SZS") else {
+        return;
+    };
+    let needle = std::env::var("GRAFFITO_PROBE_MATCH")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let assets = sms_formats::mount_scene_archive(std::path::Path::new(&path)).expect("mount szs");
+    let mut shown = 0usize;
+    for asset in &assets {
+        let name = asset.path.to_string_lossy().replace('\\', "/");
+        if needle.is_empty() || name.to_ascii_lowercase().contains(&needle) {
+            println!("{name}");
+            shown += 1;
+        }
+    }
+    println!("({shown} of {} assets matched)", assets.len());
+}
+
+/// Hashes one resource across several retail stages.
+/// `GRAFFITO_PROBE_BASE_ROOT=... GRAFFITO_PROBE_RES=hamukuri/default.bmd
+/// cargo test probe_resource_hashes -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_resource_hashes() {
+    let Ok(base_root) = std::env::var("GRAFFITO_PROBE_BASE_ROOT") else {
+        return;
+    };
+    let wanted = std::env::var("GRAFFITO_PROBE_RES")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let base_root = std::path::Path::new(&base_root);
+    let archives = sms_formats::discover_scene_archives(base_root).expect("discover");
+    for archive in archives.iter().filter(|archive| archive.size_bytes > 0) {
+        let Ok(assets) = sms_formats::mount_scene_archive(&archive.path) else {
+            continue;
+        };
+        for asset in &assets {
+            let name = asset
+                .path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase();
+            if !name.ends_with(&wanted) {
+                continue;
+            }
+            let Ok(bytes) = sms_formats::read_stage_asset_bytes(&asset.path) else {
+                continue;
+            };
+            let mut hash = 0xcbf2_9ce4_8422_2325u64;
+            for byte in &bytes {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+            }
+            println!(
+                "{}: {} bytes, fnv {:016x}",
+                archive.stage_id,
+                bytes.len(),
+                hash
+            );
+        }
+    }
+}
+
+/// Bakes the stain into the real retail Stu model and round-trips it.
+/// `GRAFFITO_PROBE_BASE_ROOT=... cargo test probe_stain_bake -- --ignored
+/// --nocapture`
+#[test]
+#[ignore]
+fn probe_stain_bake() {
+    let Ok(base_root) = std::env::var("GRAFFITO_PROBE_BASE_ROOT") else {
+        return;
+    };
+    let base_root = std::path::Path::new(&base_root);
+    let archives = sms_formats::discover_scene_archives(base_root).expect("discover");
+    let bianco = archives
+        .iter()
+        .find(|archive| archive.stage_id == "bianco0")
+        .expect("bianco0");
+    let assets = sms_formats::mount_scene_archive(&bianco.path).expect("mount");
+    let find = |suffix: &str| {
+        assets
+            .iter()
+            .find(|asset| {
+                asset
+                    .path
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .ends_with(suffix)
+            })
+            .map(|asset| sms_formats::read_stage_asset_bytes(&asset.path).expect("read"))
+            .expect(suffix)
+    };
+    let model_bytes = find("hamukuri/default.bmd");
+    let stain_bytes = find("h_ma_rak.bti");
+
+    let mut model = sms_formats::J3dRebuildDocument::parse(&model_bytes).expect("parse model");
+    let stain = sms_formats::BtiFile::parse(&stain_bytes).expect("parse stain");
+
+    for section in &model.sections {
+        let sms_formats::J3dRebuildSectionData::Materials(materials) = &section.data else {
+            continue;
+        };
+        if let Some(names) = &materials.names {
+            for (index, entry) in names.entries.iter().enumerate() {
+                if entry.name == "_mat_body_top1" {
+                    println!("material index {index}");
+                }
+            }
+        }
+        for (index, record) in materials.material_init_records.iter().enumerate() {
+            println!(
+                "record {index}: alpha {:?} color {:?}",
+                record.tev_konst_alpha_selectors, record.tev_konst_color_selectors
+            );
+        }
+    }
+    let replaced = model
+        .replace_named_texture_from_bti("H_ma_rak_dummy", &stain)
+        .expect("replace texture");
+    let pinned = model
+        .pin_material_konst_alpha_half("_mat_body_top1")
+        .expect("pin alpha");
+    println!("replaced {replaced} texture slot(s), pinned {pinned} TEV stage(s)");
+    assert!(
+        replaced > 0,
+        "the dummy slot must exist in the retail model"
+    );
+    assert!(pinned > 0, "the stain material must use K0 alpha");
+
+    let encoded = model.to_bytes().expect("encode");
+    let reparsed = sms_formats::J3dRebuildDocument::parse(&encoded).expect("reparse");
+    let repinned = {
+        let mut copy = reparsed.clone();
+        copy.pin_material_konst_alpha_half("_mat_body_top1")
+            .expect("pin twice")
+    };
+    assert_eq!(repinned, 0, "a second pin must find nothing left to pin");
+
+    // The toggle's off state: unpinning must restore the pristine selectors
+    // exactly, since the retail material carries no 0x04 of its own.
+    let mut unbaked = reparsed.clone();
+    let unpinned = unbaked
+        .pin_material_konst_alpha_half("_mat_body_top1")
+        .map(|_| 0usize)
+        .unwrap_or(0)
+        + unbaked
+            .unpin_material_konst_alpha_half("_mat_body_top1")
+            .expect("unpin");
+    assert_eq!(unpinned, pinned, "unpin must reverse exactly what pin did");
+    let pristine = sms_formats::J3dRebuildDocument::parse(&model_bytes).expect("pristine");
+    for (section, original) in unbaked.sections.iter().zip(pristine.sections.iter()) {
+        let (
+            sms_formats::J3dRebuildSectionData::Materials(edited),
+            sms_formats::J3dRebuildSectionData::Materials(reference),
+        ) = (&section.data, &original.data)
+        else {
+            continue;
+        };
+        for (record, reference_record) in edited
+            .material_init_records
+            .iter()
+            .zip(reference.material_init_records.iter())
+        {
+            assert_eq!(
+                record.tev_konst_alpha_selectors,
+                reference_record.tev_konst_alpha_selectors
             );
         }
     }

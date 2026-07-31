@@ -51,6 +51,7 @@ mod dolphin_graphics;
 mod game_content_index;
 mod game_text;
 mod goop;
+mod goop_spawn;
 mod gpu_viewport;
 mod managed_build;
 mod model_assets;

@@ -275,6 +275,15 @@ fn validate_routes(document: &StageDocument, issues: &mut Vec<ValidationIssue>) 
         return;
     };
     for object in &document.objects {
+        // A pool-only enemy exports its manager without the actor record, so
+        // the record's route reference never reaches the stage and there is
+        // nothing for the runtime to miss.
+        if matches!(
+            &object.placement,
+            Some(crate::PlacementBinding::Authored(placement)) if placement.pool_only
+        ) {
+            continue;
+        }
         let Some(graph_name) = object.raw_param("graph_name") else {
             continue;
         };
@@ -692,6 +701,7 @@ mod tests {
             target_group_index: 0,
             prototype: JDramaRecord::new("Group", "Group", JDramaRecordPayload::Empty).unwrap(),
             dependencies: Vec::new(),
+            pool_only: false,
         }));
         assert!(route_reference_requires_named_graph(&object, None));
     }
