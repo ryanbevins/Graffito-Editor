@@ -1245,6 +1245,27 @@ impl SmsEditorApp {
                 self.set_manager_spawns_from_goop(&entity, enabled);
             }
         }
+
+        // The stain bake needs no placed actor -- it edits the copied Stu
+        // model -- so a pool spawned purely from this panel gets its stain
+        // control here too.
+        if self.stu_stain_available() {
+            let mut stained = self.stu_stain_baked();
+            if ui
+                .checkbox(&mut stained, "Goop stain on cap")
+                .on_hover_text(
+                    "Bakes the stage's stain texture into the Stu model and pins its \
+                     blend, so it shows regardless of what the runtime decides. Applies \
+                     to every Stu using this model in the stage.",
+                )
+                .changed()
+            {
+                match stained {
+                    true => self.bake_stu_stain(),
+                    false => self.unbake_stu_stain(),
+                }
+            }
+        }
     }
 }
 
