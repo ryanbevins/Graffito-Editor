@@ -839,7 +839,7 @@ impl StageDocument {
         Ok(())
     }
 
-    fn reconcile_appended_runtime_route_graphs(&mut self) -> bool {
+    fn reconcile_route_overlay(&mut self) -> bool {
         let Some(raw_resource_path) = self
             .route_authoring
             .as_ref()
@@ -859,11 +859,88 @@ impl StageDocument {
             .filter(|graph| self.route_reference_count(&graph.name) > 0)
             .map(|graph| graph.name.clone())
             .collect::<BTreeSet<_>>();
-        self.route_authoring
+        if self
+            .route_authoring
             .as_mut()
             .expect("route authoring was checked above")
             .reconcile_appended_runtime_graphs(&runtime, &referenced_graph_names)
             .unwrap_or(false)
+        {
+            return true;
+        }
+
+        // Early catalog imports replaced an existing stage's complete RAL
+        // overlay with only the dependency graph copied for the authored
+        // object. That legacy shape is the inverse of the suffix form above:
+        // route authoring still owns the retail graphs, while the managed edit
+        // contains only catalog graphs. Repair only an explicitly
+        // catalog-managed edit whose every stored graph still has a live scene
+        // reference. User-authored RAL conflicts remain validation errors.
+        let is_catalog_managed = self.archive_edits.resources.iter().any(|edit| {
+            edit.raw_resource_path == raw_resource_path
+                && edit.catalog_managed
+                && matches!(&edit.document, StageResourceDocument::Rail(_))
+        });
+        if !is_catalog_managed
+            || runtime.graphs.is_empty()
+            || runtime
+                .graphs
+                .iter()
+                .any(|graph| !referenced_graph_names.contains(&graph.name))
+        {
+            return false;
+        }
+
+        let Some(mut merged) = self
+            .route_authoring
+            .as_ref()
+            .and_then(|authoring| authoring.compile().ok())
+        else {
+            return false;
+        };
+        let graph_names = runtime
+            .graphs
+            .iter()
+            .map(|graph| graph.name.clone())
+            .collect::<Vec<_>>();
+        let Ok(outcomes) = merged.merge_named_graphs(&runtime, &graph_names) else {
+            return false;
+        };
+        if outcomes
+            .iter()
+            .any(|outcome| outcome.source_name != outcome.target_name)
+        {
+            return false;
+        }
+        if outcomes.iter().any(|outcome| outcome.inserted)
+            && !self
+                .route_authoring
+                .as_mut()
+                .expect("route authoring was checked above")
+                .reconcile_appended_runtime_graphs(&merged, &referenced_graph_names)
+                .unwrap_or(false)
+        {
+            return false;
+        }
+        if self
+            .route_authoring
+            .as_ref()
+            .and_then(|authoring| authoring.compile().ok())
+            .as_ref()
+            != Some(&merged)
+        {
+            return false;
+        }
+
+        let Some(edit) = self.archive_edits.resources.iter_mut().find(|edit| {
+            edit.raw_resource_path == raw_resource_path
+                && edit.catalog_managed
+                && matches!(&edit.document, StageResourceDocument::Rail(_))
+        }) else {
+            return false;
+        };
+        edit.document = StageResourceDocument::Rail(merged);
+        true
     }
 
     pub fn route_consumers(&self, graph_name: &str) -> Vec<&SceneObject> {
@@ -1525,7 +1602,7 @@ impl StageDocument {
         &mut self,
         project_root: impl AsRef<Path>,
     ) -> Result<ProjectSaveOutcome> {
-        self.reconcile_appended_runtime_route_graphs();
+        self.reconcile_route_overlay();
         self.queue_editor_overlay_change()?;
         self.queue_dialogue_library_change()?;
         self.queue_authored_stage_baseline_change()?;
@@ -4885,6 +4962,56 @@ mod tests {
                 .unwrap(),
             runtime
         );
+        assert!(!reopened
+            .validate()
+            .iter()
+            .any(|issue| issue.code == "route-authoring-overlay-mismatch"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_load_repairs_legacy_catalog_route_replacement() {
+        let root = unique_test_project_root("load-catalog-route-replacement");
+        let base = test_route_document("poihana2");
+        let dependency = test_route_document("main");
+        let mut legacy = empty_document("bobomb0");
+        let mut consumer = SceneObject::new("boss-manta", "BossManta");
+        consumer.set_raw_param("graph_name", "main");
+        legacy.objects.push(consumer);
+        legacy.route_authoring = Some(RouteAuthoringDocument::lift(ROUTE_RESOURCE_PATH, &base));
+        legacy.archive_edits.resources.push(StageResourceEdit {
+            raw_resource_path: ROUTE_RESOURCE_PATH.to_vec(),
+            document: StageResourceDocument::Rail(dependency),
+            mode: StageResourceEditMode::Upsert,
+            catalog_managed: true,
+        });
+        legacy.queue_editor_overlay_change().unwrap();
+        project_store::save_project_folder(&legacy, &root).unwrap();
+
+        let mut reopened = empty_document("bobomb0");
+        assert!(reopened.load_project_folder(&root).unwrap());
+        let compiled = reopened
+            .route_authoring
+            .as_ref()
+            .unwrap()
+            .compile()
+            .unwrap();
+        assert_eq!(
+            compiled
+                .graphs
+                .iter()
+                .map(|graph| graph.name.as_str())
+                .collect::<Vec<_>>(),
+            ["poihana2", "main"]
+        );
+        let stored = reopened
+            .archive_edits
+            .resources
+            .iter()
+            .find(|edit| edit.raw_resource_path == ROUTE_RESOURCE_PATH)
+            .unwrap();
+        assert!(stored.catalog_managed);
+        assert_eq!(stored.document, StageResourceDocument::Rail(compiled));
         assert!(!reopened
             .validate()
             .iter()

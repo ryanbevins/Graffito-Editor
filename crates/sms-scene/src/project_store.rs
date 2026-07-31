@@ -515,7 +515,7 @@ pub(super) fn load_project_overlay(
             (Ok(compiled), Ok(Some(super::StageResourceDocument::Rail(stored))))
                 if compiled != stored =>
             {
-                if !document.reconcile_appended_runtime_route_graphs() {
+                if !document.reconcile_route_overlay() {
                     document.load_issues.push(super::ValidationIssue::error(
                         "route-authoring-overlay-mismatch",
                         "Saved route authoring data does not compile to the stored RAL overlay; both representations were retained for review.",
