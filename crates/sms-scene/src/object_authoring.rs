@@ -682,42 +682,52 @@ fn build_from_sources_with_common(
 
         let mut resolved: Option<(Candidate, _, _)> = None;
         let mut rejections: Vec<ObjectAuthoringCatalogWarning> = Vec::new();
-        for (_, candidate) in ranked {
-            let resources = match resolve_resources(&candidate, &sources, registry) {
-                Ok(resources) => resources,
-                Err(reason) => {
-                    rejections.push(ObjectAuthoringCatalogWarning {
-                        source_stage: candidate.source_stage.clone(),
-                        source_asset_path: Some(candidate.source_asset_path.clone()),
-                        message: format!(
-                            "Omitted unsafe authoring candidate '{}': {reason}",
-                            candidate.factory_name
-                        ),
-                    });
-                    continue;
-                }
-            };
-            let table_dependencies = match resolve_runtime_table_dependencies(
-                &candidate.factory_name,
-                &candidate.source_stage,
-                &sources,
-                registry,
-            ) {
-                Ok(dependencies) => dependencies,
-                Err(reason) => {
-                    rejections.push(ObjectAuthoringCatalogWarning {
-                        source_stage: candidate.source_stage.clone(),
-                        source_asset_path: Some(candidate.source_asset_path.clone()),
-                        message: format!(
-                            "Omitted unsafe authoring candidate '{}': {reason}",
-                            candidate.factory_name
-                        ),
-                    });
-                    continue;
-                }
-            };
-            resolved = Some((candidate, resources, table_dependencies));
-            break;
+        // Strict resolution first, borrowing shared resources from another
+        // stage only when no candidate resolves natively. A stage that lacks a
+        // shared resource often lacks it for a reason -- Corona's Stu model
+        // has no goop hat, which is exactly why Corona ships no pollution
+        // texture -- and borrowing the file would mask that the candidate is
+        // the wrong variant of the enemy.
+        'passes: for allow_shared in [false, true] {
+            for (_, candidate) in &ranked {
+                let candidate = candidate.clone();
+                let resources =
+                    match resolve_resources(&candidate, &sources, registry, allow_shared) {
+                        Ok(resources) => resources,
+                        Err(reason) => {
+                            rejections.push(ObjectAuthoringCatalogWarning {
+                                source_stage: candidate.source_stage.clone(),
+                                source_asset_path: Some(candidate.source_asset_path.clone()),
+                                message: format!(
+                                    "Omitted unsafe authoring candidate '{}': {reason}",
+                                    candidate.factory_name
+                                ),
+                            });
+                            continue;
+                        }
+                    };
+                let table_dependencies = match resolve_runtime_table_dependencies(
+                    &candidate.factory_name,
+                    &candidate.source_stage,
+                    &sources,
+                    registry,
+                ) {
+                    Ok(dependencies) => dependencies,
+                    Err(reason) => {
+                        rejections.push(ObjectAuthoringCatalogWarning {
+                            source_stage: candidate.source_stage.clone(),
+                            source_asset_path: Some(candidate.source_asset_path.clone()),
+                            message: format!(
+                                "Omitted unsafe authoring candidate '{}': {reason}",
+                                candidate.factory_name
+                            ),
+                        });
+                        continue;
+                    }
+                };
+                resolved = Some((candidate, resources, table_dependencies));
+                break 'passes;
+            }
         }
 
         let Some((candidate, resources, table_dependencies)) = resolved else {
@@ -1276,6 +1286,7 @@ fn resolve_resources(
     candidate: &Candidate,
     sources: &[&CatalogSource],
     registry: &ObjectRegistry,
+    allow_shared: bool,
 ) -> Result<Vec<ObjectAuthoringResource>, String> {
     let mut out = BTreeSet::new();
     for registration in &candidate.character_resource_records {
@@ -1376,22 +1387,69 @@ fn resolve_resources(
             )?;
         }
         if let Some(manager) = find_enemy_manager(registry, factory_name) {
+            // A bare model filename like "default.bmd" can match several
+            // resources in a stage that carries more than one variant of the
+            // family. The runtime resolves it inside the manager's character
+            // archive, so qualifying the reference with the candidate's own
+            // character folders reproduces that scoping: hamukuri/default.bmd
+            // rather than whichever default.bmd the filename scan met first.
+            let character_folders = candidate
+                .character_resource_records
+                .iter()
+                .filter_map(
+                    |registration| match semantic_type_name(&registration.type_name) {
+                        "ObjChara" => reference_field(registration, "resource_folder"),
+                        "SmplChara" => reference_field(registration, "archive_path"),
+                        _ => None,
+                    },
+                )
+                .map(|folder| {
+                    // Character folders are runtime-absolute ("/scene/hamukuri")
+                    // while archive paths are root-stripped ("hamukuri/...").
+                    let folder = normalize_text_path(folder);
+                    let folder = folder.trim_matches('/');
+                    folder.strip_prefix("scene/").unwrap_or(folder).to_string()
+                })
+                .collect::<BTreeSet<_>>();
             for model in &manager.models {
-                if !bound_names.contains(&normalize_text_path(&model.model_name)) {
-                    add_stage_reference(
-                        &mut out,
-                        sources,
-                        &candidate.source_stage,
-                        &model.model_name,
-                        &format!("{factory_name} manager model"),
-                        false,
-                    )?;
+                if bound_names.contains(&normalize_text_path(&model.model_name)) {
+                    continue;
                 }
+                let qualified = character_folders
+                    .iter()
+                    .map(|folder| format!("{folder}/{}", model.model_name))
+                    .filter(|reference| {
+                        stage_resources(sources, &candidate.source_stage)
+                            .into_iter()
+                            .any(|resource| {
+                                let path = normalized_path(&resource.raw_resource_path);
+                                path == normalize_text_path(reference)
+                                    || path
+                                        .ends_with(&format!("/{}", normalize_text_path(reference)))
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                let reference = match qualified.len() {
+                    1 => qualified[0].clone(),
+                    _ => model.model_name.clone(),
+                };
+                add_stage_reference(
+                    &mut out,
+                    sources,
+                    &candidate.source_stage,
+                    &reference,
+                    &format!("{factory_name} manager model"),
+                    false,
+                )?;
             }
         }
     }
     for replacement in registry.runtime_texture_replacements_for(&candidate.factory_name) {
-        add_shared_stage_reference(
+        let add = match allow_shared {
+            true => add_shared_stage_reference,
+            false => add_stage_reference,
+        };
+        add(
             &mut out,
             sources,
             &candidate.source_stage,
@@ -3893,7 +3951,7 @@ mod tests {
                 "montemcommon/readme.txt",
             ],
         );
-        let selected = resolve_resources(&candidate, &[&source], &registry)
+        let selected = resolve_resources(&candidate, &[&source], &registry, true)
             .expect("complete NPC runtime resource closure");
 
         assert_eq!(
