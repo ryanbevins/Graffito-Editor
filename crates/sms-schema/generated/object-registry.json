@@ -2,7 +2,7 @@
   "format_version": 1,
   "source_revision": "01ffd369c94b23be158abde1254c277879c04a9f",
   "source_fingerprint": 15545920352673147969,
-  "generator_fingerprint": 17611020877306567682,
+  "generator_fingerprint": 12879722444608376315,
   "registry": {
     "objects": [
       {
@@ -49504,6 +49504,24 @@
         "source_file": "src/MoveBG/MapObjPinna.cpp"
       },
       {
+        "factory_name": "AmiKing",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "エフェクト水柱マネージャー",
+        "source_file": "src/MoveBG/MapObjPinna.cpp"
+      },
+      {
+        "factory_name": "BathtubKiller",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "エフェクト爆発マネージャー",
+        "source_file": "src/Enemy/BathtubKiller.cpp"
+      },
+      {
         "factory_name": "BellDolpicPolice",
         "target": {
           "kind": "actor",
@@ -49584,6 +49602,51 @@
         "source_file": "src/MoveBG/MapObjDolpic.cpp"
       },
       {
+        "factory_name": "BiaTurnBridge",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "エフェクト水柱マネージャー",
+        "source_file": "src/MoveBG/MapObjLib.cpp"
+      },
+      {
+        "factory_name": "BombHei",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "エフェクト爆発マネージャー",
+        "source_file": "src/Enemy/bombhei.cpp"
+      },
+      {
+        "factory_name": "BombHei",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": true,
+        "record_name": "エフェクト爆発水柱マネージャー",
+        "source_file": "src/Enemy/bombhei.cpp"
+      },
+      {
+        "factory_name": "BombHei",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": true,
+        "record_name": "エフェクト砂柱マネージャー",
+        "source_file": "src/Enemy/bombhei.cpp"
+      },
+      {
+        "factory_name": "BossDangoHamuKuri",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "だんごハムクリマネージャー",
+        "source_file": "src/Enemy/hamukuri.cpp"
+      },
+      {
         "factory_name": "BossGesso",
         "target": {
           "kind": "actor",
@@ -49624,6 +49687,15 @@
         "source_file": "src/Enemy/BossHanachanMain.cpp"
       },
       {
+        "factory_name": "BossManta",
+        "target": {
+          "kind": "graph"
+        },
+        "required": true,
+        "record_name": "main",
+        "source_file": "src/Enemy/bossManta.cpp"
+      },
+      {
         "factory_name": "BossPakkun",
         "target": {
           "kind": "actor",
@@ -49642,6 +49714,33 @@
         "required": true,
         "record_name": "ボスシャインカメラ",
         "source_file": "src/Enemy/bosspakkun.cpp"
+      },
+      {
+        "factory_name": "BossPakkun",
+        "target": {
+          "kind": "graph"
+        },
+        "required": true,
+        "record_name": "bosspakkun",
+        "source_file": "src/Enemy/bosspakkun.cpp"
+      },
+      {
+        "factory_name": "BossTelesa",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "テレサマネージャー",
+        "source_file": "src/Enemy/bosstelesa.cpp"
+      },
+      {
+        "factory_name": "BossTelesa",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "バブルマネージャー",
+        "source_file": "src/Enemy/bosstelesa.cpp"
       },
       {
         "factory_name": "BossWanwan",
@@ -49664,6 +49763,87 @@
         "source_file": "src/Enemy/bosswanwan.cpp"
       },
       {
+        "factory_name": "BossWanwan",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": true,
+        "record_name": "エフェクト水柱マネージャー",
+        "source_file": "src/Enemy/bosswanwan.cpp"
+      },
+      {
+        "factory_name": "BossWanwan",
+        "target": {
+          "kind": "graph"
+        },
+        "required": true,
+        "record_name": "bwanwan",
+        "source_file": "src/Enemy/bosswanwan.cpp"
+      },
+      {
+        "factory_name": "Cannon",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "イガイガマネージャー",
+        "source_file": "src/Enemy/cannon.cpp"
+      },
+      {
+        "factory_name": "Cannon",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "キラーマネージャー",
+        "source_file": "src/Enemy/cannon.cpp"
+      },
+      {
+        "factory_name": "Cannon",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "ハムクリマネージャ",
+        "source_file": "src/Enemy/cannon.cpp"
+      },
+      {
+        "factory_name": "Cannon",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "ボム兵マネージャー",
+        "source_file": "src/Enemy/cannon.cpp"
+      },
+      {
+        "factory_name": "Cannon",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "ポポマネージャ",
+        "source_file": "src/Enemy/cannon.cpp"
+      },
+      {
+        "factory_name": "Cannon",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": true,
+        "record_name": "エフェクト爆発マネージャー",
+        "source_file": "src/Enemy/cannon.cpp"
+      },
+      {
+        "factory_name": "CoasterKiller",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "エフェクト爆発マネージャー",
+        "source_file": "src/Enemy/coasterkiller.cpp"
+      },
+      {
         "factory_name": "Coin",
         "target": {
           "kind": "actor",
@@ -49762,6 +49942,24 @@
         "required": false,
         "record_name": "シャイン（１００枚コイン用）カメラ",
         "source_file": "src/MoveBG/Item.cpp"
+      },
+      {
+        "factory_name": "FruitTree",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "エフェクト水柱マネージャー",
+        "source_file": "src/MoveBG/MapObjLib.cpp"
+      },
+      {
+        "factory_name": "GateKeeper",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": true,
+        "record_name": "ゴロゴロマネージャー",
+        "source_file": "src/Enemy/gatekeeper.cpp"
       },
       {
         "factory_name": "GoalWatermelon",
@@ -49784,6 +49982,51 @@
         "source_file": "src/MoveBG/MapObjMamma.cpp"
       },
       {
+        "factory_name": "HanaSambo",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": true,
+        "record_name": "サンボフラワーマネージャー",
+        "source_file": "src/Enemy/hanasambo.cpp"
+      },
+      {
+        "factory_name": "HauntLegManager",
+        "target": {
+          "kind": "graph"
+        },
+        "required": true,
+        "record_name": "main",
+        "source_file": "src/Enemy/hauntLeg.cpp"
+      },
+      {
+        "factory_name": "HinoKuri2",
+        "target": {
+          "kind": "graph"
+        },
+        "required": true,
+        "record_name": "hinokuri",
+        "source_file": "src/Enemy/hinokuri2.cpp"
+      },
+      {
+        "factory_name": "IceCar",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "エフェクト水柱マネージャー",
+        "source_file": "src/MoveBG/MapObjLib.cpp"
+      },
+      {
+        "factory_name": "ItemSlotDrum",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "テレサマネージャー",
+        "source_file": "src/MoveBG/MapObjSirena.cpp"
+      },
+      {
         "factory_name": "KBossPakkun",
         "target": {
           "kind": "actor",
@@ -49802,6 +50045,60 @@
         "required": true,
         "record_name": "ボスシャインカメラ",
         "source_file": "src/Enemy/bosspakkun.cpp"
+      },
+      {
+        "factory_name": "KBossPakkun",
+        "target": {
+          "kind": "graph"
+        },
+        "required": true,
+        "record_name": "bosspakkun",
+        "source_file": "src/Enemy/bosspakkun.cpp"
+      },
+      {
+        "factory_name": "KageMarioModoki",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": true,
+        "record_name": "テレサマネージャー",
+        "source_file": "src/Enemy/telesa.cpp"
+      },
+      {
+        "factory_name": "Killer",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "エフェクト爆発マネージャー",
+        "source_file": "src/Enemy/killer.cpp"
+      },
+      {
+        "factory_name": "Killer",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": true,
+        "record_name": "エフェクト爆発水柱マネージャー",
+        "source_file": "src/Enemy/killer.cpp"
+      },
+      {
+        "factory_name": "Killer",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": true,
+        "record_name": "エフェクト砂柱マネージャー",
+        "source_file": "src/Enemy/killer.cpp"
+      },
+      {
+        "factory_name": "MammaSurfboard",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "エフェクト水柱マネージャー",
+        "source_file": "src/MoveBG/MapObjLib.cpp"
       },
       {
         "factory_name": "MapEventSinkBianco",
@@ -49834,6 +50131,33 @@
         "source_file": "src/Map/MapEventSirena.cpp"
       },
       {
+        "factory_name": "MapObjBase",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "エフェクト水柱マネージャー",
+        "source_file": "src/MoveBG/MapObjLib.cpp"
+      },
+      {
+        "factory_name": "MoePuku",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "エフェクト水柱マネージャー",
+        "source_file": "src/Enemy/tobiPuku.cpp"
+      },
+      {
+        "factory_name": "MoePukuLaunchPad",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "モエプクマネージャー",
+        "source_file": "src/Enemy/tobiPuku.cpp"
+      },
+      {
         "factory_name": "MonumentShine",
         "target": {
           "kind": "actor",
@@ -49852,6 +50176,60 @@
         "required": false,
         "record_name": "モニュメントシャインカメラ",
         "source_file": "src/MoveBG/MapObjDolpic.cpp"
+      },
+      {
+        "factory_name": "NameKuri",
+        "target": {
+          "kind": "graph"
+        },
+        "required": true,
+        "record_name": "main",
+        "source_file": "src/Enemy/namekuri.cpp"
+      },
+      {
+        "factory_name": "NormalBlock",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "エフェクト水柱マネージャー",
+        "source_file": "src/MoveBG/MapObjLib.cpp"
+      },
+      {
+        "factory_name": "Popo",
+        "target": {
+          "kind": "mario_water_gun"
+        },
+        "required": true,
+        "record_name": "SMS_GetMarioWaterGun",
+        "source_file": "src/Enemy/popo.cpp"
+      },
+      {
+        "factory_name": "Rocket",
+        "target": {
+          "kind": "mario_water_gun"
+        },
+        "required": true,
+        "record_name": "SMS_GetMarioWaterGun",
+        "source_file": "src/Enemy/rocket.cpp"
+      },
+      {
+        "factory_name": "RocketManager",
+        "target": {
+          "kind": "graph"
+        },
+        "required": true,
+        "record_name": "main",
+        "source_file": "src/Enemy/rocket.cpp"
+      },
+      {
+        "factory_name": "SamboHead",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": true,
+        "record_name": "サンボフラワーマネージャー",
+        "source_file": "src/Enemy/hanasambo.cpp"
       },
       {
         "factory_name": "SleepBossHanachan",
@@ -49874,6 +50252,42 @@
         "source_file": "src/Enemy/SleepBossHanachan.cpp"
       },
       {
+        "factory_name": "TamaNoko",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": true,
+        "record_name": "エフェクト砂柱マネージャー",
+        "source_file": "src/Enemy/tamaNoko.cpp"
+      },
+      {
+        "factory_name": "TinKoopa",
+        "target": {
+          "kind": "graph"
+        },
+        "required": true,
+        "record_name": "killer",
+        "source_file": "src/Enemy/tinkoopa.cpp"
+      },
+      {
+        "factory_name": "TobiPukuLaunchPad",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "とびプクマネージャー",
+        "source_file": "src/Enemy/tobiPuku.cpp"
+      },
+      {
+        "factory_name": "TypicalEnemy",
+        "target": {
+          "kind": "graph"
+        },
+        "required": true,
+        "record_name": "main",
+        "source_file": "src/Enemy/typicalenemy.cpp"
+      },
+      {
         "factory_name": "WaterMelon",
         "target": {
           "kind": "actor",
@@ -49892,6 +50306,24 @@
         "required": false,
         "record_name": "スイカシャインカメラ",
         "source_file": "src/MoveBG/MapObjBall.cpp"
+      },
+      {
+        "factory_name": "WindmillRoof",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "エフェクト水柱マネージャー",
+        "source_file": "src/MoveBG/MapObjLib.cpp"
+      },
+      {
+        "factory_name": "submarine",
+        "target": {
+          "kind": "enemy_manager"
+        },
+        "required": false,
+        "record_name": "エフェクト水柱マネージャー",
+        "source_file": "src/MoveBG/MapObjLib.cpp"
       }
     ],
     "enemy_actors": [

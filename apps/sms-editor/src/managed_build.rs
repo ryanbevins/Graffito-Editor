@@ -1307,6 +1307,25 @@ fn required_goop_manager_runtime_patches(
     }) {
         patches.insert(RuntimeGoopManagerPatch::HinoKuri2Pool);
     }
+    if flagged.iter().any(|manager_name| {
+        managers
+            .get(manager_name)
+            .is_some_and(|factory| factory == "MameGessoManager")
+    }) {
+        patches.insert(RuntimeGoopManagerPatch::MameGessoRelocatableReset);
+    }
+    if document.objects.iter().any(|object| {
+        let Some(sms_scene::PlacementBinding::Authored(placement)) = &object.placement else {
+            return false;
+        };
+        placement.pool_only
+            && object.factory_name == "PoiHanaRed"
+            && object
+                .raw_param("manager_name")
+                .is_some_and(|manager_name| flagged.contains(manager_name))
+    }) {
+        patches.insert(RuntimeGoopManagerPatch::PoiHanaRedPool);
+    }
     Ok(patches)
 }
 

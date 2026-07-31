@@ -281,6 +281,65 @@ fn manager_has_editor_pollution_support(
     }
 }
 
+fn actor_is_pollution_spawn_subject(
+    registry: &ObjectRegistry,
+    actor: &sms_schema::EnemyActorDefinition,
+) -> bool {
+    let factory = semantic_factory_name(&actor.factory_name);
+    let class = semantic_factory_name(&actor.class_name);
+    if factory.ends_with("LaunchPad") || class.ends_with("LaunchPad") {
+        return false;
+    }
+    // Decomp-identified equipment actors (TRocket) are physically attached to
+    // Mario's water-gun state rather than autonomous pollution subjects.
+    if registry.runtime_name_references.iter().any(|reference| {
+        reference.factory_name == actor.factory_name
+            && matches!(
+                reference.target,
+                sms_schema::RuntimeNameReferenceTarget::MarioWaterGun
+            )
+    }) {
+        return false;
+    }
+    let category = registry
+        .find_object(&actor.factory_name)
+        .map(|definition| definition.category.as_str());
+    if category == Some("Boss")
+        && !registry.runtime_name_references.iter().any(|reference| {
+            reference.factory_name == actor.factory_name
+                && matches!(
+                    reference.target,
+                    sms_schema::RuntimeNameReferenceTarget::Graph
+                )
+        })
+    {
+        return false;
+    }
+    true
+}
+
+fn manager_is_pollution_spawn_subject(
+    registry: &ObjectRegistry,
+    manager: &sms_schema::EnemyManagerDefinition,
+) -> bool {
+    if let Some(exact) = manager
+        .spawned_actor_class
+        .as_deref()
+        .and_then(|class_name| {
+            registry.enemy_actors.iter().find(|actor| {
+                actor.class_name == class_name
+                    && manager_factory_matches_actor(actor, &manager.factory_name)
+            })
+        })
+    {
+        return actor_is_pollution_spawn_subject(registry, exact);
+    }
+    registry.enemy_actors.iter().any(|actor| {
+        manager_factory_matches_actor(actor, &manager.factory_name)
+            && actor_is_pollution_spawn_subject(registry, actor)
+    })
+}
+
 fn actor_uses_stu_stain(
     registry: &ObjectRegistry,
     actor: &sms_schema::EnemyActorDefinition,
@@ -316,6 +375,9 @@ fn catalog_enemy_manager_choice(
         return None;
     }
     let actor = enemy_actor_definition(registry, &template.factory_name)?;
+    if !actor_is_pollution_spawn_subject(registry, actor) {
+        return None;
+    }
     let sms_formats::JDramaFieldValue::String(manager_name) =
         record_field(&template.record, "manager_name")?
     else {
@@ -327,9 +389,7 @@ fn catalog_enemy_manager_choice(
                 .is_some_and(|manager| manager_factory_matches_actor(actor, &manager.factory_name))
     })?;
     let manager = enemy_manager_definition(registry, &dependency.record.type_name)?;
-    if manager.spawned_actor_class.as_deref() != Some(actor.class_name.as_str())
-        || !manager_has_editor_pollution_support(registry, manager, manager_name)
-    {
+    if !manager_has_editor_pollution_support(registry, manager, manager_name) {
         return None;
     }
     Some(CatalogEnemyManagerChoice {
@@ -343,13 +403,70 @@ fn catalog_enemy_manager_choice(
 fn catalog_enemy_manager_choices(
     catalog: &ObjectAuthoringCatalog,
     registry: &ObjectRegistry,
-) -> BTreeMap<String, CatalogEnemyManagerChoice> {
-    let mut choices = BTreeMap::new();
+) -> BTreeMap<String, Vec<CatalogEnemyManagerChoice>> {
+    let mut compatible = BTreeMap::<String, Vec<CatalogEnemyManagerChoice>>::new();
     for (_, template) in catalog.iter() {
         let Some(choice) = catalog_enemy_manager_choice(template, registry) else {
             continue;
         };
-        choices.entry(choice.manager_name.clone()).or_insert(choice);
+        compatible
+            .entry(choice.manager_name.clone())
+            .or_default()
+            .push(choice);
+    }
+    let mut choices = BTreeMap::new();
+    for (manager_name, mut candidates) in compatible {
+        candidates.sort_by(|left, right| left.actor_factory.cmp(&right.actor_factory));
+        let manager = candidates
+            .first()
+            .and_then(|choice| enemy_manager_definition(registry, &choice.manager_factory));
+        let exact = manager
+            .and_then(|manager| manager.spawned_actor_class.as_deref())
+            .and_then(|spawned_class| {
+                candidates
+                    .iter()
+                    .find(|choice| {
+                        enemy_actor_definition(registry, &choice.actor_factory)
+                            .is_some_and(|actor| actor.class_name == spawned_class)
+                    })
+                    .cloned()
+            });
+        let mut selected = exact.into_iter().collect::<Vec<_>>();
+        if let Some(red) = candidates
+            .iter()
+            .find(|choice| choice.actor_factory == "PoiHanaRed")
+            .cloned()
+        {
+            if !selected
+                .iter()
+                .any(|current| current.actor_factory == red.actor_factory)
+            {
+                selected.push(red);
+            }
+        }
+        if selected.is_empty() {
+            // Some runtime-only manager products have no public factory for
+            // their exact base class (TTobiPuku is represented by PukuPuku).
+            // Use the least-ambiguous retail carrier tied to that manager.
+            candidates.sort_by_key(|choice| {
+                enemy_actor_definition(registry, &choice.actor_factory)
+                    .map_or(usize::MAX, |actor| actor.manager_factories.len())
+            });
+            if let Some(mut fallback) = candidates.into_iter().next() {
+                if let Some(spawned_class) =
+                    manager.and_then(|manager| manager.spawned_actor_class.as_deref())
+                {
+                    fallback.display_name = spawned_class
+                        .strip_prefix('T')
+                        .unwrap_or(spawned_class)
+                        .to_string();
+                }
+                selected.push(fallback);
+            }
+        }
+        if !selected.is_empty() {
+            choices.insert(manager_name, selected);
+        }
     }
     choices
 }
@@ -388,7 +505,9 @@ fn collect_enemy_manager_records(
     out: &mut BTreeMap<String, EnemyManagerInstance>,
 ) {
     if let Some(manager) = enemy_manager_definition(registry, &record.type_name) {
-        if manager_has_editor_pollution_support(registry, manager, &record.name) {
+        if manager_is_pollution_spawn_subject(registry, manager)
+            && manager_has_editor_pollution_support(registry, manager, &record.name)
+        {
             out.entry(record.name.clone())
                 .or_insert_with(|| EnemyManagerInstance {
                     factory_name: manager.factory_name.clone(),
@@ -422,7 +541,9 @@ fn enemy_manager_instances(
             else {
                 continue;
             };
-            if !manager_has_editor_pollution_support(registry, manager, &dependency.record.name) {
+            if !manager_is_pollution_spawn_subject(registry, manager)
+                || !manager_has_editor_pollution_support(registry, manager, &dependency.record.name)
+            {
                 continue;
             }
             managers
@@ -467,7 +588,42 @@ struct GoopSpawnEntity {
     manager_name: String,
     manager_factory: Option<String>,
     manager_present: bool,
+    manager_survives_pool_removal: bool,
     catalog_actor_factory: Option<String>,
+    variant_active: bool,
+}
+
+fn active_pool_actor_factory(document: &StageDocument, manager_name: &str) -> Option<String> {
+    document.objects.iter().find_map(|object| {
+        let sms_scene::PlacementBinding::Authored(placement) = object.placement.as_ref()? else {
+            return None;
+        };
+        (placement.pool_only && object.raw_param("manager_name") == Some(manager_name))
+            .then(|| object.factory_name.clone())
+    })
+}
+
+fn manager_survives_pool_removal(document: &StageDocument, manager_name: &str) -> bool {
+    let in_scene = document
+        .effective_resource_clone(SCENE_PATH)
+        .ok()
+        .flatten()
+        .and_then(|resource| match resource {
+            StageResourceDocument::Placement(scene) => Some(scene),
+            _ => None,
+        })
+        .is_some_and(|scene| any_record(&scene.root, &|record| record.name == manager_name));
+    in_scene
+        || document.objects.iter().any(|object| {
+            let Some(sms_scene::PlacementBinding::Authored(placement)) = &object.placement else {
+                return false;
+            };
+            !placement.pool_only
+                && placement
+                    .dependencies
+                    .iter()
+                    .any(|dependency| dependency.record.name == manager_name)
+        })
 }
 
 impl SmsEditorApp {
@@ -488,49 +644,67 @@ impl SmsEditorApp {
         let managers = enemy_manager_instances(document, registry);
         let catalog_choices =
             catalog_enemy_manager_choices(&self.object_authoring_catalog, registry);
-        let mut entities = managers
-            .iter()
-            .map(|(manager_name, manager)| {
-                let catalog_choice = catalog_choices.get(manager_name);
-                (
-                    manager_name.clone(),
-                    GoopSpawnEntity {
-                        display_name: manager.display_name.clone(),
+        let mut entities = Vec::new();
+        let manager_names = managers
+            .keys()
+            .chain(catalog_choices.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for manager_name in manager_names {
+            let manager = managers.get(&manager_name);
+            let choices = catalog_choices.get(&manager_name);
+            let active_factory = active_pool_actor_factory(document, &manager_name);
+            if let Some(choices) = choices {
+                for (index, choice) in choices.iter().enumerate() {
+                    entities.push(GoopSpawnEntity {
+                        display_name: choice.display_name.clone(),
                         manager_name: manager_name.clone(),
-                        manager_factory: Some(manager.factory_name.clone()),
-                        manager_present: true,
-                        catalog_actor_factory: catalog_choice
-                            .map(|choice| choice.actor_factory.clone()),
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        for (manager_name, choice) in catalog_choices {
-            entities
-                .entry(manager_name.clone())
-                .or_insert(GoopSpawnEntity {
-                    display_name: choice.display_name,
-                    manager_name,
-                    manager_factory: Some(choice.manager_factory),
-                    manager_present: false,
-                    catalog_actor_factory: Some(choice.actor_factory),
+                        manager_factory: Some(choice.manager_factory.clone()),
+                        manager_present: manager.is_some(),
+                        manager_survives_pool_removal: manager_survives_pool_removal(
+                            document,
+                            &manager_name,
+                        ),
+                        catalog_actor_factory: Some(choice.actor_factory.clone()),
+                        variant_active: active_factory
+                            .as_deref()
+                            .map_or(index == 0, |active| active == choice.actor_factory),
+                    });
+                }
+            } else if let Some(manager) = manager {
+                entities.push(GoopSpawnEntity {
+                    display_name: manager.display_name.clone(),
+                    manager_name: manager_name.clone(),
+                    manager_factory: Some(manager.factory_name.clone()),
+                    manager_present: true,
+                    manager_survives_pool_removal: true,
+                    catalog_actor_factory: None,
+                    variant_active: true,
                 });
-        }
-        for manager_name in goop_flagged_managers(document) {
-            if !entities.contains_key(&manager_name) {
-                entities.insert(
-                    manager_name.clone(),
-                    GoopSpawnEntity {
-                        display_name: "Missing enemy manager".to_string(),
-                        manager_name,
-                        manager_factory: None,
-                        manager_present: false,
-                        catalog_actor_factory: None,
-                    },
-                );
             }
         }
-        entities.into_values().collect()
+        for manager_name in goop_flagged_managers(document) {
+            if !entities
+                .iter()
+                .any(|entity| entity.manager_name == manager_name)
+            {
+                entities.push(GoopSpawnEntity {
+                    display_name: "Missing enemy manager".to_string(),
+                    manager_name,
+                    manager_factory: None,
+                    manager_present: false,
+                    manager_survives_pool_removal: false,
+                    catalog_actor_factory: None,
+                    variant_active: true,
+                });
+            }
+        }
+        entities.sort_by(|left, right| {
+            left.display_name
+                .cmp(&right.display_name)
+                .then_with(|| left.manager_name.cmp(&right.manager_name))
+        });
+        entities
     }
 
     pub(super) fn object_uses_enemy_pool(&self, object: &SceneObject) -> bool {
@@ -609,24 +783,50 @@ impl SmsEditorApp {
         let mut pool_log = Vec::new();
 
         let result: Result<(), String> = (|| {
-            if enabled && !entity.manager_present {
-                let actor_factory = entity.catalog_actor_factory.as_deref().ok_or_else(|| {
-                    format!(
+            if enabled {
+                if let Some(actor_factory) = entity.catalog_actor_factory.as_deref() {
+                    let manager_factory = entity.manager_factory.as_deref().ok_or_else(|| {
+                        format!(
+                            "manager {:?} has no decomp-derived factory",
+                            entity.manager_name
+                        )
+                    })?;
+                    let matching_pool_exists = self.document.as_ref().is_some_and(|document| {
+                        document.objects.iter().any(|object| {
+                            matches!(
+                                &object.placement,
+                                Some(sms_scene::PlacementBinding::Authored(placement))
+                                    if placement.pool_only
+                            ) && object.raw_param("manager_name") == Some(&entity.manager_name)
+                                && object.factory_name == actor_factory
+                        })
+                    });
+                    let needs_variant_carrier = actor_factory == "PoiHanaRed";
+                    if !matching_pool_exists {
+                        if let Some(document) = self.document.as_mut() {
+                            document.objects.retain(|object| {
+                                !matches!(
+                                    &object.placement,
+                                    Some(sms_scene::PlacementBinding::Authored(placement))
+                                        if placement.pool_only
+                                            && object.raw_param("manager_name") == Some(&entity.manager_name)
+                                )
+                            });
+                        }
+                        if !entity.manager_survives_pool_removal || needs_variant_carrier {
+                            pool_log.push(self.ensure_catalog_enemy_manager_pool(
+                                actor_factory,
+                                manager_factory,
+                                &entity.manager_name,
+                            )?);
+                        }
+                    }
+                } else if !entity.manager_present {
+                    return Err(format!(
                         "manager {:?} has no safe retail-backed pool bundle",
                         entity.manager_name
-                    )
-                })?;
-                let manager_factory = entity.manager_factory.as_deref().ok_or_else(|| {
-                    format!(
-                        "manager {:?} has no decomp-derived factory",
-                        entity.manager_name
-                    )
-                })?;
-                pool_log.push(self.ensure_catalog_enemy_manager_pool(
-                    actor_factory,
-                    manager_factory,
-                    &entity.manager_name,
-                )?);
+                    ));
+                }
             }
             self.apply_manager_spawn(&entity.manager_name, enabled)?;
             if !enabled {
@@ -972,7 +1172,7 @@ impl SmsEditorApp {
             let stale = !entity.manager_present && !catalog_available;
             // A flagged entry with a missing but repairable manager is shown
             // unchecked so selecting it performs the missing bundle import.
-            let mut enabled = flagged && (entity.manager_present || stale);
+            let mut enabled = flagged && entity.variant_active && (entity.manager_present || stale);
             if ui
                 .checkbox(
                     &mut enabled,
@@ -1013,6 +1213,47 @@ impl SmsEditorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires SMS_BASE_ROOT with extracted retail stages"]
+    fn bundled_us_catalog_exposes_only_supported_reported_goop_choices() {
+        let base_root = std::env::var_os("SMS_BASE_ROOT")
+            .map(std::path::PathBuf::from)
+            .expect("SMS_BASE_ROOT");
+        let archives = sms_formats::discover_scene_archives(&base_root).unwrap();
+        let registry = sms_schema::bundled_object_registry().unwrap().registry;
+        let build = sms_scene::ObjectAuthoringCatalog::build_with_base_root(
+            &archives, &registry, &base_root,
+        );
+        let choices = catalog_enemy_manager_choices(&build.catalog, &registry)
+            .into_values()
+            .flatten()
+            .collect::<Vec<_>>();
+        for expected in ["Telesa", "PukuPuku", "PoiHanaRed", "BossManta"] {
+            assert!(
+                choices
+                    .iter()
+                    .any(|choice| choice.actor_factory == expected),
+                "missing {expected} from goop choices"
+            );
+        }
+        for excluded in [
+            "BossTelesa",
+            "Rocket",
+            "TobiPukuLaunchPad",
+            "MoePukuLaunchPad",
+        ] {
+            assert!(
+                choices
+                    .iter()
+                    .all(|choice| choice.actor_factory != excluded),
+                "unsafe/non-enemy {excluded} remained in goop choices"
+            );
+        }
+        assert!(choices.iter().any(|choice| {
+            choice.actor_factory == "PukuPuku" && choice.display_name == "TobiPuku"
+        }));
+    }
 
     fn enemy_registry() -> ObjectRegistry {
         ObjectRegistry {

@@ -190,6 +190,12 @@ pub(super) enum RuntimeGoopManagerPatch {
     /// `TConductor::init` deliberately skips HinoKuri2 while constructing
     /// ordinary reusable manager pools.
     HinoKuri2Pool,
+    /// `TMameGesso::reset` restores its original scene position after
+    /// `TSpineEnemy::resetToPosition` has selected a pollution spawn point.
+    MameGessoRelocatableReset,
+    /// Make the PoiHana manager construct the retail red subclass for an
+    /// editor-authored red PoiHana pollution pool.
+    PoiHanaRedPool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -511,6 +517,216 @@ pub(super) fn patch_sms_goop_enemy_managers_dol(
             "TConductor HinoKuri2 reusable-pool exclusion branch",
         )?;
         write_be_u32(&mut bytes, anchor.file_offset()?, PPC_NOP)?;
+    }
+
+    if requested.contains(&RuntimeGoopManagerPatch::MameGessoRelocatableReset) {
+        let mut candidates = Vec::new();
+        for section in image
+            .sections
+            .iter()
+            .copied()
+            .filter(|section| section.text)
+        {
+            let words = section_words(source, section)?;
+            for word_index in 0..words.len().saturating_sub(9) {
+                let sequence = &words[word_index..word_index + 10];
+                if sequence[0] == 0x807d_01d4
+                    && sequence[1] == 0x801d_01d8
+                    && (sequence[2] == 0x907d_0010 || sequence[2] == PPC_NOP)
+                    && (sequence[3] == 0x901d_0014 || sequence[3] == PPC_NOP)
+                    && sequence[4] == 0x801d_01dc
+                    && (sequence[5] == 0x901d_0018 || sequence[5] == PPC_NOP)
+                    && sequence[6] == 0xc03d_0014
+                    && (sequence[7] & 0xffff_0000) == 0xc002_0000
+                    && sequence[8] == 0xec01_002a
+                    && sequence[9] == 0xd01d_0014
+                {
+                    candidates.push(WordAnchor {
+                        section,
+                        word_index,
+                    });
+                }
+            }
+        }
+        let anchor =
+            require_unique_anchor(candidates, "TMameGesso reset original-position restore")?;
+        for relative_word in [2usize, 3, 5] {
+            write_be_u32(
+                &mut bytes,
+                WordAnchor {
+                    section: anchor.section,
+                    word_index: anchor.word_index + relative_word,
+                }
+                .file_offset()?,
+                PPC_NOP,
+            )?;
+        }
+    }
+
+    if requested.contains(&RuntimeGoopManagerPatch::PoiHanaRedPool) {
+        let mut factory_candidates = Vec::new();
+        for section in image
+            .sections
+            .iter()
+            .copied()
+            .filter(|section| section.text)
+        {
+            let words = section_words(source, section)?;
+            for word_index in 0..words.len().saturating_sub(10) {
+                let sequence = &words[word_index..word_index + 11];
+                if sequence[0] == 0x8803_000e
+                    && sequence[1] == 0x2800_0038
+                    && (sequence[2] == 0x4082_002c || sequence[2] == PPC_NOP)
+                    && sequence[3] == 0x3860_01cc
+                    && is_relative_bl(sequence[4])
+                    && sequence[5] == 0x7c7f_1b79
+                    && sequence[6] == 0x4182_0014
+                    && is_relative_bl(sequence[10])
+                {
+                    factory_candidates.push(WordAnchor {
+                        section,
+                        word_index,
+                    });
+                }
+            }
+        }
+        let factory = require_unique_anchor(
+            factory_candidates,
+            "TPoiHanaManager actor-construction call",
+        )?;
+        let factory_words = section_words(source, factory.section)?;
+        let constructor_word_index = factory.word_index + 10;
+        let constructor_call = WordAnchor {
+            section: factory.section,
+            word_index: constructor_word_index,
+        };
+        let base_constructor = decode_branch_target(
+            factory_words[constructor_word_index],
+            constructor_call.address()?,
+        )?;
+
+        let mut subclass_vtables = BTreeSet::new();
+        for section in image
+            .sections
+            .iter()
+            .copied()
+            .filter(|section| section.text)
+        {
+            let words = section_words(source, section)?;
+            for word_index in 0..words.len().saturating_sub(7) {
+                let sequence = &words[word_index..word_index + 8];
+                let call_address = WordAnchor {
+                    section,
+                    word_index: word_index + 2,
+                }
+                .address()?;
+                if !is_relative_bl(sequence[2])
+                    || decode_branch_target(sequence[2], call_address)? != base_constructor
+                    || sequence[3] & 0xffff_0000 != 0x3c60_0000
+                    || sequence[4] & 0xffff_0000 != 0x3863_0000
+                    || sequence[5] & 0xffe0_ffff != 0x9060_0000
+                    || sequence[6] != 0x3803_0024
+                    || sequence[7] & 0xffe0_ffff != 0x9000_0020
+                {
+                    continue;
+                }
+                let high = (sequence[3] & 0xffff) << 16;
+                let low = i32::from(sequence[4] as i16) as u32;
+                let vtable = high.wrapping_add(low);
+                if image.sections.iter().any(|candidate| {
+                    !candidate.text
+                        && vtable >= candidate.address
+                        && vtable < candidate.address.saturating_add(candidate.size)
+                }) {
+                    subclass_vtables.insert(vtable);
+                }
+            }
+        }
+        if subclass_vtables.len() != 1 {
+            return Err(format!(
+                "Expected one inline TPoiHanaRed vtable assignment, found {} candidate(s)",
+                subclass_vtables.len()
+            ));
+        }
+        let red_vtable = subclass_vtables
+            .into_iter()
+            .next()
+            .expect("one candidate was checked");
+        let text_slot = (0..DOL_TEXT_SECTION_COUNT)
+            .find(|slot| {
+                !image
+                    .sections
+                    .iter()
+                    .any(|section| section.text && section.slot == *slot)
+            })
+            .ok_or_else(|| "The DOL has no unused text section for red PoiHana".to_string())?;
+        let file_offset = align_up_usize(source.len(), FILE_ALIGNMENT as usize)?;
+        let loaded_end = image
+            .sections
+            .iter()
+            .map(|section| section.address_end())
+            .chain(image.bss.map(|(_, end)| Ok(end)))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .max()
+            .ok_or_else(|| "The DOL has no loaded sections".to_string())?;
+        let stub_address = align_up_u32(loaded_end, FILE_ALIGNMENT)?;
+        let vtable_high = ((red_vtable.wrapping_add(0x8000)) >> 16) as i16;
+        let vtable_low = red_vtable as u16 as i16;
+        let stub = vec![
+            0x7c08_02a6, // mflr r0
+            encode_d_form(37, 1, 1, -0x10),
+            encode_d_form(36, 0, 1, 0x14),
+            encode_branch(stub_address + 12, base_constructor, true)?,
+            encode_d_form(15, 4, 0, vtable_high),
+            encode_d_form(14, 4, 4, vtable_low),
+            encode_d_form(36, 4, 3, 0),
+            encode_d_form(14, 4, 4, 0x24),
+            encode_d_form(36, 4, 3, 0x20),
+            encode_d_form(32, 0, 1, 0x14),
+            encode_d_form(14, 1, 1, 0x10),
+            0x7c08_03a6, // mtlr r0
+            PPC_BLR,
+        ];
+        let payload_size = align_up_usize(stub.len() * 4, FILE_ALIGNMENT as usize)?;
+        let stub_end = stub_address
+            .checked_add(u32::try_from(payload_size).map_err(|_| {
+                "Red PoiHana stub size does not fit the DOL address space".to_string()
+            })?)
+            .ok_or_else(|| "Red PoiHana stub range overflows u32".to_string())?;
+        let stack_top = find_stack_top(source, &image)?;
+        if stub_end
+            .checked_add(MIN_STAGE_MUSIC_STACK_GAP)
+            .is_none_or(|safe_end| safe_end > stack_top)
+        {
+            return Err(format!(
+                "Red PoiHana stub 0x{stub_address:08X}..0x{stub_end:08X} is too close to the original stack top 0x{stack_top:08X}"
+            ));
+        }
+        reject_injected_range_overlap(&image, stub_address, stub_end)?;
+        bytes.resize(file_offset, 0);
+        for word in &stub {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+        bytes.resize(file_offset + payload_size, 0);
+        write_be_u32(
+            &mut bytes,
+            DOL_TEXT_FILE_OFFSETS + text_slot * 4,
+            u32::try_from(file_offset)
+                .map_err(|_| "Red PoiHana file offset does not fit u32".to_string())?,
+        )?;
+        write_be_u32(&mut bytes, DOL_TEXT_ADDRESSES + text_slot * 4, stub_address)?;
+        write_be_u32(
+            &mut bytes,
+            DOL_TEXT_SIZES + text_slot * 4,
+            u32::try_from(payload_size)
+                .map_err(|_| "Red PoiHana payload size does not fit u32".to_string())?,
+        )?;
+        write_be_u32(
+            &mut bytes,
+            constructor_call.file_offset()?,
+            encode_branch(constructor_call.address()?, stub_address, true)?,
+        )?;
     }
 
     parse_dol(&bytes)?;
@@ -3969,10 +4185,32 @@ mod tests {
             )
             .unwrap();
         }
+        let mame_word = 0x150;
+        let mame_sequence = [
+            0x807d_01d4,
+            0x801d_01d8,
+            0x907d_0010,
+            0x901d_0014,
+            0x801d_01dc,
+            0x901d_0018,
+            0xc03d_0014,
+            0xc002_92cc,
+            0xec01_002a,
+            0xd01d_0014,
+        ];
+        for (index, word) in mame_sequence.into_iter().enumerate() {
+            write_be_u32(
+                &mut source,
+                SYNTHETIC_TEXT_OFFSET + (mame_word + index) * 4,
+                word,
+            )
+            .unwrap();
+        }
 
         let requested = BTreeSet::from([
             RuntimeGoopManagerPatch::PoiHanaAnyArea,
             RuntimeGoopManagerPatch::HinoKuri2Pool,
+            RuntimeGoopManagerPatch::MameGessoRelocatableReset,
         ]);
         let patched = patch_sms_goop_enemy_managers_dol(&source, &requested).unwrap();
         assert_eq!(
@@ -3983,10 +4221,37 @@ mod tests {
             read_be_u32(&patched, SYNTHETIC_TEXT_OFFSET + (hino_word + 1) * 4).unwrap(),
             PPC_NOP
         );
+        for relative_word in [2usize, 3, 5] {
+            assert_eq!(
+                read_be_u32(
+                    &patched,
+                    SYNTHETIC_TEXT_OFFSET + (mame_word + relative_word) * 4,
+                )
+                .unwrap(),
+                PPC_NOP
+            );
+        }
         assert_eq!(
             patch_sms_goop_enemy_managers_dol(&patched, &requested).unwrap(),
             patched
         );
+    }
+
+    #[test]
+    #[ignore = "requires SMS_BASE_ROOT with an extracted JP or US retail game"]
+    fn local_retail_goop_manager_patches_are_semantically_located() {
+        let path = PathBuf::from(std::env::var_os("SMS_BASE_ROOT").expect("SMS_BASE_ROOT"))
+            .join("sys/main.dol");
+        let source = fs::read(path).unwrap();
+        let requested = BTreeSet::from([
+            RuntimeGoopManagerPatch::PoiHanaAnyArea,
+            RuntimeGoopManagerPatch::HinoKuri2Pool,
+            RuntimeGoopManagerPatch::MameGessoRelocatableReset,
+            RuntimeGoopManagerPatch::PoiHanaRedPool,
+        ]);
+        let patched = patch_sms_goop_enemy_managers_dol(&source, &requested).unwrap();
+        assert_ne!(patched, source);
+        parse_dol(&patched).unwrap();
     }
 
     #[test]
@@ -5012,8 +5277,16 @@ mod tests {
             ],
         )
         .unwrap_or_else(|error| panic!("composed sound assignments: {error}"));
-        let music = patch_sms_stage_music_dol(
+        let goop = patch_sms_goop_enemy_managers_dol(
             &sound,
+            &BTreeSet::from([
+                RuntimeGoopManagerPatch::PoiHanaAnyArea,
+                RuntimeGoopManagerPatch::PoiHanaRedPool,
+            ]),
+        )
+        .unwrap_or_else(|error| panic!("composed goop manager patches: {error}"));
+        let music = patch_sms_stage_music_dol(
+            &goop,
             &[
                 RuntimeStageMusicOverride {
                     area_index: 1,

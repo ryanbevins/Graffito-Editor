@@ -388,7 +388,10 @@ fn resolve_runtime_table_dependencies(
                 RuntimeNameReferenceTarget::PlacementRecord { type_name } => {
                     Some((type_name.clone(), reference.record_name.clone()))
                 }
-                RuntimeNameReferenceTarget::Actor { .. } => None,
+                RuntimeNameReferenceTarget::Actor { .. }
+                | RuntimeNameReferenceTarget::EnemyManager
+                | RuntimeNameReferenceTarget::Graph
+                | RuntimeNameReferenceTarget::MarioWaterGun => None,
             }),
     );
 
@@ -455,7 +458,10 @@ fn runtime_actor_references(
                 required_factory_name: required_factory_name.clone(),
                 runtime_name: reference.record_name.clone(),
             }),
-            RuntimeNameReferenceTarget::PlacementRecord { .. } => None,
+            RuntimeNameReferenceTarget::PlacementRecord { .. }
+            | RuntimeNameReferenceTarget::EnemyManager
+            | RuntimeNameReferenceTarget::Graph
+            | RuntimeNameReferenceTarget::MarioWaterGun => None,
         })
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -619,11 +625,21 @@ fn build_from_sources_with_common(
                         continue;
                     }
                 };
-                let graph_names = std::iter::once(item.record)
+                let mut graph_names = std::iter::once(item.record)
                     .chain(dependencies.iter().map(|dependency| &dependency.record))
                     .filter_map(|record| reference_field(record, "graph_name"))
                     .map(str::to_owned)
-                    .collect();
+                    .collect::<BTreeSet<_>>();
+                graph_names.extend(
+                    registry
+                        .runtime_name_references
+                        .iter()
+                        .filter(|reference| reference.factory_name == factory_name)
+                        .filter(|reference| {
+                            matches!(reference.target, RuntimeNameReferenceTarget::Graph)
+                        })
+                        .map(|reference| reference.record_name.clone()),
+                );
                 candidates
                     .entry(factory_name.clone())
                     .or_default()
@@ -856,27 +872,6 @@ fn record_group_index(record: &JDramaRecord) -> Option<u32> {
     })
 }
 
-/// An enemy the retail game only ever spawns through the conductor.
-struct ConductorSpawnedActor {
-    factory: &'static str,
-    /// Object name for the synthesized record.
-    object_name: &'static str,
-    /// The manager's JDrama object name, which `manager_name` references.
-    manager_name: &'static str,
-    /// The shared character resource the manager and its actors use.
-    character_name: &'static str,
-}
-
-/// ナメクリ (Gooble): spawned by `TConductor::genEnemyFromPollution`, never
-/// placed in any retail scene, so the census has no candidate to learn from
-/// even though every resource it needs is present wherever its manager is.
-const CONDUCTOR_SPAWNED_ACTORS: &[ConductorSpawnedActor] = &[ConductorSpawnedActor {
-    factory: "NameKuri",
-    object_name: "\u{30CA}\u{30E1}\u{30AF}\u{30EA} 0",
-    manager_name: "\u{30CA}\u{30E1}\u{30AF}\u{30EA}\u{30DE}\u{30CD}\u{30FC}\u{30B8}\u{30E3}\u{30FC}",
-    character_name: "\u{30CA}\u{30E1}\u{30AF}\u{30EA}\u{30DE}\u{30CD}\u{30FC}\u{30B8}\u{30E3}\u{30FC} \u{30AD}\u{30E3}\u{30E9}",
-}];
-
 /// Builds candidates for conductor-spawned enemies from a stage that places
 /// their manager.
 ///
@@ -893,8 +888,32 @@ fn synthesize_conductor_spawned_candidates(
     common_character_document: Option<&JDramaDocument>,
     candidates: &mut BTreeMap<String, Vec<Candidate>>,
 ) {
-    for spec in CONDUCTOR_SPAWNED_ACTORS {
-        if candidates.contains_key(spec.factory) {
+    for manager in &registry.enemy_managers {
+        let Some(spawned_class) = manager.spawned_actor_class.as_deref() else {
+            continue;
+        };
+        let manager_actor = |actor: &&sms_schema::EnemyActorDefinition| {
+            actor
+                .manager_factories
+                .iter()
+                .any(|factory| semantic_type_name(factory) == manager.factory_name)
+                && !actor.factory_name.ends_with("LaunchPad")
+        };
+        let Some(actor) = registry
+            .enemy_actors
+            .iter()
+            .find(|actor| actor.class_name == spawned_class && manager_actor(actor))
+            .or_else(|| {
+                registry
+                    .enemy_actors
+                    .iter()
+                    .filter(manager_actor)
+                    .min_by_key(|actor| actor.manager_factories.len())
+            })
+        else {
+            continue;
+        };
+        if candidates.contains_key(&actor.factory_name) {
             continue;
         }
         for source in sources {
@@ -906,12 +925,18 @@ fn synthesize_conductor_spawned_candidates(
                 continue;
             };
             let located = located_records(&document.document);
-            let has_manager = located_dependency_records(&document.document)
-                .iter()
-                .any(|item| item.record.name == spec.manager_name);
-            if !has_manager {
+            let Some(manager_record) = located_dependency_records(&document.document)
+                .into_iter()
+                .find(|item| semantic_type_name(&item.record.type_name) == manager.factory_name)
+            else {
                 continue;
-            }
+            };
+            let manager_name = manager_record.record.name.clone();
+            let Some(character_name) =
+                record_character_name(manager_record.record).map(str::to_owned)
+            else {
+                continue;
+            };
             // Borrow the strategy group an ordinary enemy actor of this stage
             // sits in, so placement lands the synthesized actor where retail
             // puts enemies.
@@ -923,22 +948,22 @@ fn synthesize_conductor_spawned_candidates(
             };
 
             let record = JDramaRecord {
-                type_name: spec.factory.to_string(),
-                name: spec.object_name.to_string(),
+                type_name: actor.factory_name.clone(),
+                name: format!("{} 0", actor.factory_name),
                 payload: JDramaRecordPayload::Actor {
                     transform: sms_formats::JDramaTransform {
                         translation: [0.0; 3],
                         rotation: [0.0; 3],
                         scale: [1.0; 3],
                     },
-                    character_name: spec.character_name.to_string(),
+                    character_name,
                     light_map: sms_formats::JDramaLightMap {
                         entries: Vec::new(),
                     },
                     fields: vec![
                         JDramaField {
                             name: "manager_name".to_string(),
-                            value: JDramaFieldValue::String(spec.manager_name.to_string()),
+                            value: JDramaFieldValue::String(manager_name),
                         },
                         JDramaField {
                             name: "graph_name".to_string(),
@@ -953,7 +978,7 @@ fn synthesize_conductor_spawned_candidates(
             };
             let Ok(dependencies) = resolve_dependencies(
                 &record,
-                spec.factory,
+                &actor.factory_name,
                 source,
                 &document.raw_resource_path,
                 registry,
@@ -970,9 +995,9 @@ fn synthesize_conductor_spawned_candidates(
                 continue;
             };
             candidates.insert(
-                spec.factory.to_string(),
+                actor.factory_name.clone(),
                 vec![Candidate {
-                    factory_name: spec.factory.to_string(),
+                    factory_name: actor.factory_name.clone(),
                     group_index,
                     record,
                     dependencies,
@@ -1053,6 +1078,14 @@ fn resolve_dependencies(
                 .map(str::to_owned),
         );
     }
+    let runtime_manager_names = registry
+        .runtime_name_references
+        .iter()
+        .filter(|reference| reference.factory_name == actor_factory && reference.required)
+        .filter(|reference| matches!(reference.target, RuntimeNameReferenceTarget::EnemyManager))
+        .map(|reference| reference.record_name.clone())
+        .collect::<BTreeSet<_>>();
+    manager_names.extend(runtime_manager_names.iter().cloned());
     if manager_names.is_empty() {
         return Ok(Vec::new());
     }
@@ -1071,14 +1104,17 @@ fn resolve_dependencies(
             .filter(|(_, item)| item.record.name == name)
             .filter(|(_, item)| {
                 let factory = semantic_type_name(&item.record.type_name);
-                enemy.is_some_and(|enemy| {
-                    enemy
-                        .manager_factories
-                        .iter()
-                        .any(|expected| semantic_type_name(expected) == factory)
-                }) || (enemy.is_none()
-                    && (factory.ends_with("Manager")
-                        || find_enemy_manager(registry, factory).is_some()))
+                (runtime_manager_names.contains(&name)
+                    && find_enemy_manager(registry, factory).is_some())
+                    || enemy.is_some_and(|enemy| {
+                        enemy
+                            .manager_factories
+                            .iter()
+                            .any(|expected| semantic_type_name(expected) == factory)
+                    })
+                    || (enemy.is_none()
+                        && (factory.ends_with("Manager")
+                            || find_enemy_manager(registry, factory).is_some()))
             })
             .map(|(raw_path, item)| {
                 (
@@ -1393,9 +1429,22 @@ fn resolve_resources(
             // archive, so qualifying the reference with the candidate's own
             // character folders reproduces that scoping: hamukuri/default.bmd
             // rather than whichever default.bmd the filename scan met first.
+            let manager_character_names = candidate
+                .dependencies
+                .iter()
+                .filter(|dependency| {
+                    find_object(registry, &dependency.record.type_name)
+                        .is_some_and(|definition| definition.factory_name == *factory_name)
+                })
+                .filter_map(|dependency| record_character_name(&dependency.record))
+                .collect::<BTreeSet<_>>();
             let character_folders = candidate
                 .character_resource_records
                 .iter()
+                .filter(|registration| {
+                    manager_character_names.is_empty()
+                        || manager_character_names.contains(registration.name.as_str())
+                })
                 .filter_map(
                     |registration| match semantic_type_name(&registration.type_name) {
                         "ObjChara" => reference_field(registration, "resource_folder"),
@@ -4138,6 +4187,42 @@ mod tests {
             }),
             "HamuKuri template omitted the mushroom1up instantiated by its manager's loadAfter"
         );
+    }
+
+    #[test]
+    #[ignore = "requires SMS_BASE_ROOT with extracted retail stages"]
+    fn bundled_retail_catalog_closes_goop_enemy_runtime_dependencies() {
+        let base_root = std::env::var_os("SMS_BASE_ROOT")
+            .map(PathBuf::from)
+            .expect("set SMS_BASE_ROOT to the extracted game's root");
+        let archives = sms_formats::discover_scene_archives(&base_root)
+            .expect("discover extracted retail stage archives");
+        let registry = sms_schema::bundled_object_registry()
+            .expect("load bundled object registry")
+            .registry;
+        let build = ObjectAuthoringCatalog::build_with_base_root(&archives, &registry, &base_root);
+
+        for factory in ["SamboHead", "HanaSambo"] {
+            let template = build
+                .catalog
+                .find(factory)
+                .unwrap_or_else(|| panic!("missing {factory}; warnings: {:?}", build.warnings));
+            assert!(template.dependencies.iter().any(|dependency| {
+                semantic_type_name(&dependency.record.type_name) == "SamboFlowerManager"
+            }));
+        }
+        let boss_manta = build.catalog.find("BossManta").expect("BossManta template");
+        assert!(boss_manta
+            .required_graph_names
+            .iter()
+            .any(|name| name == "main"));
+        for factory in ["Telesa", "PoiHanaRed", "PukuPuku"] {
+            assert!(
+                build.catalog.find(factory).is_some(),
+                "missing goop picker carrier {factory}; warnings: {:?}",
+                build.warnings.iter().take(20).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

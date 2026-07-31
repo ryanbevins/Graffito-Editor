@@ -1064,8 +1064,18 @@ pub struct RuntimeMapObjDependencyDefinition {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RuntimeNameReferenceTarget {
-    Actor { factory_name: String },
-    PlacementRecord { type_name: String },
+    Actor {
+        factory_name: String,
+    },
+    PlacementRecord {
+        type_name: String,
+    },
+    /// A fixed `TEnemyManager` object name passed to the conductor at runtime.
+    EnemyManager,
+    /// A fixed rail graph name resolved through `TConductor::getGraphByName`.
+    Graph,
+    /// Runtime behavior is physically attached to Mario's water-gun state.
+    MarioWaterGun,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1645,21 +1655,32 @@ impl SchemaGenerator {
                     }
                 }),
             );
-            registry.runtime_name_references.extend(
-                inherited_actor_models_union(
-                    &object.class_name,
-                    &runtime_name_references,
-                    &inheritance,
-                )
-                .into_iter()
-                .map(|reference| RuntimeNameReferenceDefinition {
-                    factory_name: object.factory_name.clone(),
-                    target: reference.target,
-                    required: reference.required,
-                    record_name: reference.record_name,
-                    source_file: reference.source_file,
-                }),
-            );
+            let inherited_name_references = inherited_actor_models_union(
+                &object.class_name,
+                &runtime_name_references,
+                &inheritance,
+            )
+            .into_iter()
+            .filter(|reference| {
+                matches!(
+                    reference.target,
+                    RuntimeNameReferenceTarget::Actor { .. }
+                        | RuntimeNameReferenceTarget::PlacementRecord { .. }
+                ) || runtime_name_references
+                    .get(&object.class_name)
+                    .is_some_and(|direct| direct.contains(reference))
+            });
+            registry
+                .runtime_name_references
+                .extend(inherited_name_references.map(|reference| {
+                    RuntimeNameReferenceDefinition {
+                        factory_name: object.factory_name.clone(),
+                        target: reference.target,
+                        required: reference.required,
+                        record_name: reference.record_name,
+                        source_file: reference.source_file,
+                    }
+                }));
             registry.runtime_texture_replacements.extend(
                 inherited_actor_models_union(
                     &object.class_name,
@@ -3276,7 +3297,7 @@ fn extract_runtime_name_references(
     source_file: &str,
 ) -> Vec<(String, Vec<ExtractedRuntimeNameReference>)> {
     let method_re = Regex::new(
-        r"(?m)^[^\r\n{};]*\b([A-Za-z_][A-Za-z0-9_]*)::[A-Za-z_][A-Za-z0-9_]*\s*\([^;{}]*\)\s*(?:const\s*)?\{",
+        r"(?m)^[^\r\n{};]*\b([A-Za-z_][A-Za-z0-9_]*)::([A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*(?:const\s*)?\{",
     )
     .expect("valid runtime name-reference method regex");
     let shine_demo_re =
@@ -3284,6 +3305,12 @@ fn extract_runtime_name_references(
             .expect("valid Shine demo dependency regex");
     let shine_time_re = Regex::new(r#"(?s)makeShineAppearWithTime(?:Offset)?\s*\(\s*"([^"]+)""#)
         .expect("valid timed Shine dependency regex");
+    let enemy_manager_re = Regex::new(r#"(?s)makeOneEnemyAppear\s*\(\s*[^,]+,\s*"([^"]+)"\s*,"#)
+        .expect("valid conductor enemy-manager dependency regex");
+    let graph_re = Regex::new(r#"getGraphByName\s*\(\s*"([^"]+)"\s*\)"#)
+        .expect("valid runtime graph dependency regex");
+    let mario_water_gun_re =
+        Regex::new(r"SMS_GetMarioWaterGun\s*\(").expect("valid Mario water-gun dependency regex");
     let mut by_class = BTreeMap::<String, BTreeSet<ExtractedRuntimeNameReference>>::new();
     let nerve_re = Regex::new(r"(?m)^\s*DEFINE_NERVE\s*\([^)]*\)\s*\{")
         .expect("valid nerve implementation regex");
@@ -3328,6 +3355,34 @@ fn extract_runtime_name_references(
                 source_file: source_file.to_string(),
             });
         }
+        for call in enemy_manager_re.captures_iter(body) {
+            references.insert(ExtractedRuntimeNameReference {
+                target: RuntimeNameReferenceTarget::EnemyManager,
+                required: false,
+                record_name: call[1].to_string(),
+                source_file: source_file.to_string(),
+            });
+        }
+        for call in graph_re.captures_iter(body) {
+            references.insert(ExtractedRuntimeNameReference {
+                target: RuntimeNameReferenceTarget::Graph,
+                required: true,
+                record_name: call[1].to_string(),
+                source_file: source_file.to_string(),
+            });
+        }
+        if method
+            .get(2)
+            .is_some_and(|name| name.as_str() == "calcRootMatrix")
+            && mario_water_gun_re.is_match(body)
+        {
+            references.insert(ExtractedRuntimeNameReference {
+                target: RuntimeNameReferenceTarget::MarioWaterGun,
+                required: true,
+                record_name: "SMS_GetMarioWaterGun".to_string(),
+                source_file: source_file.to_string(),
+            });
+        }
     }
 
     // State-machine implementations are emitted through DEFINE_NERVE rather than
@@ -3367,6 +3422,22 @@ fn extract_runtime_name_references(
                 target: RuntimeNameReferenceTarget::Actor {
                     factory_name: "Shine".to_string(),
                 },
+                required: true,
+                record_name: call[1].to_string(),
+                source_file: source_file.to_string(),
+            });
+        }
+        for call in enemy_manager_re.captures_iter(body) {
+            references.insert(ExtractedRuntimeNameReference {
+                target: RuntimeNameReferenceTarget::EnemyManager,
+                required: true,
+                record_name: call[1].to_string(),
+                source_file: source_file.to_string(),
+            });
+        }
+        for call in graph_re.captures_iter(body) {
+            references.insert(ExtractedRuntimeNameReference {
+                target: RuntimeNameReferenceTarget::Graph,
                 required: true,
                 record_name: call[1].to_string(),
                 source_file: source_file.to_string(),
@@ -5458,6 +5529,10 @@ fn validate_registry(registry: &ObjectRegistry) -> Result<()> {
                     ),
                 });
             }
+            RuntimeNameReferenceTarget::EnemyManager
+            | RuntimeNameReferenceTarget::Graph
+            | RuntimeNameReferenceTarget::MarioWaterGun
+            | RuntimeNameReferenceTarget::PlacementRecord { .. } => {}
             _ => {}
         }
     }
@@ -6181,6 +6256,20 @@ mod tests {
                 gpItemManager->makeShineAppearWithTime(
                     "timed reward", 60, 1.0f, 2.0f, 3.0f, 0, 0, 0);
             }
+
+            void TGraphEnemy::init() {
+                gpConductor->getGraphByName("main");
+            }
+
+            void TEquipmentEnemy::calcRootMatrix() {
+                SMS_GetMarioWaterGun();
+            }
+
+            DEFINE_NERVE(TNerveFlowerEnemyHide, TLiveActor) {
+                TFlowerEnemy* enemy = (TFlowerEnemy*)spine->getBody();
+                gpConductor->makeOneEnemyAppear(
+                    enemy->mPosition, "flower manager", 1);
+            }
         "#;
         let extracted = extract_runtime_name_references(text, "src/Enemy/fixture.cpp")
             .into_iter()
@@ -6205,6 +6294,20 @@ mod tests {
         }));
         assert_eq!(extracted["TTimedActor"][0].record_name, "timed reward");
         assert!(!extracted["TTimedActor"][0].required);
+        assert!(extracted["TGraphEnemy"].iter().any(|reference| {
+            reference.record_name == "main"
+                && reference.required
+                && matches!(reference.target, RuntimeNameReferenceTarget::Graph)
+        }));
+        assert!(extracted["TFlowerEnemy"].iter().any(|reference| {
+            reference.record_name == "flower manager"
+                && reference.required
+                && matches!(reference.target, RuntimeNameReferenceTarget::EnemyManager)
+        }));
+        assert!(extracted["TEquipmentEnemy"].iter().any(|reference| {
+            reference.record_name == "SMS_GetMarioWaterGun"
+                && matches!(reference.target, RuntimeNameReferenceTarget::MarioWaterGun)
+        }));
     }
 
     #[test]
