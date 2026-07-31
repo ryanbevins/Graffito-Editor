@@ -5628,3 +5628,61 @@ fn probe_resource_hashes() {
         }
     }
 }
+
+/// Bakes the stain into the real retail Stu model and round-trips it.
+/// `GRAFFITO_PROBE_BASE_ROOT=... cargo test probe_stain_bake -- --ignored
+/// --nocapture`
+#[test]
+#[ignore]
+fn probe_stain_bake() {
+    let Ok(base_root) = std::env::var("GRAFFITO_PROBE_BASE_ROOT") else {
+        return;
+    };
+    let base_root = std::path::Path::new(&base_root);
+    let archives = sms_formats::discover_scene_archives(base_root).expect("discover");
+    let bianco = archives
+        .iter()
+        .find(|archive| archive.stage_id == "bianco0")
+        .expect("bianco0");
+    let assets = sms_formats::mount_scene_archive(&bianco.path).expect("mount");
+    let find = |suffix: &str| {
+        assets
+            .iter()
+            .find(|asset| {
+                asset
+                    .path
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .ends_with(suffix)
+            })
+            .map(|asset| sms_formats::read_stage_asset_bytes(&asset.path).expect("read"))
+            .expect(suffix)
+    };
+    let model_bytes = find("hamukuri/default.bmd");
+    let stain_bytes = find("h_ma_rak.bti");
+
+    let mut model = sms_formats::J3dRebuildDocument::parse(&model_bytes).expect("parse model");
+    let stain = sms_formats::BtiFile::parse(&stain_bytes).expect("parse stain");
+
+    let replaced = model
+        .replace_named_texture_from_bti("H_ma_rak_dummy", &stain)
+        .expect("replace texture");
+    let pinned = model
+        .pin_material_konst_alpha_half("_mat_body_top1")
+        .expect("pin alpha");
+    println!("replaced {replaced} texture slot(s), pinned {pinned} TEV stage(s)");
+    assert!(
+        replaced > 0,
+        "the dummy slot must exist in the retail model"
+    );
+    assert!(pinned > 0, "the stain material must use K0 alpha");
+
+    let encoded = model.to_bytes().expect("encode");
+    let reparsed = sms_formats::J3dRebuildDocument::parse(&encoded).expect("reparse");
+    let repinned = {
+        let mut copy = reparsed.clone();
+        copy.pin_material_konst_alpha_half("_mat_body_top1")
+            .expect("pin twice")
+    };
+    assert_eq!(repinned, 0, "a second pin must find nothing left to pin");
+}
