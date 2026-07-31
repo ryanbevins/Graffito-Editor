@@ -592,6 +592,69 @@ fn material_has_translucent_source(
         })
 }
 
+fn document_draws_both_sides(document: &ModelAssetDocument) -> bool {
+    let has_materialless_primitive = document
+        .meshes
+        .iter()
+        .flat_map(|mesh| &mesh.primitives)
+        .any(|primitive| primitive.material.is_none());
+    !has_materialless_primitive
+        && !document.materials.is_empty()
+        && document
+            .materials
+            .iter()
+            .all(|material| material.gx.cull_mode == GX_CULL_NONE)
+}
+
+fn make_document_opaque(document: &mut ModelAssetDocument) -> (usize, usize) {
+    let translucent = document
+        .materials
+        .iter()
+        .map(|material| material_has_translucent_source(document, material))
+        .collect::<Vec<_>>();
+    let mut changed = 0usize;
+    let mut kept = 0usize;
+    for (material, translucent) in document.materials.iter_mut().zip(translucent) {
+        let non_opaque_state = material.gx.material_mode != 1
+            || material.gx.alpha_compare != sms_formats::GxAlphaCompare::default()
+            || material.gx.blend_mode != sms_formats::GxBlendMode::default()
+            || material.gx.depth_mode != sms_formats::GxDepthMode::default()
+            || material.gx.z_compare_location != 1;
+        if !non_opaque_state {
+            continue;
+        }
+        if translucent {
+            kept += 1;
+            continue;
+        }
+        // Material mode controls J3D's opaque/translucent draw-buffer choice
+        // independently of the explicit pixel-engine block. Restore both
+        // representations so the repaired material is opaque in either path.
+        material.gx.material_mode = 1;
+        material.gx.alpha_compare = sms_formats::GxAlphaCompare::default();
+        material.gx.blend_mode = sms_formats::GxBlendMode::default();
+        material.gx.depth_mode = sms_formats::GxDepthMode::default();
+        material.gx.z_compare_location = 1;
+        material.source_alpha_mode = sms_authoring::ImportedAlphaMode::Opaque;
+        changed += 1;
+    }
+    (changed, kept)
+}
+
+fn clear_document_vertex_colors(document: &mut ModelAssetDocument) {
+    let diffuse = prepare_document_vertex_colors(document);
+    let mut primitive_index = 0usize;
+    for mesh in &mut document.meshes {
+        for primitive in &mut mesh.primitives {
+            let base = diffuse.get(primitive_index).copied().unwrap_or([1.0; 4]);
+            primitive_index += 1;
+            for color in primitive_colors_mut(primitive, base) {
+                *color = [base[0], base[1], base[2], color[3]];
+            }
+        }
+    }
+}
+
 /// GX_SRC_VTX. `GXColorSrc` in the decomp is `{ GX_SRC_REG = 0, GX_SRC_VTX = 1 }`,
 /// so a channel left on the default register source ignores the vertex colour
 /// array entirely.
@@ -1288,16 +1351,17 @@ impl SmsEditorApp {
         targets: Vec<PaintTarget>,
         label: &str,
         enable_colors: bool,
-    ) {
+    ) -> bool {
         if targets.is_empty() {
-            return;
+            return false;
         }
         if !self.content_catalog_mutation_allowed(label) {
-            return;
+            return false;
         }
         let Ok(catalog) = self.model_catalog() else {
-            return;
+            return false;
         };
+        let target_count = targets.len();
         // A live stroke spans multiple frames, so another in-app operation can
         // replace the same asset after the stroke loaded its document. Never
         // let the stale in-memory target overwrite that newer revision.
@@ -1318,7 +1382,7 @@ impl SmsEditorApp {
                             .retain(|key, _| key.asset_id != target.id);
                     }
                     self.rebuild_model_preview_cache();
-                    return;
+                    return false;
                 }
                 Err(error) => {
                     self.log.push(format!(
@@ -1331,7 +1395,7 @@ impl SmsEditorApp {
                             .retain(|key, _| key.asset_id != target.id);
                     }
                     self.rebuild_model_preview_cache();
-                    return;
+                    return false;
                 }
             }
         }
@@ -1356,13 +1420,14 @@ impl SmsEditorApp {
             }
         }
         if saved == 0 {
-            return;
+            return false;
         }
         self.record_vertex_paint_undo(label, before, after);
         self.force_refresh_model_catalog();
         self.rebuild_model_preview_cache();
         self.log
             .push(format!("{label} across {saved} terrain asset(s)."));
+        saved == target_count
     }
 
     /// Runs `edit` over every terrain vertex, giving it the world position,
@@ -1440,7 +1505,6 @@ impl SmsEditorApp {
         self.commit_terrain_targets(targets, "Smoothed vertex paint", true);
     }
 
-    /// Resets every terrain vertex to opaque white.
     /// Rewinds terrain triangles that disagree with their own vertex normals.
     pub(super) fn repair_terrain_winding(&mut self) {
         let mut targets = self.terrain_paint_targets_scoped(true);
@@ -1466,10 +1530,11 @@ impl SmsEditorApp {
             return;
         }
         // Geometry only, so the colour channel switch is left alone.
-        self.commit_terrain_targets(targets, "Repaired terrain winding", false);
-        self.log.push(format!(
-            "Rewound {flipped} of {checked} triangle(s) to face the way their normals point."
-        ));
+        if self.commit_terrain_targets(targets, "Repaired terrain winding", false) {
+            self.log.push(format!(
+                "Rewound {flipped} of {checked} triangle(s) to face the way their normals point."
+            ));
+        }
     }
 
     /// Whether the selected terrain draws both sides, reading the asset once
@@ -1491,11 +1556,7 @@ impl SmsEditorApp {
         // An empty material list is the textureless case, which paints against
         // a material this tool synthesises later; report it as single sided so
         // the toggle still offers the fix.
-        let both = !document.materials.is_empty()
-            && document
-                .materials
-                .iter()
-                .all(|material| material.gx.cull_mode == GX_CULL_NONE);
+        let both = document_draws_both_sides(&document);
         self.vertex_paint_double_sided = Some((asset, both));
         Some(both)
     }
@@ -1550,13 +1611,14 @@ impl SmsEditorApp {
             true => "Made terrain double sided",
             false => "Made terrain single sided",
         };
-        self.commit_terrain_targets(targets, label, false);
-        self.log.push(match both {
-            true => format!(
-                "{changed} material(s) now draw both sides, so no face drops out of the bake."
-            ),
-            false => format!("{changed} material(s) now cull back faces again."),
-        });
+        if self.commit_terrain_targets(targets, label, false) {
+            self.log.push(match both {
+                true => format!(
+                    "{changed} material(s) now draw both sides, so no face drops out of the bake."
+                ),
+                false => format!("{changed} material(s) now cull back faces again."),
+            });
+        }
     }
 
     /// Turns blended terrain materials back into opaque ones.
@@ -1586,28 +1648,9 @@ impl SmsEditorApp {
         let mut changed = 0usize;
         let mut kept = 0usize;
         for target in &mut targets {
-            let translucent = target
-                .document
-                .materials
-                .iter()
-                .map(|material| material_has_translucent_source(&target.document, material))
-                .collect::<Vec<_>>();
-            for (material, translucent) in target.document.materials.iter_mut().zip(translucent) {
-                let blended = material.gx.blend_mode != sms_formats::GxBlendMode::default()
-                    || material.gx.depth_mode.update_enabled == 0;
-                if !blended {
-                    continue;
-                }
-                if translucent {
-                    kept += 1;
-                    continue;
-                }
-                material.gx.blend_mode = sms_formats::GxBlendMode::default();
-                material.gx.depth_mode.update_enabled = 1;
-                material.gx.z_compare_location = 1;
-                material.source_alpha_mode = sms_authoring::ImportedAlphaMode::Opaque;
-                changed += 1;
-            }
+            let (target_changed, target_kept) = make_document_opaque(&mut target.document);
+            changed += target_changed;
+            kept += target_kept;
         }
 
         if changed == 0 {
@@ -1619,17 +1662,20 @@ impl SmsEditorApp {
             });
             return;
         }
-        self.commit_terrain_targets(targets, "Made terrain opaque", false);
-        let mut message =
-            format!("{changed} material(s) now write depth again, so the terrain occludes itself.");
-        if kept > 0 {
-            message.push_str(&format!(
-                " Left {kept} alone for having a genuinely translucent base colour."
-            ));
+        if self.commit_terrain_targets(targets, "Made terrain opaque", false) {
+            let mut message = format!(
+                "{changed} material(s) now use the opaque draw queue and write depth again."
+            );
+            if kept > 0 {
+                message.push_str(&format!(
+                    " Left {kept} alone for having a genuinely translucent base colour."
+                ));
+            }
+            self.log.push(message);
         }
-        self.log.push(message);
     }
 
+    /// Resets every terrain vertex to its material diffuse.
     pub(super) fn clear_terrain_vertex_colors(&mut self) {
         let mut targets = self.terrain_paint_targets_scoped(true);
         if targets.is_empty() {
@@ -1644,19 +1690,7 @@ impl SmsEditorApp {
         // contributing; clearing to flat white therefore threw the model's
         // diffuse away along with the paint, and the mesh came back blank.
         for target in &mut targets {
-            let diffuse = prepare_document_vertex_colors(&mut target.document);
-            for mesh in &mut target.document.meshes {
-                for primitive in &mut mesh.primitives {
-                    let base = primitive
-                        .material
-                        .and_then(|index| diffuse.get(index as usize))
-                        .copied()
-                        .unwrap_or([1.0; 4]);
-                    for color in primitive_colors_mut(primitive, base) {
-                        *color = [base[0], base[1], base[2], color[3]];
-                    }
-                }
-            }
+            clear_document_vertex_colors(&mut target.document);
         }
         self.commit_terrain_targets(targets, "Cleared vertex paint", true);
     }
@@ -2896,6 +2930,76 @@ mod tests {
     }
 
     #[test]
+    fn clear_uses_each_primitives_diffuse_even_when_material_indices_are_sparse() {
+        let unused = [0.8f32, 0.1, 0.1, 1.0];
+        let expected = [0.05f32, 0.53, 0.05, 1.0];
+        let mut document = tinted_document(unused);
+        let mut used = vertex_color_material("used");
+        used.source_base_color = expected;
+        used.gx.material_colors[0] = Some(expected.map(|value| (value * 255.0).round() as u8));
+        document.materials.push(used);
+        document.meshes[0].primitives[0].material = Some(1);
+
+        clear_document_vertex_colors(&mut document);
+
+        let colors = &document.meshes[0].primitives[0].colors[0].values;
+        assert!(colors.iter().all(|color| {
+            color
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| (actual - expected).abs() < 0.01)
+        }));
+    }
+
+    #[test]
+    fn making_terrain_opaque_restores_draw_mode_and_complete_pixel_state() {
+        let mut document = tinted_document([1.0; 4]);
+        let material = &mut document.materials[0];
+        material.gx.material_mode = 4;
+        material.gx.alpha_compare.comparison_0 = 6;
+        material.gx.blend_mode = sms_formats::GxBlendMode {
+            mode: 1,
+            source_factor: 4,
+            destination_factor: 5,
+            logic_operation: 3,
+        };
+        material.gx.depth_mode.update_enabled = 0;
+        material.gx.z_compare_location = 0;
+        material.source_alpha_mode = sms_authoring::ImportedAlphaMode::Blend;
+
+        let (changed, kept) = make_document_opaque(&mut document);
+
+        assert_eq!((changed, kept), (1, 0));
+        let material = &document.materials[0];
+        assert_eq!(material.gx.material_mode, 1);
+        assert_eq!(
+            material.gx.alpha_compare,
+            sms_formats::GxAlphaCompare::default()
+        );
+        assert_eq!(material.gx.blend_mode, sms_formats::GxBlendMode::default());
+        assert_eq!(material.gx.depth_mode, sms_formats::GxDepthMode::default());
+        assert_eq!(material.gx.z_compare_location, 1);
+        assert_eq!(
+            material.source_alpha_mode,
+            sms_authoring::ImportedAlphaMode::Opaque
+        );
+    }
+
+    #[test]
+    fn materialless_primitives_keep_double_sided_state_unchecked() {
+        let mut document = test_document();
+        let mut unrelated = vertex_color_material("unrelated");
+        unrelated.gx.cull_mode = GX_CULL_NONE;
+        unrelated.source_double_sided = true;
+        document.materials.push(unrelated);
+
+        assert!(!document_draws_both_sides(&document));
+
+        document.meshes[0].primitives[0].material = Some(0);
+        assert!(document_draws_both_sides(&document));
+    }
+
+    #[test]
     fn authored_default_material_makes_materialless_culling_editable() {
         let mut document = test_document();
 
@@ -3267,6 +3371,59 @@ mod tests {
     }
 
     #[test]
+    fn catalog_refresh_invalidates_cached_culling_for_same_asset_id() {
+        let id = AssetId::new();
+        let mut app = SmsEditorApp {
+            vertex_paint_double_sided: Some((id, true)),
+            ..SmsEditorApp::default()
+        };
+
+        app.force_refresh_model_catalog();
+
+        assert!(app.vertex_paint_double_sided.is_none());
+    }
+
+    #[test]
+    fn blocked_culling_commit_does_not_claim_success() {
+        let temporary = tempfile::tempdir().unwrap();
+        let catalog =
+            sms_authoring::ModelAssetCatalog::open_content_root(temporary.path().join("Content"))
+                .unwrap();
+        let before = test_document();
+        let entry = catalog
+            .create_asset("terrain.smsmodel", &before)
+            .expect("create terrain asset");
+        let mut placement = sms_authoring::ModelInstancePlacement::new(entry.id, "terrain");
+        placement.export_mode = ModelInstanceExportMode::MapTerrain;
+        let selected_model_instance_id = placement.instance_id;
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut app = SmsEditorApp {
+            project_root: temporary.path().to_string_lossy().into_owned(),
+            stage_id: String::new(),
+            model_instances: vec![EditorModelInstance {
+                stage_id: String::new(),
+                placement,
+                local_bounds: [[0.0; 3]; 2],
+            }],
+            selected_model_instance_id: Some(selected_model_instance_id),
+            background_receiver: Some(receiver),
+            ..SmsEditorApp::default()
+        };
+
+        app.set_terrain_double_sided(true);
+
+        assert_eq!(catalog.load_asset(entry.id).unwrap(), before);
+        assert!(app
+            .log
+            .iter()
+            .any(|message| message.contains("Content snapshot")));
+        assert!(!app
+            .log
+            .iter()
+            .any(|message| message.contains("now draw both sides")));
+    }
+
+    #[test]
     fn terrain_undo_refuses_to_overwrite_a_newer_asset_revision() {
         let temporary = tempfile::tempdir().unwrap();
         let catalog =
@@ -3341,7 +3498,7 @@ mod tests {
             transform: IDENTITY_MATRIX,
         };
 
-        app.commit_terrain_targets(vec![target], "Painted vertex colour", true);
+        assert!(!app.commit_terrain_targets(vec![target], "Painted vertex colour", true));
 
         assert_eq!(catalog.load_asset(entry.id).unwrap(), replacement);
         assert!(app.vertex_paint_undo_stack.is_empty());

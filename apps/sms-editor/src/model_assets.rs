@@ -544,6 +544,11 @@ impl SmsEditorApp {
     }
 
     pub(super) fn force_refresh_model_catalog(&mut self) {
+        // Model saves and source replacements retain their AssetId. Any state
+        // cached only by that id must therefore be dropped before the catalog
+        // is rescanned, or the vertex-paint panel can describe the previous
+        // revision of the selected terrain.
+        self.vertex_paint_double_sided = None;
         self.model_catalog_entries.clear();
         self.model_catalog_root = None;
         self.refresh_model_catalog();
