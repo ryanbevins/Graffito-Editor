@@ -465,7 +465,7 @@ impl SmsEditorApp {
     /// Detection is exact: the pristine Stu material has no 0x04 selector, so
     /// one appearing means the bake ran.
     pub(super) fn stu_stain_baked(&self) -> bool {
-        const KASEL_HALF: u8 = 0x04;
+        const KONST_PINNED: u8 = 0x01;
         let Some(document) = self.document.as_ref() else {
             return false;
         };
@@ -484,10 +484,10 @@ impl SmsEditorApp {
                     .entries
                     .iter()
                     .any(|entry| entry.name == "_mat_body_top1")
-                    && materials
-                        .material_init_records
-                        .iter()
-                        .any(|record| record.tev_konst_alpha_selectors.contains(&KASEL_HALF))
+                    && materials.material_init_records.iter().any(|record| {
+                        record.tev_konst_alpha_selectors.contains(&KONST_PINNED)
+                            || record.tev_konst_color_selectors.contains(&KONST_PINNED)
+                    })
             })
         })
     }
