@@ -5301,9 +5301,12 @@ fn probe_authoring_census() {
     println!("warnings: {}", build.warnings.len());
 
     println!("\n--- templates matching {needle:?} ---");
-    for (name, _) in build.catalog.iter() {
+    for (name, template) in build.catalog.iter() {
         if name.to_ascii_lowercase().contains(&needle) {
-            println!("  present: {name}");
+            println!("  present: {name} (from {})", template.source_stage);
+            for resource in &template.resources {
+                println!("    resource: {}", resource.source_asset_path.display());
+            }
         }
     }
 
@@ -5555,4 +5558,73 @@ fn probe_tables_roundtrip() {
         }
     }
     println!("identical: {same}  different: {different}");
+}
+
+/// Lists resources in an exported stage archive matching a filter.
+/// `GRAFFITO_PROBE_SZS=<path> GRAFFITO_PROBE_MATCH=pollution cargo test
+/// probe_szs_contents -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_szs_contents() {
+    let Ok(path) = std::env::var("GRAFFITO_PROBE_SZS") else {
+        return;
+    };
+    let needle = std::env::var("GRAFFITO_PROBE_MATCH")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let assets = sms_formats::mount_scene_archive(std::path::Path::new(&path)).expect("mount szs");
+    let mut shown = 0usize;
+    for asset in &assets {
+        let name = asset.path.to_string_lossy().replace('\\', "/");
+        if needle.is_empty() || name.to_ascii_lowercase().contains(&needle) {
+            println!("{name}");
+            shown += 1;
+        }
+    }
+    println!("({shown} of {} assets matched)", assets.len());
+}
+
+/// Hashes one resource across several retail stages.
+/// `GRAFFITO_PROBE_BASE_ROOT=... GRAFFITO_PROBE_RES=hamukuri/default.bmd
+/// cargo test probe_resource_hashes -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_resource_hashes() {
+    let Ok(base_root) = std::env::var("GRAFFITO_PROBE_BASE_ROOT") else {
+        return;
+    };
+    let wanted = std::env::var("GRAFFITO_PROBE_RES")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let base_root = std::path::Path::new(&base_root);
+    let archives = sms_formats::discover_scene_archives(base_root).expect("discover");
+    for archive in archives.iter().filter(|archive| archive.size_bytes > 0) {
+        let Ok(assets) = sms_formats::mount_scene_archive(&archive.path) else {
+            continue;
+        };
+        for asset in &assets {
+            let name = asset
+                .path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase();
+            if !name.ends_with(&wanted) {
+                continue;
+            }
+            let Ok(bytes) = sms_formats::read_stage_asset_bytes(&asset.path) else {
+                continue;
+            };
+            let mut hash = 0xcbf2_9ce4_8422_2325u64;
+            for byte in &bytes {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+            }
+            println!(
+                "{}: {} bytes, fnv {:016x}",
+                archive.stage_id,
+                bytes.len(),
+                hash
+            );
+        }
+    }
 }
