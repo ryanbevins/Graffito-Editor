@@ -1688,16 +1688,22 @@ impl SmsEditorApp {
                 )
                 .iter()
                 .any(|(dummy, _)| dummy == "H_ma_rak_dummy")
-                    && ui
-                        .button("Bake goop stain into model")
-                        .on_hover_text(
-                            "Writes the stain texture into the Stu model and pins its blend, so \
-                             it shows regardless of what the runtime decides. Applies to every \
-                             Stu using this model in the stage. Ctrl+Z reverses it.",
-                        )
-                        .clicked()
                 {
-                    self.bake_stu_stain();
+                    let mut stained = self.stu_stain_baked();
+                    if ui
+                        .checkbox(&mut stained, "Goop stain on cap")
+                        .on_hover_text(
+                            "Bakes the stage's stain texture into the Stu model and pins its \
+                             blend, so it shows regardless of what the runtime decides. Applies \
+                             to every Stu using this model in the stage.",
+                        )
+                        .changed()
+                    {
+                        match stained {
+                            true => self.bake_stu_stain(),
+                            false => self.unbake_stu_stain(),
+                        }
+                    }
                 }
                 if object.raw_param("manager_name").is_some() {
                     ui.separator();

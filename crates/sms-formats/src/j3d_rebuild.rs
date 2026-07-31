@@ -663,6 +663,57 @@ impl J3dRebuildDocument {
         Ok(pinned)
     }
 
+    /// Reverses [`Self::pin_material_konst_alpha_half`], returning selectors
+    /// to the runtime-driven KCOLOR0 register.
+    ///
+    /// Lossless because the retail materials this is used on carry no 0x04
+    /// selector of their own -- measured on the Stu: fifteen 0x1C and one
+    /// 0x00. The dummy texture is deliberately left as baked: with the
+    /// selector back on the register the runtime rewrites both the alpha and
+    /// the texture each time it decides to show the effect, so the slot's
+    /// content no longer affects anything.
+    pub fn unpin_material_konst_alpha_half(&mut self, material_name: &str) -> Result<usize> {
+        const KASEL_K0_A: u8 = 0x1C;
+        const KASEL_HALF: u8 = 0x04;
+        let mut unpinned = 0usize;
+        for section in &mut self.sections {
+            let J3dRebuildSectionData::Materials(materials) = &mut section.data else {
+                continue;
+            };
+            let Some(names) = &materials.names else {
+                continue;
+            };
+            let Some(name_index) = names
+                .entries
+                .iter()
+                .position(|entry| entry.name == material_name)
+            else {
+                continue;
+            };
+            let record_index = materials
+                .tables
+                .iter()
+                .find(|table| table.kind == J3dMaterialTableKind::MaterialRemap)
+                .and_then(|table| match &table.allocation {
+                    J3dScalarArray::Unsigned16(values) => {
+                        values.get(name_index).map(|value| *value as usize)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(name_index);
+            let Some(record) = materials.material_init_records.get_mut(record_index) else {
+                continue;
+            };
+            for selector in &mut record.tev_konst_alpha_selectors {
+                if *selector == KASEL_HALF {
+                    *selector = KASEL_K0_A;
+                    unpinned += 1;
+                }
+            }
+        }
+        Ok(unpinned)
+    }
+
     /// Replaces every TEX1 texture with the requested name using a detached
     /// BTI and grows the texture section when the imported dummy allocation is
     /// smaller than the runtime texture. The name table is retained so the
