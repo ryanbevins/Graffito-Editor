@@ -362,6 +362,16 @@ struct CatalogEnemyManagerChoice {
     manager_factory: String,
     manager_name: String,
     display_name: String,
+    unavailable_reason: Option<&'static str>,
+}
+
+fn goop_enemy_unavailable_reason(
+    actor_factory: Option<&str>,
+    manager_factory: Option<&str>,
+) -> Option<&'static str> {
+    (actor_factory == Some("BossManta") || manager_factory == Some("BossMantaManager")).then_some(
+        "BossManta currently soft-crashes when its goop pool initializes and does not move after spawning.",
+    )
 }
 
 fn catalog_enemy_manager_choice(
@@ -397,6 +407,10 @@ fn catalog_enemy_manager_choice(
         manager_factory: manager.factory_name.clone(),
         manager_name: manager_name.clone(),
         display_name: actor.factory_name.clone(),
+        unavailable_reason: goop_enemy_unavailable_reason(
+            Some(&actor.factory_name),
+            Some(&manager.factory_name),
+        ),
     })
 }
 
@@ -591,6 +605,7 @@ struct GoopSpawnEntity {
     manager_survives_pool_removal: bool,
     catalog_actor_factory: Option<String>,
     variant_active: bool,
+    unavailable_reason: Option<&'static str>,
 }
 
 fn active_pool_actor_factory(document: &StageDocument, manager_name: &str) -> Option<String> {
@@ -669,6 +684,7 @@ impl SmsEditorApp {
                         variant_active: active_factory
                             .as_deref()
                             .map_or(index == 0, |active| active == choice.actor_factory),
+                        unavailable_reason: choice.unavailable_reason,
                     });
                 }
             } else if let Some(manager) = manager {
@@ -680,6 +696,10 @@ impl SmsEditorApp {
                     manager_survives_pool_removal: true,
                     catalog_actor_factory: None,
                     variant_active: true,
+                    unavailable_reason: goop_enemy_unavailable_reason(
+                        None,
+                        Some(&manager.factory_name),
+                    ),
                 });
             }
         }
@@ -696,6 +716,7 @@ impl SmsEditorApp {
                     manager_survives_pool_removal: false,
                     catalog_actor_factory: None,
                     variant_active: true,
+                    unavailable_reason: None,
                 });
             }
         }
@@ -1168,40 +1189,57 @@ impl SmsEditorApp {
         }
         for entity in entities {
             let flagged = self.manager_spawns_from_goop(&entity.manager_name);
-            let catalog_available = entity.catalog_actor_factory.is_some();
+            let catalog_available =
+                entity.catalog_actor_factory.is_some() && entity.unavailable_reason.is_none();
             let stale = !entity.manager_present && !catalog_available;
             // A flagged entry with a missing but repairable manager is shown
             // unchecked so selecting it performs the missing bundle import.
             let mut enabled = flagged && entity.variant_active && (entity.manager_present || stale);
-            if ui
-                .checkbox(
+            let suffix = if entity.unavailable_reason.is_some() {
+                if flagged {
+                    " (unavailable; uncheck to remove)"
+                } else {
+                    " (unavailable)"
+                }
+            } else if entity.manager_present {
+                ""
+            } else if catalog_available {
+                " (add manager pool)"
+            } else {
+                " (remove stale flag)"
+            };
+            let response = ui.add_enabled(
+                entity.unavailable_reason.is_none() || flagged,
+                egui::Checkbox::new(
                     &mut enabled,
                     format!(
                         "{} \u{2014} {}{}",
-                        entity.display_name,
-                        entity.manager_name,
-                        if entity.manager_present {
-                            ""
-                        } else if catalog_available {
-                            " (add manager pool)"
-                        } else {
-                            " (remove stale flag)"
-                        }
+                        entity.display_name, entity.manager_name, suffix
                     ),
-                )
-                .on_hover_text(if entity.manager_present {
-                    "Writes the retail enemy table: the conductor periodically picks a spot \
+                ),
+            );
+            let hover = if let Some(reason) = entity.unavailable_reason {
+                if flagged {
+                    format!("{reason} Uncheck it to remove this goop spawn configuration.")
+                } else {
+                    reason.to_string()
+                }
+            } else if entity.manager_present {
+                "Writes the retail enemy table: the conductor periodically picks a spot \
                          near Mario and, if that spot is goop, relocates one of this manager's \
                          enemies there."
-                } else if catalog_available {
-                    "Adds this decomp-identified manager with its exact retail dependency and \
+                    .to_string()
+            } else if catalog_available {
+                "Adds this decomp-identified manager with its exact retail dependency and \
                          resource bundle, but no placed enemy instance, then enables it in the \
                          retail enemy table. The whole change is one undo step."
-                } else {
-                    "This flagged table entry no longer has a TEnemyManager in map/scene.bin. \
+                    .to_string()
+            } else {
+                "This flagged table entry no longer has a TEnemyManager in map/scene.bin. \
                          Uncheck it; export also clears stale entries defensively."
-                })
-                .changed()
+                    .to_string()
+            };
+            if response.on_hover_text(hover).changed()
                 && (entity.manager_present || catalog_available || !enabled)
             {
                 self.set_manager_spawns_from_goop(&entity, enabled);
@@ -1229,7 +1267,7 @@ mod tests {
             .into_values()
             .flatten()
             .collect::<Vec<_>>();
-        for expected in ["Telesa", "PukuPuku", "PoiHanaRed", "BossManta"] {
+        for expected in ["Telesa", "PukuPuku", "PoiHanaRed"] {
             assert!(
                 choices
                     .iter()
@@ -1237,6 +1275,11 @@ mod tests {
                 "missing {expected} from goop choices"
             );
         }
+        let boss_manta = choices
+            .iter()
+            .find(|choice| choice.actor_factory == "BossManta")
+            .expect("BossManta remains visible as unavailable");
+        assert!(boss_manta.unavailable_reason.is_some());
         for excluded in [
             "BossTelesa",
             "Rocket",
@@ -1253,6 +1296,13 @@ mod tests {
         assert!(choices.iter().any(|choice| {
             choice.actor_factory == "PukuPuku" && choice.display_name == "TobiPuku"
         }));
+    }
+
+    #[test]
+    fn boss_manta_is_unavailable_until_its_runtime_pool_is_fixed() {
+        assert!(goop_enemy_unavailable_reason(Some("BossManta"), None).is_some());
+        assert!(goop_enemy_unavailable_reason(None, Some("BossMantaManager")).is_some());
+        assert!(goop_enemy_unavailable_reason(Some("Telesa"), Some("TelesaManager")).is_none());
     }
 
     fn enemy_registry() -> ObjectRegistry {
