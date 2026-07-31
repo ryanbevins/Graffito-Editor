@@ -5677,8 +5677,8 @@ fn probe_stain_bake() {
         }
         for (index, record) in materials.material_init_records.iter().enumerate() {
             println!(
-                "record {index}: alpha selectors {:?}",
-                record.tev_konst_alpha_selectors
+                "record {index}: alpha {:?} color {:?}",
+                record.tev_konst_alpha_selectors, record.tev_konst_color_selectors
             );
         }
     }
