@@ -2009,7 +2009,37 @@ fn add_stage_reference_inner(
                 .collect::<BTreeSet<_>>();
             match distinct.len() {
                 1 => {
-                    out.insert(shared[0].clone());
+                    // The same path can carry different content per stage --
+                    // H_ma_rak.bti alone has at least two variants -- and the
+                    // first stage in sort order is an arbitrary choice of
+                    // variant. Take the majority content across retail, which
+                    // for the Stu stain is the classic bianco texture, and
+                    // fall back to first-in-order when nothing reads.
+                    let mut votes: Vec<(u64, usize)> = Vec::new();
+                    for (index, resource) in shared.iter().enumerate() {
+                        let Ok(bytes) = read_stage_asset_bytes(&resource.source_asset_path) else {
+                            continue;
+                        };
+                        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+                        for byte in &bytes {
+                            hash ^= u64::from(*byte);
+                            hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+                        }
+                        votes.push((hash, index));
+                    }
+                    let mut counts: BTreeMap<u64, (usize, usize)> = BTreeMap::new();
+                    for (hash, index) in votes {
+                        let entry = counts.entry(hash).or_insert((0, index));
+                        entry.0 += 1;
+                    }
+                    let chosen = counts
+                        .values()
+                        .max_by(|left, right| {
+                            left.0.cmp(&right.0).then(right.1.cmp(&left.1))
+                        })
+                        .map(|(_, index)| *index)
+                        .unwrap_or(0);
+                    out.insert(shared[chosen].clone());
                     Ok(())
                 }
                 _ => Err(format!(
