@@ -3450,6 +3450,13 @@ impl SmsEditorApp {
         let Some(sms_scene::PlacementBinding::Authored(placement)) = &before.placement else {
             return;
         };
+        if pool_only && !self.object_uses_enemy_pool(&before) {
+            self.log.push(format!(
+                "Could not make '{}' pool-only: its manager is not a decomp-identified TEnemyManager in this stage.",
+                object_display_name(&before)
+            ));
+            return;
+        }
         if placement.pool_only == pool_only {
             return;
         }

@@ -1682,13 +1682,7 @@ impl SmsEditorApp {
             }
 
             if let Some(sms_scene::PlacementBinding::Authored(placement)) = &object.placement {
-                if crate::preview_assets::actor_runtime_texture_replacements(
-                    &object.factory_name,
-                    self.registry.as_ref(),
-                )
-                .iter()
-                .any(|(dummy, _)| dummy == "H_ma_rak_dummy")
-                {
+                if self.object_uses_stu_stain_model(&object) {
                     let mut stained = self.stu_stain_baked();
                     if ui
                         .checkbox(&mut stained, "Goop stain on cap")
@@ -1705,7 +1699,7 @@ impl SmsEditorApp {
                         }
                     }
                 }
-                if object.raw_param("manager_name").is_some() {
+                if self.object_uses_enemy_pool(&object) {
                     ui.separator();
                     let mut pool_only = placement.pool_only;
                     if ui

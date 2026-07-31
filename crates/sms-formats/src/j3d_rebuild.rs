@@ -284,7 +284,7 @@ pub struct J3dMaterialSection {
     pub tables: Vec<J3dMaterialTable>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct J3dMaterialInitRecord {
     pub material_mode: u8,
     pub cull_mode_index: u8,
@@ -501,6 +501,47 @@ pub enum J3dPaddingKind {
     SuperBmdMessage(Vec<u8>),
 }
 
+fn material_record_index(materials: &J3dMaterialSection, material_name: &str) -> Option<usize> {
+    let name_index = materials
+        .names
+        .as_ref()?
+        .entries
+        .iter()
+        .position(|entry| entry.name == material_name)?;
+    Some(
+        materials
+            .tables
+            .iter()
+            .find(|table| table.kind == J3dMaterialTableKind::MaterialRemap)
+            .and_then(|table| match &table.allocation {
+                J3dScalarArray::Unsigned16(values) => {
+                    values.get(name_index).map(|value| *value as usize)
+                }
+                _ => None,
+            })
+            .unwrap_or(name_index),
+    )
+}
+
+fn material_tev_stage_count(
+    materials: &J3dMaterialSection,
+    record: &J3dMaterialInitRecord,
+) -> usize {
+    materials
+        .tables
+        .iter()
+        .find(|table| table.kind == J3dMaterialTableKind::TevStageCount)
+        .and_then(|table| match &table.allocation {
+            J3dScalarArray::Unsigned8(values) => values
+                .get(record.tev_stage_count_index as usize)
+                .copied()
+                .map(usize::from),
+            _ => None,
+        })
+        .unwrap_or(0)
+        .min(record.tev_konst_color_selectors.len())
+}
+
 impl J3dRebuildDocument {
     pub fn parse(bytes: impl AsRef<[u8]>) -> Result<Self> {
         let bytes = bytes.as_ref();
@@ -611,55 +652,109 @@ impl J3dRebuildDocument {
         Ok(())
     }
 
-    /// Pins a material's KCOLOR0-alpha inputs to a constant.
+    /// Whether the model has a named TEX1 texture slot.
+    pub fn has_named_texture(&self, texture_name: &str) -> bool {
+        self.sections.iter().any(|section| {
+            matches!(
+                &section.data,
+                J3dRebuildSectionData::Textures(textures)
+                    if textures.names.entries.iter().any(|entry| entry.name == texture_name)
+            )
+        })
+    }
+
+    /// Whether an active TEV stage in `material_name` is driven by KCOLOR0
+    /// alpha, or is already pinned by this editor.
+    pub fn can_pin_material_konst_alpha_half(&self, material_name: &str) -> bool {
+        const KONST_K0_A: u8 = 0x1C;
+        const KONST_HALF: u8 = 0x04;
+        const LEGACY_PINNED: u8 = 0x01;
+        self.sections.iter().any(|section| {
+            let J3dRebuildSectionData::Materials(materials) = &section.data else {
+                return false;
+            };
+            let Some(record_index) = material_record_index(materials, material_name) else {
+                return false;
+            };
+            let Some(record) = materials.material_init_records.get(record_index) else {
+                return false;
+            };
+            let stage_count = material_tev_stage_count(materials, record);
+            record
+                .tev_konst_alpha_selectors
+                .iter()
+                .take(stage_count)
+                .chain(record.tev_konst_color_selectors.iter().take(stage_count))
+                .any(|selector| matches!(*selector, KONST_K0_A | KONST_HALF | LEGACY_PINNED))
+        })
+    }
+
+    /// Whether an active TEV stage in `material_name` carries the baked
+    /// one-half selector (or the 7/8 marker written by PR #28).
+    pub fn material_konst_alpha_half_is_pinned(&self, material_name: &str) -> bool {
+        const KONST_HALF: u8 = 0x04;
+        const LEGACY_PINNED: u8 = 0x01;
+        self.sections.iter().any(|section| {
+            let J3dRebuildSectionData::Materials(materials) = &section.data else {
+                return false;
+            };
+            let Some(record_index) = material_record_index(materials, material_name) else {
+                return false;
+            };
+            let Some(record) = materials.material_init_records.get(record_index) else {
+                return false;
+            };
+            let stage_count = material_tev_stage_count(materials, record);
+            record
+                .tev_konst_alpha_selectors
+                .iter()
+                .take(stage_count)
+                .chain(record.tev_konst_color_selectors.iter().take(stage_count))
+                .any(|selector| matches!(*selector, KONST_HALF | LEGACY_PINNED))
+        })
+    }
+
+    /// Pins a material's active KCOLOR0-alpha inputs to a constant.
     ///
     /// `K0_A` (0x1C) reads register KCOLOR0's alpha, which Sunshine rewrites
     /// per frame for runtime-driven effects like the Stu's goop stain; whatever
     /// the file says is overridden at run time. The stain's visible mix runs in
     /// the colour channel -- measured on the Stu, colour selector stage 0 is
-    /// 0x1C -- so both selector arrays are pinned. The constant is 7/8 (0x01)
-    /// rather than the runtime's one-half because 0x04 already occurs in the
-    /// pristine colour selectors and the pin must stay unambiguous to reverse.
+    /// 0x1C -- so both selector arrays are pinned. GX selector 0x04 is the
+    /// runtime's exact one-half constant; only active TEV stages are changed so
+    /// pristine padding selectors with the same byte remain untouched.
     /// Returns how many selectors were pinned.
     pub fn pin_material_konst_alpha_half(&mut self, material_name: &str) -> Result<usize> {
         const KONST_K0_A: u8 = 0x1C;
-        const KONST_PINNED: u8 = 0x01;
+        const KONST_HALF: u8 = 0x04;
         let mut pinned = 0usize;
         for section in &mut self.sections {
             let J3dRebuildSectionData::Materials(materials) = &mut section.data else {
                 continue;
             };
-            let Some(names) = &materials.names else {
+            let Some(record_index) = material_record_index(materials, material_name) else {
                 continue;
             };
-            let Some(name_index) = names
-                .entries
-                .iter()
-                .position(|entry| entry.name == material_name)
-            else {
+            let Some(record) = materials.material_init_records.get(record_index) else {
                 continue;
             };
-            let record_index = materials
-                .tables
-                .iter()
-                .find(|table| table.kind == J3dMaterialTableKind::MaterialRemap)
-                .and_then(|table| match &table.allocation {
-                    J3dScalarArray::Unsigned16(values) => {
-                        values.get(name_index).map(|value| *value as usize)
-                    }
-                    _ => None,
-                })
-                .unwrap_or(name_index);
+            let stage_count = material_tev_stage_count(materials, record);
             let Some(record) = materials.material_init_records.get_mut(record_index) else {
                 continue;
             };
             for selector in record
                 .tev_konst_alpha_selectors
                 .iter_mut()
-                .chain(record.tev_konst_color_selectors.iter_mut())
+                .take(stage_count)
+                .chain(
+                    record
+                        .tev_konst_color_selectors
+                        .iter_mut()
+                        .take(stage_count),
+                )
             {
                 if *selector == KONST_K0_A {
-                    *selector = KONST_PINNED;
+                    *selector = KONST_HALF;
                     pinned += 1;
                 }
             }
@@ -670,53 +765,58 @@ impl J3dRebuildDocument {
     /// Reverses [`Self::pin_material_konst_alpha_half`], returning selectors
     /// to the runtime-driven KCOLOR0 register.
     ///
-    /// Lossless because 0x01 occurs nowhere in the pristine selectors of the
-    /// materials this is used on. 0x04 in the alpha array is also reversed for
-    /// stages baked by an earlier revision that used it as the pin. The dummy
-    /// texture is deliberately left as baked: with the selector back on the
-    /// register the runtime rewrites both the alpha and the texture whenever
-    /// it shows the effect, so the slot's content no longer affects anything.
+    /// Active 0x04 selectors are returned to KCOLOR0. The 0x01 marker written by
+    /// PR #28 is also removed from the full arrays because it never occurs in
+    /// the pristine Stu material. The dummy texture is deliberately left as
+    /// baked: with the selector back on the register the runtime rewrites both
+    /// the alpha and the texture whenever it shows the effect.
     pub fn unpin_material_konst_alpha_half(&mut self, material_name: &str) -> Result<usize> {
         const KONST_K0_A: u8 = 0x1C;
-        const KONST_PINNED: u8 = 0x01;
-        const LEGACY_PINNED: u8 = 0x04;
+        const KONST_HALF: u8 = 0x04;
+        const LEGACY_PINNED: u8 = 0x01;
         let mut unpinned = 0usize;
         for section in &mut self.sections {
             let J3dRebuildSectionData::Materials(materials) = &mut section.data else {
                 continue;
             };
-            let Some(names) = &materials.names else {
+            let Some(record_index) = material_record_index(materials, material_name) else {
                 continue;
             };
-            let Some(name_index) = names
-                .entries
-                .iter()
-                .position(|entry| entry.name == material_name)
-            else {
+            let Some(record) = materials.material_init_records.get(record_index) else {
                 continue;
             };
-            let record_index = materials
-                .tables
-                .iter()
-                .find(|table| table.kind == J3dMaterialTableKind::MaterialRemap)
-                .and_then(|table| match &table.allocation {
-                    J3dScalarArray::Unsigned16(values) => {
-                        values.get(name_index).map(|value| *value as usize)
-                    }
-                    _ => None,
-                })
-                .unwrap_or(name_index);
+            let stage_count = material_tev_stage_count(materials, record);
             let Some(record) = materials.material_init_records.get_mut(record_index) else {
                 continue;
             };
-            for selector in &mut record.tev_konst_alpha_selectors {
-                if *selector == KONST_PINNED || *selector == LEGACY_PINNED {
+            for selector in record
+                .tev_konst_alpha_selectors
+                .iter_mut()
+                .take(stage_count)
+                .chain(
+                    record
+                        .tev_konst_color_selectors
+                        .iter_mut()
+                        .take(stage_count),
+                )
+            {
+                if *selector == KONST_HALF || *selector == LEGACY_PINNED {
                     *selector = KONST_K0_A;
                     unpinned += 1;
                 }
             }
-            for selector in &mut record.tev_konst_color_selectors {
-                if *selector == KONST_PINNED {
+            for selector in record
+                .tev_konst_alpha_selectors
+                .iter_mut()
+                .skip(stage_count)
+                .chain(
+                    record
+                        .tev_konst_color_selectors
+                        .iter_mut()
+                        .skip(stage_count),
+                )
+            {
+                if *selector == LEGACY_PINNED {
                     *selector = KONST_K0_A;
                     unpinned += 1;
                 }
@@ -3617,6 +3717,120 @@ mod tests {
                 padding: Vec::new(),
             }],
         }
+    }
+
+    fn synthetic_stain_material_document() -> J3dRebuildDocument {
+        let mut record = J3dMaterialInitRecord {
+            tev_stage_count_index: 0,
+            tev_konst_color_selectors: [0x1C; 16],
+            tev_konst_alpha_selectors: [0x1C; 16],
+            ..J3dMaterialInitRecord::default()
+        };
+        // Pristine retail data can carry the half selector in unused slots.
+        // Pinning and unpinning must not use those bytes as state.
+        record.tev_konst_color_selectors[5] = 0x04;
+        record.tev_konst_alpha_selectors[6] = 0x04;
+        J3dRebuildDocument {
+            file_type: *b"bmd3",
+            version_tag: *b"SVR3",
+            reserved_words: [u32::MAX; 3],
+            declared_section_count: 1,
+            sections: vec![J3dRebuildSection {
+                declared_size: 0,
+                data: J3dRebuildSectionData::Materials(J3dMaterialSection {
+                    material_count: 1,
+                    reserved: u16::MAX,
+                    offsets: [0; 30],
+                    material_init_records: vec![record],
+                    names: Some(J3dNameTable {
+                        reserved: u16::MAX,
+                        entries: vec![J3dNameEntry {
+                            hash: j3d_name_hash(b"_mat_body_top1"),
+                            string_offset: 8,
+                            name: "_mat_body_top1".to_string(),
+                        }],
+                    }),
+                    tables: vec![
+                        J3dMaterialTable {
+                            kind: J3dMaterialTableKind::MaterialRemap,
+                            offset: 0,
+                            allocation: J3dScalarArray::Unsigned16(vec![0]),
+                        },
+                        J3dMaterialTable {
+                            kind: J3dMaterialTableKind::TevStageCount,
+                            offset: 0,
+                            allocation: J3dScalarArray::Unsigned8(vec![1]),
+                        },
+                    ],
+                }),
+                padding: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn stain_pin_uses_exact_half_only_on_active_tev_stages() {
+        let mut model = synthetic_stain_material_document();
+        assert!(model.can_pin_material_konst_alpha_half("_mat_body_top1"));
+        assert_eq!(
+            model
+                .pin_material_konst_alpha_half("_mat_body_top1")
+                .unwrap(),
+            2
+        );
+        assert!(model.material_konst_alpha_half_is_pinned("_mat_body_top1"));
+        let J3dRebuildSectionData::Materials(materials) = &model.sections[0].data else {
+            unreachable!()
+        };
+        let record = &materials.material_init_records[0];
+        assert_eq!(record.tev_konst_color_selectors[0], 0x04);
+        assert_eq!(record.tev_konst_alpha_selectors[0], 0x04);
+        assert_eq!(record.tev_konst_color_selectors[5], 0x04);
+        assert_eq!(record.tev_konst_alpha_selectors[6], 0x04);
+        assert_eq!(record.tev_konst_color_selectors[1], 0x1C);
+
+        assert_eq!(
+            model
+                .unpin_material_konst_alpha_half("_mat_body_top1")
+                .unwrap(),
+            2
+        );
+        let J3dRebuildSectionData::Materials(materials) = &model.sections[0].data else {
+            unreachable!()
+        };
+        let record = &materials.material_init_records[0];
+        assert_eq!(record.tev_konst_color_selectors[0], 0x1C);
+        assert_eq!(record.tev_konst_alpha_selectors[0], 0x1C);
+        assert_eq!(record.tev_konst_color_selectors[5], 0x04);
+        assert_eq!(record.tev_konst_alpha_selectors[6], 0x04);
+    }
+
+    #[test]
+    fn stain_unpin_heals_pr_28_legacy_selector_markers() {
+        let mut model = synthetic_stain_material_document();
+        let J3dRebuildSectionData::Materials(materials) = &mut model.sections[0].data else {
+            unreachable!()
+        };
+        materials.material_init_records[0].tev_konst_color_selectors = [0x01; 16];
+        materials.material_init_records[0].tev_konst_alpha_selectors = [0x01; 16];
+        assert_eq!(
+            model
+                .unpin_material_konst_alpha_half("_mat_body_top1")
+                .unwrap(),
+            32
+        );
+        let J3dRebuildSectionData::Materials(materials) = &model.sections[0].data else {
+            unreachable!()
+        };
+        assert!(materials.material_init_records[0]
+            .tev_konst_color_selectors
+            .iter()
+            .chain(
+                materials.material_init_records[0]
+                    .tev_konst_alpha_selectors
+                    .iter()
+            )
+            .all(|selector| *selector == 0x1C));
     }
 
     fn synthetic_runtime_bti() -> BtiFile {

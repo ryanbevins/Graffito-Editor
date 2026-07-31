@@ -435,6 +435,7 @@ impl StageDocument {
             self.registry.as_ref(),
             &dialogue_owned_runtime_names,
         )?;
+        reconcile_goop_enemy_table_manager_references(&mut archive, self.registry.as_ref())?;
         let rebuilt = archive.encode()?;
         let reopened = SourceFreeStageArchive::parse(&rebuilt)?;
         if reopened.encode()? != rebuilt {
@@ -1755,6 +1756,7 @@ fn reconcile_scene_objects_with_owned_dialogue_names(
         // ensured above -- and stop there: the manager's pool supplies the
         // enemies, and no actor stands in the world.
         if placement.pool_only {
+            validate_pool_only_export(archive, placement, object, &record, registry)?;
             continue;
         }
         let parent_path = authored_target_group_path(
@@ -1789,6 +1791,134 @@ fn reconcile_scene_objects_with_owned_dialogue_names(
         archive.remove_placement_record(&address.raw_resource_path, &address.record_path)?;
     }
     Ok(())
+}
+
+fn collect_enemy_managers(
+    record: &JDramaRecord,
+    registry: &ObjectRegistry,
+    managers: &mut BTreeMap<String, String>,
+) {
+    if let Some(manager) = registry.find_enemy_manager(semantic_record_type_name(&record.type_name))
+    {
+        managers
+            .entry(record.name.clone())
+            .or_insert_with(|| manager.factory_name.clone());
+    }
+    if let JDramaRecordPayload::Group { children, .. } = &record.payload {
+        for child in children {
+            collect_enemy_managers(child, registry, managers);
+        }
+    }
+}
+
+fn validate_pool_only_export(
+    archive: &SourceFreeStageArchive,
+    placement: &crate::AuthoredPlacement,
+    object: &SceneObject,
+    record: &JDramaRecord,
+    registry: Option<&ObjectRegistry>,
+) -> Result<()> {
+    let registry = registry.ok_or_else(|| {
+        stage_export_error(format!(
+            "pool-only object '{}' requires the decomp-derived enemy schema",
+            object.id
+        ))
+    })?;
+    let Some(actor) = registry.find_enemy_actor(semantic_record_type_name(&record.type_name))
+    else {
+        return Err(stage_export_error(format!(
+            "pool-only object '{}' is not a decomp-identified enemy actor",
+            object.id
+        )));
+    };
+    let manager_name =
+        record_string_field(record, &object.id, "manager_name")?.ok_or_else(|| {
+            stage_export_error(format!(
+                "pool-only enemy '{}' has no typed manager_name",
+                object.id
+            ))
+        })?;
+    let Some(StageResourceDocument::Placement(scene)) =
+        archive.resource(&placement.raw_resource_path)
+    else {
+        return Err(stage_export_error(format!(
+            "pool-only enemy '{}' has no typed scene resource {}",
+            object.id,
+            display_raw_path(&placement.raw_resource_path)
+        )));
+    };
+    let mut managers = BTreeMap::new();
+    collect_enemy_managers(&scene.root, registry, &mut managers);
+    let Some(manager_factory) = managers.get(&manager_name) else {
+        return Err(stage_export_error(format!(
+            "pool-only enemy '{}' references manager {manager_name:?}, but no decomp-identified TEnemyManager with that name is exported",
+            object.id
+        )));
+    };
+    if !actor.manager_factories.iter().any(|expected| {
+        semantic_record_type_name(expected) == semantic_record_type_name(manager_factory)
+    }) {
+        return Err(stage_export_error(format!(
+            "pool-only enemy '{}' is not compatible with exported manager {manager_name:?} ({manager_factory})",
+            object.id
+        )));
+    }
+    Ok(())
+}
+
+fn reconcile_goop_enemy_table_manager_references(
+    archive: &mut SourceFreeStageArchive,
+    registry: Option<&ObjectRegistry>,
+) -> Result<usize> {
+    const SPAWN_FROM_GOOP_FLAG: i32 = 0x1;
+    let Some(registry) = registry else {
+        return Ok(0);
+    };
+    let Some(StageResourceDocument::Placement(scene)) = archive.resource(b"map/scene.bin") else {
+        return Ok(0);
+    };
+    let mut managers = BTreeMap::new();
+    collect_enemy_managers(&scene.root, registry, &mut managers);
+
+    let Some(StageResourceDocument::Placement(tables)) = archive.resource_mut(b"map/tables.bin")
+    else {
+        return Ok(0);
+    };
+    fn clear(record: &mut JDramaRecord, managers: &BTreeMap<String, String>, cleared: &mut usize) {
+        if record.type_name == "StageEnemyInfo" {
+            let fields = jdrama_record_fields_mut(record);
+            let manager_name = fields.as_deref().and_then(|fields| {
+                fields.iter().find_map(|field| match &field.value {
+                    JDramaFieldValue::String(name) if field.name == "manager_name" => {
+                        Some(name.clone())
+                    }
+                    _ => None,
+                })
+            });
+            if manager_name.is_some_and(|name| !managers.contains_key(&name)) {
+                if let Some(fields) = fields {
+                    if let Some(JDramaField {
+                        value: JDramaFieldValue::I32(flags),
+                        ..
+                    }) = fields.iter_mut().find(|field| field.name == "flags")
+                    {
+                        if *flags & SPAWN_FROM_GOOP_FLAG != 0 {
+                            *flags &= !SPAWN_FROM_GOOP_FLAG;
+                            *cleared += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if let JDramaRecordPayload::Group { children, .. } = &mut record.payload {
+            for child in children {
+                clear(child, managers, cleared);
+            }
+        }
+    }
+    let mut cleared = 0;
+    clear(&mut tables.root, &managers, &mut cleared);
+    Ok(cleared)
 }
 
 fn validate_object_identity(object: &SceneObject, placement: &StageObjectPlacement) -> Result<()> {
@@ -2601,6 +2731,192 @@ mod tests {
             apply_runtime_texture_replacements(&mut archive, &objects, Some(&registry), true)
                 .expect_err("a custom stage with goop must carry Mario's declared runtime texture");
         assert!(error.to_string().contains("H_ma_rak.bti"));
+    }
+
+    fn enemy_table_document(manager_name: &str) -> JDramaDocument {
+        let entry = JDramaRecord::new(
+            "StageEnemyInfo",
+            "enemy info",
+            JDramaRecordPayload::Fields {
+                fields: vec![
+                    JDramaField {
+                        name: "manager_name".to_string(),
+                        value: JDramaFieldValue::String(manager_name.to_string()),
+                    },
+                    JDramaField {
+                        name: "flags".to_string(),
+                        value: JDramaFieldValue::I32(1),
+                    },
+                    JDramaField {
+                        name: "weight".to_string(),
+                        value: JDramaFieldValue::U32(100),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        JDramaDocument {
+            root: JDramaRecord::new(
+                "NameRefGrp",
+                "tables",
+                JDramaRecordPayload::Group {
+                    fields: Vec::new(),
+                    children: vec![entry],
+                },
+            )
+            .unwrap(),
+        }
+    }
+
+    fn namekuri_registry() -> ObjectRegistry {
+        ObjectRegistry {
+            enemy_managers: vec![sms_schema::EnemyManagerDefinition {
+                factory_name: "NameKuriManager".to_string(),
+                class_name: "TNameKuriManager".to_string(),
+                model_index: None,
+                spawned_actor_class: Some("TNameKuri".to_string()),
+                parameter_path: None,
+                models: Vec::new(),
+            }],
+            enemy_actors: vec![sms_schema::EnemyActorDefinition {
+                factory_name: "NameKuri".to_string(),
+                class_name: "TNameKuri".to_string(),
+                model_index: None,
+                fallback_models: Vec::new(),
+                primary_model: None,
+                named_models: Vec::new(),
+                indexed_models: Vec::new(),
+                manager_factories: vec!["NameKuriManager".to_string()],
+                runtime_uniform_scale: None,
+            }],
+            ..ObjectRegistry::default()
+        }
+    }
+
+    #[test]
+    fn export_clears_only_goop_flags_whose_enemy_manager_is_absent() {
+        let manager_name = "gooble manager";
+        let manager = JDramaRecord::new(
+            "NameKuriManager",
+            manager_name,
+            JDramaRecordPayload::Fields { fields: Vec::new() },
+        )
+        .unwrap();
+        let registry = namekuri_registry();
+        let mut present = authoring_strategy_archive(vec![manager]);
+        present
+            .insert_resource(
+                b"map/tables.bin".to_vec(),
+                StageResourceDocument::Placement(enemy_table_document(manager_name)),
+            )
+            .unwrap();
+        assert_eq!(
+            reconcile_goop_enemy_table_manager_references(&mut present, Some(&registry)).unwrap(),
+            0
+        );
+
+        let mut absent = authoring_strategy_archive(Vec::new());
+        absent
+            .insert_resource(
+                b"map/tables.bin".to_vec(),
+                StageResourceDocument::Placement(enemy_table_document(manager_name)),
+            )
+            .unwrap();
+        assert_eq!(
+            reconcile_goop_enemy_table_manager_references(&mut absent, Some(&registry)).unwrap(),
+            1
+        );
+        let Some(StageResourceDocument::Placement(tables)) = absent.resource(b"map/tables.bin")
+        else {
+            unreachable!()
+        };
+        let JDramaRecordPayload::Group { children, .. } = &tables.root.payload else {
+            unreachable!()
+        };
+        assert!(matches!(
+            jdrama_record_fields(&children[0])
+                .unwrap()
+                .iter()
+                .find(|field| field.name == "flags")
+                .map(|field| &field.value),
+            Some(JDramaFieldValue::I32(0))
+        ));
+    }
+
+    #[test]
+    fn pool_only_export_rejects_non_enemy_actor_factories() {
+        let archive = authoring_strategy_archive(Vec::new());
+        let record = JDramaRecord::new(
+            "NPCBoard",
+            "board",
+            JDramaRecordPayload::Fields {
+                fields: vec![JDramaField {
+                    name: "manager_name".to_string(),
+                    value: JDramaFieldValue::String("board manager".to_string()),
+                }],
+            },
+        )
+        .unwrap();
+        let object = authored_test_object("board", record.clone(), 7, Vec::new());
+        let PlacementBinding::Authored(placement) = object.placement.as_ref().unwrap() else {
+            unreachable!()
+        };
+        let error = validate_pool_only_export(
+            &archive,
+            placement,
+            &object,
+            &record,
+            Some(&namekuri_registry()),
+        )
+        .expect_err("a TLiveManager-backed board is not an enemy pool");
+        assert!(
+            error
+                .to_string()
+                .contains("not a decomp-identified enemy actor"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn pool_only_export_rejects_an_incompatible_enemy_manager() {
+        let manager_name = "winged manager";
+        let manager = JDramaRecord::new(
+            "HaneHamuKuriManager",
+            manager_name,
+            JDramaRecordPayload::Fields { fields: Vec::new() },
+        )
+        .unwrap();
+        let mut registry = namekuri_registry();
+        registry
+            .enemy_managers
+            .push(sms_schema::EnemyManagerDefinition {
+                factory_name: "HaneHamuKuriManager".to_string(),
+                class_name: "THaneHamuKuriManager".to_string(),
+                model_index: None,
+                spawned_actor_class: Some("THaneHamuKuri".to_string()),
+                parameter_path: None,
+                models: Vec::new(),
+            });
+        let archive = authoring_strategy_archive(vec![manager]);
+        let record = JDramaRecord::new(
+            "NameKuri",
+            "gooble",
+            JDramaRecordPayload::Fields {
+                fields: vec![JDramaField {
+                    name: "manager_name".to_string(),
+                    value: JDramaFieldValue::String(manager_name.to_string()),
+                }],
+            },
+        )
+        .unwrap();
+        let object = authored_test_object("gooble", record.clone(), 7, Vec::new());
+        let PlacementBinding::Authored(placement) = object.placement.as_ref().unwrap() else {
+            unreachable!()
+        };
+        let error =
+            validate_pool_only_export(&archive, placement, &object, &record, Some(&registry))
+                .expect_err("pool-only actors require their own compatible manager");
+        assert!(error.to_string().contains("is not compatible"), "{error}");
     }
 
     #[test]

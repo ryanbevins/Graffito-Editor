@@ -23,8 +23,8 @@ const SCENE_PATH: &[u8] = b"map/scene.bin";
 
 /// ナメクリマネージャー — the Gooble manager's JDrama object name, which is
 /// what `getManagerByName` resolves. The factory name is `NameKuriManager`.
-/// Production code no longer special-cases it — any manager in the scene can
-/// be flagged — so only the tests pin against it.
+/// Production code no longer special-cases it — any decomp-identified
+/// TEnemyManager in the scene can be flagged — so only the tests pin against it.
 #[cfg(test)]
 const GOOBLE_MANAGER_NAME: &str =
     "\u{30CA}\u{30E1}\u{30AF}\u{30EA}\u{30DE}\u{30CD}\u{30FC}\u{30B8}\u{30E3}\u{30FC}";
@@ -223,6 +223,164 @@ fn fresh_tables_document() -> sms_formats::JDramaDocument {
     }
 }
 
+fn semantic_factory_name(type_name: &str) -> &str {
+    type_name.rsplit("::").next().unwrap_or(type_name)
+}
+
+fn enemy_manager_definition<'a>(
+    registry: &'a ObjectRegistry,
+    factory_name: &str,
+) -> Option<&'a sms_schema::EnemyManagerDefinition> {
+    registry
+        .find_enemy_manager(factory_name)
+        .or_else(|| registry.find_enemy_manager(semantic_factory_name(factory_name)))
+}
+
+fn enemy_actor_definition<'a>(
+    registry: &'a ObjectRegistry,
+    factory_name: &str,
+) -> Option<&'a sms_schema::EnemyActorDefinition> {
+    registry
+        .find_enemy_actor(factory_name)
+        .or_else(|| registry.find_enemy_actor(semantic_factory_name(factory_name)))
+}
+
+fn manager_factory_matches_actor(
+    actor: &sms_schema::EnemyActorDefinition,
+    manager_factory: &str,
+) -> bool {
+    let manager_factory = semantic_factory_name(manager_factory);
+    actor
+        .manager_factories
+        .iter()
+        .any(|expected| semantic_factory_name(expected) == manager_factory)
+}
+
+fn actor_uses_stu_stain(
+    registry: &ObjectRegistry,
+    actor: &sms_schema::EnemyActorDefinition,
+) -> bool {
+    registry
+        .runtime_texture_replacements_for(&actor.factory_name)
+        .any(|replacement| {
+            replacement.dummy_texture_name == "H_ma_rak_dummy"
+                && replacement.resource_path == "/scene/map/pollution/H_ma_rak.bti"
+                && replacement
+                    .source_file
+                    .replace('\\', "/")
+                    .ends_with("/Enemy/hamukuri.cpp")
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EnemyManagerInstance {
+    factory_name: String,
+    display_name: String,
+}
+
+fn enemy_manager_display_name(
+    registry: &ObjectRegistry,
+    manager: &sms_schema::EnemyManagerDefinition,
+) -> String {
+    manager
+        .spawned_actor_class
+        .as_deref()
+        .and_then(|class_name| {
+            registry.enemy_actors.iter().find(|actor| {
+                actor.class_name == class_name
+                    && actor
+                        .manager_factories
+                        .iter()
+                        .any(|factory| factory == &manager.factory_name)
+            })
+        })
+        .map_or_else(
+            || manager.factory_name.clone(),
+            |actor| actor.factory_name.clone(),
+        )
+}
+
+fn collect_enemy_manager_records(
+    record: &sms_formats::JDramaRecord,
+    registry: &ObjectRegistry,
+    out: &mut BTreeMap<String, EnemyManagerInstance>,
+) {
+    if let Some(manager) = enemy_manager_definition(registry, &record.type_name) {
+        out.entry(record.name.clone())
+            .or_insert_with(|| EnemyManagerInstance {
+                factory_name: manager.factory_name.clone(),
+                display_name: enemy_manager_display_name(registry, manager),
+            });
+    }
+    if let sms_formats::JDramaRecordPayload::Group { children, .. } = &record.payload {
+        for child in children {
+            collect_enemy_manager_records(child, registry, out);
+        }
+    }
+}
+
+fn enemy_manager_instances(
+    document: &StageDocument,
+    registry: &ObjectRegistry,
+) -> BTreeMap<String, EnemyManagerInstance> {
+    let mut managers = BTreeMap::new();
+    if let Ok(Some(StageResourceDocument::Placement(scene))) =
+        document.effective_resource_clone(SCENE_PATH)
+    {
+        collect_enemy_manager_records(&scene.root, registry, &mut managers);
+    }
+    for object in &document.objects {
+        let Some(sms_scene::PlacementBinding::Authored(placement)) = &object.placement else {
+            continue;
+        };
+        for dependency in &placement.dependencies {
+            let Some(manager) = enemy_manager_definition(registry, &dependency.record.type_name)
+            else {
+                continue;
+            };
+            managers
+                .entry(dependency.record.name.clone())
+                .or_insert_with(|| EnemyManagerInstance {
+                    factory_name: manager.factory_name.clone(),
+                    display_name: enemy_manager_display_name(registry, manager),
+                });
+        }
+    }
+    managers
+}
+
+fn goop_flagged_managers(document: &StageDocument) -> BTreeSet<String> {
+    let Ok(Some(StageResourceDocument::Placement(tables))) =
+        document.effective_resource_clone(TABLES_PATH)
+    else {
+        return BTreeSet::new();
+    };
+    fn collect(record: &sms_formats::JDramaRecord, out: &mut BTreeSet<String>) {
+        if record.type_name == "StageEnemyInfo" && entry_spawns_from_goop(record) {
+            if let Some(sms_formats::JDramaFieldValue::String(manager)) =
+                record_field(record, "manager_name")
+            {
+                out.insert(manager.clone());
+            }
+        }
+        if let sms_formats::JDramaRecordPayload::Group { children, .. } = &record.payload {
+            for child in children {
+                collect(child, out);
+            }
+        }
+    }
+    let mut managers = BTreeSet::new();
+    collect(&tables.root, &mut managers);
+    managers
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GoopSpawnEntity {
+    display_name: String,
+    manager_name: String,
+    manager_present: bool,
+}
+
 impl SmsEditorApp {
     /// Whether the effective enemy table flags Goobles to generate from goop.
     /// Enemy managers this stage could spawn from goop, derived from what is
@@ -233,22 +391,78 @@ impl SmsEditorApp {
     /// stage additionally carries managers in its effective scene. Either way
     /// the conductor can only spawn from managers that exist, so the list is
     /// built from presence rather than from a registry of everything.
-    pub(super) fn goop_spawnable_entities(&self) -> Vec<(String, String)> {
-        let Some(document) = self.document.as_ref() else {
+    fn goop_spawnable_entities(&self) -> Vec<GoopSpawnEntity> {
+        let (Some(document), Some(registry)) = (self.document.as_ref(), self.registry.as_ref())
+        else {
             return Vec::new();
         };
-        let mut entities: Vec<(String, String)> = Vec::new();
-        let mut seen = BTreeSet::new();
-        for object in &document.objects {
-            let Some(manager) = object.raw_param("manager_name") else {
-                continue;
-            };
-            if manager.is_empty() || !seen.insert(manager.to_string()) {
-                continue;
+        let managers = enemy_manager_instances(document, registry);
+        let mut entities = managers
+            .iter()
+            .map(|(manager_name, manager)| GoopSpawnEntity {
+                display_name: manager.display_name.clone(),
+                manager_name: manager_name.clone(),
+                manager_present: true,
+            })
+            .collect::<Vec<_>>();
+        for manager_name in goop_flagged_managers(document) {
+            if !managers.contains_key(&manager_name) {
+                entities.push(GoopSpawnEntity {
+                    display_name: "Missing enemy manager".to_string(),
+                    manager_name,
+                    manager_present: false,
+                });
             }
-            entities.push((object.factory_name.clone(), manager.to_string()));
         }
         entities
+    }
+
+    pub(super) fn object_uses_enemy_pool(&self, object: &SceneObject) -> bool {
+        let (Some(document), Some(registry)) = (self.document.as_ref(), self.registry.as_ref())
+        else {
+            return false;
+        };
+        let Some(actor) = enemy_actor_definition(registry, &object.factory_name) else {
+            return false;
+        };
+        if !matches!(
+            object.placement,
+            Some(sms_scene::PlacementBinding::Authored(_))
+        ) {
+            return false;
+        }
+        let Some(manager_name) = object.raw_param("manager_name") else {
+            return false;
+        };
+        let managers = enemy_manager_instances(document, registry);
+        managers
+            .get(manager_name)
+            .is_some_and(|manager| manager_factory_matches_actor(actor, &manager.factory_name))
+    }
+
+    pub(super) fn object_uses_stu_stain_model(&self, object: &SceneObject) -> bool {
+        let (Some(document), Some(registry)) = (self.document.as_ref(), self.registry.as_ref())
+        else {
+            return false;
+        };
+        let Some(actor) = enemy_actor_definition(registry, &object.factory_name) else {
+            return false;
+        };
+        let Some(manager_name) = object.raw_param("manager_name") else {
+            return false;
+        };
+        let managers = enemy_manager_instances(document, registry);
+        let Some(manager_instance) = managers.get(manager_name) else {
+            return false;
+        };
+        let Some(manager) = enemy_manager_definition(registry, &manager_instance.factory_name)
+        else {
+            return false;
+        };
+        manager_factory_matches_actor(actor, &manager.factory_name)
+            && manager.spawned_actor_class.as_deref() == Some(actor.class_name.as_str())
+            && actor_uses_stu_stain(registry, actor)
+            && self.stu_stain_available()
     }
 
     /// Whether the effective enemy table flags `manager` for goop spawning.
@@ -313,6 +527,21 @@ impl SmsEditorApp {
     }
 
     fn apply_manager_spawn(&mut self, manager: &str, enabled: bool) -> Result<(), String> {
+        if enabled {
+            let registry = self
+                .registry
+                .as_ref()
+                .ok_or_else(|| "enemy schema is unavailable".to_string())?;
+            let document = self
+                .document
+                .as_ref()
+                .ok_or_else(|| "no stage is open".to_string())?;
+            if !enemy_manager_instances(document, registry).contains_key(manager) {
+                return Err(format!(
+                    "{manager:?} is not a decomp-identified TEnemyManager in the effective scene"
+                ));
+            }
+        }
         let document = self
             .document
             .as_mut()
@@ -395,7 +624,24 @@ impl SmsEditorApp {
             let StageResourceDocument::Model(model) = &mut edit.document else {
                 continue;
             };
-            let replaced = match model.replace_named_texture_from_bti(DUMMY_TEXTURE, &stain) {
+            if !model.has_named_texture(DUMMY_TEXTURE)
+                || !model.can_pin_material_konst_alpha_half(STAIN_MATERIAL)
+            {
+                continue;
+            }
+            let mut baked = model.clone();
+            let pinned = match baked.pin_material_konst_alpha_half(STAIN_MATERIAL) {
+                Ok(count) if count > 0 => count,
+                Ok(_) => continue,
+                Err(error) => {
+                    self.log.push(format!(
+                        "Could not pin the stain blend in {}: {error}",
+                        String::from_utf8_lossy(&edit.raw_resource_path)
+                    ));
+                    continue;
+                }
+            };
+            let replaced = match baked.replace_named_texture_from_bti(DUMMY_TEXTURE, &stain) {
                 Ok(count) => count,
                 Err(error) => {
                     self.log.push(format!(
@@ -408,15 +654,12 @@ impl SmsEditorApp {
             if replaced == 0 {
                 continue;
             }
-            match model.pin_material_konst_alpha_half(STAIN_MATERIAL) {
-                Ok(_) => baked_models += 1,
-                Err(error) => {
-                    self.log.push(format!(
-                        "Could not pin the stain blend in {}: {error}",
-                        String::from_utf8_lossy(&edit.raw_resource_path)
-                    ));
-                }
-            }
+            *model = baked;
+            baked_models += 1;
+            self.log.push(format!(
+                "Pinned {pinned} active stain selector(s) in {}.",
+                String::from_utf8_lossy(&edit.raw_resource_path)
+            ));
         }
 
         if baked_models == 0 {
@@ -460,35 +703,34 @@ impl SmsEditorApp {
         ));
     }
 
-    /// Whether any copied model in the stage carries the baked stain.
-    ///
-    /// Detection is exact: the pristine Stu material has no 0x04 selector, so
-    /// one appearing means the bake ran.
-    pub(super) fn stu_stain_baked(&self) -> bool {
-        const KONST_PINNED: u8 = 0x01;
+    pub(super) fn stu_stain_available(&self) -> bool {
+        const DUMMY_TEXTURE: &str = "H_ma_rak_dummy";
+        const STAIN_MATERIAL: &str = "_mat_body_top1";
         let Some(document) = self.document.as_ref() else {
             return false;
         };
         document.archive_edits.resources.iter().any(|edit| {
-            let StageResourceDocument::Model(model) = &edit.document else {
-                return false;
-            };
-            model.sections.iter().any(|section| {
-                let sms_formats::J3dRebuildSectionData::Materials(materials) = &section.data else {
-                    return false;
-                };
-                let Some(names) = &materials.names else {
-                    return false;
-                };
-                names
-                    .entries
-                    .iter()
-                    .any(|entry| entry.name == "_mat_body_top1")
-                    && materials.material_init_records.iter().any(|record| {
-                        record.tev_konst_alpha_selectors.contains(&KONST_PINNED)
-                            || record.tev_konst_color_selectors.contains(&KONST_PINNED)
-                    })
-            })
+            matches!(
+                &edit.document,
+                StageResourceDocument::Model(model)
+                    if model.has_named_texture(DUMMY_TEXTURE)
+                        && model.can_pin_material_konst_alpha_half(STAIN_MATERIAL)
+            )
+        })
+    }
+
+    /// Whether any copied Stu model carries the baked stain.
+    pub(super) fn stu_stain_baked(&self) -> bool {
+        const STAIN_MATERIAL: &str = "_mat_body_top1";
+        let Some(document) = self.document.as_ref() else {
+            return false;
+        };
+        document.archive_edits.resources.iter().any(|edit| {
+            matches!(
+                &edit.document,
+                StageResourceDocument::Model(model)
+                    if model.material_konst_alpha_half_is_pinned(STAIN_MATERIAL)
+            )
         })
     }
 
@@ -557,23 +799,39 @@ impl SmsEditorApp {
         let entities = self.goop_spawnable_entities();
         if entities.is_empty() {
             ui.label(
-                "Place an enemy from the content browser first; whatever is in the scene can \
-                 be flagged to emerge from painted goop. Goobles are NameKuri.",
+                "Place an enemy from the content browser first; its decomp-identified enemy \
+                 manager can be flagged to emerge from painted goop. Goobles are NameKuri.",
             );
             return;
         }
-        for (factory, manager) in entities {
-            let mut enabled = self.manager_spawns_from_goop(&manager);
+        for entity in entities {
+            let mut enabled = self.manager_spawns_from_goop(&entity.manager_name);
             if ui
-                .checkbox(&mut enabled, format!("{factory} \u{2014} {manager}"))
-                .on_hover_text(
-                    "Writes the retail enemy table: the conductor periodically picks a spot \
-                     near Mario and, if that spot is goop, relocates one of this manager's \
-                     enemies there.",
+                .checkbox(
+                    &mut enabled,
+                    format!(
+                        "{} \u{2014} {}{}",
+                        entity.display_name,
+                        entity.manager_name,
+                        if entity.manager_present {
+                            ""
+                        } else {
+                            " (remove stale flag)"
+                        }
+                    ),
                 )
+                .on_hover_text(if entity.manager_present {
+                    "Writes the retail enemy table: the conductor periodically picks a spot \
+                         near Mario and, if that spot is goop, relocates one of this manager's \
+                         enemies there."
+                } else {
+                    "This flagged table entry no longer has a TEnemyManager in map/scene.bin. \
+                         Uncheck it; export also clears stale entries defensively."
+                })
                 .changed()
+                && (entity.manager_present || !enabled)
             {
-                self.set_manager_spawns_from_goop(&manager, enabled);
+                self.set_manager_spawns_from_goop(&entity.manager_name, enabled);
             }
         }
     }
@@ -582,6 +840,108 @@ impl SmsEditorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn enemy_registry() -> ObjectRegistry {
+        ObjectRegistry {
+            enemy_managers: vec![sms_schema::EnemyManagerDefinition {
+                factory_name: "NameKuriManager".to_string(),
+                class_name: "TNameKuriManager".to_string(),
+                model_index: None,
+                spawned_actor_class: Some("TNameKuri".to_string()),
+                parameter_path: None,
+                models: Vec::new(),
+            }],
+            enemy_actors: vec![sms_schema::EnemyActorDefinition {
+                factory_name: "NameKuri".to_string(),
+                class_name: "TNameKuri".to_string(),
+                model_index: None,
+                fallback_models: Vec::new(),
+                primary_model: None,
+                named_models: Vec::new(),
+                indexed_models: Vec::new(),
+                manager_factories: vec!["NameKuriManager".to_string()],
+                runtime_uniform_scale: None,
+            }],
+            ..ObjectRegistry::default()
+        }
+    }
+
+    fn manager_record(factory: &str, name: &str) -> sms_formats::JDramaRecord {
+        sms_formats::JDramaRecord::new(
+            factory,
+            name,
+            sms_formats::JDramaRecordPayload::Fields { fields: Vec::new() },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn manager_census_includes_manager_only_enemies_and_excludes_live_managers() {
+        let registry = enemy_registry();
+        let root = sms_formats::JDramaRecord::new(
+            "NameRefGrp",
+            "root",
+            sms_formats::JDramaRecordPayload::Group {
+                fields: Vec::new(),
+                children: vec![
+                    manager_record("NameKuriManager", GOOBLE_MANAGER_NAME),
+                    manager_record("BoardNpcManager", "board manager"),
+                ],
+            },
+        )
+        .unwrap();
+        let mut managers = BTreeMap::new();
+        collect_enemy_manager_records(&root, &registry, &mut managers);
+
+        assert_eq!(managers.len(), 1);
+        assert_eq!(
+            managers.get(GOOBLE_MANAGER_NAME),
+            Some(&EnemyManagerInstance {
+                factory_name: "NameKuriManager".to_string(),
+                display_name: "NameKuri".to_string(),
+            })
+        );
+        assert!(!managers.contains_key("board manager"));
+    }
+
+    #[test]
+    fn stu_stain_identification_excludes_other_users_of_the_dummy_texture() {
+        fn actor(factory_name: &str, class_name: &str) -> sms_schema::EnemyActorDefinition {
+            sms_schema::EnemyActorDefinition {
+                factory_name: factory_name.to_string(),
+                class_name: class_name.to_string(),
+                model_index: None,
+                fallback_models: Vec::new(),
+                primary_model: None,
+                named_models: Vec::new(),
+                indexed_models: Vec::new(),
+                manager_factories: Vec::new(),
+                runtime_uniform_scale: None,
+            }
+        }
+        fn replacement(
+            factory_name: &str,
+            source_file: &str,
+        ) -> sms_schema::RuntimeTextureReplacementDefinition {
+            sms_schema::RuntimeTextureReplacementDefinition {
+                factory_name: factory_name.to_string(),
+                dummy_texture_name: "H_ma_rak_dummy".to_string(),
+                resource_path: "/scene/map/pollution/H_ma_rak.bti".to_string(),
+                source_file: source_file.to_string(),
+            }
+        }
+
+        let stu = actor("HamuKuri", "THamuKuri");
+        let boss = actor("BossGesso", "TBossGesso");
+        let mut registry = enemy_registry();
+        registry.runtime_texture_replacements = vec![
+            replacement("HamuKuri", "src/Enemy/hamukuri.cpp"),
+            replacement("BossGesso", "src/Enemy/bossgesso.cpp"),
+        ];
+
+        assert!(actor_uses_stu_stain(&registry, &stu));
+        assert!(!actor_uses_stu_stain(&registry, &boss));
+    }
 
     /// A fresh stage gains a table whose only entry is the flagged Gooble one,
     /// and disabling clears the bit without deleting anything.

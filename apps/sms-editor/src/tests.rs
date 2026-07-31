@@ -5703,8 +5703,8 @@ fn probe_stain_bake() {
     };
     assert_eq!(repinned, 0, "a second pin must find nothing left to pin");
 
-    // The toggle's off state: unpinning must restore the pristine selectors
-    // exactly, since the retail material carries no 0x04 of its own.
+    // The toggle's off state: unpinning must restore both pristine selector
+    // arrays exactly, including unrelated half selectors in inactive stages.
     let mut unbaked = reparsed.clone();
     let unpinned = unbaked
         .pin_material_konst_alpha_half("_mat_body_top1")
@@ -5731,6 +5731,10 @@ fn probe_stain_bake() {
             assert_eq!(
                 record.tev_konst_alpha_selectors,
                 reference_record.tev_konst_alpha_selectors
+            );
+            assert_eq!(
+                record.tev_konst_color_selectors,
+                reference_record.tev_konst_color_selectors
             );
         }
     }
