@@ -460,6 +460,96 @@ impl SmsEditorApp {
         ));
     }
 
+    /// Whether any copied model in the stage carries the baked stain.
+    ///
+    /// Detection is exact: the pristine Stu material has no 0x04 selector, so
+    /// one appearing means the bake ran.
+    pub(super) fn stu_stain_baked(&self) -> bool {
+        const KASEL_HALF: u8 = 0x04;
+        let Some(document) = self.document.as_ref() else {
+            return false;
+        };
+        document.archive_edits.resources.iter().any(|edit| {
+            let StageResourceDocument::Model(model) = &edit.document else {
+                return false;
+            };
+            model.sections.iter().any(|section| {
+                let sms_formats::J3dRebuildSectionData::Materials(materials) = &section.data else {
+                    return false;
+                };
+                let Some(names) = &materials.names else {
+                    return false;
+                };
+                names
+                    .entries
+                    .iter()
+                    .any(|entry| entry.name == "_mat_body_top1")
+                    && materials
+                        .material_init_records
+                        .iter()
+                        .any(|record| record.tev_konst_alpha_selectors.contains(&KASEL_HALF))
+            })
+        })
+    }
+
+    /// Removes the baked stain, returning the blend to the runtime register.
+    pub(super) fn unbake_stu_stain(&mut self) {
+        const STAIN_MATERIAL: &str = "_mat_body_top1";
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let before = document.archive_edits.clone();
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let mut unbaked = 0usize;
+        for edit in &mut document.archive_edits.resources {
+            let StageResourceDocument::Model(model) = &mut edit.document else {
+                continue;
+            };
+            match model.unpin_material_konst_alpha_half(STAIN_MATERIAL) {
+                Ok(count) if count > 0 => unbaked += 1,
+                Ok(_) => {}
+                Err(error) => self.log.push(format!(
+                    "Could not remove the stain from {}: {error}",
+                    String::from_utf8_lossy(&edit.raw_resource_path)
+                )),
+            }
+        }
+        if unbaked == 0 {
+            return;
+        }
+        let (record, dirty) = {
+            let Some(document) = self.document.as_ref() else {
+                return;
+            };
+            (
+                ObjectUndoRecord::between(
+                    &document.objects,
+                    &document.objects,
+                    &before,
+                    &document.archive_edits,
+                ),
+                stage_document_differs_from_saved(
+                    document,
+                    &self.saved_objects,
+                    &self.saved_lighting,
+                    &self.saved_death_barrier,
+                    &self.saved_archive_edits,
+                    &self.saved_dialogue_authoring,
+                    &self.saved_dialogue_library,
+                ),
+            )
+        };
+        if !record.is_empty() {
+            self.push_undo_record(record);
+        }
+        self.document_dirty = dirty;
+        self.flush_document_change();
+        self.log
+            .push(format!("Removed the baked stain from {unbaked} model(s)."));
+    }
+
     /// The Spawning section of the goop inspector.
     pub(super) fn gooble_spawn_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();

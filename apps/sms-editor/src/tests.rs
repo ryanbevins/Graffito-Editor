@@ -5664,6 +5664,24 @@ fn probe_stain_bake() {
     let mut model = sms_formats::J3dRebuildDocument::parse(&model_bytes).expect("parse model");
     let stain = sms_formats::BtiFile::parse(&stain_bytes).expect("parse stain");
 
+    for section in &model.sections {
+        let sms_formats::J3dRebuildSectionData::Materials(materials) = &section.data else {
+            continue;
+        };
+        if let Some(names) = &materials.names {
+            for (index, entry) in names.entries.iter().enumerate() {
+                if entry.name == "_mat_body_top1" {
+                    println!("material index {index}");
+                }
+            }
+        }
+        for (index, record) in materials.material_init_records.iter().enumerate() {
+            println!(
+                "record {index}: alpha selectors {:?}",
+                record.tev_konst_alpha_selectors
+            );
+        }
+    }
     let replaced = model
         .replace_named_texture_from_bti("H_ma_rak_dummy", &stain)
         .expect("replace texture");
@@ -5685,4 +5703,36 @@ fn probe_stain_bake() {
             .expect("pin twice")
     };
     assert_eq!(repinned, 0, "a second pin must find nothing left to pin");
+
+    // The toggle's off state: unpinning must restore the pristine selectors
+    // exactly, since the retail material carries no 0x04 of its own.
+    let mut unbaked = reparsed.clone();
+    let unpinned = unbaked
+        .pin_material_konst_alpha_half("_mat_body_top1")
+        .map(|_| 0usize)
+        .unwrap_or(0)
+        + unbaked
+            .unpin_material_konst_alpha_half("_mat_body_top1")
+            .expect("unpin");
+    assert_eq!(unpinned, pinned, "unpin must reverse exactly what pin did");
+    let pristine = sms_formats::J3dRebuildDocument::parse(&model_bytes).expect("pristine");
+    for (section, original) in unbaked.sections.iter().zip(pristine.sections.iter()) {
+        let (
+            sms_formats::J3dRebuildSectionData::Materials(edited),
+            sms_formats::J3dRebuildSectionData::Materials(reference),
+        ) = (&section.data, &original.data)
+        else {
+            continue;
+        };
+        for (record, reference_record) in edited
+            .material_init_records
+            .iter()
+            .zip(reference.material_init_records.iter())
+        {
+            assert_eq!(
+                record.tev_konst_alpha_selectors,
+                reference_record.tev_konst_alpha_selectors
+            );
+        }
+    }
 }
