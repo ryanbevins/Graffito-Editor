@@ -215,3 +215,41 @@ the base archive, a file it never reads is probably passed through untouched, so
 nothing is being lost today. Confirm before changing the loader, because once
 `tables.bin` is loaded it becomes the editor's responsibility to write it back
 correctly.
+
+## The Stu goop-stain investigation (hat on head)
+
+Symptom: editor preview shows the goop stain on HamuKuri's cap; the user's
+custom stage shows clean caps at runtime.
+
+Mechanism, from the decomp: `THamuKuri::setMActorAndKeeper` binds a KColor to
+`_mat_body_top1` with alpha 0x80, loads `/scene/map/pollution/H_ma_rak.bti`,
+swaps it over `H_ma_rak_dummy`, and clears the alpha to 0 only when the file is
+missing. The launcher sets no special state -- it pulls `getFarOutEnemy()` from
+the same pool -- so "only launcher Stus have the stain" is a retail data
+correlation, not a mechanism: launcher stages (bianco, pinna) ship the texture,
+placed-Stu stages (dolpic episodes, corona, monte cave) do not.
+
+Verified, in order, all healthy in the user's stage:
+
+- texture present in every export, including the live project's
+- `hamukuri/default.bmd` byte-identical across all 12 retail stages (fnv
+  4bd49281056942c5), killing the wrong-variant-model theory
+- RARC file flags 0x11 (MRAM preload), root named `scene` (test-asserted)
+- pool enemies run `setMActorAndKeeper` via `TEnemyManager::createEnemies`
+  -> `enemy->init(this)`
+- the runtime directory walk reaches `map/pollution/`: goop models load from
+  that directory via `initJointModel("scene/map/pollution", ...)` and the
+  user's painted goop renders in Dolphin
+
+Open lead: `H_ma_rak.bti` is NOT one texture. At least two variants exist
+(ricco/mare fnv 116993acef3ab783, bianco fnv 345ba4fc9f798e55). The shared
+borrow picks the first source in sort order rather than a canonical variant, so
+the user's stage likely carries airport's stain, which may read as no stain.
+Next step: eyeball the cap up close in Dolphin; if a faint or off-colour
+overlay exists, pin the borrow to bianco's variant. If the cap is truly clean,
+every static suspect is exhausted and it needs a breakpoint on JKRGetResource.
+
+The census fixes that came out of this chase, both committed: native-stage
+resolution is preferred over borrowing, and manager model references are
+qualified by the candidate's own character folders, which newly resolves
+HamukuriLauncher.
