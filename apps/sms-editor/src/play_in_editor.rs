@@ -567,22 +567,28 @@ mod tests {
     use super::*;
 
     #[cfg(windows)]
+    const DROP_TEST_HELPER: &str = "SMS_EDITOR_DROP_TEST_HELPER";
+
+    #[cfg(windows)]
     #[test]
     fn dropping_session_terminates_the_owned_process() {
         let temp = tempfile::tempdir().expect("create Play in Editor drop-test directory");
         let started = temp.path().join("started");
         let survived = temp.path().join("survived");
-        let child = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "[IO.File]::WriteAllText($env:SMS_EDITOR_DROP_TEST_STARTED, 'started'); Start-Sleep -Seconds 5; [IO.File]::WriteAllText($env:SMS_EDITOR_DROP_TEST_SURVIVED, 'survived')",
-            ])
-            .env("SMS_EDITOR_DROP_TEST_STARTED", &started)
-            .env("SMS_EDITOR_DROP_TEST_SURVIVED", &survived)
-            .spawn()
-            .expect("launch disposable child process");
+        let child = std::process::Command::new(
+            std::env::current_exe().expect("locate the Play in Editor test executable"),
+        )
+        .args([
+            "--ignored",
+            "--exact",
+            "play_in_editor::tests::drop_test_child_process",
+            "--nocapture",
+        ])
+        .env(DROP_TEST_HELPER, "1")
+        .env("SMS_EDITOR_DROP_TEST_STARTED", &started)
+        .env("SMS_EDITOR_DROP_TEST_SURVIVED", &survived)
+        .spawn()
+        .expect("launch disposable child process");
         let session = EmbeddedDolphinSession::new(child, EditorHostWindow(0));
 
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -596,6 +602,22 @@ mod tests {
             !survived.exists(),
             "dropping the session left its child process running"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "spawned only by the EmbeddedDolphinSession drop test"]
+    fn drop_test_child_process() {
+        if std::env::var(DROP_TEST_HELPER).as_deref() != Ok("1") {
+            return;
+        }
+        let started = std::env::var_os("SMS_EDITOR_DROP_TEST_STARTED")
+            .expect("drop-test startup marker path");
+        let survived = std::env::var_os("SMS_EDITOR_DROP_TEST_SURVIVED")
+            .expect("drop-test survival marker path");
+        std::fs::write(started, b"started").expect("write drop-test startup marker");
+        std::thread::sleep(Duration::from_secs(5));
+        std::fs::write(survived, b"survived").expect("write drop-test survival marker");
     }
 
     #[test]
