@@ -1682,6 +1682,23 @@ impl SmsEditorApp {
             }
 
             if let Some(sms_scene::PlacementBinding::Authored(placement)) = &object.placement {
+                if crate::preview_assets::actor_runtime_texture_replacements(
+                    &object.factory_name,
+                    self.registry.as_ref(),
+                )
+                .iter()
+                .any(|(dummy, _)| dummy == "H_ma_rak_dummy")
+                    && ui
+                        .button("Bake goop stain into model")
+                        .on_hover_text(
+                            "Writes the stain texture into the Stu model and pins its blend, so \
+                             it shows regardless of what the runtime decides. Applies to every \
+                             Stu using this model in the stage. Ctrl+Z reverses it.",
+                        )
+                        .clicked()
+                {
+                    self.bake_stu_stain();
+                }
                 if object.raw_param("manager_name").is_some() {
                     ui.separator();
                     let mut pool_only = placement.pool_only;

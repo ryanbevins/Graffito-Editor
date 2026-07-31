@@ -611,6 +611,58 @@ impl J3dRebuildDocument {
         Ok(())
     }
 
+    /// Pins a material's konst-alpha inputs to the constant one-half.
+    ///
+    /// `GX_TEV_KASEL_K0_A` (0x1C) reads register KCOLOR0, which Sunshine
+    /// rewrites per frame for runtime-driven effects like the Stu's goop
+    /// stain; whatever the file says is overridden at run time. Selector 0x04
+    /// is the constant 1/2 -- numerically the 0x80 the runtime writes when it
+    /// wants the effect shown -- and being a constant, no register write can
+    /// take it away. Returns how many TEV stages were pinned.
+    pub fn pin_material_konst_alpha_half(&mut self, material_name: &str) -> Result<usize> {
+        const KASEL_K0_A: u8 = 0x1C;
+        const KASEL_HALF: u8 = 0x04;
+        let mut pinned = 0usize;
+        for section in &mut self.sections {
+            let J3dRebuildSectionData::Materials(materials) = &mut section.data else {
+                continue;
+            };
+            let Some(names) = &materials.names else {
+                continue;
+            };
+            let Some(name_index) = names
+                .entries
+                .iter()
+                .position(|entry| entry.name == material_name)
+            else {
+                continue;
+            };
+            // The name table indexes materials; the remap table carries each
+            // material's init-record index.
+            let record_index = materials
+                .tables
+                .iter()
+                .find(|table| table.kind == J3dMaterialTableKind::MaterialRemap)
+                .and_then(|table| match &table.allocation {
+                    J3dScalarArray::Unsigned16(values) => {
+                        values.get(name_index).map(|value| *value as usize)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(name_index);
+            let Some(record) = materials.material_init_records.get_mut(record_index) else {
+                continue;
+            };
+            for selector in &mut record.tev_konst_alpha_selectors {
+                if *selector == KASEL_K0_A {
+                    *selector = KASEL_HALF;
+                    pinned += 1;
+                }
+            }
+        }
+        Ok(pinned)
+    }
+
     /// Replaces every TEX1 texture with the requested name using a detached
     /// BTI and grows the texture section when the imported dummy allocation is
     /// smaller than the runtime texture. The name table is retained so the

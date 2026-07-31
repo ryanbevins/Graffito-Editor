@@ -351,6 +351,115 @@ impl SmsEditorApp {
         Ok(())
     }
 
+    /// Bakes the goop stain into every copied model that carries the stain's
+    /// dummy texture slot.
+    ///
+    /// The runtime decides the stain per frame -- the JP source keys it on a
+    /// texture lookup, and the US build observably applies a further condition
+    /// the decomp does not show -- so a custom stage cannot rely on it. Baking
+    /// writes the stain texture into the model's `H_ma_rak_dummy` slot and
+    /// pins the blend to a constant one-half, which is the same 0x80 the
+    /// runtime uses when it shows the effect. After that there is nothing left
+    /// for the runtime to decide. Undo reverses it.
+    pub(super) fn bake_stu_stain(&mut self) {
+        const DUMMY_TEXTURE: &str = "H_ma_rak_dummy";
+        const STAIN_PATH: &[u8] = b"map/pollution/H_ma_rak.bti";
+        const STAIN_MATERIAL: &str = "_mat_body_top1";
+
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let before = document.archive_edits.clone();
+        let stain = match document.effective_resource_clone(STAIN_PATH) {
+            Ok(Some(StageResourceDocument::Texture(stain))) => stain,
+            Ok(_) => {
+                self.log.push(
+                    "The stage has no map/pollution/H_ma_rak.bti to bake; place a Stu first so \
+                     its resources are copied."
+                        .to_string(),
+                );
+                return;
+            }
+            Err(error) => {
+                self.log
+                    .push(format!("Could not read the stain texture: {error}"));
+                return;
+            }
+        };
+
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let mut baked_models = 0usize;
+        for edit in &mut document.archive_edits.resources {
+            let StageResourceDocument::Model(model) = &mut edit.document else {
+                continue;
+            };
+            let replaced = match model.replace_named_texture_from_bti(DUMMY_TEXTURE, &stain) {
+                Ok(count) => count,
+                Err(error) => {
+                    self.log.push(format!(
+                        "Could not bake the stain into {}: {error}",
+                        String::from_utf8_lossy(&edit.raw_resource_path)
+                    ));
+                    continue;
+                }
+            };
+            if replaced == 0 {
+                continue;
+            }
+            match model.pin_material_konst_alpha_half(STAIN_MATERIAL) {
+                Ok(_) => baked_models += 1,
+                Err(error) => {
+                    self.log.push(format!(
+                        "Could not pin the stain blend in {}: {error}",
+                        String::from_utf8_lossy(&edit.raw_resource_path)
+                    ));
+                }
+            }
+        }
+
+        if baked_models == 0 {
+            self.log.push(
+                "No copied model carries the stain slot; place a Stu from the content browser \
+                 first."
+                    .to_string(),
+            );
+            return;
+        }
+
+        let (record, dirty) = {
+            let Some(document) = self.document.as_ref() else {
+                return;
+            };
+            (
+                ObjectUndoRecord::between(
+                    &document.objects,
+                    &document.objects,
+                    &before,
+                    &document.archive_edits,
+                ),
+                stage_document_differs_from_saved(
+                    document,
+                    &self.saved_objects,
+                    &self.saved_lighting,
+                    &self.saved_death_barrier,
+                    &self.saved_archive_edits,
+                    &self.saved_dialogue_authoring,
+                    &self.saved_dialogue_library,
+                ),
+            )
+        };
+        if !record.is_empty() {
+            self.push_undo_record(record);
+        }
+        self.document_dirty = dirty;
+        self.flush_document_change();
+        self.log.push(format!(
+            "Baked the goop stain into {baked_models} model(s); Ctrl+Z reverses it."
+        ));
+    }
+
     /// The Spawning section of the goop inspector.
     pub(super) fn gooble_spawn_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
