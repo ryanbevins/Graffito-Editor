@@ -1314,6 +1314,13 @@ fn required_goop_manager_runtime_patches(
     }) {
         patches.insert(RuntimeGoopManagerPatch::MameGessoRelocatableReset);
     }
+    if flagged.iter().any(|manager_name| {
+        managers
+            .get(manager_name)
+            .is_some_and(|factory| factory == "TelesaManager")
+    }) {
+        patches.insert(RuntimeGoopManagerPatch::TelesaVisibleReset);
+    }
     if document.objects.iter().any(|object| {
         let Some(sms_scene::PlacementBinding::Authored(placement)) = &object.placement else {
             return false;
@@ -3329,6 +3336,81 @@ mod tests {
             )
             .unwrap(),
         }
+    }
+
+    #[test]
+    fn active_telesa_pollution_pool_requires_visible_reset_patch() {
+        let manager_name = "テレサマネージャー";
+        let mut archive = SourceFreeStageArchive::new_for_blank("fixture", 1).unwrap();
+        archive
+            .insert_resource(
+                b"map/scene.bin".to_vec(),
+                StageResourceDocument::Placement(placement_document(vec![JDramaRecord::new(
+                    "TelesaManager",
+                    manager_name,
+                    JDramaRecordPayload::Fields { fields: Vec::new() },
+                )
+                .unwrap()])),
+            )
+            .unwrap();
+        archive
+            .insert_resource(
+                b"map/tables.bin".to_vec(),
+                StageResourceDocument::Placement(placement_document(vec![JDramaRecord::new(
+                    "StageEnemyInfo",
+                    "Telesa pollution pool",
+                    JDramaRecordPayload::Fields {
+                        fields: vec![
+                            sms_formats::JDramaField {
+                                name: "manager_name".to_string(),
+                                value: JDramaFieldValue::String(manager_name.to_string()),
+                            },
+                            sms_formats::JDramaField {
+                                name: "flags".to_string(),
+                                value: JDramaFieldValue::I32(1),
+                            },
+                        ],
+                    },
+                )
+                .unwrap()])),
+            )
+            .unwrap();
+        let registry = ObjectRegistry {
+            enemy_managers: vec![sms_schema::EnemyManagerDefinition {
+                factory_name: "TelesaManager".to_string(),
+                class_name: "TTelesaManager".to_string(),
+                model_index: None,
+                spawned_actor_class: Some("TTelesa".to_string()),
+                parameter_path: Some("/enemy/telesa.prm".to_string()),
+                models: Vec::new(),
+            }],
+            ..ObjectRegistry::default()
+        };
+        let document = StageDocument {
+            stage_id: "fixture".to_string(),
+            base_root: PathBuf::new(),
+            assets: Vec::new(),
+            objects: Vec::new(),
+            changed_files: BTreeMap::new(),
+            stage_archive: Some(archive),
+            stage_archive_source_path: None,
+            archive_edits: StageArchiveEdits::default(),
+            registry: Some(registry.clone()),
+            route_authoring: None,
+            goop_authoring: None,
+            dialogue_authoring: None,
+            dialogue_library: Default::default(),
+            load_issues: Vec::new(),
+            lighting: Default::default(),
+            death_barrier: None,
+            actor_previews: BTreeMap::new(),
+            loaded_project: None,
+        };
+
+        assert_eq!(
+            required_goop_manager_runtime_patches(&document, &registry).unwrap(),
+            BTreeSet::from([RuntimeGoopManagerPatch::TelesaVisibleReset])
+        );
     }
 
     fn runtime_stage_table_for_contexts(contexts: &[(usize, usize, &str)]) -> Vec<u8> {

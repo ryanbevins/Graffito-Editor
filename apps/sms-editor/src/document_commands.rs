@@ -1656,6 +1656,20 @@ struct PreparedCatalogEnemyManagerPool {
     upgraded_bootstrap_proxies: usize,
 }
 
+fn manager_constructs_actor_or_managed_variant(
+    manager: &sms_schema::EnemyManagerDefinition,
+    actor: &sms_schema::EnemyActorDefinition,
+) -> bool {
+    if manager.spawned_actor_class.as_deref() == Some(actor.class_name.as_str()) {
+        return true;
+    }
+
+    semantic_record_type(&manager.factory_name) == "PoiHanaManager"
+        && semantic_record_type(&actor.factory_name) == "PoiHanaRed"
+        && manager.spawned_actor_class.as_deref() == Some("TPoiHana")
+        && actor.class_name == "TPoiHanaRed"
+}
+
 fn prepare_catalog_enemy_manager_pool(
     document: &StageDocument,
     registry: &ObjectRegistry,
@@ -1686,7 +1700,7 @@ fn prepare_catalog_enemy_manager_pool(
             "enemy actor '{actor_factory}' is not compatible with manager '{manager_factory}'"
         ));
     }
-    if manager.spawned_actor_class.as_deref() != Some(actor.class_name.as_str()) {
+    if !manager_constructs_actor_or_managed_variant(manager, actor) {
         return Err(format!(
             "manager '{manager_factory}' creates {}, not {}",
             manager
@@ -6194,13 +6208,13 @@ mod tests {
     }
 
     #[test]
-    fn catalog_manager_pool_adds_no_world_actor_and_is_one_undo_record() {
-        let manager_name = "fixture manager";
+    fn red_poi_hana_manager_pool_uses_managed_subclass_factory_and_one_undo_record() {
+        let manager_name = "ポイハナマネージャー";
         let template = sms_scene::ObjectAuthoringTemplate {
-            factory_name: "FixtureEnemy".to_string(),
+            factory_name: "PoiHanaRed".to_string(),
             group_index: 4,
             record: JDramaRecord {
-                type_name: "FixtureEnemy".to_string(),
+                type_name: "PoiHanaRed".to_string(),
                 name: "retail fixture".to_string(),
                 payload: JDramaRecordPayload::Actor {
                     transform: sms_formats::JDramaTransform {
@@ -6222,7 +6236,7 @@ mod tests {
                     group_index: 2,
                 },
                 record: JDramaRecord::new(
-                    "FixtureManager",
+                    "PoiHanaManager",
                     manager_name,
                     JDramaRecordPayload::Fields { fields: Vec::new() },
                 )
@@ -6238,24 +6252,25 @@ mod tests {
         };
         let registry = ObjectRegistry {
             enemy_managers: vec![sms_schema::EnemyManagerDefinition {
-                factory_name: "FixtureManager".to_string(),
-                class_name: "TFixtureManager".to_string(),
+                factory_name: "PoiHanaManager".to_string(),
+                class_name: "TPoiHanaManager".to_string(),
                 model_index: None,
-                spawned_actor_class: Some("TFixtureEnemy".to_string()),
+                spawned_actor_class: Some("TPoiHana".to_string()),
                 parameter_path: None,
                 models: Vec::new(),
             }],
             enemy_actors: vec![sms_schema::EnemyActorDefinition {
-                factory_name: "FixtureEnemy".to_string(),
-                class_name: "TFixtureEnemy".to_string(),
+                factory_name: "PoiHanaRed".to_string(),
+                class_name: "TPoiHanaRed".to_string(),
                 model_index: None,
                 fallback_models: Vec::new(),
                 primary_model: None,
                 named_models: Vec::new(),
                 indexed_models: Vec::new(),
-                manager_factories: vec!["FixtureManager".to_string()],
+                manager_factories: vec!["PoiHanaManager".to_string()],
                 runtime_uniform_scale: None,
             }],
+            conditional_enemy_manager_factories: vec!["PoiHanaManager".to_string()],
             ..ObjectRegistry::default()
         };
         let mut document = command_test_document(Vec::new());
@@ -6263,8 +6278,8 @@ mod tests {
             &document,
             &registry,
             &template,
-            "FixtureEnemy",
-            "FixtureManager",
+            "PoiHanaRed",
+            "PoiHanaManager",
             manager_name,
             "fixture0-obj-0001".to_string(),
         )

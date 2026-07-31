@@ -196,6 +196,9 @@ pub(super) enum RuntimeGoopManagerPatch {
     /// Make the PoiHana manager construct the retail red subclass for an
     /// editor-authored red PoiHana pollution pool.
     PoiHanaRedPool,
+    /// `TTelesa::reset` hides a normal Telesa and leaves its fade state
+    /// invisible, so a pollution-spawned pool member never becomes visible.
+    TelesaVisibleReset,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -726,6 +729,119 @@ pub(super) fn patch_sms_goop_enemy_managers_dol(
             &mut bytes,
             constructor_call.file_offset()?,
             encode_branch(constructor_call.address()?, stub_address, true)?,
+        )?;
+    }
+
+    if requested.contains(&RuntimeGoopManagerPatch::TelesaVisibleReset) {
+        let mut candidates = Vec::new();
+        for section in image
+            .sections
+            .iter()
+            .copied()
+            .filter(|section| section.text)
+        {
+            let words = section_words(source, section)?;
+            for word_index in 0..words.len().saturating_sub(10) {
+                let sequence = &words[word_index..word_index + 11];
+                if word_index >= 10
+                    && words[word_index - 10] == 0x7c08_02a6
+                    && words[word_index - 9] == 0x9001_0004
+                    && words[word_index - 8] == 0x9421_ff90
+                    && words[word_index - 7] == 0xdbe1_0068
+                    && words[word_index - 6] == 0x93e1_0064
+                    && words[word_index - 5] == 0x7c7f_1b78
+                    && words[word_index - 4] == 0x93c1_0060
+                    && words[word_index - 3] == 0x93a1_005c
+                    && words[word_index - 2] == 0x9381_0058
+                    && is_relative_bl(words[word_index - 1])
+                    && sequence[0] == 0x801f_00f0
+                    && sequence[1] == 0x6000_0008
+                    && sequence[2] == 0x901f_00f0
+                    && sequence[3] == 0x801f_00f0
+                    && sequence[4] == 0x6000_0002
+                    && sequence[5] == 0x901f_00f0
+                    && sequence[6] == 0x807f_0194
+                    && sequence[7] == 0x3bc3_0458
+                    && sequence[8] == 0xc023_045c
+                    && sequence[9] == 0xc003_0458
+                    && sequence[10] == 0xefe1_0028
+                {
+                    candidates.push(WordAnchor {
+                        section,
+                        word_index: word_index + 4,
+                    });
+                }
+            }
+        }
+        let hidden_flag = require_unique_anchor(candidates, "TTelesa reset hidden-state setup")?;
+        let current_image = parse_dol(&bytes)?;
+        let text_slot = (0..DOL_TEXT_SECTION_COUNT)
+            .rev()
+            .find(|slot| {
+                !current_image
+                    .sections
+                    .iter()
+                    .any(|section| section.text && section.slot == *slot)
+            })
+            .ok_or_else(|| "The DOL has no unused text section for Telesa reset".to_string())?;
+        let file_offset = align_up_usize(bytes.len(), FILE_ALIGNMENT as usize)?;
+        let loaded_end = current_image
+            .sections
+            .iter()
+            .map(|section| section.address_end())
+            .chain(current_image.bss.map(|(_, end)| Ok(end)))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .max()
+            .ok_or_else(|| "The DOL has no loaded sections".to_string())?;
+        let stub_address = align_up_u32(loaded_end, FILE_ALIGNMENT)?;
+        let stub = [
+            0x5400_07fa, // rlwinm r0,r0,0,31,29: clear LIVE_FLAG_HIDDEN
+            encode_d_form(14, 12, 0, 0),
+            encode_d_form(36, 12, 31, 0x1c0), // mFadeLoopTimer = 0
+            encode_d_form(36, 12, 31, 0x1d8), // mFadeTimer = 0
+            encode_d_form(14, 12, 0, 1),
+            encode_d_form(36, 12, 31, 0x1dc), // mFadeState = FADE_STATE_FADE_IN
+            PPC_BLR,
+        ];
+        let payload_size = align_up_usize(stub.len() * 4, FILE_ALIGNMENT as usize)?;
+        let stub_end = stub_address
+            .checked_add(u32::try_from(payload_size).map_err(|_| {
+                "Telesa reset stub size does not fit the DOL address space".to_string()
+            })?)
+            .ok_or_else(|| "Telesa reset stub range overflows u32".to_string())?;
+        let stack_top = find_stack_top(&bytes, &current_image)?;
+        if stub_end
+            .checked_add(MIN_STAGE_MUSIC_STACK_GAP)
+            .is_none_or(|safe_end| safe_end > stack_top)
+        {
+            return Err(format!(
+                "Telesa reset stub 0x{stub_address:08X}..0x{stub_end:08X} is too close to the original stack top 0x{stack_top:08X}"
+            ));
+        }
+        reject_injected_range_overlap(&current_image, stub_address, stub_end)?;
+        bytes.resize(file_offset, 0);
+        for word in stub {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+        bytes.resize(file_offset + payload_size, 0);
+        write_be_u32(
+            &mut bytes,
+            DOL_TEXT_FILE_OFFSETS + text_slot * 4,
+            u32::try_from(file_offset)
+                .map_err(|_| "Telesa reset file offset does not fit u32".to_string())?,
+        )?;
+        write_be_u32(&mut bytes, DOL_TEXT_ADDRESSES + text_slot * 4, stub_address)?;
+        write_be_u32(
+            &mut bytes,
+            DOL_TEXT_SIZES + text_slot * 4,
+            u32::try_from(payload_size)
+                .map_err(|_| "Telesa reset payload size does not fit u32".to_string())?,
+        )?;
+        write_be_u32(
+            &mut bytes,
+            hidden_flag.file_offset()?,
+            encode_branch(hidden_flag.address()?, stub_address, true)?,
         )?;
     }
 
@@ -4238,6 +4354,111 @@ mod tests {
     }
 
     #[test]
+    fn telesa_pollution_pool_reset_clears_hidden_and_starts_fade_in() {
+        let layout = SyntheticLayout {
+            text_address: 0x8000_4000,
+            hook_word: 0x80,
+            movie_word: 0xc0,
+            setter_word: 0xe0,
+        };
+        let mut source = synthetic_dol(layout);
+        write_be_u32(&mut source, DOL_TEXT_SIZES, 0x20).unwrap();
+        write_be_u32(
+            &mut source,
+            SYNTHETIC_ENTRY_OFFSET,
+            encode_branch(0x8000_3100, 0x8000_3108, true).unwrap(),
+        )
+        .unwrap();
+        write_be_u32(
+            &mut source,
+            SYNTHETIC_ENTRY_OFFSET + 8,
+            encode_d_form(15, 1, 0, 0x8040_u16 as i16),
+        )
+        .unwrap();
+        write_be_u32(
+            &mut source,
+            SYNTHETIC_ENTRY_OFFSET + 12,
+            encode_d_form(14, 1, 1, 0),
+        )
+        .unwrap();
+        write_be_u32(&mut source, SYNTHETIC_ENTRY_OFFSET + 16, PPC_BLR).unwrap();
+        let telesa_word = 0x100;
+        let telesa_prologue = [
+            0x7c08_02a6,
+            0x9001_0004,
+            0x9421_ff90,
+            0xdbe1_0068,
+            0x93e1_0064,
+            0x7c7f_1b78,
+            0x93c1_0060,
+            0x93a1_005c,
+            0x9381_0058,
+            0x4800_0001,
+        ];
+        for (index, word) in telesa_prologue.into_iter().enumerate() {
+            write_be_u32(
+                &mut source,
+                SYNTHETIC_TEXT_OFFSET + (telesa_word - 10 + index) * 4,
+                word,
+            )
+            .unwrap();
+        }
+        let telesa_sequence = [
+            0x801f_00f0,
+            0x6000_0008,
+            0x901f_00f0,
+            0x801f_00f0,
+            0x6000_0002,
+            0x901f_00f0,
+            0x807f_0194,
+            0x3bc3_0458,
+            0xc023_045c,
+            0xc003_0458,
+            0xefe1_0028,
+        ];
+        for (index, word) in telesa_sequence.into_iter().enumerate() {
+            write_be_u32(
+                &mut source,
+                SYNTHETIC_TEXT_OFFSET + (telesa_word + index) * 4,
+                word,
+            )
+            .unwrap();
+        }
+
+        let patched = patch_sms_goop_enemy_managers_dol(
+            &source,
+            &BTreeSet::from([RuntimeGoopManagerPatch::TelesaVisibleReset]),
+        )
+        .unwrap();
+        let hook_word = telesa_word + 4;
+        let hook_address = layout.text_address + u32::try_from(hook_word * 4).unwrap();
+        let hook = read_be_u32(&patched, SYNTHETIC_TEXT_OFFSET + hook_word * 4).unwrap();
+        assert!(is_relative_bl(hook));
+        let stub_address = decode_branch_target(hook, hook_address).unwrap();
+        let image = parse_dol(&patched).unwrap();
+        let stub_anchor = address_to_word_anchor(&image, stub_address)
+            .unwrap()
+            .expect("Telesa stub must be in an injected text section");
+        let stub_words = section_words(&patched, stub_anchor.section).unwrap();
+        assert_eq!(
+            &stub_words[stub_anchor.word_index..stub_anchor.word_index + 7],
+            &[
+                0x5400_07fa,
+                encode_d_form(14, 12, 0, 0),
+                encode_d_form(36, 12, 31, 0x1c0),
+                encode_d_form(36, 12, 31, 0x1d8),
+                encode_d_form(14, 12, 0, 1),
+                encode_d_form(36, 12, 31, 0x1dc),
+                PPC_BLR,
+            ]
+        );
+        assert_eq!(
+            read_be_u32(&patched, SYNTHETIC_TEXT_OFFSET + (telesa_word + 5) * 4).unwrap(),
+            0x901f_00f0
+        );
+    }
+
+    #[test]
     #[ignore = "requires SMS_BASE_ROOT with an extracted JP or US retail game"]
     fn local_retail_goop_manager_patches_are_semantically_located() {
         let path = PathBuf::from(std::env::var_os("SMS_BASE_ROOT").expect("SMS_BASE_ROOT"))
@@ -4248,6 +4469,7 @@ mod tests {
             RuntimeGoopManagerPatch::HinoKuri2Pool,
             RuntimeGoopManagerPatch::MameGessoRelocatableReset,
             RuntimeGoopManagerPatch::PoiHanaRedPool,
+            RuntimeGoopManagerPatch::TelesaVisibleReset,
         ]);
         let patched = patch_sms_goop_enemy_managers_dol(&source, &requested).unwrap();
         assert_ne!(patched, source);
@@ -5282,6 +5504,7 @@ mod tests {
             &BTreeSet::from([
                 RuntimeGoopManagerPatch::PoiHanaAnyArea,
                 RuntimeGoopManagerPatch::PoiHanaRedPool,
+                RuntimeGoopManagerPatch::TelesaVisibleReset,
             ]),
         )
         .unwrap_or_else(|error| panic!("composed goop manager patches: {error}"));
