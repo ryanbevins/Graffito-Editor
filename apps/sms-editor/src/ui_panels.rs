@@ -1681,6 +1681,58 @@ impl SmsEditorApp {
                 }
             }
 
+            // A placed actor can be bound to a goop layer so it wears the goop
+            // it stands in. Offered whenever the stage has styled layers and
+            // the actor carries a manager to rebind.
+            if object.raw_param("manager_name").is_some() {
+                let choices = self.goop_layer_choices();
+                if !choices.is_empty() {
+                    ui.separator();
+                    let current = Self::selected_actor_goop_layer(&object);
+                    let selected_text = match current {
+                        Some(index) => choices
+                            .iter()
+                            .find(|(item, _)| *item == index)
+                            .map(|(index, name)| format!("{index:02} {name}"))
+                            .unwrap_or_else(|| format!("{index:02}")),
+                        None => "Stage default".to_string(),
+                    };
+                    let mut picked: Option<Option<usize>> = None;
+                    egui::ComboBox::from_label("Goop texture")
+                        .selected_text(selected_text)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(current.is_none(), "Stage default")
+                                .clicked()
+                            {
+                                picked = Some(None);
+                            }
+                            for (index, name) in &choices {
+                                if ui
+                                    .selectable_label(
+                                        current == Some(*index),
+                                        format!("{index:02} {name}"),
+                                    )
+                                    .clicked()
+                                {
+                                    picked = Some(Some(*index));
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Bakes this actor's goop coating from a scene goop layer, so it \
+                             wears the goop it stands in. Rebinds the actor to that layer's \
+                             own model pool.",
+                        );
+                    if let Some(layer) = picked {
+                        if layer != current {
+                            self.set_selected_actor_goop_layer(layer);
+                        }
+                    }
+                }
+            }
+
             ui.separator();
             ui.heading("Params");
             let editable_parameters = self
