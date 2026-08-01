@@ -3656,15 +3656,60 @@ impl SmsEditorApp {
         manager_factory: &str,
         manager_name: &str,
     ) -> Result<String, String> {
-        let template = self
-            .object_authoring_catalog
+        let template = self.catalog_template_for(actor_factory)?;
+        self.insert_catalog_enemy_manager_pool(
+            &template,
+            actor_factory,
+            manager_factory,
+            manager_name,
+        )
+    }
+
+    fn catalog_template_for(
+        &self,
+        actor_factory: &str,
+    ) -> Result<sms_scene::ObjectAuthoringTemplate, String> {
+        self.object_authoring_catalog
             .find(actor_factory)
             .cloned()
             .ok_or_else(|| {
                 format!(
                     "the retail authoring catalog has no complete template for '{actor_factory}'"
                 )
-            })?;
+            })
+    }
+
+    /// Imports the same retail bundle again as a second, independent pool.
+    ///
+    /// The clone renames the manager, its character registration and that
+    /// character's resource folder together, so it loads its own models --
+    /// what per-layer goop spawning needs, since a baked stain lives in the
+    /// model rather than in any per-instance state.
+    pub(super) fn ensure_cloned_enemy_manager_pool(
+        &mut self,
+        actor_factory: &str,
+        manager_factory: &str,
+        manager_name: &str,
+        suffix: &str,
+    ) -> Result<String, String> {
+        let template = self.catalog_template_for(actor_factory)?;
+        let clone = sms_scene::clone_enemy_manager_template(&template, manager_name, suffix)?;
+        let cloned_manager_name = format!("{manager_name}{suffix}");
+        self.insert_catalog_enemy_manager_pool(
+            &clone,
+            actor_factory,
+            manager_factory,
+            &cloned_manager_name,
+        )
+    }
+
+    fn insert_catalog_enemy_manager_pool(
+        &mut self,
+        template: &sms_scene::ObjectAuthoringTemplate,
+        actor_factory: &str,
+        manager_factory: &str,
+        manager_name: &str,
+    ) -> Result<String, String> {
         let registry = self
             .registry
             .as_ref()
@@ -3679,7 +3724,7 @@ impl SmsEditorApp {
         let prepared = prepare_catalog_enemy_manager_pool(
             document,
             registry,
-            &template,
+            template,
             actor_factory,
             manager_factory,
             manager_name,

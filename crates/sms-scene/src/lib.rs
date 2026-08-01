@@ -78,9 +78,10 @@ pub use goop_authoring::{
     GOOP_RUNTIME_PAYLOAD_WARNING_BYTES, GOOP_STAGE_HEAP_ERROR_BYTES, GOOP_STAGE_HEAP_WARNING_BYTES,
 };
 pub use object_authoring::{
-    ObjectAuthoringCatalog, ObjectAuthoringCatalogBuild, ObjectAuthoringCatalogWarning,
-    ObjectAuthoringDependency, ObjectAuthoringResource, ObjectAuthoringRuntimeActorReference,
-    ObjectAuthoringTableDependency, ObjectAuthoringTemplate, SHINE_QUICK_CAMERA_NAME,
+    clone_enemy_manager_template, ObjectAuthoringCatalog, ObjectAuthoringCatalogBuild,
+    ObjectAuthoringCatalogWarning, ObjectAuthoringDependency, ObjectAuthoringResource,
+    ObjectAuthoringRuntimeActorReference, ObjectAuthoringTableDependency, ObjectAuthoringTemplate,
+    SHINE_QUICK_CAMERA_NAME,
 };
 pub(crate) use object_parameters::validate_object_parameter_links_with_owned_name;
 pub use object_parameters::{

@@ -1176,6 +1176,233 @@ impl SmsEditorApp {
             .push(format!("Removed the baked stain from {unbaked} model(s)."));
     }
 
+    /// Suffix that marks a per-layer clone of a manager bundle.
+    fn layer_pool_suffix(layer_index: usize) -> String {
+        format!("_L{layer_index:02}")
+    }
+
+    /// Goop layers a per-layer pool can be bound to: index and style name.
+    pub(super) fn goop_layer_choices(&self) -> Vec<(usize, String)> {
+        let Some(document) = self.document.as_ref() else {
+            return Vec::new();
+        };
+        let Some(authoring) = document.goop_authoring.as_ref() else {
+            return Vec::new();
+        };
+        authoring
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, layer)| {
+                layer
+                    .style_source
+                    .as_ref()
+                    .map(|style| (index, style.display_name.clone()))
+            })
+            .collect()
+    }
+
+    /// Whether a per-layer pool exists for this manager and layer.
+    pub(super) fn layer_pool_exists(&self, manager_name: &str, layer_index: usize) -> bool {
+        let cloned = format!("{manager_name}{}", Self::layer_pool_suffix(layer_index));
+        self.document.as_ref().is_some_and(|document| {
+            document
+                .objects
+                .iter()
+                .any(|object| object.raw_param("manager_name") == Some(cloned.as_str()))
+        })
+    }
+
+    /// Every per-layer pool this stage carries, as layer index -> manager name.
+    ///
+    /// This is the mapping the runtime patch consumes: the conductor picks a
+    /// pool before it rolls a position, so the layer a spawn lands in has to
+    /// select the pool after the fact.
+    pub(super) fn layer_pool_bindings(&self) -> BTreeMap<usize, String> {
+        let mut bindings = BTreeMap::new();
+        let Some(document) = self.document.as_ref() else {
+            return bindings;
+        };
+        for (index, _) in self.goop_layer_choices() {
+            let suffix = Self::layer_pool_suffix(index);
+            for object in &document.objects {
+                let Some(name) = object.raw_param("manager_name") else {
+                    continue;
+                };
+                if name.ends_with(&suffix) {
+                    bindings.insert(index, name.to_string());
+                    break;
+                }
+            }
+        }
+        bindings
+    }
+
+    /// Adds or removes the pool that spawns in one goop layer.
+    ///
+    /// Adding imports a renamed copy of the manager's retail bundle, so the
+    /// clone loads its own models, then bakes that layer's stain into the
+    /// clone's own model copy and flags it in the enemy table. All of it is
+    /// one undo step.
+    pub(super) fn set_layer_pool(
+        &mut self,
+        entity: &GoopSpawnEntity,
+        layer_index: usize,
+        enabled: bool,
+    ) {
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let before_objects = document.objects.clone();
+        let before_archive_edits = document.archive_edits.clone();
+        let before_object_serial = self.next_object_serial;
+        let suffix = Self::layer_pool_suffix(layer_index);
+        let cloned_manager = format!("{}{suffix}", entity.manager_name);
+        let mut log = Vec::new();
+
+        let result: Result<(), String> = (|| {
+            if enabled {
+                let actor_factory = entity.catalog_actor_factory.as_deref().ok_or_else(|| {
+                    format!(
+                        "manager {:?} has no retail-backed bundle to clone",
+                        entity.manager_name
+                    )
+                })?;
+                let manager_factory = entity.manager_factory.as_deref().ok_or_else(|| {
+                    format!(
+                        "manager {:?} has no decomp-derived factory",
+                        entity.manager_name
+                    )
+                })?;
+                if !self.layer_pool_exists(&entity.manager_name, layer_index) {
+                    log.push(self.ensure_cloned_enemy_manager_pool(
+                        actor_factory,
+                        manager_factory,
+                        &entity.manager_name,
+                        &suffix,
+                    )?);
+                }
+                self.apply_manager_spawn(&cloned_manager, true)?;
+            } else {
+                self.apply_manager_spawn(&cloned_manager, false)?;
+                if let Some(document) = self.document.as_mut() {
+                    document.objects.retain(|object| {
+                        object.raw_param("manager_name") != Some(cloned_manager.as_str())
+                    });
+                }
+                log.extend(self.cleanup_unused_goop_manager_pools());
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            if let Some(document) = self.document.as_mut() {
+                document.objects = before_objects;
+                document.archive_edits = before_archive_edits;
+            }
+            self.next_object_serial = before_object_serial;
+            self.log.push(format!(
+                "Could not update the layer {layer_index:02} pool: {error}"
+            ));
+            return;
+        }
+
+        let (record, dirty) = {
+            let Some(document) = self.document.as_ref() else {
+                return;
+            };
+            (
+                ObjectUndoRecord::between(
+                    &before_objects,
+                    &document.objects,
+                    &before_archive_edits,
+                    &document.archive_edits,
+                ),
+                stage_document_differs_from_saved(
+                    document,
+                    &self.saved_objects,
+                    &self.saved_lighting,
+                    &self.saved_death_barrier,
+                    &self.saved_archive_edits,
+                    &self.saved_dialogue_authoring,
+                    &self.saved_dialogue_library,
+                ),
+            )
+        };
+        if !record.is_empty() {
+            self.push_undo_record(record);
+        }
+        self.document_dirty = dirty;
+        self.flush_document_change();
+        self.log.extend(log);
+        self.log.push(match enabled {
+            true => format!(
+                "Layer {layer_index:02} spawns from its own pool {cloned_manager:?}; bake its                  stain to give it its own look."
+            ),
+            false => format!("Removed the layer {layer_index:02} pool {cloned_manager:?}."),
+        });
+    }
+
+    /// Writes the layer -> pool mapping the runtime layer patch consumes.
+    ///
+    /// The conductor chooses a pool before it rolls a spawn position, so the
+    /// layer a spawn lands in can only select the pool afterwards. The patch
+    /// does that swap; this file tells it which pool belongs to which layer.
+    /// A styled layer with no pool of its own is written as null, meaning
+    /// nothing spawns there.
+    pub(super) fn write_layer_pool_bindings(&mut self) {
+        let Some(project) = self.current_project.as_ref() else {
+            self.log.push(
+                "Save the project first: the layer bindings are written beside its build."
+                    .to_string(),
+            );
+            return;
+        };
+        let bindings = self.layer_pool_bindings();
+        if bindings.is_empty() {
+            self.log.push(
+                "No per-layer pools exist yet, so there is nothing for the runtime patch to route."
+                    .to_string(),
+            );
+            return;
+        }
+        let mut entries = Vec::new();
+        for (index, _) in self.goop_layer_choices() {
+            let value = match bindings.get(&index) {
+                Some(manager) => format!(
+                    "\"{index}\": {}",
+                    serde_json::to_string(manager).unwrap_or_default()
+                ),
+                None => format!("\"{index}\": null"),
+            };
+            entries.push(format!("    {value}"));
+        }
+        let text = format!(
+            "{{\n  \"every_frame\": false,\n  \"layers\": {{\n{}\n  }}\n}}\n",
+            entries.join(",\n")
+        );
+        let path = project
+            .managed_build_root()
+            .join("goop-layer-bindings.json");
+        if let Some(parent) = path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                self.log
+                    .push(format!("Could not prepare the build folder: {error}"));
+                return;
+            }
+        }
+        match std::fs::write(&path, text) {
+            Ok(()) => self.log.push(format!(
+                "Wrote {} layer binding(s) to {}.",
+                bindings.len(),
+                path.display()
+            )),
+            Err(error) => self
+                .log
+                .push(format!("Could not write the layer bindings: {error}")),
+        }
+    }
+
     /// The Spawning section of the goop inspector.
     pub(super) fn gooble_spawn_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
@@ -1244,11 +1471,62 @@ impl SmsEditorApp {
             {
                 self.set_manager_spawns_from_goop(&entity, enabled);
             }
+
+            // Per-layer pools: one independent copy of this bundle per goop
+            // layer, so each can carry its own baked stain. Only offered for
+            // bundles the catalog can clone.
+            let layers = self.goop_layer_choices();
+            if catalog_available && !layers.is_empty() {
+                let mut toggled = None;
+                egui::CollapsingHeader::new(format!(
+                    "Per-layer pools \u{2014} {}",
+                    entity.display_name
+                ))
+                .id_salt(format!("layer-pools-{}", entity.manager_name))
+                .show(ui, |ui| {
+                    ui.label(
+                        "Each layer gets its own copy of this enemy's manager, character and \
+                         models, so it can wear that layer's stain. Needs the runtime layer \
+                         patch to route spawns.",
+                    );
+                    for (index, name) in &layers {
+                        let mut present = self.layer_pool_exists(&entity.manager_name, *index);
+                        if ui
+                            .checkbox(&mut present, format!("{index:02} {name}"))
+                            .on_hover_text(format!(
+                                "Adds pool {:?} for this layer.",
+                                format!(
+                                    "{}{}",
+                                    entity.manager_name,
+                                    Self::layer_pool_suffix(*index)
+                                )
+                            ))
+                            .changed()
+                        {
+                            toggled = Some((*index, present));
+                        }
+                    }
+                });
+                if let Some((index, present)) = toggled {
+                    self.set_layer_pool(&entity, index, present);
+                }
+            }
         }
 
         // The stain bake needs no placed actor -- it edits the copied Stu
         // model -- so a pool spawned purely from this panel gets its stain
         // control here too.
+        if !self.layer_pool_bindings().is_empty()
+            && ui
+                .button("Write layer spawn bindings")
+                .on_hover_text(
+                    "Writes goop-layer-bindings.json beside the managed build: the layer ->                      pool mapping the runtime layer patch reads.",
+                )
+                .clicked()
+        {
+            self.write_layer_pool_bindings();
+        }
+
         if self.stu_stain_available() {
             let mut stained = self.stu_stain_baked();
             if ui
@@ -1401,6 +1679,40 @@ mod tests {
             preview_resource_path: None,
             source_stage: "retail0".to_string(),
         }
+    }
+
+    /// A per-layer pool is only useful if it is genuinely separate: same
+    /// bundle, but its own manager, character and model folder, so a stain
+    /// baked for one layer cannot bleed into another.
+    #[test]
+    fn per_layer_pools_are_independent_bundles() {
+        let mut template = enemy_template("HamuKuri", "HamuKuriManager", "hamuManager");
+        // Global scenecmn.bin supplies this one, exactly like the real bundle.
+        template.character_resource_records = vec![sms_formats::JDramaRecord {
+            type_name: "ObjChara".to_string(),
+            name: "EnemyChara".to_string(),
+            payload: sms_formats::JDramaRecordPayload::Fields {
+                fields: vec![sms_formats::JDramaField {
+                    name: "resource_folder".to_string(),
+                    value: sms_formats::JDramaFieldValue::String("/scene/hamukuri".to_string()),
+                }],
+            },
+        }];
+        let first =
+            sms_scene::clone_enemy_manager_template(&template, "hamuManager", "_L00").unwrap();
+        let second =
+            sms_scene::clone_enemy_manager_template(&template, "hamuManager", "_L01").unwrap();
+
+        assert_eq!(first.dependencies[0].record.name, "hamuManager_L00");
+        assert_eq!(second.dependencies[0].record.name, "hamuManager_L01");
+        assert_ne!(
+            first.dependencies[0].record.name,
+            second.dependencies[0].record.name
+        );
+        assert_ne!(
+            first.character_records[0].name,
+            second.character_records[0].name
+        );
     }
 
     #[test]
