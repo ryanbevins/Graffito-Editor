@@ -829,6 +829,99 @@ impl J3dRebuildDocument {
     /// BTI and grows the texture section when the imported dummy allocation is
     /// smaller than the runtime texture. The name table is retained so the
     /// game's normal `SMS_ChangeTextureAll` call remains valid and idempotent.
+    /// Texture names carried by every TEX1 section, in section order.
+    pub fn texture_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for section in &self.sections {
+            if let J3dRebuildSectionData::Textures(textures) = &section.data {
+                names.extend(
+                    textures
+                        .names
+                        .entries
+                        .iter()
+                        .map(|entry| entry.name.clone()),
+                );
+            }
+        }
+        names
+    }
+
+    /// Extracts a named texture back into a standalone BTI.
+    ///
+    /// The inverse of [`replace_named_texture_from_bti`]: a TEX1 record already
+    /// holds the same tiled GX payload and sampler fields a BTI does, so the
+    /// texture can be lifted out of a model and baked into another. Baking a
+    /// goop layer's own surface look onto a Stu cap relies on this, since a
+    /// stage carries its per-layer looks inside `pollutionNN.bmd`, not as loose
+    /// BTI files.
+    pub fn named_texture_as_bti(&self, texture_name: &str) -> Result<BtiFile> {
+        for section in &self.sections {
+            let J3dRebuildSectionData::Textures(textures) = &section.data else {
+                continue;
+            };
+            let index = textures
+                .names
+                .entries
+                .iter()
+                .position(|entry| entry.name == texture_name);
+            let Some(index) = index else {
+                continue;
+            };
+            let record = textures.textures.get(index).ok_or_else(|| {
+                unsupported(format!(
+                    "TEX1 name {texture_name:?} has no texture record at index {index}"
+                ))
+            })?;
+            let palette_entries = match &record.encoded_palette {
+                Some(block) => block
+                    .bytes
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                    .collect(),
+                None => Vec::new(),
+            };
+            let encoded_mip_levels = record
+                .encoded_mip_levels
+                .iter()
+                .map(|block| block.bytes.clone())
+                .collect::<Vec<_>>();
+            let mut bti = BtiFile {
+                allocation_size: 0,
+                format: record.format,
+                transparency: record.transparency,
+                width: record.width,
+                height: record.height,
+                wrap_s: record.wrap_s,
+                wrap_t: record.wrap_t,
+                palette_enabled: record.palette_enabled,
+                palette_format: record.palette_format,
+                palette_entries,
+                palette_offset: 0,
+                mipmap_enabled: record.mipmap_enabled,
+                edge_lod: record.edge_lod,
+                bias_clamp: record.bias_clamp,
+                max_anisotropy: record.max_anisotropy,
+                min_filter: record.min_filter,
+                mag_filter: record.mag_filter,
+                min_lod: record.min_lod,
+                max_lod: record.max_lod,
+                mipmap_count: record.mipmap_count,
+                reserved_19: record.reserved_19,
+                lod_bias: record.lod_bias,
+                image_offset: 0,
+                encoded_mip_levels,
+            };
+            // Recompute the palette/image offsets and allocation size the way
+            // a fresh BTI would carry them; the record's own offsets are
+            // relative to the model section, not to a standalone file.
+            bti.canonicalize_layout()?;
+            return Ok(bti);
+        }
+        Err(unsupported(format!(
+            "no TEX1 section carries a texture named {texture_name:?}"
+        )))
+    }
+
     pub fn replace_named_texture_from_bti(
         &mut self,
         texture_name: &str,

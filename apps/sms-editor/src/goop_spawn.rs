@@ -1106,6 +1106,16 @@ impl SmsEditorApp {
 
     /// The stain texture for a goop layer's style, from the style's retail
     /// source archive.
+    /// The surface texture a goop layer paints with, lifted from the layer's
+    /// pollution model.
+    ///
+    /// A stage's per-layer looks live inside `pollutionNN.bmd`, not in the
+    /// stage-wide `H_ma_rak.bti` (which is one shared pink across nearly every
+    /// retail stage). Across every retail pollution model the first TEX1
+    /// texture is the goop surface itself -- the following one or two are the
+    /// shared decoration/edge maps -- so index 0 is the layer's own look. That
+    /// is what a per-layer pool bakes onto its caps, so a Stu wears the goop it
+    /// climbs out of rather than the uniform stain.
     fn stain_for_layer(&self, layer_index: usize) -> Option<sms_formats::BtiFile> {
         let document = self.document.as_ref()?;
         let style = document
@@ -1118,17 +1128,19 @@ impl SmsEditorApp {
         let template = self.retail_goop_templates.iter().find(|template| {
             template.stage_id == style.stage_id && template.layer_index == style.layer_index
         })?;
+        let model_path = format!("map/pollution/pollution{:02}.bmd", style.layer_index);
         let bytes = std::fs::read(&template.archive_path).ok()?;
         let archive = sms_scene::SourceFreeStageArchive::parse(&bytes).ok()?;
         let resource = archive.resources().iter().find(|resource| {
             String::from_utf8_lossy(&resource.raw_path)
                 .replace('\\', "/")
-                .eq_ignore_ascii_case("map/pollution/H_ma_rak.bti")
+                .eq_ignore_ascii_case(&model_path)
         })?;
-        match &resource.document {
-            StageResourceDocument::Texture(stain) => Some(stain.clone()),
-            _ => None,
-        }
+        let StageResourceDocument::Model(model) = &resource.document else {
+            return None;
+        };
+        let texture_name = model.texture_names().into_iter().next()?;
+        model.named_texture_as_bti(&texture_name).ok()
     }
 
     pub(super) fn bake_stu_stain(&mut self) {
