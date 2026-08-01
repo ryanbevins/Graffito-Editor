@@ -1049,9 +1049,15 @@ impl SmsEditorApp {
         &mut self,
         stain: &sms_formats::BtiFile,
         included: &dyn Fn(&str) -> bool,
+        protect_from_runtime: bool,
     ) -> usize {
         const DUMMY_TEXTURE: &str = "H_ma_rak_dummy";
         const STAIN_MATERIAL: &str = "_mat_body_top1";
+        // `THamuKuri::setMActorAndKeeper` looks the stain slot up by this name
+        // and overwrites it from the one stage-wide texture on every spawn.
+        // A pool that must keep its own look renames the slot out of reach;
+        // materials address textures by index, so only the lookup changes.
+        const PROTECTED_TEXTURE: &str = "H_ma_rak_layer";
         let Some(document) = self.document.as_mut() else {
             return 0;
         };
@@ -1064,9 +1070,15 @@ impl SmsEditorApp {
             let StageResourceDocument::Model(model) = &mut edit.document else {
                 continue;
             };
-            if !model.has_named_texture(DUMMY_TEXTURE) {
+            // A pool baked once already carries the renamed slot, so re-baking
+            // has to target whichever name this model actually has.
+            let slot = if model.has_named_texture(DUMMY_TEXTURE) {
+                DUMMY_TEXTURE
+            } else if protect_from_runtime && model.has_named_texture(PROTECTED_TEXTURE) {
+                PROTECTED_TEXTURE
+            } else {
                 continue;
-            }
+            };
             let already_pinned = model.material_konst_alpha_half_is_pinned(STAIN_MATERIAL);
             if !already_pinned && !model.can_pin_material_konst_alpha_half(STAIN_MATERIAL) {
                 continue;
@@ -1085,7 +1097,7 @@ impl SmsEditorApp {
                     }
                 }
             }
-            let replaced = match baked.replace_named_texture_from_bti(DUMMY_TEXTURE, stain) {
+            let replaced = match baked.replace_named_texture_from_bti(slot, stain) {
                 Ok(count) => count,
                 Err(error) => {
                     self.log.push(format!(
@@ -1097,6 +1109,15 @@ impl SmsEditorApp {
             };
             if replaced == 0 {
                 continue;
+            }
+            if protect_from_runtime && slot == DUMMY_TEXTURE {
+                if let Err(error) = baked.rename_texture(DUMMY_TEXTURE, PROTECTED_TEXTURE) {
+                    self.log.push(format!(
+                        "Could not shield the baked stain in {} from the runtime: {error}",
+                        String::from_utf8_lossy(&edit.raw_resource_path)
+                    ));
+                    continue;
+                }
             }
             *model = baked;
             baked_models += 1;
@@ -1167,7 +1188,8 @@ impl SmsEditorApp {
             }
         };
 
-        let baked_models = self.bake_stain_into_models(&stain, &Self::outside_layer_pool_folders);
+        let baked_models =
+            self.bake_stain_into_models(&stain, &Self::outside_layer_pool_folders, false);
 
         if baked_models == 0 {
             self.log.push(
@@ -1425,15 +1447,20 @@ impl SmsEditorApp {
                     self.cloned_manager_folders(actor_factory, &entity.manager_name, &suffix)?;
                 match self.stain_for_layer(layer_index) {
                     Some(stain) => {
-                        let baked = self.bake_stain_into_models(&stain, &|path: &str| {
-                            let path = path.to_ascii_lowercase();
-                            folders.iter().any(|folder| {
-                                let folder = folder.to_ascii_lowercase();
-                                path == folder || path.starts_with(&format!("{folder}/"))
-                            })
-                        });
+                        let baked = self.bake_stain_into_models(
+                            &stain,
+                            &|path: &str| {
+                                let path = path.to_ascii_lowercase();
+                                folders.iter().any(|folder| {
+                                    let folder = folder.to_ascii_lowercase();
+                                    path == folder || path.starts_with(&format!("{folder}/"))
+                                })
+                            },
+                            true,
+                        );
                         log.push(format!(
-                            "Baked layer {layer_index:02}'s own stain into {baked} pool model(s)."
+                            "Baked layer {layer_index:02}'s own look into {baked} pool model(s), \
+                             shielded from the runtime's stain replacement."
                         ));
                     }
                     None => log.push(format!(

@@ -5793,6 +5793,50 @@ fn probe_resource_hashes() {
     }
 }
 
+/// Reports the format of the cap-stain decal vs the goop surface texture, to
+/// decide how to recolor one from the other.
+/// `GRAFFITO_PROBE_SZS=<stage.szs> cargo test probe_stain_formats -- --ignored
+/// --nocapture`
+#[test]
+#[ignore]
+fn probe_stain_formats() {
+    let Ok(path) = std::env::var("GRAFFITO_PROBE_SZS") else {
+        return;
+    };
+    let assets = sms_formats::mount_scene_archive(std::path::Path::new(&path)).expect("mount");
+    let read = |suffix: &str| {
+        assets
+            .iter()
+            .find(|asset| {
+                asset
+                    .path
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .ends_with(suffix)
+            })
+            .map(|asset| sms_formats::read_stage_asset_bytes(&asset.path).expect("read"))
+    };
+    if let Some(bytes) = read("h_ma_rak.bti") {
+        let bti = sms_formats::BtiFile::parse(&bytes).expect("parse bti");
+        println!(
+            "H_ma_rak.bti: {}x{} format {} palette {}",
+            bti.width, bti.height, bti.format, bti.palette_enabled
+        );
+    }
+    for suffix in ["pollution00.bmd", "pollution01.bmd"] {
+        if let Some(bytes) = read(suffix) {
+            let model = sms_formats::J3dRebuildDocument::parse(&bytes).expect("parse");
+            if let Some(name) = model.texture_names().into_iter().next() {
+                let bti = model.named_texture_as_bti(&name).expect("extract");
+                println!(
+                    "{suffix} [{name}]: {}x{} format {} palette {}",
+                    bti.width, bti.height, bti.format, bti.palette_enabled
+                );
+            }
+        }
+    }
+}
+
 /// Extracting a texture from a model and baking it back into another must
 /// preserve the pixels. `GRAFFITO_PROBE_SZS=<stage.szs>
 /// cargo test probe_texture_roundtrip -- --ignored --nocapture`
