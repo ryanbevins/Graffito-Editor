@@ -1751,8 +1751,39 @@ impl SmsEditorApp {
         sms_scene::sync_scene_object_parameter_aliases(&mut after);
         if let Some(sms_scene::PlacementBinding::Authored(authored)) = after.placement.as_mut() {
             for dependency in &mut authored.dependencies {
-                if dependency.record.name == current_manager {
-                    dependency.record.name.clone_from(&target_manager);
+                if dependency.record.name != current_manager {
+                    continue;
+                }
+                dependency.record.name.clone_from(&target_manager);
+                // The payload must move with the name: the clone bundle's
+                // manager record points at the clone's character, and export
+                // refuses two same-named records with different payloads.
+                let fields = match &mut dependency.record.payload {
+                    sms_formats::JDramaRecordPayload::Fields { fields }
+                    | sms_formats::JDramaRecordPayload::Actor { fields, .. } => fields,
+                    _ => continue,
+                };
+                for field in fields {
+                    if field.name != "character_name" {
+                        continue;
+                    }
+                    if let sms_formats::JDramaFieldValue::String(value) = &mut field.value {
+                        let base = match value.rsplit_once("_L") {
+                            Some((base, digits))
+                                if digits.len() == 2
+                                    && digits.chars().all(|item| item.is_ascii_digit()) =>
+                            {
+                                base.to_string()
+                            }
+                            _ => value.clone(),
+                        };
+                        *value = match layer {
+                            Some(index) => {
+                                format!("{base}{}", Self::layer_pool_suffix(index))
+                            }
+                            None => base,
+                        };
+                    }
                 }
             }
         }
