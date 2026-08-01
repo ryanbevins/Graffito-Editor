@@ -1132,11 +1132,13 @@ impl SmsEditorApp {
     ///
     /// A stage's per-layer looks live inside `pollutionNN.bmd`, not in the
     /// stage-wide `H_ma_rak.bti` (which is one shared pink across nearly every
-    /// retail stage). Across every retail pollution model the first TEX1
-    /// texture is the goop surface itself -- the following one or two are the
-    /// shared decoration/edge maps -- so index 0 is the layer's own look. That
-    /// is what a per-layer pool bakes onto its caps, so a Stu wears the goop it
-    /// climbs out of rather than the uniform stain.
+    /// retail stage). A pollution model carries three textures in a consistent
+    /// order: the stage's painted coverage mask, then the goop material, then
+    /// a shared edge map. The material is the one that reads as the goop --
+    /// `B_RAKenogu_pink` for graffiti pink, `B_ricoDrDr` for Ricco's sludge,
+    /// `TestChoco2` for bianco's brown -- so the layer's look is index 1.
+    /// Index 0 is a stage-shaped mask and renders as a meaningless blob on a
+    /// cap.
     fn stain_for_layer(&self, layer_index: usize) -> Option<sms_formats::BtiFile> {
         let document = self.document.as_ref()?;
         let style = document
@@ -1160,8 +1162,11 @@ impl SmsEditorApp {
         let StageResourceDocument::Model(model) = &resource.document else {
             return None;
         };
-        let texture_name = model.texture_names().into_iter().next()?;
-        model.named_texture_as_bti(&texture_name).ok()
+        let names = model.texture_names();
+        // Fall back to whatever exists if a model does not follow the retail
+        // three-texture layout, so an unusual style still yields something.
+        let texture_name = names.get(1).or_else(|| names.first())?;
+        model.named_texture_as_bti(texture_name).ok()
     }
 
     pub(super) fn bake_stu_stain(&mut self) {
