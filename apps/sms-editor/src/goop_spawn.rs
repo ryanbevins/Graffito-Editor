@@ -1017,10 +1017,122 @@ impl SmsEditorApp {
     /// pins the blend to a constant one-half, which is the same 0x80 the
     /// runtime uses when it shows the effect. After that there is nothing left
     /// for the runtime to decide. Undo reverses it.
-    pub(super) fn bake_stu_stain(&mut self) {
+    /// Whether a top-level archive folder belongs to a per-layer pool clone.
+    ///
+    /// Pool folders are the original folder plus the lowercased layer suffix
+    /// ("hamukuri" -> "hamukuri_l00"). Stage-wide stain actions skip them:
+    /// each pool's look belongs to its layer, not to the stage toggle.
+    fn is_layer_pool_folder(segment: &str) -> bool {
+        let bytes = segment.as_bytes();
+        bytes.len() > 4
+            && bytes[bytes.len() - 4..bytes.len() - 2] == *b"_l"
+            && bytes[bytes.len() - 2..]
+                .iter()
+                .all(|byte| byte.is_ascii_digit())
+    }
+
+    fn outside_layer_pool_folders(path: &str) -> bool {
+        match path.split('/').next() {
+            Some(segment) => !Self::is_layer_pool_folder(segment),
+            None => true,
+        }
+    }
+
+    /// Bakes `stain` into every copied model whose archive path satisfies
+    /// `included`, returning how many models changed.
+    ///
+    /// Models whose blend is already pinned are re-baked rather than skipped,
+    /// so a pool cloned from an already-stained stage still takes its own
+    /// layer's look. Callers own the undo record, letting the bake ride a
+    /// larger transaction.
+    fn bake_stain_into_models(
+        &mut self,
+        stain: &sms_formats::BtiFile,
+        included: &dyn Fn(&str) -> bool,
+    ) -> usize {
         const DUMMY_TEXTURE: &str = "H_ma_rak_dummy";
-        const STAIN_PATH: &[u8] = b"map/pollution/H_ma_rak.bti";
         const STAIN_MATERIAL: &str = "_mat_body_top1";
+        let Some(document) = self.document.as_mut() else {
+            return 0;
+        };
+        let mut baked_models = 0usize;
+        for edit in &mut document.archive_edits.resources {
+            let path = String::from_utf8_lossy(&edit.raw_resource_path).replace('\\', "/");
+            if !included(path.trim_matches('/')) {
+                continue;
+            }
+            let StageResourceDocument::Model(model) = &mut edit.document else {
+                continue;
+            };
+            if !model.has_named_texture(DUMMY_TEXTURE) {
+                continue;
+            }
+            let already_pinned = model.material_konst_alpha_half_is_pinned(STAIN_MATERIAL);
+            if !already_pinned && !model.can_pin_material_konst_alpha_half(STAIN_MATERIAL) {
+                continue;
+            }
+            let mut baked = model.clone();
+            if !already_pinned {
+                match baked.pin_material_konst_alpha_half(STAIN_MATERIAL) {
+                    Ok(count) if count > 0 => {}
+                    Ok(_) => continue,
+                    Err(error) => {
+                        self.log.push(format!(
+                            "Could not pin the stain blend in {}: {error}",
+                            String::from_utf8_lossy(&edit.raw_resource_path)
+                        ));
+                        continue;
+                    }
+                }
+            }
+            let replaced = match baked.replace_named_texture_from_bti(DUMMY_TEXTURE, stain) {
+                Ok(count) => count,
+                Err(error) => {
+                    self.log.push(format!(
+                        "Could not bake the stain into {}: {error}",
+                        String::from_utf8_lossy(&edit.raw_resource_path)
+                    ));
+                    continue;
+                }
+            };
+            if replaced == 0 {
+                continue;
+            }
+            *model = baked;
+            baked_models += 1;
+        }
+        baked_models
+    }
+
+    /// The stain texture for a goop layer's style, from the style's retail
+    /// source archive.
+    fn stain_for_layer(&self, layer_index: usize) -> Option<sms_formats::BtiFile> {
+        let document = self.document.as_ref()?;
+        let style = document
+            .goop_authoring
+            .as_ref()?
+            .layers
+            .get(layer_index)?
+            .style_source
+            .as_ref()?;
+        let template = self.retail_goop_templates.iter().find(|template| {
+            template.stage_id == style.stage_id && template.layer_index == style.layer_index
+        })?;
+        let bytes = std::fs::read(&template.archive_path).ok()?;
+        let archive = sms_scene::SourceFreeStageArchive::parse(&bytes).ok()?;
+        let resource = archive.resources().iter().find(|resource| {
+            String::from_utf8_lossy(&resource.raw_path)
+                .replace('\\', "/")
+                .eq_ignore_ascii_case("map/pollution/H_ma_rak.bti")
+        })?;
+        match &resource.document {
+            StageResourceDocument::Texture(stain) => Some(stain.clone()),
+            _ => None,
+        }
+    }
+
+    pub(super) fn bake_stu_stain(&mut self) {
+        const STAIN_PATH: &[u8] = b"map/pollution/H_ma_rak.bti";
 
         let Some(document) = self.document.as_ref() else {
             return;
@@ -1043,51 +1155,7 @@ impl SmsEditorApp {
             }
         };
 
-        let Some(document) = self.document.as_mut() else {
-            return;
-        };
-        let mut baked_models = 0usize;
-        for edit in &mut document.archive_edits.resources {
-            let StageResourceDocument::Model(model) = &mut edit.document else {
-                continue;
-            };
-            if !model.has_named_texture(DUMMY_TEXTURE)
-                || !model.can_pin_material_konst_alpha_half(STAIN_MATERIAL)
-            {
-                continue;
-            }
-            let mut baked = model.clone();
-            let pinned = match baked.pin_material_konst_alpha_half(STAIN_MATERIAL) {
-                Ok(count) if count > 0 => count,
-                Ok(_) => continue,
-                Err(error) => {
-                    self.log.push(format!(
-                        "Could not pin the stain blend in {}: {error}",
-                        String::from_utf8_lossy(&edit.raw_resource_path)
-                    ));
-                    continue;
-                }
-            };
-            let replaced = match baked.replace_named_texture_from_bti(DUMMY_TEXTURE, &stain) {
-                Ok(count) => count,
-                Err(error) => {
-                    self.log.push(format!(
-                        "Could not bake the stain into {}: {error}",
-                        String::from_utf8_lossy(&edit.raw_resource_path)
-                    ));
-                    continue;
-                }
-            };
-            if replaced == 0 {
-                continue;
-            }
-            *model = baked;
-            baked_models += 1;
-            self.log.push(format!(
-                "Pinned {pinned} active stain selector(s) in {}.",
-                String::from_utf8_lossy(&edit.raw_resource_path)
-            ));
-        }
+        let baked_models = self.bake_stain_into_models(&stain, &Self::outside_layer_pool_folders);
 
         if baked_models == 0 {
             self.log.push(
@@ -1173,6 +1241,10 @@ impl SmsEditorApp {
         };
         let mut unbaked = 0usize;
         for edit in &mut document.archive_edits.resources {
+            let path = String::from_utf8_lossy(&edit.raw_resource_path).replace('\\', "/");
+            if !Self::outside_layer_pool_folders(path.trim_matches('/')) {
+                continue;
+            }
             let StageResourceDocument::Model(model) = &mut edit.document else {
                 continue;
             };
@@ -1334,6 +1406,29 @@ impl SmsEditorApp {
                         &suffix,
                     )?);
                 }
+                // The pool's own model copy takes its layer's stain, so what
+                // climbs out of a layer wears that layer's look. Baking is
+                // idempotent and re-runs on repair, keeping the look current.
+                let folders =
+                    self.cloned_manager_folders(actor_factory, &entity.manager_name, &suffix)?;
+                match self.stain_for_layer(layer_index) {
+                    Some(stain) => {
+                        let baked = self.bake_stain_into_models(&stain, &|path: &str| {
+                            let path = path.to_ascii_lowercase();
+                            folders.iter().any(|folder| {
+                                let folder = folder.to_ascii_lowercase();
+                                path == folder || path.starts_with(&format!("{folder}/"))
+                            })
+                        });
+                        log.push(format!(
+                            "Baked layer {layer_index:02}'s own stain into {baked} pool model(s)."
+                        ));
+                    }
+                    None => log.push(format!(
+                        "Layer {layer_index:02} has no retail stain texture available, so its \
+                         pool keeps the current look."
+                    )),
+                }
                 self.apply_manager_spawn(&cloned_manager, true)?;
             } else {
                 self.apply_manager_spawn(&cloned_manager, false)?;
@@ -1389,7 +1484,8 @@ impl SmsEditorApp {
         self.log.extend(log);
         self.log.push(match enabled {
             true => format!(
-                "Layer {layer_index:02} spawns from its own pool {cloned_manager:?}; bake its                  stain to give it its own look."
+                "Layer {layer_index:02} spawns from its own pool {cloned_manager:?}, wearing \
+                 that layer's stain."
             ),
             false => format!("Removed the layer {layer_index:02} pool {cloned_manager:?}."),
         });
@@ -1586,7 +1682,7 @@ impl SmsEditorApp {
                 .on_hover_text(
                     "Bakes the stage's stain texture into the Stu model and pins its \
                      blend, so it shows regardless of what the runtime decides. Applies \
-                     to every Stu using this model in the stage.",
+                     to the base pool; per-layer pools keep their own layer's stain.",
                 )
                 .changed()
             {
@@ -1731,6 +1827,26 @@ mod tests {
             preview_resource_path: None,
             source_stage: "retail0".to_string(),
         }
+    }
+
+    /// The stage-wide stain toggle must not repaint per-layer pool folders:
+    /// their look belongs to their layer.
+    #[test]
+    fn stage_wide_stain_actions_skip_layer_pool_folders() {
+        assert!(SmsEditorApp::is_layer_pool_folder("hamukuri_l00"));
+        assert!(SmsEditorApp::is_layer_pool_folder("namekuri_l15"));
+        assert!(!SmsEditorApp::is_layer_pool_folder("hamukuri"));
+        assert!(!SmsEditorApp::is_layer_pool_folder("hamukurianm"));
+        assert!(!SmsEditorApp::is_layer_pool_folder("namekuri2"));
+        assert!(SmsEditorApp::outside_layer_pool_folders(
+            "hamukuri/default.bmd"
+        ));
+        assert!(SmsEditorApp::outside_layer_pool_folders(
+            "map/pollution/H_ma_rak.bti"
+        ));
+        assert!(!SmsEditorApp::outside_layer_pool_folders(
+            "hamukuri_l01/default.bmd"
+        ));
     }
 
     /// A per-layer pool is only useful if it is genuinely separate: same

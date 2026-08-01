@@ -2635,14 +2635,23 @@ pub fn clone_enemy_manager_template(
             continue;
         }
         if let Some(folder) = string_field(registration, folder_field).map(str::to_string) {
-            // Folder names stay lowercase like every retail one: archive
-            // lookups hash raw bytes, so a case difference between the stored
-            // name and the name the runtime asks for never matches.
-            let new_folder = format!(
-                "{}{}",
-                folder.trim_end_matches('/'),
-                suffix.to_ascii_lowercase()
-            );
+            // Folder names copy retail's shape exactly: every folder in the
+            // retail archives is lowercase alphanumeric with no separators
+            // (`namekuri2`, `hamukurianm`). Archive lookups hash raw bytes, so
+            // an unusual name is not worth risking for readability.
+            let folder_suffix = suffix
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            let folder_suffix = match folder_suffix.chars().any(|item| item.is_ascii_digit()) {
+                true => folder_suffix
+                    .chars()
+                    .filter(char::is_ascii_digit)
+                    .collect::<String>(),
+                false => folder_suffix,
+            };
+            let new_folder = format!("{}{folder_suffix}", folder.trim_end_matches('/'));
             set_string_field(registration, folder_field, &new_folder);
             folder_rewrites.push((folder, new_folder));
         }
@@ -4539,7 +4548,7 @@ mod tests {
         assert_eq!(clone.character_records[0].name, "hamukuriChara_L01");
         assert_eq!(
             string_field(&clone.character_records[0], "resource_folder"),
-            Some("/scene/hamukuri_l01")
+            Some("/scene/hamukuri01")
         );
         assert_eq!(
             record_character_name(&clone.record),
@@ -4554,8 +4563,8 @@ mod tests {
         assert_eq!(
             raw_paths(&clone.resources),
             vec![
-                "hamukuri_l01/default.bmd".to_string(),
-                "hamukuri_l01/wait.bck".to_string(),
+                "hamukuri01/default.bmd".to_string(),
+                "hamukuri01/wait.bck".to_string(),
                 "map/scene.ral".to_string(),
             ]
         );
@@ -4582,13 +4591,13 @@ mod tests {
         assert_eq!(clone.character_records[0].name, "hamukuriChara_L02");
         assert_eq!(
             string_field(&clone.character_records[0], "resource_folder"),
-            Some("/scene/hamukuri_l02")
+            Some("/scene/hamukuri02")
         );
         assert_eq!(
             record_character_name(&clone.dependencies[0].record),
             Some("hamukuriChara_L02")
         );
-        assert_eq!(raw_paths(&clone.resources)[0], "hamukuri_l02/default.bmd");
+        assert_eq!(raw_paths(&clone.resources)[0], "hamukuri02/default.bmd");
     }
 
     /// The clone's folder has to be reported, because renaming the reference
@@ -4600,7 +4609,7 @@ mod tests {
         let clone = clone_enemy_manager_template(&template, "hamuManager", "_L01", true).unwrap();
         assert_eq!(
             clone.folder_rewrites,
-            vec![("hamukuri".to_string(), "hamukuri_l01".to_string())]
+            vec![("hamukuri".to_string(), "hamukuri01".to_string())]
         );
     }
 

@@ -1689,7 +1689,7 @@ impl SmsEditorApp {
                         .on_hover_text(
                             "Bakes the stage's stain texture into the Stu model and pins its \
                              blend, so it shows regardless of what the runtime decides. Applies \
-                             to every Stu using this model in the stage.",
+                             to the base pool; per-layer pools keep their own layer's stain.",
                         )
                         .changed()
                     {

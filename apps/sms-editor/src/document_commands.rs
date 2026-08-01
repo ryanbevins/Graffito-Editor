@@ -3764,6 +3764,22 @@ impl SmsEditorApp {
         Ok(())
     }
 
+    /// Archive folders a layer pool owns, derived the same way the clone is.
+    pub(super) fn cloned_manager_folders(
+        &self,
+        actor_factory: &str,
+        manager_name: &str,
+        suffix: &str,
+    ) -> Result<Vec<String>, String> {
+        let template = self.catalog_template_for(actor_factory)?;
+        let clone = sms_scene::clone_enemy_manager_template(&template, manager_name, suffix, true)?;
+        Ok(clone
+            .folder_rewrites
+            .into_iter()
+            .map(|(_, to)| to)
+            .collect())
+    }
+
     /// Ensures an existing clone's folder actually holds its models.
     ///
     /// A pool imported before the folder was materialized -- or one whose
