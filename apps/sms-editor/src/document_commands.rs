@@ -1843,6 +1843,13 @@ fn duplicate_object_for_spawn(
         .placement
         .as_ref()
         .map(sms_scene::PlacementBinding::duplicate_for_new_object);
+    // A spawn template can be a hidden pool-only carrier -- one exists for any
+    // goop-flagged manager -- and a duplicate that inherits the flag is born
+    // invisible: hidden from the outliner and dropped from export. Whatever
+    // the template was, the user asked to place an actor that stands.
+    if let Some(sms_scene::PlacementBinding::Authored(authored)) = &mut source.placement {
+        authored.pool_only = false;
+    }
     let generated_clone_name = sms_scene::generated_clone_runtime_name(&source.id);
     let owned_name = match &mut source.placement {
         Some(sms_scene::PlacementBinding::Authored(authored))
