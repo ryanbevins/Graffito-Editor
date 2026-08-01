@@ -237,6 +237,12 @@ pub struct ObjectAuthoringTemplate {
     /// Exact `ObjChara`/`SmplChara` registrations required before this actor
     /// and its manager records are loaded.
     pub character_records: Vec<JDramaRecord>,
+    /// Every registration this actor loads through, including the ones global
+    /// `scenecmn.bin` already provides and `character_records` therefore
+    /// omits. Cloning a bundle into an independent pool needs them: a pool's
+    /// models come from its character's folder, so a clone has to register a
+    /// renamed character of its own.
+    pub character_resource_records: Vec<JDramaRecord>,
     /// Named records outside `map/scene.bin` that the actor reaches through
     /// fixed runtime lookups rather than serialized actor fields.
     pub table_dependencies: Vec<ObjectAuthoringTableDependency>,
@@ -764,6 +770,7 @@ fn build_from_sources_with_common(
                 record: candidate.record,
                 dependencies: candidate.dependencies,
                 character_records: candidate.character_records,
+                character_resource_records: candidate.character_resource_records,
                 table_dependencies,
                 required_graph_names: candidate.graph_names.into_iter().collect(),
                 resources,
@@ -2583,6 +2590,19 @@ pub fn clone_enemy_manager_template(
 
     // Characters are renamed with their folders, and every reference to them
     // in the actor and manager records follows.
+    // Characters that global `scenecmn.bin` already provides are never copied
+    // into a stage, so the template leaves them out. A clone cannot share one
+    // -- it needs its own folder -- so its renamed copy is promoted into the
+    // registrations the import writes into the stage's own table.
+    if clone.character_records.is_empty() {
+        clone.character_records = clone
+            .character_resource_records
+            .iter()
+            .filter(|record| is_character_registration(record))
+            .cloned()
+            .collect();
+    }
+
     let mut folder_rewrites: Vec<(String, String)> = Vec::new();
     let mut character_rewrites: Vec<(String, String)> = Vec::new();
     for registration in &mut clone.character_records {
@@ -4452,6 +4472,7 @@ mod tests {
                     fields: vec![string_value("resource_folder", "/scene/hamukuri")],
                 },
             }],
+            character_resource_records: Vec::new(),
             table_dependencies: Vec::new(),
             runtime_actor_references: Vec::new(),
             required_graph_names: Vec::new(),
@@ -4503,6 +4524,30 @@ mod tests {
         // The original is untouched, so repeated clones all derive from retail.
         assert_eq!(template.dependencies[0].record.name, "hamuManager");
         assert_eq!(raw_paths(&template.resources)[0], "hamukuri/default.bmd");
+    }
+
+    /// HamuKuri's registration lives in global `scenecmn.bin`, so its
+    /// template carries no `character_records` at all -- the case that blocks
+    /// per-layer goop pools if the clone cannot supply its own.
+    #[test]
+    fn a_clone_registers_its_own_character_when_the_original_is_global() {
+        let mut template = cloneable_manager_template();
+        template.character_resource_records = std::mem::take(&mut template.character_records);
+        assert!(template.character_records.is_empty());
+
+        let clone = clone_enemy_manager_template(&template, "hamuManager", "_L02").unwrap();
+
+        assert_eq!(clone.character_records.len(), 1);
+        assert_eq!(clone.character_records[0].name, "hamukuriChara_L02");
+        assert_eq!(
+            string_field(&clone.character_records[0], "resource_folder"),
+            Some("/scene/hamukuri_L02")
+        );
+        assert_eq!(
+            record_character_name(&clone.dependencies[0].record),
+            Some("hamukuriChara_L02")
+        );
+        assert_eq!(raw_paths(&clone.resources)[0], "hamukuri_L02/default.bmd");
     }
 
     #[test]

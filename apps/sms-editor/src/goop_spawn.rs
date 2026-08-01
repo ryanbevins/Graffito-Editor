@@ -1368,6 +1368,7 @@ mod tests {
         sms_scene::ObjectAuthoringTemplate {
             factory_name: actor_factory.to_string(),
             group_index: 4,
+            character_resource_records: Vec::new(),
             record: sms_formats::JDramaRecord {
                 type_name: actor_factory.to_string(),
                 name: "retail enemy".to_string(),
