@@ -340,22 +340,6 @@ fn manager_is_pollution_spawn_subject(
     })
 }
 
-fn actor_uses_stu_stain(
-    registry: &ObjectRegistry,
-    actor: &sms_schema::EnemyActorDefinition,
-) -> bool {
-    registry
-        .runtime_texture_replacements_for(&actor.factory_name)
-        .any(|replacement| {
-            replacement.dummy_texture_name == "H_ma_rak_dummy"
-                && replacement.resource_path == "/scene/map/pollution/H_ma_rak.bti"
-                && replacement
-                    .source_file
-                    .replace('\\', "/")
-                    .ends_with("/Enemy/hamukuri.cpp")
-        })
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CatalogEnemyManagerChoice {
     actor_factory: String,
@@ -769,54 +753,6 @@ impl SmsEditorApp {
                 .then_with(|| left.manager_name.cmp(&right.manager_name))
         });
         entities
-    }
-
-    pub(super) fn object_uses_enemy_pool(&self, object: &SceneObject) -> bool {
-        let (Some(document), Some(registry)) = (self.document.as_ref(), self.registry.as_ref())
-        else {
-            return false;
-        };
-        let Some(actor) = enemy_actor_definition(registry, &object.factory_name) else {
-            return false;
-        };
-        if !matches!(
-            object.placement,
-            Some(sms_scene::PlacementBinding::Authored(_))
-        ) {
-            return false;
-        }
-        let Some(manager_name) = object.raw_param("manager_name") else {
-            return false;
-        };
-        let managers = enemy_manager_instances(document, registry);
-        managers
-            .get(manager_name)
-            .is_some_and(|manager| manager_factory_matches_actor(actor, &manager.factory_name))
-    }
-
-    pub(super) fn object_uses_stu_stain_model(&self, object: &SceneObject) -> bool {
-        let (Some(document), Some(registry)) = (self.document.as_ref(), self.registry.as_ref())
-        else {
-            return false;
-        };
-        let Some(actor) = enemy_actor_definition(registry, &object.factory_name) else {
-            return false;
-        };
-        let Some(manager_name) = object.raw_param("manager_name") else {
-            return false;
-        };
-        let managers = enemy_manager_instances(document, registry);
-        let Some(manager_instance) = managers.get(manager_name) else {
-            return false;
-        };
-        let Some(manager) = enemy_manager_definition(registry, &manager_instance.factory_name)
-        else {
-            return false;
-        };
-        manager_factory_matches_actor(actor, &manager.factory_name)
-            && manager.spawned_actor_class.as_deref() == Some(actor.class_name.as_str())
-            && actor_uses_stu_stain(registry, actor)
-            && self.stu_stain_available()
     }
 
     /// Whether the effective enemy table flags `manager` for goop spawning.
@@ -1977,45 +1913,6 @@ mod tests {
             &registry,
         )
         .is_none());
-    }
-
-    #[test]
-    fn stu_stain_identification_excludes_other_users_of_the_dummy_texture() {
-        fn actor(factory_name: &str, class_name: &str) -> sms_schema::EnemyActorDefinition {
-            sms_schema::EnemyActorDefinition {
-                factory_name: factory_name.to_string(),
-                class_name: class_name.to_string(),
-                model_index: None,
-                fallback_models: Vec::new(),
-                primary_model: None,
-                named_models: Vec::new(),
-                indexed_models: Vec::new(),
-                manager_factories: Vec::new(),
-                runtime_uniform_scale: None,
-            }
-        }
-        fn replacement(
-            factory_name: &str,
-            source_file: &str,
-        ) -> sms_schema::RuntimeTextureReplacementDefinition {
-            sms_schema::RuntimeTextureReplacementDefinition {
-                factory_name: factory_name.to_string(),
-                dummy_texture_name: "H_ma_rak_dummy".to_string(),
-                resource_path: "/scene/map/pollution/H_ma_rak.bti".to_string(),
-                source_file: source_file.to_string(),
-            }
-        }
-
-        let stu = actor("HamuKuri", "THamuKuri");
-        let boss = actor("BossGesso", "TBossGesso");
-        let mut registry = enemy_registry();
-        registry.runtime_texture_replacements = vec![
-            replacement("HamuKuri", "src/Enemy/hamukuri.cpp"),
-            replacement("BossGesso", "src/Enemy/bossgesso.cpp"),
-        ];
-
-        assert!(actor_uses_stu_stain(&registry, &stu));
-        assert!(!actor_uses_stu_stain(&registry, &boss));
     }
 
     /// A fresh stage gains a table whose only entry is the flagged Gooble one,

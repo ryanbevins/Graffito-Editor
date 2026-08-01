@@ -4005,47 +4005,6 @@ impl SmsEditorApp {
         messages
     }
 
-    /// Marks the selected authored enemy as pool-only: export carries its
-    /// manager and resources but not the actor record, so nothing stands in
-    /// the world and the manager's pool supplies every spawn.
-    pub(super) fn set_selected_object_pool_only(&mut self, pool_only: bool) {
-        let Some(before) = self.selected_object().cloned() else {
-            return;
-        };
-        let Some(sms_scene::PlacementBinding::Authored(placement)) = &before.placement else {
-            return;
-        };
-        if pool_only && !self.object_uses_enemy_pool(&before) {
-            self.log.push(format!(
-                "Could not make '{}' pool-only: its manager is not a decomp-identified TEnemyManager in this stage.",
-                object_display_name(&before)
-            ));
-            return;
-        }
-        if placement.pool_only == pool_only {
-            return;
-        }
-        let mut after = before.clone();
-        if let Some(sms_scene::PlacementBinding::Authored(placement)) = &mut after.placement {
-            placement.pool_only = pool_only;
-        }
-        self.apply_object_edit(
-            match pool_only {
-                true => "Made enemy pool-only",
-                false => "Made enemy stand in the world",
-            },
-            ObjectUndoRecord {
-                deltas: vec![ObjectDelta::Update {
-                    before: Box::new(before),
-                    after: Box::new(after),
-                }],
-                resource_deltas: Vec::new(),
-                route_delta: None,
-                dialogue_delta: None,
-            },
-        );
-    }
-
     pub(super) fn update_selected_runtime_reference(
         &mut self,
         reference_index: usize,
