@@ -571,6 +571,49 @@ fn enemy_manager_instances(
     managers
 }
 
+/// What each goop layer does to a spawn that lands in it, for the build's
+/// runtime patch.
+///
+/// A styled layer with its own pool routes spawns to that pool; a styled
+/// layer without one spawns nothing, so a stage that binds any layer does not
+/// silently keep spawning the wrong enemy elsewhere. Unstyled layers are left
+/// alone. Returns nothing when no layer has a pool, which keeps the patch off
+/// entirely.
+pub(super) fn goop_layer_spawn_bindings(
+    document: &StageDocument,
+) -> BTreeMap<usize, crate::direct_boot::RuntimeGoopLayerBinding> {
+    use crate::direct_boot::RuntimeGoopLayerBinding;
+
+    let mut bindings = BTreeMap::new();
+    let Some(authoring) = document.goop_authoring.as_ref() else {
+        return bindings;
+    };
+    let mut any_pool = false;
+    for (index, layer) in authoring.layers.iter().enumerate() {
+        if layer.style_source.is_none() {
+            continue;
+        }
+        let suffix = format!("_L{index:02}");
+        let pool = document.objects.iter().find_map(|object| {
+            let manager = object.raw_param("manager_name")?;
+            manager.ends_with(&suffix).then(|| manager.to_string())
+        });
+        match pool {
+            Some(manager) => {
+                any_pool = true;
+                bindings.insert(index, RuntimeGoopLayerBinding::Pool(manager));
+            }
+            None => {
+                bindings.insert(index, RuntimeGoopLayerBinding::Empty);
+            }
+        }
+    }
+    if !any_pool {
+        return BTreeMap::new();
+    }
+    bindings
+}
+
 pub(super) fn goop_flagged_managers(document: &StageDocument) -> BTreeSet<String> {
     let Ok(Some(StageResourceDocument::Placement(tables))) =
         document.effective_resource_clone(TABLES_PATH)

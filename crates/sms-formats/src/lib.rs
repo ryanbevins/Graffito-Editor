@@ -66,8 +66,8 @@ pub use j3d_rebuild::*;
 pub use j3d_static::*;
 pub use jdrama::{
     append_jdrama_scenario_archive_slot, effective_npc_parts_mask, encode_jdrama_document,
-    ensure_jdrama_scenario_archive_slot, jdrama_key_code, parse_jdrama_document,
-    parse_jdrama_object_records, parse_jdrama_scenario_archive_areas,
+    encode_shift_jis_name, ensure_jdrama_scenario_archive_slot, jdrama_key_code,
+    parse_jdrama_document, parse_jdrama_object_records, parse_jdrama_scenario_archive_areas,
     parse_jdrama_scenario_archive_entries, JDramaAmbient, JDramaCubeGeneralInfo, JDramaDocument,
     JDramaField, JDramaFieldValue, JDramaLight, JDramaLightMap, JDramaLightMapEntry,
     JDramaMapEventBuilding, JDramaMapEventSinkParams, JDramaNpcParams, JDramaObjectRecord,
