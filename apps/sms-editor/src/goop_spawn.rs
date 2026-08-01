@@ -1738,7 +1738,36 @@ impl SmsEditorApp {
             }
         }
 
-        self.update_selected_parameter("manager_name", target_manager);
+        // The parameter editor refuses manager_name on a retail-placed actor
+        // ("no owned dependency"), which is right in general: relinking to a
+        // manager that does not exist would break export. Here the target
+        // manager was just created and owned by its pool carrier, so the link
+        // resolves and the edit is applied directly.
+        let Some(mut after) = self.selected_object().cloned() else {
+            return;
+        };
+        let before = after.clone();
+        after.set_raw_param("manager_name", target_manager.clone());
+        sms_scene::sync_scene_object_parameter_aliases(&mut after);
+        if let Some(sms_scene::PlacementBinding::Authored(authored)) = after.placement.as_mut() {
+            for dependency in &mut authored.dependencies {
+                if dependency.record.name == current_manager {
+                    dependency.record.name.clone_from(&target_manager);
+                }
+            }
+        }
+        self.apply_object_edit(
+            "Bound actor to a goop layer",
+            ObjectUndoRecord {
+                deltas: vec![ObjectDelta::Update {
+                    before: Box::new(before),
+                    after: Box::new(after),
+                }],
+                resource_deltas: Vec::new(),
+                route_delta: None,
+                dialogue_delta: None,
+            },
+        );
         self.log.push(match layer {
             Some(index) => format!("'{}' now samples goop layer {index:02}.", object.id),
             None => format!("'{}' returned to the stage goop texture.", object.id),

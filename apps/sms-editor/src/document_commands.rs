@@ -4137,7 +4137,7 @@ impl SmsEditorApp {
         }
     }
 
-    fn apply_object_edit(&mut self, label: &str, record: ObjectUndoRecord) {
+    pub(super) fn apply_object_edit(&mut self, label: &str, record: ObjectUndoRecord) {
         self.apply_object_edit_inner(label, record, true);
     }
 
