@@ -3693,8 +3693,7 @@ impl SmsEditorApp {
         suffix: &str,
     ) -> Result<String, String> {
         let template = self.catalog_template_for(actor_factory)?;
-        let clone =
-            sms_scene::clone_enemy_manager_template(&template, manager_name, suffix, false)?;
+        let clone = sms_scene::clone_enemy_manager_template(&template, manager_name, suffix, true)?;
         let cloned_manager_name = format!("{manager_name}{suffix}");
         self.purge_cloned_character_registration(suffix)?;
         let summary = self.insert_catalog_enemy_manager_pool(

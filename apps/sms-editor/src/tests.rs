@@ -5630,6 +5630,103 @@ fn probe_tables_roundtrip() {
 /// Lists resources in an exported stage archive matching a filter.
 /// `GRAFFITO_PROBE_SZS=<path> GRAFFITO_PROBE_MATCH=pollution cargo test
 /// probe_szs_contents -- --ignored --nocapture`
+/// Reproduces what the archive writer emits for a brand-new folder, so it can
+/// be compared against a folder that came from retail.
+/// `GRAFFITO_PROBE_SZS=<retail.szs> cargo test probe_rarc_new_folder --
+/// --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_rarc_new_folder() {
+    let Ok(path) = std::env::var("GRAFFITO_PROBE_SZS") else {
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read archive");
+    let decoded = match sms_formats::decode_yaz0(&raw) {
+        Ok(decoded) => decoded,
+        Err(_) => raw.clone(),
+    };
+    let document = sms_formats::RarcDocument::parse(&decoded).expect("parse rarc");
+    let mut builder = sms_formats::RarcBuilder::from_document(&document).expect("builder");
+    builder
+        .insert_file(b"hamukuri_L00/default.bmd", vec![0_u8; 64])
+        .expect("insert model");
+    builder
+        .insert_file(b"hamukuri_L00/bas/hamukuri_walk.bas", vec![0_u8; 16])
+        .expect("insert bas");
+    let rebuilt = builder.into_document().expect("rebuild");
+    let bytes = rebuilt.to_bytes().expect("serialize");
+    let reparsed = sms_formats::RarcDocument::parse(&bytes).expect("reparse");
+    for node in &reparsed.nodes {
+        let name = String::from_utf8_lossy(&node.raw_name).to_string();
+        if !name.starts_with("hamukuri") {
+            continue;
+        }
+        println!(
+            "node name={name:?} type={:02X?} hash={:#06x} entries={}",
+            node.node_type, node.name_hash, node.entry_count
+        );
+        let first = node.first_entry_index as usize;
+        for offset in 0..node.entry_count as usize {
+            if let Some(entry) = reparsed.entries.get(first + offset) {
+                println!(
+                    "    entry name={:?} id={:#06x} flags={:#04x}",
+                    String::from_utf8_lossy(&entry.raw_name),
+                    entry.file_id,
+                    entry.flags
+                );
+            }
+        }
+    }
+}
+
+/// Dumps RARC directory nodes so a built archive can be compared against a
+/// retail one. Local diagnostic:
+/// `GRAFFITO_PROBE_SZS=<path.szs> GRAFFITO_PROBE_MATCH=hamukuri
+/// cargo test probe_rarc_nodes -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_rarc_nodes() {
+    let Ok(path) = std::env::var("GRAFFITO_PROBE_SZS") else {
+        return;
+    };
+    let needle = std::env::var("GRAFFITO_PROBE_MATCH")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let raw = std::fs::read(&path).expect("read archive");
+    let decoded = match sms_formats::decode_yaz0(&raw) {
+        Ok(decoded) => decoded,
+        Err(_) => raw.clone(),
+    };
+    let document = sms_formats::RarcDocument::parse(&decoded).expect("parse rarc");
+    println!(
+        "nodes: {}, entries: {}",
+        document.nodes.len(),
+        document.entries.len()
+    );
+    for (index, node) in document.nodes.iter().enumerate() {
+        let name = String::from_utf8_lossy(&node.raw_name).to_string();
+        if !needle.is_empty() && !name.to_ascii_lowercase().contains(&needle) {
+            continue;
+        }
+        println!(
+            "node {index}: name={name:?} type={:02X?} hash={:#06x} entries={} first={}",
+            node.node_type, node.name_hash, node.entry_count, node.first_entry_index
+        );
+        let first = node.first_entry_index as usize;
+        for offset in 0..node.entry_count as usize {
+            if let Some(entry) = document.entries.get(first + offset) {
+                println!(
+                    "    entry: name={:?} id={:#06x} flags={:#04x} hash={:#06x}",
+                    String::from_utf8_lossy(&entry.raw_name),
+                    entry.file_id,
+                    entry.flags,
+                    entry.name_hash
+                );
+            }
+        }
+    }
+}
+
 #[test]
 #[ignore]
 fn probe_szs_contents() {
