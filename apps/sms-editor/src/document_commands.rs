@@ -3693,7 +3693,8 @@ impl SmsEditorApp {
         suffix: &str,
     ) -> Result<String, String> {
         let template = self.catalog_template_for(actor_factory)?;
-        let clone = sms_scene::clone_enemy_manager_template(&template, manager_name, suffix)?;
+        let clone =
+            sms_scene::clone_enemy_manager_template(&template, manager_name, suffix, false)?;
         let cloned_manager_name = format!("{manager_name}{suffix}");
         let summary = self.insert_catalog_enemy_manager_pool(
             &clone.template,
@@ -3701,6 +3702,11 @@ impl SmsEditorApp {
             manager_factory,
             &cloned_manager_name,
         )?;
+        if clone.folder_rewrites.is_empty() {
+            return Ok(format!(
+                "{summary} It shares the original's models, so both pools look the same."
+            ));
+        }
         let copied = self.materialize_cloned_manager_folders(&clone.folder_rewrites)?;
         Ok(format!(
             "{summary} Copied {copied} model resource(s) into the clone's own folder."
@@ -3720,7 +3726,7 @@ impl SmsEditorApp {
         suffix: &str,
     ) -> Result<usize, String> {
         let template = self.catalog_template_for(actor_factory)?;
-        let clone = sms_scene::clone_enemy_manager_template(&template, manager_name, suffix)?;
+        let clone = sms_scene::clone_enemy_manager_template(&template, manager_name, suffix, true)?;
         let missing = {
             let document = self
                 .document

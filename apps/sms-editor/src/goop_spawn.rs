@@ -1750,12 +1750,13 @@ mod tests {
                 }],
             },
         }];
-        let first = sms_scene::clone_enemy_manager_template(&template, "hamuManager", "_L00")
+        let first = sms_scene::clone_enemy_manager_template(&template, "hamuManager", "_L00", true)
             .unwrap()
             .template;
-        let second = sms_scene::clone_enemy_manager_template(&template, "hamuManager", "_L01")
-            .unwrap()
-            .template;
+        let second =
+            sms_scene::clone_enemy_manager_template(&template, "hamuManager", "_L01", true)
+                .unwrap()
+                .template;
 
         assert_eq!(first.dependencies[0].record.name, "hamuManager_L00");
         assert_eq!(second.dependencies[0].record.name, "hamuManager_L01");

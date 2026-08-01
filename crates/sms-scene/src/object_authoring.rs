@@ -2569,6 +2569,7 @@ pub fn clone_enemy_manager_template(
     template: &ObjectAuthoringTemplate,
     manager_name: &str,
     suffix: &str,
+    own_models: bool,
 ) -> Result<ClonedEnemyManagerBundle, String> {
     if suffix.is_empty() {
         return Err("a cloned manager bundle needs a non-empty suffix".to_string());
@@ -2624,6 +2625,15 @@ pub fn clone_enemy_manager_template(
             "SmplChara" => "archive_path",
             _ => continue,
         };
+        // Sharing the folder makes the clone an independent pool that still
+        // draws on the original's models -- correct whenever the copies would
+        // only ever be identical, and the only option until each copy needs
+        // its own baked look.
+        if !own_models {
+            registration.name = new_name.clone();
+            character_rewrites.push((old_name, new_name));
+            continue;
+        }
         if let Some(folder) = string_field(registration, folder_field).map(str::to_string) {
             let new_folder = format!("{}{suffix}", folder.trim_end_matches('/'));
             set_string_field(registration, folder_field, &new_folder);
@@ -4510,7 +4520,7 @@ mod tests {
     #[test]
     fn a_cloned_manager_bundle_renames_manager_character_and_folder() {
         let template = cloneable_manager_template();
-        let clone = clone_enemy_manager_template(&template, "hamuManager", "_L01")
+        let clone = clone_enemy_manager_template(&template, "hamuManager", "_L01", true)
             .unwrap()
             .template;
 
@@ -4557,7 +4567,7 @@ mod tests {
         template.character_resource_records = std::mem::take(&mut template.character_records);
         assert!(template.character_records.is_empty());
 
-        let clone = clone_enemy_manager_template(&template, "hamuManager", "_L02")
+        let clone = clone_enemy_manager_template(&template, "hamuManager", "_L02", true)
             .unwrap()
             .template;
 
@@ -4580,7 +4590,7 @@ mod tests {
     #[test]
     fn a_clone_reports_the_folder_its_models_must_be_copied_into() {
         let template = cloneable_manager_template();
-        let clone = clone_enemy_manager_template(&template, "hamuManager", "_L01").unwrap();
+        let clone = clone_enemy_manager_template(&template, "hamuManager", "_L01", true).unwrap();
         assert_eq!(
             clone.folder_rewrites,
             vec![("hamukuri".to_string(), "hamukuri_L01".to_string())]
@@ -4590,7 +4600,7 @@ mod tests {
     #[test]
     fn cloning_rejects_a_template_without_the_requested_manager() {
         let template = cloneable_manager_template();
-        assert!(clone_enemy_manager_template(&template, "otherManager", "_L01").is_err());
-        assert!(clone_enemy_manager_template(&template, "hamuManager", "").is_err());
+        assert!(clone_enemy_manager_template(&template, "otherManager", "_L01", true).is_err());
+        assert!(clone_enemy_manager_template(&template, "hamuManager", "", true).is_err());
     }
 }
