@@ -1244,12 +1244,7 @@ impl SmsEditorApp {
     /// clone loads its own models, then bakes that layer's stain into the
     /// clone's own model copy and flags it in the enemy table. All of it is
     /// one undo step.
-    pub(super) fn set_layer_pool(
-        &mut self,
-        entity: &GoopSpawnEntity,
-        layer_index: usize,
-        enabled: bool,
-    ) {
+    fn set_layer_pool(&mut self, entity: &GoopSpawnEntity, layer_index: usize, enabled: bool) {
         let Some(document) = self.document.as_ref() else {
             return;
         };
