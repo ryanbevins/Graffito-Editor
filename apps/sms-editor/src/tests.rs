@@ -5630,6 +5630,103 @@ fn probe_tables_roundtrip() {
 /// Lists resources in an exported stage archive matching a filter.
 /// `GRAFFITO_PROBE_SZS=<path> GRAFFITO_PROBE_MATCH=pollution cargo test
 /// probe_szs_contents -- --ignored --nocapture`
+/// Reproduces what the archive writer emits for a brand-new folder, so it can
+/// be compared against a folder that came from retail.
+/// `GRAFFITO_PROBE_SZS=<retail.szs> cargo test probe_rarc_new_folder --
+/// --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_rarc_new_folder() {
+    let Ok(path) = std::env::var("GRAFFITO_PROBE_SZS") else {
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read archive");
+    let decoded = match sms_formats::decode_yaz0(&raw) {
+        Ok(decoded) => decoded,
+        Err(_) => raw.clone(),
+    };
+    let document = sms_formats::RarcDocument::parse(&decoded).expect("parse rarc");
+    let mut builder = sms_formats::RarcBuilder::from_document(&document).expect("builder");
+    builder
+        .insert_file(b"hamukuri_L00/default.bmd", vec![0_u8; 64])
+        .expect("insert model");
+    builder
+        .insert_file(b"hamukuri_L00/bas/hamukuri_walk.bas", vec![0_u8; 16])
+        .expect("insert bas");
+    let rebuilt = builder.into_document().expect("rebuild");
+    let bytes = rebuilt.to_bytes().expect("serialize");
+    let reparsed = sms_formats::RarcDocument::parse(&bytes).expect("reparse");
+    for node in &reparsed.nodes {
+        let name = String::from_utf8_lossy(&node.raw_name).to_string();
+        if !name.starts_with("hamukuri") {
+            continue;
+        }
+        println!(
+            "node name={name:?} type={:02X?} hash={:#06x} entries={}",
+            node.node_type, node.name_hash, node.entry_count
+        );
+        let first = node.first_entry_index as usize;
+        for offset in 0..node.entry_count as usize {
+            if let Some(entry) = reparsed.entries.get(first + offset) {
+                println!(
+                    "    entry name={:?} id={:#06x} flags={:#04x}",
+                    String::from_utf8_lossy(&entry.raw_name),
+                    entry.file_id,
+                    entry.flags
+                );
+            }
+        }
+    }
+}
+
+/// Dumps RARC directory nodes so a built archive can be compared against a
+/// retail one. Local diagnostic:
+/// `GRAFFITO_PROBE_SZS=<path.szs> GRAFFITO_PROBE_MATCH=hamukuri
+/// cargo test probe_rarc_nodes -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_rarc_nodes() {
+    let Ok(path) = std::env::var("GRAFFITO_PROBE_SZS") else {
+        return;
+    };
+    let needle = std::env::var("GRAFFITO_PROBE_MATCH")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let raw = std::fs::read(&path).expect("read archive");
+    let decoded = match sms_formats::decode_yaz0(&raw) {
+        Ok(decoded) => decoded,
+        Err(_) => raw.clone(),
+    };
+    let document = sms_formats::RarcDocument::parse(&decoded).expect("parse rarc");
+    println!(
+        "nodes: {}, entries: {}",
+        document.nodes.len(),
+        document.entries.len()
+    );
+    for (index, node) in document.nodes.iter().enumerate() {
+        let name = String::from_utf8_lossy(&node.raw_name).to_string();
+        if !needle.is_empty() && !name.to_ascii_lowercase().contains(&needle) {
+            continue;
+        }
+        println!(
+            "node {index}: name={name:?} type={:02X?} hash={:#06x} entries={} first={}",
+            node.node_type, node.name_hash, node.entry_count, node.first_entry_index
+        );
+        let first = node.first_entry_index as usize;
+        for offset in 0..node.entry_count as usize {
+            if let Some(entry) = document.entries.get(first + offset) {
+                println!(
+                    "    entry: name={:?} id={:#06x} flags={:#04x} hash={:#06x}",
+                    String::from_utf8_lossy(&entry.raw_name),
+                    entry.file_id,
+                    entry.flags,
+                    entry.name_hash
+                );
+            }
+        }
+    }
+}
+
 #[test]
 #[ignore]
 fn probe_szs_contents() {
@@ -5693,6 +5790,130 @@ fn probe_resource_hashes() {
                 hash
             );
         }
+    }
+}
+
+/// Reports the format of the cap-stain decal vs the goop surface texture, to
+/// decide how to recolor one from the other.
+/// `GRAFFITO_PROBE_SZS=<stage.szs> cargo test probe_stain_formats -- --ignored
+/// --nocapture`
+#[test]
+#[ignore]
+fn probe_stain_formats() {
+    let Ok(path) = std::env::var("GRAFFITO_PROBE_SZS") else {
+        return;
+    };
+    let assets = sms_formats::mount_scene_archive(std::path::Path::new(&path)).expect("mount");
+    let read = |suffix: &str| {
+        assets
+            .iter()
+            .find(|asset| {
+                asset
+                    .path
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .ends_with(suffix)
+            })
+            .map(|asset| sms_formats::read_stage_asset_bytes(&asset.path).expect("read"))
+    };
+    if let Some(bytes) = read("h_ma_rak.bti") {
+        let bti = sms_formats::BtiFile::parse(&bytes).expect("parse bti");
+        println!(
+            "H_ma_rak.bti: {}x{} format {} palette {}",
+            bti.width, bti.height, bti.format, bti.palette_enabled
+        );
+    }
+    for suffix in ["pollution00.bmd", "pollution01.bmd"] {
+        if let Some(bytes) = read(suffix) {
+            let model = sms_formats::J3dRebuildDocument::parse(&bytes).expect("parse");
+            if let Some(name) = model.texture_names().into_iter().next() {
+                let bti = model.named_texture_as_bti(&name).expect("extract");
+                println!(
+                    "{suffix} [{name}]: {}x{} format {} palette {}",
+                    bti.width, bti.height, bti.format, bti.palette_enabled
+                );
+            }
+        }
+    }
+}
+
+/// Extracting a texture from a model and baking it back into another must
+/// preserve the pixels. `GRAFFITO_PROBE_SZS=<stage.szs>
+/// cargo test probe_texture_roundtrip -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_texture_roundtrip() {
+    let Ok(path) = std::env::var("GRAFFITO_PROBE_SZS") else {
+        return;
+    };
+    let assets = sms_formats::mount_scene_archive(std::path::Path::new(&path)).expect("mount");
+    let model_bytes = assets
+        .iter()
+        .find(|asset| {
+            asset
+                .path
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with("pollution00.bmd")
+        })
+        .map(|asset| sms_formats::read_stage_asset_bytes(&asset.path).expect("read"))
+        .expect("pollution00.bmd");
+    let model = sms_formats::J3dRebuildDocument::parse(&model_bytes).expect("parse");
+    let name = model.texture_names().into_iter().next().expect("a texture");
+    let extracted = model.named_texture_as_bti(&name).expect("extract");
+    println!(
+        "extracted {name:?}: {}x{} format {} -> {} bytes",
+        extracted.width,
+        extracted.height,
+        extracted.format,
+        extracted.encode().expect("encode").len()
+    );
+    // The extracted texture bakes into a Stu model like any stain would.
+    let stu = assets
+        .iter()
+        .find(|asset| {
+            asset
+                .path
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with("hamukuri/default.bmd")
+        })
+        .map(|asset| sms_formats::read_stage_asset_bytes(&asset.path).expect("read"));
+    if let Some(stu_bytes) = stu {
+        let mut stu = sms_formats::J3dRebuildDocument::parse(&stu_bytes).expect("parse stu");
+        let replaced = stu
+            .replace_named_texture_from_bti("H_ma_rak_dummy", &extracted)
+            .expect("bake");
+        println!("baked layer texture into {replaced} stu slot(s)");
+        assert!(replaced > 0);
+    }
+}
+
+/// Lists the textures inside a pollution model, so the per-layer stain can
+/// pull the layer's own surface look. `GRAFFITO_PROBE_SZS=<stage.szs>
+/// cargo test probe_pollution_textures -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_pollution_textures() {
+    let Ok(path) = std::env::var("GRAFFITO_PROBE_SZS") else {
+        return;
+    };
+    let assets = sms_formats::mount_scene_archive(std::path::Path::new(&path)).expect("mount");
+    for asset in &assets {
+        let name = asset
+            .path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        if !name.contains("pollution") || !name.ends_with(".bmd") {
+            continue;
+        }
+        let bytes = sms_formats::read_stage_asset_bytes(&asset.path).expect("read");
+        let Ok(model) = sms_formats::J3dRebuildDocument::parse(&bytes) else {
+            println!("{name}: (not a parseable J3D model)");
+            continue;
+        };
+        println!("{name}: textures = {:?}", model.texture_names());
     }
 }
 

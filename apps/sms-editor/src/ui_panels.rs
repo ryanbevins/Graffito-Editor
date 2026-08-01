@@ -1681,35 +1681,54 @@ impl SmsEditorApp {
                 }
             }
 
-            if let Some(sms_scene::PlacementBinding::Authored(placement)) = &object.placement {
-                if self.object_uses_stu_stain_model(&object) {
-                    let mut stained = self.stu_stain_baked();
-                    if ui
-                        .checkbox(&mut stained, "Goop stain on cap")
-                        .on_hover_text(
-                            "Bakes the stage's stain texture into the Stu model and pins its \
-                             blend, so it shows regardless of what the runtime decides. Applies \
-                             to every Stu using this model in the stage.",
-                        )
-                        .changed()
-                    {
-                        match stained {
-                            true => self.bake_stu_stain(),
-                            false => self.unbake_stu_stain(),
-                        }
-                    }
-                }
-                if self.object_uses_enemy_pool(&object) {
+            // A placed actor can be bound to a goop layer so it wears the goop
+            // it stands in. Offered whenever the stage has styled layers and
+            // the actor carries a manager to rebind.
+            if object.raw_param("manager_name").is_some() {
+                let choices = self.goop_layer_choices();
+                if !choices.is_empty() {
                     ui.separator();
-                    let mut pool_only = placement.pool_only;
-                    if ui
-                        .checkbox(&mut pool_only, "Pool only (no placed instance)")
+                    let current = Self::selected_actor_goop_layer(&object);
+                    let selected_text = match current {
+                        Some(index) => choices
+                            .iter()
+                            .find(|(item, _)| *item == index)
+                            .map(|(index, name)| format!("{index:02} {name}"))
+                            .unwrap_or_else(|| format!("{index:02}")),
+                        None => "Stage default".to_string(),
+                    };
+                    let mut picked: Option<Option<usize>> = None;
+                    egui::ComboBox::from_label("Goop texture")
+                        .selected_text(selected_text)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(current.is_none(), "Stage default")
+                                .clicked()
+                            {
+                                picked = Some(None);
+                            }
+                            for (index, name) in &choices {
+                                if ui
+                                    .selectable_label(
+                                        current == Some(*index),
+                                        format!("{index:02} {name}"),
+                                    )
+                                    .clicked()
+                                {
+                                    picked = Some(Some(*index));
+                                }
+                            }
+                        })
+                        .response
                         .on_hover_text(
-                            "Export the manager and its resources without this actor record.                              The conductor fills the manager's pool at load, so goop spawning                              still works and nothing stands in the world.",
-                        )
-                        .changed()
-                    {
-                        self.set_selected_object_pool_only(pool_only);
+                            "Bakes this actor's goop coating from a scene goop layer, so it \
+                             wears the goop it stands in. Rebinds the actor to that layer's \
+                             own model pool.",
+                        );
+                    if let Some(layer) = picked {
+                        if layer != current {
+                            self.set_selected_actor_goop_layer(layer);
+                        }
                     }
                 }
             }
