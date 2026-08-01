@@ -3715,7 +3715,13 @@ impl SmsEditorApp {
         let template = self.catalog_template_for(actor_factory)?;
         let clone = sms_scene::clone_enemy_manager_template(&template, manager_name, suffix, true)?;
         let cloned_manager_name = format!("{manager_name}{suffix}");
-        self.purge_cloned_character_registration(suffix)?;
+        let owned_names = clone
+            .template
+            .character_records
+            .iter()
+            .map(|record| record.name.clone())
+            .collect::<Vec<_>>();
+        self.purge_cloned_character_registration(&owned_names)?;
         let summary = self.insert_catalog_enemy_manager_pool(
             &clone.template,
             actor_factory,
@@ -3738,7 +3744,7 @@ impl SmsEditorApp {
     /// Removing a layer pool leaves its registration behind, and re-adding one
     /// that resolves differently is refused as a conflicting same-name record
     /// -- which reads as a checkbox that silently unticks itself.
-    fn purge_cloned_character_registration(&mut self, suffix: &str) -> Result<(), String> {
+    fn purge_cloned_character_registration(&mut self, names: &[String]) -> Result<(), String> {
         const TABLES: &[u8] = b"map/tables.bin";
         let document = self
             .document
@@ -3750,7 +3756,7 @@ impl SmsEditorApp {
         else {
             return Ok(());
         };
-        fn prune(record: &mut sms_formats::JDramaRecord, suffix: &str) -> bool {
+        fn prune(record: &mut sms_formats::JDramaRecord, names: &[String]) -> bool {
             let sms_formats::JDramaRecordPayload::Group { children, .. } = &mut record.payload
             else {
                 return false;
@@ -3762,15 +3768,18 @@ impl SmsEditorApp {
                     .rsplit("::")
                     .next()
                     .unwrap_or(&child.type_name);
-                !(matches!(short, "ObjChara" | "SmplChara") && child.name.ends_with(suffix))
+                // Only this clone's own registrations: a broad suffix match
+                // deleted every other manager's clone for the same layer.
+                !(matches!(short, "ObjChara" | "SmplChara")
+                    && names.iter().any(|name| name == &child.name))
             });
             let mut changed = before != children.len();
             for child in children {
-                changed |= prune(child, suffix);
+                changed |= prune(child, names);
             }
             changed
         }
-        if !prune(&mut tables.root, suffix) {
+        if !prune(&mut tables.root, names) {
             return Ok(());
         }
         let document = self
@@ -3814,6 +3823,29 @@ impl SmsEditorApp {
     ) -> Result<usize, String> {
         let template = self.catalog_template_for(actor_factory)?;
         let clone = sms_scene::clone_enemy_manager_template(&template, manager_name, suffix, true)?;
+        // A clone that lost its character registration crashes the stage on
+        // load: the manager dereferences the registration it fails to find.
+        // Restoring it is idempotent, so it runs on every repair.
+        if !clone.template.character_records.is_empty() {
+            let current = self
+                .document
+                .as_ref()
+                .ok_or_else(|| "no stage is open".to_string())?
+                .effective_resource_clone(b"map/tables.bin")
+                .map_err(|error| error.to_string())?;
+            let (merged, changed) =
+                merge_character_table(current, &clone.template.character_records)?;
+            if changed {
+                let document = self
+                    .document
+                    .as_mut()
+                    .ok_or_else(|| "no stage is open".to_string())?;
+                document.archive_edits.upsert_resource(
+                    b"map/tables.bin".to_vec(),
+                    sms_scene::StageResourceDocument::Placement(merged),
+                );
+            }
+        }
         let missing = {
             let document = self
                 .document

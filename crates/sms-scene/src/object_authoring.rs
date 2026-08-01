@@ -4613,6 +4613,45 @@ mod tests {
         );
     }
 
+    /// Two managers cloned for the same layer must register distinct
+    /// characters. They previously collided by suffix, so creating one
+    /// manager's layer clone deleted the other's registration and left its
+    /// pool resolving models through a character the game could not find.
+    #[test]
+    fn clones_of_different_managers_do_not_share_a_registration_name() {
+        let mut pakkun = cloneable_manager_template();
+        pakkun.factory_name = "Pakkun".to_string();
+        pakkun.dependencies[0].record.name = "pakkuManager".to_string();
+        set_string_field(&mut pakkun.record, "manager_name", "pakkuManager");
+        pakkun.character_records[0].name = "pakkuChara".to_string();
+        set_string_field(
+            &mut pakkun.character_records[0],
+            "resource_folder",
+            "/scene/pakkun",
+        );
+        set_character_reference(&mut pakkun.record, "pakkuChara");
+        set_character_reference(&mut pakkun.dependencies[0].record, "pakkuChara");
+
+        let hamu = clone_enemy_manager_template(
+            &cloneable_manager_template(),
+            "hamuManager",
+            "_L01",
+            true,
+        )
+        .unwrap()
+        .template;
+        let pakkun = clone_enemy_manager_template(&pakkun, "pakkuManager", "_L01", true)
+            .unwrap()
+            .template;
+
+        assert_eq!(hamu.character_records[0].name, "hamukuriChara_L01");
+        assert_eq!(pakkun.character_records[0].name, "pakkuChara_L01");
+        assert_ne!(
+            hamu.character_records[0].name,
+            pakkun.character_records[0].name
+        );
+    }
+
     #[test]
     fn cloning_rejects_a_template_without_the_requested_manager() {
         let template = cloneable_manager_template();
