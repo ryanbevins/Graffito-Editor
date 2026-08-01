@@ -43,6 +43,15 @@ const SPAWN_FROM_GOOP_FLAG: i32 = 0x1;
 /// likely.
 const SPAWN_WEIGHT: u32 = 100;
 
+/// Suffix of the hidden pool that spawns from goop when placed actors exist.
+///
+/// The conductor recycles every enemy of a flagged manager into goop --
+/// retail's "spawns" are its placed enemies being teleported -- so flagging a
+/// manager that also has hand-placed actors steals them off their placements.
+/// Spawning is instead given an unplaced clone pool under this suffix, and the
+/// placed actors' own manager stays unflagged.
+const GOOP_POOL_SUFFIX: &str = "_gp";
+
 fn jdrama_field(name: &str, value: sms_formats::JDramaFieldValue) -> sms_formats::JDramaField {
     sms_formats::JDramaField {
         name: name.to_string(),
@@ -765,8 +774,19 @@ impl SmsEditorApp {
         else {
             return false;
         };
+        let spawn_pool = format!("{manager}{GOOP_POOL_SUFFIX}");
         any_record(&tables.root, &|record| {
-            entry_for_manager(record, manager) && entry_spawns_from_goop(record)
+            (entry_for_manager(record, manager) || entry_for_manager(record, &spawn_pool))
+                && entry_spawns_from_goop(record)
+        })
+    }
+
+    /// Whether any hand-placed (non-carrier) actor is bound to `manager`.
+    fn placed_actors_use_manager(&self, manager: &str) -> bool {
+        self.document.as_ref().is_some_and(|document| {
+            document.objects.iter().any(|object| {
+                !object.is_pool_only() && object.raw_param("manager_name") == Some(manager)
+            })
         })
     }
 
@@ -782,7 +802,63 @@ impl SmsEditorApp {
         let before_object_serial = self.next_object_serial;
         let mut pool_log = Vec::new();
 
+        let spawn_pool = format!("{}{GOOP_POOL_SUFFIX}", entity.manager_name);
         let result: Result<(), String> = (|| {
+            if enabled && self.placed_actors_use_manager(&entity.manager_name) {
+                // Placed actors must keep standing where they were put, so the
+                // goop flag goes onto an unplaced clone pool instead of the
+                // manager that owns the placements.
+                let actor_factory = entity.catalog_actor_factory.as_deref().ok_or_else(|| {
+                    format!(
+                        "manager {:?} has hand-placed actors but no retail-backed bundle to                          clone for goop spawning",
+                        entity.manager_name
+                    )
+                })?;
+                let manager_factory = entity.manager_factory.as_deref().ok_or_else(|| {
+                    format!(
+                        "manager {:?} has no decomp-derived factory",
+                        entity.manager_name
+                    )
+                })?;
+                let clone_exists = self.document.as_ref().is_some_and(|document| {
+                    document
+                        .objects
+                        .iter()
+                        .any(|object| object.raw_param("manager_name") == Some(spawn_pool.as_str()))
+                });
+                if clone_exists {
+                    let repaired = self.ensure_cloned_manager_pool_resources(
+                        actor_factory,
+                        &entity.manager_name,
+                        GOOP_POOL_SUFFIX,
+                    )?;
+                    if repaired > 0 {
+                        pool_log.push(format!(
+                            "Restored {repaired} missing model resource(s) for the goop spawn                              pool."
+                        ));
+                    }
+                } else {
+                    pool_log.push(self.ensure_cloned_enemy_manager_pool(
+                        actor_factory,
+                        manager_factory,
+                        &entity.manager_name,
+                        GOOP_POOL_SUFFIX,
+                    )?);
+                }
+                self.apply_manager_spawn(&spawn_pool, true)?;
+                // A project flagged before this arrangement existed migrates:
+                // the placed actors' manager gives the flag up to the clone.
+                if goop_flagged_managers(self.document.as_ref().expect("document checked"))
+                    .contains(&entity.manager_name)
+                {
+                    self.apply_manager_spawn(&entity.manager_name, false)?;
+                    pool_log.push(format!(
+                        "Moved the goop flag off {:?} so its placed actors keep their                          placements; spawning now comes from {spawn_pool:?}.",
+                        entity.manager_name
+                    ));
+                }
+                return Ok(());
+            }
             if enabled {
                 if let Some(actor_factory) = entity.catalog_actor_factory.as_deref() {
                     let manager_factory = entity.manager_factory.as_deref().ok_or_else(|| {
@@ -830,6 +906,8 @@ impl SmsEditorApp {
             }
             self.apply_manager_spawn(&entity.manager_name, enabled)?;
             if !enabled {
+                // Clearing a spawn-pool entry that never existed is a no-op.
+                self.apply_manager_spawn(&spawn_pool, false)?;
                 pool_log.extend(self.cleanup_unused_goop_manager_pools());
             }
             Ok(())
