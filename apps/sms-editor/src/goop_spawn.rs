@@ -1761,10 +1761,11 @@ impl SmsEditorApp {
         };
         let before = after.clone();
         after.set_raw_param("manager_name", target_manager.clone());
-        // The actor names the character it resolves its own models through, so
-        // it has to follow the manager onto the layer's registration -- left
-        // on the base one it keeps loading the base folder's models and the
-        // runtime paints them with the stage stain.
+        // The actor's own character stays on the base registration: export
+        // re-applies parameters and refuses a changed character_name (it owns
+        // a registration), and the model comes through the manager's keeper
+        // anyway, so only the manager needs to move. Writing the base also
+        // repairs actors a previous build had suffixed, which failed export.
         if let Some(character) = before.raw_param("character_name") {
             let base = match character.rsplit_once("_L") {
                 Some((base, digits))
@@ -1774,11 +1775,7 @@ impl SmsEditorApp {
                 }
                 _ => character.to_string(),
             };
-            let bound = match layer {
-                Some(index) => format!("{base}{}", Self::layer_pool_suffix(index)),
-                None => base,
-            };
-            after.set_raw_param("character_name", bound);
+            after.set_raw_param("character_name", base);
         }
         sms_scene::sync_scene_object_parameter_aliases(&mut after);
         if let Some(sms_scene::PlacementBinding::Authored(authored)) = after.placement.as_mut() {
