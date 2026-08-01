@@ -1664,10 +1664,23 @@ fn manager_constructs_actor_or_managed_variant(
         return true;
     }
 
-    semantic_record_type(&manager.factory_name) == "PoiHanaManager"
-        && semantic_record_type(&actor.factory_name) == "PoiHanaRed"
-        && manager.spawned_actor_class.as_deref() == Some("TPoiHana")
-        && actor.class_name == "TPoiHanaRed"
+    // Subclasses a manager legitimately manages: the manager constructs the
+    // base class, and the variant derives from it, so a pool of the base
+    // manager can carry it. `TPoiHanaRed : TPoiHana` and
+    // `TStayPakkun : TPakkun` (Enemy/Pakkun.hpp), whose init takes the
+    // manager like any other.
+    const MANAGED_VARIANTS: [(&str, &str, &str, &str); 2] = [
+        ("PoiHanaManager", "PoiHanaRed", "TPoiHana", "TPoiHanaRed"),
+        ("PakkunManager", "StayPakkun", "TPakkun", "TStayPakkun"),
+    ];
+    MANAGED_VARIANTS.iter().any(
+        |(manager_factory, actor_factory, base_class, variant_class)| {
+            semantic_record_type(&manager.factory_name) == *manager_factory
+                && semantic_record_type(&actor.factory_name) == *actor_factory
+                && manager.spawned_actor_class.as_deref() == Some(*base_class)
+                && actor.class_name == *variant_class
+        },
+    )
 }
 
 fn prepare_catalog_enemy_manager_pool(
