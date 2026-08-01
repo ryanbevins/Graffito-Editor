@@ -1748,6 +1748,25 @@ impl SmsEditorApp {
         };
         let before = after.clone();
         after.set_raw_param("manager_name", target_manager.clone());
+        // The actor names the character it resolves its own models through, so
+        // it has to follow the manager onto the layer's registration -- left
+        // on the base one it keeps loading the base folder's models and the
+        // runtime paints them with the stage stain.
+        if let Some(character) = before.raw_param("character_name") {
+            let base = match character.rsplit_once("_L") {
+                Some((base, digits))
+                    if digits.len() == 2 && digits.chars().all(|item| item.is_ascii_digit()) =>
+                {
+                    base.to_string()
+                }
+                _ => character.to_string(),
+            };
+            let bound = match layer {
+                Some(index) => format!("{base}{}", Self::layer_pool_suffix(index)),
+                None => base,
+            };
+            after.set_raw_param("character_name", bound);
+        }
         sms_scene::sync_scene_object_parameter_aliases(&mut after);
         if let Some(sms_scene::PlacementBinding::Authored(authored)) = after.placement.as_mut() {
             for dependency in &mut authored.dependencies {
