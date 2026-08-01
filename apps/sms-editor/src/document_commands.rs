@@ -3707,6 +3707,45 @@ impl SmsEditorApp {
         ))
     }
 
+    /// Ensures an existing clone's folder actually holds its models.
+    ///
+    /// A pool imported before the folder was materialized -- or one whose
+    /// resources were pruned -- looks present but resolves to nothing, which
+    /// the game only reports by dying on load. Repairing is cheap and
+    /// idempotent, so it runs whenever a layer pool is (re)enabled.
+    pub(super) fn ensure_cloned_manager_pool_resources(
+        &mut self,
+        actor_factory: &str,
+        manager_name: &str,
+        suffix: &str,
+    ) -> Result<usize, String> {
+        let template = self.catalog_template_for(actor_factory)?;
+        let clone = sms_scene::clone_enemy_manager_template(&template, manager_name, suffix)?;
+        let missing = {
+            let document = self
+                .document
+                .as_ref()
+                .ok_or_else(|| "no stage is open".to_string())?;
+            let present = document
+                .effective_resource_paths()
+                .into_iter()
+                .map(|path| {
+                    let text = String::from_utf8_lossy(&path).replace('\\', "/");
+                    text.trim_matches('/').to_ascii_lowercase()
+                })
+                .collect::<BTreeSet<_>>();
+            clone.folder_rewrites.iter().any(|(_, to)| {
+                !present
+                    .iter()
+                    .any(|path| path.starts_with(&format!("{to}/")))
+            })
+        };
+        if !missing {
+            return Ok(0);
+        }
+        self.materialize_cloned_manager_folders(&clone.folder_rewrites)
+    }
+
     /// Fills a clone's resource folder with the stage's copy of the models.
     ///
     /// A renamed folder is an empty folder: the manager resolves its models

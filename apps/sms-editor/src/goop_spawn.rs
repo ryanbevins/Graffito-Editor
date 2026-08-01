@@ -1312,7 +1312,21 @@ impl SmsEditorApp {
                         entity.manager_name
                     )
                 })?;
-                if !self.layer_pool_exists(&entity.manager_name, layer_index) {
+                if self.layer_pool_exists(&entity.manager_name, layer_index) {
+                    // An existing pool may predate the folder materialization,
+                    // in which case it resolves to no models and kills the
+                    // stage on load. Repair rather than trust it.
+                    let repaired = self.ensure_cloned_manager_pool_resources(
+                        actor_factory,
+                        &entity.manager_name,
+                        &suffix,
+                    )?;
+                    if repaired > 0 {
+                        log.push(format!(
+                            "Restored {repaired} missing model resource(s) for the existing                              layer {layer_index:02} pool."
+                        ));
+                    }
+                } else {
                     log.push(self.ensure_cloned_enemy_manager_pool(
                         actor_factory,
                         manager_factory,
