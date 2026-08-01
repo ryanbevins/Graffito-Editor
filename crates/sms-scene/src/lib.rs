@@ -78,10 +78,10 @@ pub use goop_authoring::{
     GOOP_RUNTIME_PAYLOAD_WARNING_BYTES, GOOP_STAGE_HEAP_ERROR_BYTES, GOOP_STAGE_HEAP_WARNING_BYTES,
 };
 pub use object_authoring::{
-    clone_enemy_manager_template, ObjectAuthoringCatalog, ObjectAuthoringCatalogBuild,
-    ObjectAuthoringCatalogWarning, ObjectAuthoringDependency, ObjectAuthoringResource,
-    ObjectAuthoringRuntimeActorReference, ObjectAuthoringTableDependency, ObjectAuthoringTemplate,
-    SHINE_QUICK_CAMERA_NAME,
+    clone_enemy_manager_template, ClonedEnemyManagerBundle, ObjectAuthoringCatalog,
+    ObjectAuthoringCatalogBuild, ObjectAuthoringCatalogWarning, ObjectAuthoringDependency,
+    ObjectAuthoringResource, ObjectAuthoringRuntimeActorReference, ObjectAuthoringTableDependency,
+    ObjectAuthoringTemplate, SHINE_QUICK_CAMERA_NAME,
 };
 pub(crate) use object_parameters::validate_object_parameter_links_with_owned_name;
 pub use object_parameters::{
@@ -703,6 +703,29 @@ impl StageDocument {
     /// Clones the semantic resource after applying the current authored
     /// overlay in export order. This lets transactional editors merge into a
     /// detached resource without consulting or mutating the imported source.
+    /// Every resource path the stage would export: the archive's own, plus
+    /// anything the project added, minus what it removed.
+    pub fn effective_resource_paths(&self) -> Vec<Vec<u8>> {
+        let mut paths: BTreeSet<Vec<u8>> = self
+            .stage_archive
+            .as_ref()
+            .map(|archive| {
+                archive
+                    .resources()
+                    .iter()
+                    .map(|resource| resource.raw_path.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for edit in &self.archive_edits.resources {
+            paths.insert(edit.raw_resource_path.clone());
+        }
+        for removed in &self.archive_edits.resource_removals {
+            paths.remove(removed);
+        }
+        paths.into_iter().collect()
+    }
+
     pub fn effective_resource_clone(
         &self,
         raw_resource_path: &[u8],

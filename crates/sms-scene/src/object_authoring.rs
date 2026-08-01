@@ -2557,11 +2557,19 @@ fn set_character_reference(record: &mut JDramaRecord, value: &str) {
 /// Only the template is rewritten. Every import check compares the request
 /// against the template's own contents, so a consistently renamed copy passes
 /// the existing validation unchanged.
+pub struct ClonedEnemyManagerBundle {
+    pub template: ObjectAuthoringTemplate,
+    /// Source folder -> clone folder, as archive-relative paths. The clone's
+    /// folder starts out empty: the caller has to place the models there, or
+    /// the manager loads with no model data and the stage crashes on load.
+    pub folder_rewrites: Vec<(String, String)>,
+}
+
 pub fn clone_enemy_manager_template(
     template: &ObjectAuthoringTemplate,
     manager_name: &str,
     suffix: &str,
-) -> Result<ObjectAuthoringTemplate, String> {
+) -> Result<ClonedEnemyManagerBundle, String> {
     if suffix.is_empty() {
         return Err("a cloned manager bundle needs a non-empty suffix".to_string());
     }
@@ -2668,7 +2676,19 @@ pub fn clone_enemy_manager_template(
         }
     }
 
-    Ok(clone)
+    let folder_rewrites = folder_rewrites
+        .into_iter()
+        .map(|(old_folder, new_folder)| {
+            (
+                normalize_runtime_reference(&old_folder),
+                runtime_reference_archive_path(&new_folder),
+            )
+        })
+        .collect();
+    Ok(ClonedEnemyManagerBundle {
+        template: clone,
+        folder_rewrites,
+    })
 }
 
 #[cfg(test)]
@@ -4490,7 +4510,9 @@ mod tests {
     #[test]
     fn a_cloned_manager_bundle_renames_manager_character_and_folder() {
         let template = cloneable_manager_template();
-        let clone = clone_enemy_manager_template(&template, "hamuManager", "_L01").unwrap();
+        let clone = clone_enemy_manager_template(&template, "hamuManager", "_L01")
+            .unwrap()
+            .template;
 
         assert_eq!(clone.dependencies[0].record.name, "hamuManager_L01");
         assert_eq!(
@@ -4535,7 +4557,9 @@ mod tests {
         template.character_resource_records = std::mem::take(&mut template.character_records);
         assert!(template.character_records.is_empty());
 
-        let clone = clone_enemy_manager_template(&template, "hamuManager", "_L02").unwrap();
+        let clone = clone_enemy_manager_template(&template, "hamuManager", "_L02")
+            .unwrap()
+            .template;
 
         assert_eq!(clone.character_records.len(), 1);
         assert_eq!(clone.character_records[0].name, "hamukuriChara_L02");
@@ -4548,6 +4572,19 @@ mod tests {
             Some("hamukuriChara_L02")
         );
         assert_eq!(raw_paths(&clone.resources)[0], "hamukuri_L02/default.bmd");
+    }
+
+    /// The clone's folder has to be reported, because renaming the reference
+    /// without placing models there produces a manager with no model data --
+    /// which the game dereferences on load.
+    #[test]
+    fn a_clone_reports_the_folder_its_models_must_be_copied_into() {
+        let template = cloneable_manager_template();
+        let clone = clone_enemy_manager_template(&template, "hamuManager", "_L01").unwrap();
+        assert_eq!(
+            clone.folder_rewrites,
+            vec![("hamukuri".to_string(), "hamukuri_L01".to_string())]
+        );
     }
 
     #[test]

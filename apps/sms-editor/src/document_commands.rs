@@ -3695,12 +3695,88 @@ impl SmsEditorApp {
         let template = self.catalog_template_for(actor_factory)?;
         let clone = sms_scene::clone_enemy_manager_template(&template, manager_name, suffix)?;
         let cloned_manager_name = format!("{manager_name}{suffix}");
-        self.insert_catalog_enemy_manager_pool(
-            &clone,
+        let summary = self.insert_catalog_enemy_manager_pool(
+            &clone.template,
             actor_factory,
             manager_factory,
             &cloned_manager_name,
-        )
+        )?;
+        let copied = self.materialize_cloned_manager_folders(&clone.folder_rewrites)?;
+        Ok(format!(
+            "{summary} Copied {copied} model resource(s) into the clone's own folder."
+        ))
+    }
+
+    /// Fills a clone's resource folder with the stage's copy of the models.
+    ///
+    /// A renamed folder is an empty folder: the manager resolves its models
+    /// through it, finds nothing, and the stage dies on load dereferencing
+    /// absent model data. Copying the stage's current resources also means a
+    /// clone starts from whatever the stage already baked, and can then be
+    /// baked differently without disturbing the original.
+    fn materialize_cloned_manager_folders(
+        &mut self,
+        folder_rewrites: &[(String, String)],
+    ) -> Result<usize, String> {
+        let document = self
+            .document
+            .as_ref()
+            .ok_or_else(|| "no stage is open".to_string())?;
+        let mut sources: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for path in document.effective_resource_paths() {
+            let text = String::from_utf8_lossy(&path).replace('\\', "/");
+            let text = text.trim_matches('/');
+            let folded = text.to_ascii_lowercase();
+            for (from, to) in folder_rewrites {
+                if from.is_empty() {
+                    continue;
+                }
+                if folded.starts_with(&format!("{from}/")) {
+                    let rest = &text[from.len() + 1..];
+                    sources.insert(path.clone(), format!("{to}/{rest}").into_bytes());
+                    break;
+                }
+            }
+        }
+        if sources.is_empty() {
+            return Err(format!(
+                "the stage has no resources under {} to copy into the clone's folder",
+                folder_rewrites
+                    .iter()
+                    .map(|(from, _)| from.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        let mut copies = Vec::new();
+        for (source, destination) in sources {
+            let document = self
+                .document
+                .as_ref()
+                .ok_or_else(|| "no stage is open".to_string())?;
+            let resource = document
+                .effective_resource_clone(&source)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!(
+                        "resource '{}' vanished while cloning",
+                        String::from_utf8_lossy(&source)
+                    )
+                })?;
+            copies.push((destination, resource));
+        }
+        let copied = copies.len();
+        let document = self
+            .document
+            .as_mut()
+            .ok_or_else(|| "no stage is open".to_string())?;
+        for (destination, resource) in copies {
+            document
+                .archive_edits
+                .upsert_resource(destination, resource);
+        }
+        Ok(copied)
     }
 
     fn insert_catalog_enemy_manager_pool(
