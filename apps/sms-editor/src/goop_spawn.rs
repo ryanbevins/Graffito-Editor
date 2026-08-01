@@ -1265,27 +1265,40 @@ impl SmsEditorApp {
             return false;
         };
         document.archive_edits.resources.iter().any(|edit| {
-            matches!(
-                &edit.document,
-                StageResourceDocument::Model(model)
-                    if model.has_named_texture(DUMMY_TEXTURE)
-                        && model.can_pin_material_konst_alpha_half(STAIN_MATERIAL)
-            )
+            Self::edit_outside_layer_pool_folders(&edit.raw_resource_path)
+                && matches!(
+                    &edit.document,
+                    StageResourceDocument::Model(model)
+                        if model.has_named_texture(DUMMY_TEXTURE)
+                            && model.can_pin_material_konst_alpha_half(STAIN_MATERIAL)
+                )
         })
     }
 
-    /// Whether any copied Stu model carries the baked stain.
+    /// Whether a resource path belongs outside every per-layer pool folder.
+    ///
+    /// The stage-wide stain reads and writes only the base pool: a per-layer
+    /// pool owns its look. Reporting on pool folders too made the toggle show
+    /// as baked whenever any layer was, so clicking it always unbaked and the
+    /// base Stus could never get their stain back.
+    fn edit_outside_layer_pool_folders(raw_resource_path: &[u8]) -> bool {
+        let path = String::from_utf8_lossy(raw_resource_path).replace('\\', "/");
+        Self::outside_layer_pool_folders(path.trim_matches('/'))
+    }
+
+    /// Whether a base-pool Stu model carries the baked stain.
     pub(super) fn stu_stain_baked(&self) -> bool {
         const STAIN_MATERIAL: &str = "_mat_body_top1";
         let Some(document) = self.document.as_ref() else {
             return false;
         };
         document.archive_edits.resources.iter().any(|edit| {
-            matches!(
-                &edit.document,
-                StageResourceDocument::Model(model)
-                    if model.material_konst_alpha_half_is_pinned(STAIN_MATERIAL)
-            )
+            Self::edit_outside_layer_pool_folders(&edit.raw_resource_path)
+                && matches!(
+                    &edit.document,
+                    StageResourceDocument::Model(model)
+                        if model.material_konst_alpha_half_is_pinned(STAIN_MATERIAL)
+                )
         })
     }
 
