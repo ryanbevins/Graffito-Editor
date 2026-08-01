@@ -3696,6 +3696,7 @@ impl SmsEditorApp {
         let clone =
             sms_scene::clone_enemy_manager_template(&template, manager_name, suffix, false)?;
         let cloned_manager_name = format!("{manager_name}{suffix}");
+        self.purge_cloned_character_registration(suffix)?;
         let summary = self.insert_catalog_enemy_manager_pool(
             &clone.template,
             actor_factory,
@@ -3711,6 +3712,57 @@ impl SmsEditorApp {
         Ok(format!(
             "{summary} Copied {copied} model resource(s) into the clone's own folder."
         ))
+    }
+
+    /// Drops a cloned pool's character registration from the stage table.
+    ///
+    /// Removing a layer pool leaves its registration behind, and re-adding one
+    /// that resolves differently is refused as a conflicting same-name record
+    /// -- which reads as a checkbox that silently unticks itself.
+    fn purge_cloned_character_registration(&mut self, suffix: &str) -> Result<(), String> {
+        const TABLES: &[u8] = b"map/tables.bin";
+        let document = self
+            .document
+            .as_ref()
+            .ok_or_else(|| "no stage is open".to_string())?;
+        let Some(sms_scene::StageResourceDocument::Placement(mut tables)) = document
+            .effective_resource_clone(TABLES)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(());
+        };
+        fn prune(record: &mut sms_formats::JDramaRecord, suffix: &str) -> bool {
+            let sms_formats::JDramaRecordPayload::Group { children, .. } = &mut record.payload
+            else {
+                return false;
+            };
+            let before = children.len();
+            children.retain(|child| {
+                let short = child
+                    .type_name
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(&child.type_name);
+                !(matches!(short, "ObjChara" | "SmplChara") && child.name.ends_with(suffix))
+            });
+            let mut changed = before != children.len();
+            for child in children {
+                changed |= prune(child, suffix);
+            }
+            changed
+        }
+        if !prune(&mut tables.root, suffix) {
+            return Ok(());
+        }
+        let document = self
+            .document
+            .as_mut()
+            .ok_or_else(|| "no stage is open".to_string())?;
+        document.archive_edits.upsert_resource(
+            TABLES.to_vec(),
+            sms_scene::StageResourceDocument::Placement(tables),
+        );
+        Ok(())
     }
 
     /// Ensures an existing clone's folder actually holds its models.
