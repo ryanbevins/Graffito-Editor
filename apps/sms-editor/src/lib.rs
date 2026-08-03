@@ -1987,6 +1987,10 @@ impl eframe::App for SmsEditorApp {
             ui.separator();
             if self.embedded_dolphin.is_some() {
                 self.embedded_dolphin_viewport(ui, frame);
+            } else if self.tool == EditorTool::Mask {
+                // The Mask Tool takes the viewport over: it is a model editor,
+                // not a stage view, so the stage would only be in the way.
+                self.mask_tool_viewport(ui);
             } else {
                 self.viewport(ui);
             }

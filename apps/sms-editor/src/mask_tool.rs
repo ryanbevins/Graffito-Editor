@@ -151,10 +151,7 @@ impl SmsEditorApp {
             if registry.find_enemy_actor(&object.factory_name).is_none() {
                 continue;
             }
-            let Some(model_path) = document
-                .actor_preview(object)
-                .map(|preview| preview.model_path.clone())
-            else {
+            let Some(model_path) = mask_model_path(document, object) else {
                 continue;
             };
             choices.push(MaskActorChoice {
@@ -563,25 +560,42 @@ impl SmsEditorApp {
         self.mask_wash_controls(ui);
 
         ui.separator();
-        if let Some(image) = self.mask_preview_image() {
-            let texture = self.mask_texture.get_or_insert_with(|| {
-                ui.ctx()
-                    .load_texture("mask-tool-preview", image.clone(), Default::default())
-            });
-            texture.set(image, Default::default());
-            let size = texture.size_vec2();
-            ui.add(egui::Image::new(&*texture).fit_to_exact_size(size));
-        }
         if let Some(preview) = self.mask_preview.as_ref() {
             ui.label(
                 egui::RichText::new(format!(
-                    "{} \u{2014} {} triangles, front-projected",
+                    "{} \u{2014} {} triangles, shown in the viewport",
                     preview.object_id, preview.triangle_count
                 ))
                 .small()
                 .color(egui::Color32::GRAY),
             );
         }
+    }
+
+    /// The Mask Tool's viewport: the loaded model, filling the stage view.
+    ///
+    /// The tool edits one model rather than the level, so while it is active it
+    /// takes the viewport over instead of leaving the stage behind it.
+    pub(super) fn mask_tool_viewport(&mut self, ui: &mut egui::Ui) {
+        let Some(image) = self.mask_preview_image() else {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    egui::RichText::new("Pick an actor in the Mask Tool panel to load its model.")
+                        .color(egui::Color32::GRAY),
+                );
+            });
+            return;
+        };
+        let texture = self.mask_texture.get_or_insert_with(|| {
+            ui.ctx()
+                .load_texture("mask-tool-preview", image.clone(), Default::default())
+        });
+        texture.set(image, Default::default());
+        let available = ui.available_size();
+        let side = available.x.min(available.y).max(64.0);
+        ui.centered_and_justified(|ui| {
+            ui.add(egui::Image::new(&*texture).fit_to_exact_size(egui::vec2(side, side)));
+        });
     }
 
     /// The wash-cycle preview: sweeps the threshold the mask is compared to.
@@ -637,6 +651,32 @@ impl SmsEditorApp {
             .color(egui::Color32::GRAY),
         );
     }
+}
+
+/// The model a placed actor renders with.
+///
+/// Resolution follows the viewport's own order: an explicit preview asset hint
+/// first, then the catalog's actor preview, then an inferred hint. Checking
+/// only the catalog missed actors placed from the content browser, which carry
+/// their model as a hint.
+fn mask_model_path(
+    document: &sms_scene::StageDocument,
+    object: &sms_scene::SceneObject,
+) -> Option<String> {
+    let hint = |role: sms_scene::AssetRole| {
+        object
+            .asset_hints
+            .iter()
+            .find(|asset| asset.role == role)
+            .map(|asset| asset.path.clone())
+    };
+    hint(sms_scene::AssetRole::PreviewModel)
+        .or_else(|| {
+            document
+                .actor_preview(object)
+                .map(|preview| preview.model_path.clone())
+        })
+        .or_else(|| hint(sms_scene::AssetRole::InferredPreviewModel))
 }
 
 /// Nearest-neighbour sample of a decoded preview texture, with wrapping.
