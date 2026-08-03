@@ -90,6 +90,13 @@ pub(super) struct MaskPreview {
     center: [f32; 3],
     radius: f32,
     triangle_count: usize,
+    /// Tint per texture slot, from the material that samples it.
+    ///
+    /// Toon-shaded actors put their colour in a TEV register and sample a
+    /// greyscale ramp, so modulating by the material colour alone renders them
+    /// grey. Triangles do not carry a material index in this preview, so the
+    /// tint is keyed by the texture the material binds.
+    texture_tint: Vec<Option<[u8; 4]>>,
 }
 
 impl MaskPreview {
@@ -204,6 +211,41 @@ fn procedural_mask(size: usize) -> (usize, Vec<u8>) {
         }
     }
     (size, values)
+}
+
+/// A material's TEV register colour, when it reads as an actual tint.
+///
+/// Registers are signed and can overshoot the display range, so they clamp.
+/// White, black and neutral greys carry no tint and are ignored, which leaves
+/// the texture to speak for itself.
+fn tev_register_tint(material: &sms_formats::J3dMaterial) -> Option<[u8; 4]> {
+    let clamp = |value: i16| value.clamp(0, 255) as u8;
+    let registers = material
+        .tev_colors
+        .iter()
+        .map(|colour| [colour[0], colour[1], colour[2]])
+        .chain(
+            material
+                .tev_k_colors
+                .iter()
+                .map(|colour| [colour[0] as i16, colour[1] as i16, colour[2] as i16]),
+        );
+    for register in registers {
+        let colour = [
+            clamp(register[0]),
+            clamp(register[1]),
+            clamp(register[2]),
+            255,
+        ];
+        let low = colour[0].min(colour[1]).min(colour[2]);
+        let high = colour[0].max(colour[1]).max(colour[2]);
+        // A tint needs some saturation and some brightness; a grey does not
+        // colour anything, and black would erase the model.
+        if high >= 48 && high.saturating_sub(low) >= 24 {
+            return Some(colour);
+        }
+    }
+    None
 }
 
 /// Nearest-neighbour sample of a decoded preview texture, with wrapping.
@@ -337,6 +379,17 @@ impl SmsEditorApp {
             .fold(0.0f32, f32::max)
             .max(f32::EPSILON);
 
+        let mut texture_tint = vec![None; geometry.textures.len()];
+        for material in &geometry.materials {
+            let Some(slot) = material.texture_indices.iter().flatten().next().copied() else {
+                continue;
+            };
+            if slot >= texture_tint.len() || texture_tint[slot].is_some() {
+                continue;
+            }
+            texture_tint[slot] = tev_register_tint(material);
+        }
+
         let triangle_count = geometry.triangles.len();
         self.mask_preview = Some(MaskPreview {
             object_id: choice.object_id.clone(),
@@ -345,6 +398,7 @@ impl SmsEditorApp {
             center,
             radius,
             triangle_count,
+            texture_tint,
         });
         self.mask_yaw = 0.0;
         self.mask_pitch = 0.0;
@@ -717,11 +771,21 @@ impl SmsEditorApp {
                             ((a[channel] as u32 * b[channel] as u32) / 255) as u8
                         })
                     };
+                    let tint = triangle
+                        .texture_index
+                        .and_then(|slot| preview.texture_tint.get(slot).copied().flatten());
                     let colour = match triangle.combine_mode {
-                        Combine::TextureOnly => sampled.unwrap_or(flat),
-                        Combine::TextureModulateMaterial => match sampled {
-                            Some(sample) => modulate(sample, flat),
-                            None => flat,
+                        Combine::TextureOnly => match (sampled, tint) {
+                            // A greyscale ramp with a register tint is how a
+                            // toon-shaded actor carries its colour.
+                            (Some(sample), Some(tint)) => modulate(sample, tint),
+                            (Some(sample), None) => sample,
+                            (None, _) => flat,
+                        },
+                        Combine::TextureModulateMaterial => match (sampled, tint) {
+                            (Some(sample), Some(tint)) => modulate(sample, tint),
+                            (Some(sample), None) => modulate(sample, flat),
+                            (None, _) => flat,
                         },
                         Combine::TextureModulateVertex => match (sampled, vertex) {
                             (Some(sample), Some(vertex)) => modulate(sample, vertex),
@@ -843,6 +907,9 @@ impl SmsEditorApp {
 
     /// The inspector panel for the Mask Tool.
     pub(super) fn mask_tool_panel(&mut self, ui: &mut egui::Ui) {
+        // The goop catalog is indexed lazily by whoever needs it first; the
+        // colour list offers those styles, so make sure they are loaded.
+        self.ensure_goop_templates_indexed();
         ui.heading("Mask Tool");
         ui.label(
             egui::RichText::new("Author washable goop on the enemies placed in this stage")
