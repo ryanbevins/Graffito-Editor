@@ -237,6 +237,12 @@ pub struct ObjectAuthoringTemplate {
     /// Exact `ObjChara`/`SmplChara` registrations required before this actor
     /// and its manager records are loaded.
     pub character_records: Vec<JDramaRecord>,
+    /// Every registration this actor loads through, including the ones global
+    /// `scenecmn.bin` already provides and `character_records` therefore
+    /// omits. Cloning a bundle into an independent pool needs them: a pool's
+    /// models come from its character's folder, so a clone has to register a
+    /// renamed character of its own.
+    pub character_resource_records: Vec<JDramaRecord>,
     /// Named records outside `map/scene.bin` that the actor reaches through
     /// fixed runtime lookups rather than serialized actor fields.
     pub table_dependencies: Vec<ObjectAuthoringTableDependency>,
@@ -764,6 +770,7 @@ fn build_from_sources_with_common(
                 record: candidate.record,
                 dependencies: candidate.dependencies,
                 character_records: candidate.character_records,
+                character_resource_records: candidate.character_resource_records,
                 table_dependencies,
                 required_graph_names: candidate.graph_names.into_iter().collect(),
                 resources,
@@ -2505,6 +2512,209 @@ fn archive_resource_path(path: &Path) -> Option<Vec<u8>> {
 
 fn semantic_type_name(name: &str) -> &str {
     name.rsplit("::").next().unwrap_or(name)
+}
+
+fn set_string_field(record: &mut JDramaRecord, name: &str, value: &str) -> bool {
+    let fields = match &mut record.payload {
+        JDramaRecordPayload::Actor { fields, .. } | JDramaRecordPayload::Fields { fields } => {
+            fields
+        }
+        _ => return false,
+    };
+    let mut replaced = false;
+    for field in fields {
+        if field.name == name {
+            if let JDramaFieldValue::String(current) = &mut field.value {
+                *current = value.to_string();
+                replaced = true;
+            }
+        }
+    }
+    replaced
+}
+
+fn set_character_reference(record: &mut JDramaRecord, value: &str) {
+    if let JDramaRecordPayload::Actor { character_name, .. } = &mut record.payload {
+        if runtime_reference(character_name).is_some() {
+            *character_name = value.to_string();
+            return;
+        }
+    }
+    set_string_field(record, "character_name", value);
+}
+
+/// Renames a bundle so a second import of the same retail template becomes an
+/// independent runtime pool instead of merging into the first.
+///
+/// The runtime keys a pool on three names that must move together: the manager
+/// record's object name (what `TConductor::getManagerByName` resolves), the
+/// character registration the manager loads through (`TObjManager::load`
+/// searches it by name), and that character's resource folder, which is the
+/// prefix of every model path the manager loads. Renaming all three yields a
+/// pool with its own models -- the seam that lets two pools of the same enemy
+/// carry different baked textures.
+///
+/// Only the template is rewritten. Every import check compares the request
+/// against the template's own contents, so a consistently renamed copy passes
+/// the existing validation unchanged.
+pub struct ClonedEnemyManagerBundle {
+    pub template: ObjectAuthoringTemplate,
+    /// Source folder -> clone folder, as archive-relative paths. The clone's
+    /// folder starts out empty: the caller has to place the models there, or
+    /// the manager loads with no model data and the stage crashes on load.
+    pub folder_rewrites: Vec<(String, String)>,
+}
+
+pub fn clone_enemy_manager_template(
+    template: &ObjectAuthoringTemplate,
+    manager_name: &str,
+    suffix: &str,
+    own_models: bool,
+) -> Result<ClonedEnemyManagerBundle, String> {
+    if suffix.is_empty() {
+        return Err("a cloned manager bundle needs a non-empty suffix".to_string());
+    }
+    let mut clone = template.clone();
+    let new_manager_name = format!("{manager_name}{suffix}");
+
+    let mut renamed_manager = false;
+    for dependency in &mut clone.dependencies {
+        if dependency.record.name == manager_name {
+            dependency.record.name = new_manager_name.clone();
+            renamed_manager = true;
+        }
+    }
+    if !renamed_manager {
+        return Err(format!(
+            "template '{}' has no dependency named {manager_name:?} to clone",
+            clone.factory_name
+        ));
+    }
+    if !set_string_field(&mut clone.record, "manager_name", &new_manager_name) {
+        return Err(format!(
+            "template '{}' actor record has no manager_name field",
+            clone.factory_name
+        ));
+    }
+
+    // Characters are renamed with their folders, and every reference to them
+    // in the actor and manager records follows.
+    // Characters that global `scenecmn.bin` already provides are never copied
+    // into a stage, so the template leaves them out. A clone cannot share one
+    // -- it needs its own folder -- so its renamed copy is promoted into the
+    // registrations the import writes into the stage's own table.
+    if clone.character_records.is_empty() {
+        clone.character_records = clone
+            .character_resource_records
+            .iter()
+            .filter(|record| is_character_registration(record))
+            .cloned()
+            .collect();
+    }
+
+    let mut folder_rewrites: Vec<(String, String)> = Vec::new();
+    let mut character_rewrites: Vec<(String, String)> = Vec::new();
+    for registration in &mut clone.character_records {
+        if !is_character_registration(registration) {
+            continue;
+        }
+        let old_name = registration.name.clone();
+        let new_name = format!("{old_name}{suffix}");
+        let folder_field = match semantic_type_name(&registration.type_name) {
+            "ObjChara" => "resource_folder",
+            "SmplChara" => "archive_path",
+            _ => continue,
+        };
+        // Sharing the folder makes the clone an independent pool that still
+        // draws on the original's models -- correct whenever the copies would
+        // only ever be identical, and the only option until each copy needs
+        // its own baked look.
+        if !own_models {
+            registration.name = new_name.clone();
+            character_rewrites.push((old_name, new_name));
+            continue;
+        }
+        if let Some(folder) = string_field(registration, folder_field).map(str::to_string) {
+            // Folder names copy retail's shape exactly: every folder in the
+            // retail archives is lowercase alphanumeric with no separators
+            // (`namekuri2`, `hamukurianm`). Archive lookups hash raw bytes, so
+            // an unusual name is not worth risking for readability.
+            let folder_suffix = suffix
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            let folder_suffix = match folder_suffix.chars().any(|item| item.is_ascii_digit()) {
+                true => folder_suffix
+                    .chars()
+                    .filter(char::is_ascii_digit)
+                    .collect::<String>(),
+                false => folder_suffix,
+            };
+            let new_folder = format!("{}{folder_suffix}", folder.trim_end_matches('/'));
+            set_string_field(registration, folder_field, &new_folder);
+            folder_rewrites.push((folder, new_folder));
+        }
+        registration.name = new_name.clone();
+        character_rewrites.push((old_name, new_name));
+    }
+    if character_rewrites.is_empty() {
+        return Err(format!(
+            "template '{}' registers no character for its manager, so its models cannot be \
+             cloned",
+            clone.factory_name
+        ));
+    }
+    for (old_name, new_name) in &character_rewrites {
+        for record in std::iter::once(&mut clone.record)
+            .chain(clone.dependencies.iter_mut().map(|item| &mut item.record))
+        {
+            if record_character_name(record) == Some(old_name.as_str()) {
+                set_character_reference(record, new_name);
+            }
+        }
+    }
+
+    // Resource destinations move under the renamed folders so the clone writes
+    // its own models instead of silently reusing the original's.
+    for resource in &mut clone.resources {
+        // Matching is case-insensitive like the rest of the archive lookups,
+        // but the rewrite keeps the original casing of everything it does not
+        // replace: these paths are compared against real archive entries.
+        let path = String::from_utf8_lossy(&resource.raw_resource_path).replace('\\', "/");
+        let path = path.trim_matches('/');
+        let folded = path.to_ascii_lowercase();
+        for (old_folder, new_folder) in &folder_rewrites {
+            let old = normalize_runtime_reference(old_folder);
+            let new = runtime_reference_archive_path(new_folder);
+            if old.is_empty() {
+                continue;
+            }
+            if folded == old {
+                resource.raw_resource_path = new.into_bytes();
+                break;
+            }
+            if folded.starts_with(&format!("{old}/")) {
+                let rest = &path[old.len() + 1..];
+                resource.raw_resource_path = format!("{new}/{rest}").into_bytes();
+                break;
+            }
+        }
+    }
+
+    let folder_rewrites = folder_rewrites
+        .into_iter()
+        .map(|(old_folder, new_folder)| {
+            (
+                normalize_runtime_reference(&old_folder),
+                runtime_reference_archive_path(&new_folder),
+            )
+        })
+        .collect();
+    Ok(ClonedEnemyManagerBundle {
+        template: clone,
+        folder_rewrites,
+    })
 }
 
 #[cfg(test)]
@@ -4263,5 +4473,150 @@ mod tests {
             .iter()
             .map(|resource| String::from_utf8_lossy(&resource.raw_resource_path).into_owned())
             .collect()
+    }
+
+    fn string_value(name: &str, value: &str) -> sms_formats::JDramaField {
+        sms_formats::JDramaField {
+            name: name.to_string(),
+            value: JDramaFieldValue::String(value.to_string()),
+        }
+    }
+
+    fn cloneable_manager_template() -> ObjectAuthoringTemplate {
+        ObjectAuthoringTemplate {
+            factory_name: "HamuKuri".to_string(),
+            group_index: 4,
+            record: JDramaRecord {
+                type_name: "HamuKuri".to_string(),
+                name: "hamukuri".to_string(),
+                payload: JDramaRecordPayload::Actor {
+                    transform: JDramaTransform {
+                        translation: [0.0; 3],
+                        rotation: [0.0; 3],
+                        scale: [1.0; 3],
+                    },
+                    character_name: "hamukuriChara".to_string(),
+                    light_map: JDramaLightMap::default(),
+                    fields: vec![string_value("manager_name", "hamuManager")],
+                },
+            },
+            dependencies: vec![ObjectAuthoringDependency {
+                group_index: 4,
+                target: AuthoredPlacementDependencyTarget::IndexedGroup { group_index: 4 },
+                record: JDramaRecord {
+                    type_name: "HamuKuriManager".to_string(),
+                    name: "hamuManager".to_string(),
+                    payload: JDramaRecordPayload::Fields {
+                        fields: vec![string_value("character_name", "hamukuriChara")],
+                    },
+                },
+            }],
+            character_records: vec![JDramaRecord {
+                type_name: "ObjChara".to_string(),
+                name: "hamukuriChara".to_string(),
+                payload: JDramaRecordPayload::Fields {
+                    fields: vec![string_value("resource_folder", "/scene/hamukuri")],
+                },
+            }],
+            character_resource_records: Vec::new(),
+            table_dependencies: Vec::new(),
+            runtime_actor_references: Vec::new(),
+            required_graph_names: Vec::new(),
+            resources: resources(
+                "bianco0.szs",
+                &["hamukuri/default.bmd", "hamukuri/wait.bck", "map/scene.ral"],
+            ),
+            preview_resource_path: None,
+            source_stage: "bianco0".to_string(),
+        }
+    }
+
+    /// A clone must be independent in all three names the runtime keys a pool
+    /// on, or the second import merges into the first and shares its models.
+    #[test]
+    fn a_cloned_manager_bundle_renames_manager_character_and_folder() {
+        let template = cloneable_manager_template();
+        let clone = clone_enemy_manager_template(&template, "hamuManager", "_L01", true)
+            .unwrap()
+            .template;
+
+        assert_eq!(clone.dependencies[0].record.name, "hamuManager_L01");
+        assert_eq!(
+            string_field(&clone.record, "manager_name"),
+            Some("hamuManager_L01")
+        );
+        assert_eq!(clone.character_records[0].name, "hamukuriChara_L01");
+        assert_eq!(
+            string_field(&clone.character_records[0], "resource_folder"),
+            Some("/scene/hamukuri01")
+        );
+        assert_eq!(
+            record_character_name(&clone.record),
+            Some("hamukuriChara_L01")
+        );
+        assert_eq!(
+            record_character_name(&clone.dependencies[0].record),
+            Some("hamukuriChara_L01")
+        );
+
+        // Models move under the renamed folder; unrelated shared resources stay.
+        assert_eq!(
+            raw_paths(&clone.resources),
+            vec![
+                "hamukuri01/default.bmd".to_string(),
+                "hamukuri01/wait.bck".to_string(),
+                "map/scene.ral".to_string(),
+            ]
+        );
+
+        // The original is untouched, so repeated clones all derive from retail.
+        assert_eq!(template.dependencies[0].record.name, "hamuManager");
+        assert_eq!(raw_paths(&template.resources)[0], "hamukuri/default.bmd");
+    }
+
+    /// HamuKuri's registration lives in global `scenecmn.bin`, so its
+    /// template carries no `character_records` at all -- the case that blocks
+    /// per-layer goop pools if the clone cannot supply its own.
+    #[test]
+    fn a_clone_registers_its_own_character_when_the_original_is_global() {
+        let mut template = cloneable_manager_template();
+        template.character_resource_records = std::mem::take(&mut template.character_records);
+        assert!(template.character_records.is_empty());
+
+        let clone = clone_enemy_manager_template(&template, "hamuManager", "_L02", true)
+            .unwrap()
+            .template;
+
+        assert_eq!(clone.character_records.len(), 1);
+        assert_eq!(clone.character_records[0].name, "hamukuriChara_L02");
+        assert_eq!(
+            string_field(&clone.character_records[0], "resource_folder"),
+            Some("/scene/hamukuri02")
+        );
+        assert_eq!(
+            record_character_name(&clone.dependencies[0].record),
+            Some("hamukuriChara_L02")
+        );
+        assert_eq!(raw_paths(&clone.resources)[0], "hamukuri02/default.bmd");
+    }
+
+    /// The clone's folder has to be reported, because renaming the reference
+    /// without placing models there produces a manager with no model data --
+    /// which the game dereferences on load.
+    #[test]
+    fn a_clone_reports_the_folder_its_models_must_be_copied_into() {
+        let template = cloneable_manager_template();
+        let clone = clone_enemy_manager_template(&template, "hamuManager", "_L01", true).unwrap();
+        assert_eq!(
+            clone.folder_rewrites,
+            vec![("hamukuri".to_string(), "hamukuri01".to_string())]
+        );
+    }
+
+    #[test]
+    fn cloning_rejects_a_template_without_the_requested_manager() {
+        let template = cloneable_manager_template();
+        assert!(clone_enemy_manager_template(&template, "otherManager", "_L01", true).is_err());
+        assert!(clone_enemy_manager_template(&template, "hamuManager", "", true).is_err());
     }
 }

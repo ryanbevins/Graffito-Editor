@@ -3656,15 +3656,248 @@ impl SmsEditorApp {
         manager_factory: &str,
         manager_name: &str,
     ) -> Result<String, String> {
-        let template = self
-            .object_authoring_catalog
+        let template = self.catalog_template_for(actor_factory)?;
+        self.insert_catalog_enemy_manager_pool(
+            &template,
+            actor_factory,
+            manager_factory,
+            manager_name,
+        )
+    }
+
+    fn catalog_template_for(
+        &self,
+        actor_factory: &str,
+    ) -> Result<sms_scene::ObjectAuthoringTemplate, String> {
+        self.object_authoring_catalog
             .find(actor_factory)
             .cloned()
             .ok_or_else(|| {
                 format!(
                     "the retail authoring catalog has no complete template for '{actor_factory}'"
                 )
-            })?;
+            })
+    }
+
+    /// Imports the same retail bundle again as a second, independent pool.
+    ///
+    /// The clone renames the manager, its character registration and that
+    /// character's resource folder together, so it loads its own models --
+    /// what per-layer goop spawning needs, since a baked stain lives in the
+    /// model rather than in any per-instance state.
+    pub(super) fn ensure_cloned_enemy_manager_pool(
+        &mut self,
+        actor_factory: &str,
+        manager_factory: &str,
+        manager_name: &str,
+        suffix: &str,
+    ) -> Result<String, String> {
+        let template = self.catalog_template_for(actor_factory)?;
+        let clone = sms_scene::clone_enemy_manager_template(&template, manager_name, suffix, true)?;
+        let cloned_manager_name = format!("{manager_name}{suffix}");
+        self.purge_cloned_character_registration(suffix)?;
+        let summary = self.insert_catalog_enemy_manager_pool(
+            &clone.template,
+            actor_factory,
+            manager_factory,
+            &cloned_manager_name,
+        )?;
+        if clone.folder_rewrites.is_empty() {
+            return Ok(format!(
+                "{summary} It shares the original's models, so both pools look the same."
+            ));
+        }
+        let copied = self.materialize_cloned_manager_folders(&clone.folder_rewrites)?;
+        Ok(format!(
+            "{summary} Copied {copied} model resource(s) into the clone's own folder."
+        ))
+    }
+
+    /// Drops a cloned pool's character registration from the stage table.
+    ///
+    /// Removing a layer pool leaves its registration behind, and re-adding one
+    /// that resolves differently is refused as a conflicting same-name record
+    /// -- which reads as a checkbox that silently unticks itself.
+    fn purge_cloned_character_registration(&mut self, suffix: &str) -> Result<(), String> {
+        const TABLES: &[u8] = b"map/tables.bin";
+        let document = self
+            .document
+            .as_ref()
+            .ok_or_else(|| "no stage is open".to_string())?;
+        let Some(sms_scene::StageResourceDocument::Placement(mut tables)) = document
+            .effective_resource_clone(TABLES)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(());
+        };
+        fn prune(record: &mut sms_formats::JDramaRecord, suffix: &str) -> bool {
+            let sms_formats::JDramaRecordPayload::Group { children, .. } = &mut record.payload
+            else {
+                return false;
+            };
+            let before = children.len();
+            children.retain(|child| {
+                let short = child
+                    .type_name
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(&child.type_name);
+                !(matches!(short, "ObjChara" | "SmplChara") && child.name.ends_with(suffix))
+            });
+            let mut changed = before != children.len();
+            for child in children {
+                changed |= prune(child, suffix);
+            }
+            changed
+        }
+        if !prune(&mut tables.root, suffix) {
+            return Ok(());
+        }
+        let document = self
+            .document
+            .as_mut()
+            .ok_or_else(|| "no stage is open".to_string())?;
+        document.archive_edits.upsert_resource(
+            TABLES.to_vec(),
+            sms_scene::StageResourceDocument::Placement(tables),
+        );
+        Ok(())
+    }
+
+    /// Archive folders a layer pool owns, derived the same way the clone is.
+    pub(super) fn cloned_manager_folders(
+        &self,
+        actor_factory: &str,
+        manager_name: &str,
+        suffix: &str,
+    ) -> Result<Vec<String>, String> {
+        let template = self.catalog_template_for(actor_factory)?;
+        let clone = sms_scene::clone_enemy_manager_template(&template, manager_name, suffix, true)?;
+        Ok(clone
+            .folder_rewrites
+            .into_iter()
+            .map(|(_, to)| to)
+            .collect())
+    }
+
+    /// Ensures an existing clone's folder actually holds its models.
+    ///
+    /// A pool imported before the folder was materialized -- or one whose
+    /// resources were pruned -- looks present but resolves to nothing, which
+    /// the game only reports by dying on load. Repairing is cheap and
+    /// idempotent, so it runs whenever a layer pool is (re)enabled.
+    pub(super) fn ensure_cloned_manager_pool_resources(
+        &mut self,
+        actor_factory: &str,
+        manager_name: &str,
+        suffix: &str,
+    ) -> Result<usize, String> {
+        let template = self.catalog_template_for(actor_factory)?;
+        let clone = sms_scene::clone_enemy_manager_template(&template, manager_name, suffix, true)?;
+        let missing = {
+            let document = self
+                .document
+                .as_ref()
+                .ok_or_else(|| "no stage is open".to_string())?;
+            let present = document
+                .effective_resource_paths()
+                .into_iter()
+                .map(|path| {
+                    let text = String::from_utf8_lossy(&path).replace('\\', "/");
+                    text.trim_matches('/').to_ascii_lowercase()
+                })
+                .collect::<BTreeSet<_>>();
+            clone.folder_rewrites.iter().any(|(_, to)| {
+                !present
+                    .iter()
+                    .any(|path| path.starts_with(&format!("{to}/")))
+            })
+        };
+        if !missing {
+            return Ok(0);
+        }
+        self.materialize_cloned_manager_folders(&clone.folder_rewrites)
+    }
+
+    /// Fills a clone's resource folder with the stage's copy of the models.
+    ///
+    /// A renamed folder is an empty folder: the manager resolves its models
+    /// through it, finds nothing, and the stage dies on load dereferencing
+    /// absent model data. Copying the stage's current resources also means a
+    /// clone starts from whatever the stage already baked, and can then be
+    /// baked differently without disturbing the original.
+    fn materialize_cloned_manager_folders(
+        &mut self,
+        folder_rewrites: &[(String, String)],
+    ) -> Result<usize, String> {
+        let document = self
+            .document
+            .as_ref()
+            .ok_or_else(|| "no stage is open".to_string())?;
+        let mut sources: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for path in document.effective_resource_paths() {
+            let text = String::from_utf8_lossy(&path).replace('\\', "/");
+            let text = text.trim_matches('/');
+            let folded = text.to_ascii_lowercase();
+            for (from, to) in folder_rewrites {
+                if from.is_empty() {
+                    continue;
+                }
+                if folded.starts_with(&format!("{from}/")) {
+                    let rest = &text[from.len() + 1..];
+                    sources.insert(path.clone(), format!("{to}/{rest}").into_bytes());
+                    break;
+                }
+            }
+        }
+        if sources.is_empty() {
+            return Err(format!(
+                "the stage has no resources under {} to copy into the clone's folder",
+                folder_rewrites
+                    .iter()
+                    .map(|(from, _)| from.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        let mut copies = Vec::new();
+        for (source, destination) in sources {
+            let document = self
+                .document
+                .as_ref()
+                .ok_or_else(|| "no stage is open".to_string())?;
+            let resource = document
+                .effective_resource_clone(&source)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!(
+                        "resource '{}' vanished while cloning",
+                        String::from_utf8_lossy(&source)
+                    )
+                })?;
+            copies.push((destination, resource));
+        }
+        let copied = copies.len();
+        let document = self
+            .document
+            .as_mut()
+            .ok_or_else(|| "no stage is open".to_string())?;
+        for (destination, resource) in copies {
+            document
+                .archive_edits
+                .upsert_resource(destination, resource);
+        }
+        Ok(copied)
+    }
+
+    fn insert_catalog_enemy_manager_pool(
+        &mut self,
+        template: &sms_scene::ObjectAuthoringTemplate,
+        actor_factory: &str,
+        manager_factory: &str,
+        manager_name: &str,
+    ) -> Result<String, String> {
         let registry = self
             .registry
             .as_ref()
@@ -3679,7 +3912,7 @@ impl SmsEditorApp {
         let prepared = prepare_catalog_enemy_manager_pool(
             document,
             registry,
-            &template,
+            template,
             actor_factory,
             manager_factory,
             manager_name,
@@ -4974,6 +5207,7 @@ mod tests {
             .unwrap(),
             dependencies: Vec::new(),
             character_records: Vec::new(),
+            character_resource_records: Vec::new(),
             table_dependencies: Vec::new(),
             runtime_actor_references: Vec::new(),
             required_graph_names: Vec::new(),
@@ -5114,6 +5348,7 @@ mod tests {
             },
             dependencies: Vec::new(),
             character_records: Vec::new(),
+            character_resource_records: Vec::new(),
             table_dependencies: Vec::new(),
             runtime_actor_references: Vec::new(),
             required_graph_names: Vec::new(),
@@ -6155,6 +6390,7 @@ mod tests {
                 record: dependency_record,
             }],
             character_records: Vec::new(),
+            character_resource_records: Vec::new(),
             runtime_actor_references: Vec::new(),
             table_dependencies: Vec::new(),
             required_graph_names: Vec::new(),
@@ -6243,6 +6479,7 @@ mod tests {
                 .unwrap(),
             }],
             character_records: Vec::new(),
+            character_resource_records: Vec::new(),
             table_dependencies: Vec::new(),
             runtime_actor_references: Vec::new(),
             required_graph_names: Vec::new(),
@@ -6623,6 +6860,7 @@ mod tests {
             dependencies: Vec::new(),
             runtime_actor_references: Vec::new(),
             character_records: Vec::new(),
+            character_resource_records: Vec::new(),
             table_dependencies: Vec::new(),
             required_graph_names: vec!["route_a".to_string()],
             resources: Vec::new(),
@@ -6706,6 +6944,7 @@ mod tests {
             }],
             dependencies: Vec::new(),
             character_records: Vec::new(),
+            character_resource_records: Vec::new(),
             table_dependencies: Vec::new(),
             required_graph_names: Vec::new(),
             resources: vec![sms_scene::ObjectAuthoringResource {
@@ -6832,6 +7071,7 @@ mod tests {
                 .unwrap(),
             dependencies: Vec::new(),
             character_records: Vec::new(),
+            character_resource_records: Vec::new(),
             table_dependencies: Vec::new(),
             runtime_actor_references: Vec::new(),
             required_graph_names: Vec::new(),
@@ -6930,6 +7170,7 @@ mod tests {
             record: JDramaRecord::new("Coin", "coin", JDramaRecordPayload::Empty).unwrap(),
             dependencies: Vec::new(),
             character_records: Vec::new(),
+            character_resource_records: Vec::new(),
             table_dependencies: Vec::new(),
             required_graph_names: Vec::new(),
             resources: vec![sms_scene::ObjectAuthoringResource {
@@ -7258,6 +7499,7 @@ mod tests {
                 .unwrap(),
             dependencies: Vec::new(),
             character_records: Vec::new(),
+            character_resource_records: Vec::new(),
             table_dependencies: Vec::new(),
             required_graph_names: Vec::new(),
             resources: vec![sms_scene::ObjectAuthoringResource {
@@ -7577,6 +7819,7 @@ mod tests {
                 record: dependency,
             }],
             character_records: Vec::new(),
+            character_resource_records: Vec::new(),
             table_dependencies: Vec::new(),
             runtime_actor_references: Vec::new(),
             required_graph_names: vec!["manager_route".to_string()],
