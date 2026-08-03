@@ -1139,6 +1139,7 @@ impl SmsEditorApp {
     /// model leaves exactly what the stage draws for it.
     fn rebuild_mask_gpu_scene(&mut self, object_id: &str) {
         self.mask_gpu_scene = None;
+        self.mask_gpu_bounds = None;
         let Some(target_format) = self.gpu_target_format else {
             return;
         };
@@ -1155,6 +1156,27 @@ impl SmsEditorApp {
         if isolated.triangles.is_empty() {
             return;
         }
+        // The stage preview holds the actor at its placed position, which the
+        // model's own bounds know nothing about. Aiming the camera with the
+        // local bounds points it at the stage's origin instead of the actor.
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        for vertex in isolated
+            .triangles
+            .iter()
+            .flat_map(|triangle| triangle.vertices)
+        {
+            for axis in 0..3 {
+                min[axis] = min[axis].min(vertex[axis]);
+                max[axis] = max[axis].max(vertex[axis]);
+            }
+        }
+        let center = std::array::from_fn(|axis| (min[axis] + max[axis]) * 0.5);
+        let radius = (0..3)
+            .map(|axis| (max[axis] - min[axis]) * 0.5)
+            .fold(0.0f32, f32::max)
+            .max(f32::EPSILON);
+        self.mask_gpu_bounds = Some((center, radius));
         self.mask_gpu_scene = Some(gpu_viewport::GpuViewportScene::from_preview(
             &isolated,
             target_format,
@@ -1168,7 +1190,7 @@ impl SmsEditorApp {
     /// focal length that reproduces its scale. Both then frame the actor
     /// identically, and the goop overlay lands where the model is.
     fn mask_gpu_frame(&self, rect: egui::Rect) -> Option<gpu_viewport::GpuViewportFrame> {
-        let preview = self.mask_preview.as_ref()?;
+        let (center, radius) = self.mask_gpu_bounds?;
         let side = rect.width().min(rect.height()).max(1.0);
         let (sin_yaw, cos_yaw) = self.mask_yaw.sin_cos();
         let (sin_pitch, cos_pitch) = self.mask_pitch.sin_cos();
@@ -1177,10 +1199,8 @@ impl SmsEditorApp {
         let right = [cos_yaw, 0.0, sin_yaw];
         let up = [sin_pitch * sin_yaw, cos_pitch, -sin_pitch * cos_yaw];
         let forward = [-cos_pitch * sin_yaw, sin_pitch, cos_pitch * cos_yaw];
-        let radius = preview.radius.max(f32::EPSILON);
         let distance = radius * 8.0;
-        let camera_position =
-            std::array::from_fn(|axis| preview.center[axis] - forward[axis] * distance);
+        let camera_position = std::array::from_fn(|axis| center[axis] - forward[axis] * distance);
         let lighting = self
             .document
             .as_ref()
@@ -1552,7 +1572,10 @@ impl SmsEditorApp {
     fn mask_tool_model_viewport(&mut self, ui: &mut egui::Ui) {
         let available = ui.available_size();
         let side = available.x.min(available.y).max(64.0);
-        let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::drag());
+        // Take the whole space and centre the square in it, so the viewport is
+        // not left sitting against one edge.
+        let (outer, response) = ui.allocate_exact_size(available, egui::Sense::drag());
+        let rect = egui::Rect::from_center_size(outer.center(), egui::vec2(side, side));
         if response.dragged() {
             let delta = response.drag_delta();
             self.mask_yaw += delta.x * 0.01;

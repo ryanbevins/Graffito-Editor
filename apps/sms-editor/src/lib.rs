@@ -1296,6 +1296,10 @@ struct SmsEditorApp {
     /// same renderer the stage viewport uses. The Mask Tool draws through it so
     /// an actor reads here exactly as it reads in the stage.
     mask_gpu_scene: Option<gpu_viewport::GpuViewportScene>,
+    /// Where that actor sits in the stage, and how big it is there. The Mask
+    /// Tool's own bounds are the model's local ones, which is not where the
+    /// stage preview's copy of it stands.
+    mask_gpu_bounds: Option<([f32; 3], f32)>,
     mask_texture: Option<egui::TextureHandle>,
     mask_mask: Vec<u8>,
     mask_mask_size: usize,
@@ -1632,6 +1636,7 @@ impl Default for SmsEditorApp {
             mask_mask_source: mask_tool::MaskTextureSource::Generated,
             mask_preview: None,
             mask_gpu_scene: None,
+            mask_gpu_bounds: None,
             mask_texture: None,
             mask_mask: Vec::new(),
             mask_mask_size: 0,
