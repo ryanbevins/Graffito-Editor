@@ -111,6 +111,35 @@ impl SmsEditorApp {
         );
 
         ui.separator();
+        ui.heading("Goop UV layer");
+        ui.label(
+            egui::RichText::new(
+                "Generate the mask's UV set by front-projecting the model \u{2014} the same way \
+                 retail authored its goop UV (a front projection, front and back shared).",
+            )
+            .small()
+            .color(egui::Color32::GRAY),
+        );
+        if ui
+            .button("Create goop UV (front projection)")
+            .on_hover_text(
+                "Project the model from the front into a new UV layer for the goop mask, like \
+                 Blender's Project from View (Bounds).",
+            )
+            .clicked()
+        {
+            self.log.push(
+                "Front-projection goop UV: pending the model-load phase, which supplies the \
+                 geometry to project."
+                    .to_string(),
+            );
+        }
+
+        ui.separator();
+        ui.heading("Wash preview");
+        self.mask_wash_controls(ui);
+
+        ui.separator();
         ui.colored_label(
             egui::Color32::from_rgb(255, 180, 90),
             "Scaffold: painting, UV projection, and material authoring are not implemented yet.",
@@ -120,6 +149,68 @@ impl SmsEditorApp {
                 "Next: load the selected model into the viewport and project brush strokes onto \
                  its mask UV. See the module docs for the phase plan.",
             )
+            .small()
+            .color(egui::Color32::GRAY),
+        );
+    }
+
+    /// The wash-cycle preview: a "Play full cycle" button that sweeps the
+    /// threshold the game compares the mask against.
+    ///
+    /// The washable goop is `visible = mask > K0_A`, where `K0_A` runs from
+    /// full coverage down to clean as the actor is sprayed. Sweeping it here
+    /// previews exactly how a painted gradient recedes -- bright paint clings,
+    /// dark paint clears first -- so an author sees the wash without the game.
+    /// The visual application onto the model comes with the render phase; the
+    /// control and its animation are stood up now.
+    fn mask_wash_controls(&mut self, ui: &mut egui::Ui) {
+        const CYCLE_SECONDS: f32 = 4.0;
+
+        if self.mask_wash_playing {
+            let dt = ui.input(|input| input.stable_dt).clamp(0.0, 0.1);
+            self.mask_wash_phase -= dt / CYCLE_SECONDS;
+            if self.mask_wash_phase <= 0.0 {
+                self.mask_wash_phase = 0.0;
+                self.mask_wash_playing = false;
+            } else {
+                ui.ctx().request_repaint();
+            }
+        }
+
+        ui.horizontal(|ui| {
+            let label = if self.mask_wash_playing {
+                "Stop"
+            } else {
+                "Play full cycle"
+            };
+            if ui
+                .button(label)
+                .on_hover_text("Sweep the wash threshold from fully coated to clean")
+                .clicked()
+            {
+                if self.mask_wash_playing {
+                    self.mask_wash_playing = false;
+                } else {
+                    self.mask_wash_phase = 1.0;
+                    self.mask_wash_playing = true;
+                }
+            }
+            if ui.button("Reset").clicked() {
+                self.mask_wash_playing = false;
+                self.mask_wash_phase = 1.0;
+            }
+        });
+
+        ui.add(
+            egui::Slider::new(&mut self.mask_wash_phase, 0.0..=1.0)
+                .text("Coverage")
+                .clamping(egui::SliderClamping::Always),
+        );
+        ui.label(
+            egui::RichText::new(format!(
+                "threshold K0_A \u{2248} {}  (mask > this stays coated)",
+                (self.mask_wash_phase * 255.0).round() as u16
+            ))
             .small()
             .color(egui::Color32::GRAY),
         );

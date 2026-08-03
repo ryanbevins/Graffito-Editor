@@ -1280,6 +1280,10 @@ struct SmsEditorApp {
     mask_selected_actor: Option<String>,
     mask_brush_radius: f32,
     mask_brush_opacity: f32,
+    /// Wash preview: 1.0 = fully coated, 0.0 = clean. The scalar the game
+    /// compares the mask against (K0_A), normalized.
+    mask_wash_phase: f32,
+    mask_wash_playing: bool,
     selected_goop_layer: usize,
     goop_authoring_mode: GoopAuthoringMode,
     selected_goop_template: usize,
@@ -1601,6 +1605,8 @@ impl Default for SmsEditorApp {
             mask_selected_actor: None,
             mask_brush_radius: 16.0,
             mask_brush_opacity: 1.0,
+            mask_wash_phase: 1.0,
+            mask_wash_playing: false,
             selected_goop_layer: 0,
             goop_authoring_mode: GoopAuthoringMode::Simple,
             selected_goop_template: 0,
