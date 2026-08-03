@@ -5768,6 +5768,47 @@ fn probe_actor_colour() {
     }
 }
 
+/// Runs the mask preview's TEV evaluation against a real actor material, to
+/// confirm a toon-shaded body resolves to its own colour rather than grey.
+/// `GRAFFITO_PROBE_SZS=<stage.szs> GRAFFITO_PROBE_BMD=poihana/default.bmd
+/// cargo test probe_tev_colour -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_tev_colour() {
+    let Ok(path) = std::env::var("GRAFFITO_PROBE_SZS") else {
+        return;
+    };
+    let bmd = std::env::var("GRAFFITO_PROBE_BMD").expect("GRAFFITO_PROBE_BMD");
+    let assets = sms_formats::mount_scene_archive(std::path::Path::new(&path)).expect("mount");
+    let asset = assets
+        .iter()
+        .find(|a| {
+            a.path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .ends_with(&bmd.to_ascii_lowercase())
+        })
+        .expect("model");
+    let bytes = sms_formats::read_stage_asset_bytes(&asset.path).expect("read");
+    let model = sms_formats::J3dFile::parse(&bytes).expect("parse");
+    let geometry = model
+        .geometry_preview_with_loader_flags(0x0102_0000)
+        .expect("geometry");
+    for material in &geometry.materials {
+        // Sample the ramp at mid intensity, which is what a lit body reads.
+        let colour = crate::mask_tool::evaluate_tev(material, [1.0; 4], &|_map, _coord| {
+            [0.6, 0.6, 0.6, 1.0]
+        });
+        println!(
+            "[{}] {} stages -> rgb {:?}",
+            material.name,
+            material.tev_stages.len(),
+            &colour[..3]
+        );
+    }
+}
+
 /// Bakes the stain into the real retail Stu model and round-trips it.
 /// `GRAFFITO_PROBE_BASE_ROOT=... cargo test probe_stain_bake -- --ignored
 /// --nocapture`

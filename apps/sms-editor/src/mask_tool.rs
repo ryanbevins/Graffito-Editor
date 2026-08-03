@@ -90,13 +90,9 @@ pub(super) struct MaskPreview {
     center: [f32; 3],
     radius: f32,
     triangle_count: usize,
-    /// Tint per texture slot, from the material that samples it.
-    ///
-    /// Toon-shaded actors put their colour in a TEV register and sample a
-    /// greyscale ramp, so modulating by the material colour alone renders them
-    /// grey. Triangles do not carry a material index in this preview, so the
-    /// tint is keyed by the texture the material binds.
-    texture_tint: Vec<Option<[u8; 4]>>,
+    /// The material that binds each texture slot, so a triangle can find the
+    /// TEV program that shades it. Triangles carry no material index here.
+    material_for_texture: Vec<Option<usize>>,
 }
 
 impl MaskPreview {
@@ -213,39 +209,236 @@ fn procedural_mask(size: usize) -> (usize, Vec<u8>) {
     (size, values)
 }
 
-/// A material's TEV register colour, when it reads as an actual tint.
+/// One channel of a TEV colour combine, in GX's fixed point.
 ///
-/// Registers are signed and can overshoot the display range, so they clamp.
-/// White, black and neutral greys carry no tint and are ignored, which leaves
-/// the texture to speak for itself.
-fn tev_register_tint(material: &sms_formats::J3dMaterial) -> Option<[u8; 4]> {
-    let clamp = |value: i16| value.clamp(0, 255) as u8;
-    let registers = material
-        .tev_colors
-        .iter()
-        .map(|colour| [colour[0], colour[1], colour[2]])
-        .chain(
-            material
-                .tev_k_colors
-                .iter()
-                .map(|colour| [colour[0] as i16, colour[1] as i16, colour[2] as i16]),
-        );
-    for register in registers {
-        let colour = [
-            clamp(register[0]),
-            clamp(register[1]),
-            clamp(register[2]),
-            255,
-        ];
-        let low = colour[0].min(colour[1]).min(colour[2]);
-        let high = colour[0].max(colour[1]).max(colour[2]);
-        // A tint needs some saturation and some brightness; a grey does not
-        // colour anything, and black would erase the model.
-        if high >= 48 && high.saturating_sub(low) >= 24 {
-            return Some(colour);
+/// Ported from the viewport shader's `tev_regular_channel` so the preview
+/// shades a model the same way the stage does: inputs read the low eight bits
+/// of a register, C expands 0..255 to 0..256, the scale is folded into both
+/// terms, and add and subtract round differently.
+struct TevOp {
+    op: u8,
+    bias: u8,
+    scale: u8,
+    clamp_on: bool,
+}
+
+fn tev_channel(a: f32, b: f32, c: f32, d: f32, operation: &TevOp) -> f32 {
+    let TevOp {
+        op,
+        bias,
+        scale,
+        clamp_on,
+    } = *operation;
+    let to_s10 = |value: f32| (value * 255.0).round().clamp(-1024.0, 1023.0) as i32;
+    let input = |value: f32| to_s10(value) & 255;
+    let (a, b, c, d) = (input(a), input(b), input(c), to_s10(d));
+    let bias = match bias {
+        1 => 128,
+        2 => -128,
+        _ => 0,
+    };
+    let lerp_numerator = a * 256 + (b - a) * (c + (c >> 7));
+    let subtract = op == 1;
+    let result = if scale == 3 {
+        let lerp = lerp_numerator >> 8;
+        let sum = if subtract {
+            d + bias - lerp
+        } else {
+            d + bias + lerp
+        };
+        sum >> 1
+    } else {
+        let factor = match scale {
+            1 => 2,
+            2 => 4,
+            _ => 1,
+        };
+        let rounding = if subtract { 127 } else { 128 };
+        let lerp = (lerp_numerator * factor + rounding) >> 8;
+        if subtract {
+            (d + bias) * factor - lerp
+        } else {
+            (d + bias) * factor + lerp
         }
+    };
+    let clamped = if clamp_on {
+        result.clamp(0, 255)
+    } else {
+        result.clamp(-1024, 1023)
+    };
+    clamped as f32 / 255.0
+}
+
+/// A TEV colour input selector, ported from the shader's `color_arg`.
+fn tev_colour_arg(
+    selector: u8,
+    previous: [f32; 4],
+    registers: [[f32; 4]; 3],
+    texture: [f32; 4],
+    raster: [f32; 4],
+    konst: [f32; 3],
+) -> [f32; 3] {
+    let splat = |value: f32| [value, value, value];
+    match selector {
+        0 => [previous[0], previous[1], previous[2]],
+        1 => splat(previous[3]),
+        2 => [registers[0][0], registers[0][1], registers[0][2]],
+        3 => splat(registers[0][3]),
+        4 => [registers[1][0], registers[1][1], registers[1][2]],
+        5 => splat(registers[1][3]),
+        6 => [registers[2][0], registers[2][1], registers[2][2]],
+        7 => splat(registers[2][3]),
+        8 => [texture[0], texture[1], texture[2]],
+        9 => splat(texture[3]),
+        10 => [raster[0], raster[1], raster[2]],
+        11 => splat(raster[3]),
+        12 => splat(1.0),
+        13 => splat(0.5),
+        14 => konst,
+        16 => splat(texture[0]),
+        17 => splat(texture[1]),
+        18 => splat(texture[2]),
+        _ => splat(0.0),
     }
-    None
+}
+
+/// A konst colour selector, ported from the shader's `konst_color`.
+fn tev_konst_colour(selector: u8, konst_colours: &[[u8; 4]; 4]) -> [f32; 3] {
+    let splat = |value: f32| [value, value, value];
+    match selector {
+        0 => splat(1.0),
+        1 => splat(0.875),
+        2 => splat(0.75),
+        3 => splat(0.625),
+        4 => splat(0.5),
+        5 => splat(0.375),
+        6 => splat(0.25),
+        7 => splat(0.125),
+        12..=15 => {
+            let colour = konst_colours[(selector - 12) as usize];
+            [
+                colour[0] as f32 / 255.0,
+                colour[1] as f32 / 255.0,
+                colour[2] as f32 / 255.0,
+            ]
+        }
+        16..=31 => {
+            let index = ((selector - 16) & 3) as usize;
+            let channel = ((selector - 16) >> 2) as usize;
+            splat(konst_colours[index][channel] as f32 / 255.0)
+        }
+        _ => splat(1.0),
+    }
+}
+
+/// Whether a pixel survives a material's alpha test.
+///
+/// Cutout geometry -- a leaf, a fin, a frond -- is a flat quad whose shape
+/// comes entirely from discarding texels that fail this test. Without it the
+/// quad renders solid and the shape is lost.
+pub(super) fn alpha_compare_passes(compare: &sms_formats::J3dAlphaCompare, alpha: u8) -> bool {
+    let test = |function: u8, reference: u8| match function {
+        0 => false,
+        1 => alpha < reference,
+        2 => alpha == reference,
+        3 => alpha <= reference,
+        4 => alpha > reference,
+        5 => alpha != reference,
+        6 => alpha >= reference,
+        _ => true,
+    };
+    let first = test(compare.comp0, compare.ref0);
+    let second = test(compare.comp1, compare.ref1);
+    match compare.op {
+        0 => first && second,
+        1 => first || second,
+        2 => first ^ second,
+        3 => !(first ^ second),
+        _ => true,
+    }
+}
+
+/// Runs a material's TEV program for one pixel.
+///
+/// This is the same pipeline the stage viewport evaluates in its shader, which
+/// is why an actor whose colour lives in a TEV register -- a toon-shaded body
+/// sampling a greyscale ramp, say -- comes out in its own colour here rather
+/// than grey. `sample` supplies a texture for a stage's texture map.
+pub(super) fn evaluate_tev(
+    material: &sms_formats::J3dMaterial,
+    raster: [f32; 4],
+    sample: &dyn Fn(usize, Option<usize>) -> [f32; 4],
+) -> [u8; 4] {
+    let register = |colour: [i16; 4]| {
+        [
+            colour[0] as f32 / 255.0,
+            colour[1] as f32 / 255.0,
+            colour[2] as f32 / 255.0,
+            colour[3] as f32 / 255.0,
+        ]
+    };
+    let mut previous = [0.0f32; 4];
+    let mut registers = [
+        register(material.tev_colors[0]),
+        register(material.tev_colors[1]),
+        register(material.tev_colors[2]),
+    ];
+
+    for stage in &material.tev_stages {
+        let texture = match stage.order.tex_map {
+            Some(map) => sample(map as usize, stage.order.tex_coord.map(usize::from)),
+            None => [1.0; 4],
+        };
+        let konst = tev_konst_colour(stage.konst_color, &material.tev_k_colors);
+        let arg =
+            |selector: u8| tev_colour_arg(selector, previous, registers, texture, raster, konst);
+        let (a, b, c, d) = (
+            arg(stage.color_args[0]),
+            arg(stage.color_args[1]),
+            arg(stage.color_args[2]),
+            arg(stage.color_args[3]),
+        );
+        let clamp_on = stage.color_clamp != 0;
+        let colour: [f32; 3] = if stage.color_op <= 1 {
+            std::array::from_fn(|channel| {
+                tev_channel(
+                    a[channel],
+                    b[channel],
+                    c[channel],
+                    d[channel],
+                    &TevOp {
+                        op: stage.color_op,
+                        bias: stage.color_bias,
+                        scale: stage.color_scale,
+                        clamp_on,
+                    },
+                )
+            })
+        } else {
+            // Comparison stages gate C on a test of A against B.
+            let to_u8 = |value: f32| (value * 255.0).round().clamp(0.0, 255.0) as u32;
+            let passes = match stage.color_op {
+                8 => to_u8(a[0]) > to_u8(b[0]),
+                9 => to_u8(a[0]) == to_u8(b[0]),
+                10 => to_u8(a[0]) | (to_u8(a[1]) << 8) > to_u8(b[0]) | (to_u8(b[1]) << 8),
+                11 => to_u8(a[0]) | (to_u8(a[1]) << 8) == to_u8(b[0]) | (to_u8(b[1]) << 8),
+                _ => to_u8(a[0]) > to_u8(b[0]),
+            };
+            std::array::from_fn(|channel| d[channel] + if passes { c[channel] } else { 0.0 })
+        };
+
+        let target = &mut match stage.color_register {
+            0 => &mut previous,
+            other => &mut registers[(other as usize - 1).min(2)],
+        }[..3];
+        target.copy_from_slice(&colour);
+    }
+
+    // The pixel engine keeps the low eight bits of the final register.
+    std::array::from_fn(|channel| {
+        let value = previous[channel];
+        ((value * 255.0).round().clamp(-1024.0, 1023.0) as i32 & 255) as u8
+    })
 }
 
 /// Nearest-neighbour sample of a decoded preview texture, with wrapping.
@@ -379,15 +572,14 @@ impl SmsEditorApp {
             .fold(0.0f32, f32::max)
             .max(f32::EPSILON);
 
-        let mut texture_tint = vec![None; geometry.textures.len()];
-        for material in &geometry.materials {
+        let mut material_for_texture = vec![None; geometry.textures.len()];
+        for (index, material) in geometry.materials.iter().enumerate() {
             let Some(slot) = material.texture_indices.iter().flatten().next().copied() else {
                 continue;
             };
-            if slot >= texture_tint.len() || texture_tint[slot].is_some() {
-                continue;
+            if slot < material_for_texture.len() && material_for_texture[slot].is_none() {
+                material_for_texture[slot] = Some(index);
             }
-            texture_tint[slot] = tev_register_tint(material);
         }
 
         let triangle_count = geometry.triangles.len();
@@ -398,7 +590,7 @@ impl SmsEditorApp {
             center,
             radius,
             triangle_count,
-            texture_tint,
+            material_for_texture,
         });
         self.mask_yaw = 0.0;
         self.mask_pitch = 0.0;
@@ -681,6 +873,14 @@ impl SmsEditorApp {
                 .ceil() as usize)
                 .min(CANVAS - 1);
 
+            let alpha_compare = triangle.alpha_compare.or_else(|| {
+                triangle
+                    .texture_index
+                    .and_then(|slot| preview.material_for_texture.get(slot).copied().flatten())
+                    .or(triangle.material_index)
+                    .and_then(|index| geometry.materials.get(index))
+                    .map(|material| material.alpha_compare)
+            });
             let texture = triangle
                 .texture_index
                 .and_then(|slot| geometry.textures.get(slot))
@@ -738,6 +938,14 @@ impl SmsEditorApp {
                         let v = set[0][1] * w2 + set[1][1] * w1 + set[2][1] * w0;
                         sample_texture(texture, u, v)
                     });
+                    // Cutout shapes live in the texture's alpha: a leaf is a
+                    // quad until the failing texels are discarded.
+                    if let Some(compare) = alpha_compare {
+                        let alpha = sampled.map(|sample| sample[3]).unwrap_or(255);
+                        if !alpha_compare_passes(&compare, alpha) {
+                            continue;
+                        }
+                    }
                     let vertex = triangle.vertex_colors.or(triangle.color_channels[0]).map(
                         |colors| -> [u8; 4] {
                             std::array::from_fn(|channel| {
@@ -763,38 +971,58 @@ impl SmsEditorApp {
                         })
                         .unwrap_or([220, 220, 225, 255]);
 
-                    // The same combine the stage viewport resolved for this
-                    // triangle, so vertex- and material-coloured actors read
-                    // correctly instead of washing out to white.
                     let modulate = |a: [u8; 4], b: [u8; 4]| -> [u8; 4] {
                         std::array::from_fn(|channel| {
                             ((a[channel] as u32 * b[channel] as u32) / 255) as u8
                         })
                     };
-                    let tint = triangle
+                    // Running the material's own TEV program is what makes a
+                    // toon-shaded actor come out in its colour: the body
+                    // samples a greyscale ramp and the colour lives in a TEV
+                    // register, so no combination of texture and material
+                    // colour alone can reproduce it.
+                    let material = triangle
                         .texture_index
-                        .and_then(|slot| preview.texture_tint.get(slot).copied().flatten());
-                    let colour = match triangle.combine_mode {
-                        Combine::TextureOnly => match (sampled, tint) {
-                            // A greyscale ramp with a register tint is how a
-                            // toon-shaded actor carries its colour.
-                            (Some(sample), Some(tint)) => modulate(sample, tint),
-                            (Some(sample), None) => sample,
-                            (None, _) => flat,
+                        .and_then(|slot| preview.material_for_texture.get(slot).copied().flatten())
+                        .or(triangle.material_index)
+                        .and_then(|index| geometry.materials.get(index))
+                        .filter(|material| !material.tev_stages.is_empty());
+                    let colour = match material {
+                        Some(material) => {
+                            let raster = vertex
+                                .map(|colour| colour.map(|channel| channel as f32 / 255.0))
+                                .unwrap_or([1.0; 4]);
+                            evaluate_tev(material, raster, &|map, _coord| {
+                                geometry
+                                    .textures
+                                    .get(map)
+                                    .zip(tex_coords)
+                                    .and_then(|(texture, set)| {
+                                        let u = set[0][0] * w2 + set[1][0] * w1 + set[2][0] * w0;
+                                        let v = set[0][1] * w2 + set[1][1] * w1 + set[2][1] * w0;
+                                        sample_texture(texture, u, v)
+                                    })
+                                    .map(|sample| sample.map(|c| c as f32 / 255.0))
+                                    .unwrap_or([1.0; 4])
+                            })
+                        }
+                        // Without a TEV program, fall back to the combine the
+                        // geometry already resolved.
+                        None => match triangle.combine_mode {
+                            Combine::TextureOnly => sampled.unwrap_or(flat),
+                            Combine::TextureModulateMaterial => match sampled {
+                                Some(sample) => modulate(sample, flat),
+                                None => flat,
+                            },
+                            Combine::TextureModulateVertex => match (sampled, vertex) {
+                                (Some(sample), Some(vertex)) => modulate(sample, vertex),
+                                (Some(sample), None) => sample,
+                                (None, Some(vertex)) => vertex,
+                                (None, None) => flat,
+                            },
+                            Combine::MaterialOnly => flat,
+                            Combine::VertexOnly => vertex.unwrap_or(flat),
                         },
-                        Combine::TextureModulateMaterial => match (sampled, tint) {
-                            (Some(sample), Some(tint)) => modulate(sample, tint),
-                            (Some(sample), None) => modulate(sample, flat),
-                            (None, _) => flat,
-                        },
-                        Combine::TextureModulateVertex => match (sampled, vertex) {
-                            (Some(sample), Some(vertex)) => modulate(sample, vertex),
-                            (Some(sample), None) => sample,
-                            (None, Some(vertex)) => vertex,
-                            (None, None) => flat,
-                        },
-                        Combine::MaterialOnly => flat,
-                        Combine::VertexOnly => vertex.unwrap_or(flat),
                     };
 
                     base[slot] = Some([
@@ -885,15 +1113,9 @@ impl SmsEditorApp {
                     let [u, v] = goop_uv[slot];
                     let mask_value = sample_mask_bilinear(values, *size, u, v);
                     if goop_is_visible(mask_value, threshold) {
-                        let goop = self.goop_colour(u, v);
-                        let shade =
-                            base_colour[0].max(base_colour[1]).max(base_colour[2]) as f32 / 255.0;
-                        colour = [
-                            (goop[0] as f32 * (0.45 + 0.55 * shade)) as u8,
-                            (goop[1] as f32 * (0.45 + 0.55 * shade)) as u8,
-                            (goop[2] as f32 * (0.45 + 0.55 * shade)) as u8,
-                            255,
-                        ];
+                        // The coating is opaque: the model underneath must not
+                        // read through it, or a mask cannot be judged.
+                        colour = self.goop_colour(u, v);
                     }
                 }
             }
@@ -1282,6 +1504,34 @@ mod tests {
             middle > 100 && middle < 155,
             "midpoint should interpolate, got {middle}"
         );
+    }
+
+    /// Cutout geometry depends on the alpha test: a leaf quad is only a leaf
+    /// once its transparent texels are discarded.
+    #[test]
+    fn alpha_test_discards_transparent_texels() {
+        // The common cutout setup: keep texels at or above half alpha.
+        let compare = sms_formats::J3dAlphaCompare {
+            comp0: 6,
+            ref0: 128,
+            op: 0,
+            comp1: 7,
+            ref1: 0,
+        };
+        assert!(alpha_compare_passes(&compare, 255));
+        assert!(alpha_compare_passes(&compare, 128));
+        assert!(!alpha_compare_passes(&compare, 127));
+        assert!(!alpha_compare_passes(&compare, 0));
+
+        // GX_ALWAYS keeps everything, which is what an opaque body wants.
+        let always = sms_formats::J3dAlphaCompare {
+            comp0: 7,
+            ref0: 0,
+            op: 1,
+            comp1: 7,
+            ref1: 0,
+        };
+        assert!(alpha_compare_passes(&always, 0));
     }
 
     /// Orbiting must not distort the model: a rotation preserves length.
