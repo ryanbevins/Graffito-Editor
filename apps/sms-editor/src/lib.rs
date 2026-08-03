@@ -1309,6 +1309,13 @@ struct SmsEditorApp {
     /// cut by the texture's alpha, and a coating that skips the test coats
     /// the whole quad and pokes past the drawn silhouette.
     mask_gpu_textures: Vec<PreviewTexture>,
+    /// The isolated preview behind the Mask Tool's scene, kept so the wash
+    /// can update its materials in place.
+    mask_gpu_preview: Option<ModelPreview>,
+    /// Materials carrying the wash comparison, with the konst each sweeps.
+    mask_wash_materials: Vec<(usize, usize)>,
+    /// The konst value last pushed to the scene, so it only updates on change.
+    mask_wash_konst: Option<u8>,
     mask_texture: Option<egui::TextureHandle>,
     mask_mask: Vec<u8>,
     mask_mask_size: usize,
@@ -1648,6 +1655,9 @@ impl Default for SmsEditorApp {
             mask_gpu_bounds: None,
             mask_gpu_triangles: Vec::new(),
             mask_gpu_textures: Vec::new(),
+            mask_gpu_preview: None,
+            mask_wash_materials: Vec::new(),
+            mask_wash_konst: None,
             mask_texture: None,
             mask_mask: Vec::new(),
             mask_mask_size: 0,

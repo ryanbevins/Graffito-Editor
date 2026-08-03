@@ -535,6 +535,81 @@ fn sample_texture(texture: &sms_formats::J3dTexturePreview, u: f32, v: f32) -> O
 /// first, then the catalog's actor preview, then an inferred hint. Checking
 /// only the catalog missed actors placed from the content browser, which carry
 /// their model as a hint.
+/// Which konst register a wash comparison sweeps.
+fn wash_konst_index(stage: &sms_formats::J3dTevStage) -> usize {
+    match stage.konst_color {
+        12..=15 => (stage.konst_color - 12) as usize,
+        16..=31 => ((stage.konst_color - 16) & 3) as usize,
+        _ => 0,
+    }
+}
+
+/// A renderable preview built from the model the Mask Tool itself loaded,
+/// for actors the stage preview does not carry -- manager-spawned enemies
+/// load per spawn, so nothing stands in the stage to isolate.
+fn build_mask_model_preview(geometry: &sms_formats::J3dGeometryPreview) -> ModelPreview {
+    let mut preview = model_assets::empty_authored_model_preview();
+    let texture_base = preview_assets::push_preview_textures(&mut preview.textures, geometry);
+    let material_base =
+        preview_assets::push_preview_materials(&mut preview.materials, geometry, texture_base);
+    preview
+        .material_animation_bindings
+        .resize_with(preview.materials.len(), Vec::new);
+    for triangle in &geometry.triangles {
+        preview.triangles.push(PreviewTriangle {
+            vertices: triangle.vertices,
+            normals: triangle.normals,
+            color_channels: triangle.color_channels,
+            tex_coord_sets: triangle.tex_coord_sets,
+            material_index: triangle
+                .material_index
+                .map(|index| material_base + index)
+                .filter(|index| *index < preview.materials.len()),
+            packet_index: triangle.packet_index,
+            model_index: 0,
+            render_layer: PreviewRenderLayer::Main,
+            color: triangle.color,
+            vertex_colors: triangle.vertex_colors,
+            combine_mode: triangle.combine_mode,
+            tex_coords: triangle.tex_coords,
+            texture_index: triangle
+                .texture_index
+                .map(|index| texture_base + index)
+                .filter(|index| *index < preview.textures.len()),
+            mask_tex_coords: triangle.mask_tex_coords,
+            mask_texture_index: triangle
+                .mask_texture_index
+                .map(|index| texture_base + index)
+                .filter(|index| *index < preview.textures.len()),
+            cull_mode: triangle.cull_mode,
+            alpha_compare: triangle.alpha_compare,
+            blend_mode: triangle.blend_mode,
+            z_mode: triangle.z_mode,
+            billboard: triangle.billboard,
+            particle_type: None,
+            particle_pivot: None,
+            particle_direction: None,
+            particle_color_mode: None,
+            particle_environment_color: None,
+            particle_extra_texture: None,
+        });
+    }
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for vertex in preview.triangles.iter().flat_map(|triangle| triangle.vertices) {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(vertex[axis]);
+            max[axis] = max[axis].max(vertex[axis]);
+        }
+    }
+    preview.bounds_min = min;
+    preview.bounds_max = max;
+    preview.camera_bounds_min = min;
+    preview.camera_bounds_max = max;
+    preview.loaded_models = 1;
+    preview
+}
+
 fn mask_model_path(
     document: &sms_scene::StageDocument,
     object: &sms_scene::SceneObject,
@@ -656,7 +731,7 @@ impl SmsEditorApp {
         let triangle_count = geometry.triangles.len();
         let object_id = choice.object_id.clone();
         let object_position = choice.position;
-        self.rebuild_mask_gpu_scene(&object_id, object_position);
+        self.rebuild_mask_gpu_scene(&object_id, object_position, &geometry);
         self.mask_preview = Some(MaskPreview {
             object_id,
             geometry,
@@ -1023,6 +1098,25 @@ impl SmsEditorApp {
         let geometry = &preview.geometry;
         let authored_coord = self.authored_goop_coord();
         let actor_authored = self.authored_mask().is_some();
+        // The wash drives the comparison's konst here too, so the base render
+        // carries the goop at the slider's coverage itself.
+        let wash_threshold = ((1.0 - self.mask_wash_phase.clamp(0.0, 1.0)) * 255.0).round() as u8;
+        let washed_materials: Vec<sms_formats::J3dMaterial> = geometry
+            .materials
+            .iter()
+            .map(|material| {
+                let Some(stage) = material
+                    .tev_stages
+                    .iter()
+                    .find(|stage| stage.color_op >= 8 || stage.alpha_op >= 8)
+                else {
+                    return material.clone();
+                };
+                let mut washed = material.clone();
+                washed.tev_k_colors[wash_konst_index(stage)] = [wash_threshold; 4];
+                washed
+            })
+            .collect();
         let mut base = vec![None; CANVAS * CANVAS];
         let mut goop_uv: Vec<Option<[f32; 2]>> = vec![None; CANVAS * CANVAS];
         let mut depth = vec![f32::INFINITY; CANVAS * CANVAS];
@@ -1206,7 +1300,7 @@ impl SmsEditorApp {
                         .texture_index
                         .and_then(|slot| preview.material_for_texture.get(slot).copied().flatten())
                         .or(triangle.material_index)
-                        .and_then(|index| geometry.materials.get(index))
+                        .and_then(|index| washed_materials.get(index))
                         .filter(|material| !material.tev_stages.is_empty());
                     let colour = match material {
                         Some(material) => {
@@ -1402,11 +1496,19 @@ impl SmsEditorApp {
     /// The actor is already in the stage's preview, materials, textures and
     /// all, so there is nothing to rebuild: keeping only the triangles of its
     /// model leaves exactly what the stage draws for it.
-    fn rebuild_mask_gpu_scene(&mut self, object_id: &str, position: [f32; 3]) {
+    fn rebuild_mask_gpu_scene(
+        &mut self,
+        object_id: &str,
+        position: [f32; 3],
+        geometry: &sms_formats::J3dGeometryPreview,
+    ) {
         self.mask_gpu_scene = None;
         self.mask_gpu_bounds = None;
         self.mask_gpu_triangles.clear();
         self.mask_gpu_textures.clear();
+        self.mask_gpu_preview = None;
+        self.mask_wash_materials.clear();
+        self.mask_wash_konst = None;
         let Some(target_format) = self.gpu_target_format else {
             return;
         };
@@ -1470,10 +1572,8 @@ impl SmsEditorApp {
                     .min_by(|left, right| left.1.total_cmp(&right.1))
                     .map(|(index, _)| index)
             });
-        let Some(model_index) = model_index else {
-            return;
-        };
-        let mut isolated = preview.clone();
+        let mut isolated = if let Some(model_index) = model_index {
+            let mut isolated = preview.clone();
         isolated
             .triangles
             .retain(|triangle| triangle.model_index == model_index);
@@ -1522,6 +1622,12 @@ impl SmsEditorApp {
         let median = sorted[sorted.len() / 2].max(f32::EPSILON);
         let mut keep = distances.into_iter().map(|distance| distance <= median * 4.0);
         isolated.triangles.retain(|_| keep.next().unwrap_or(true));
+            isolated
+        } else {
+            // Nothing of this actor stands in the stage preview. Render the
+            // model the tool itself loaded, in its own space.
+            build_mask_model_preview(geometry)
+        };
         if isolated.triangles.is_empty() {
             return;
         }
@@ -1555,10 +1661,59 @@ impl SmsEditorApp {
         isolated.animated_flags.clear();
         isolated.rotating_models.clear();
         isolated.level_transform_models.clear();
+        // The wash is the comparison's konst. Driving it dissolves the baked
+        // goop itself -- the way the game drives it with hit points -- rather
+        // than painting a second coating over the top of it.
+        self.mask_wash_materials = isolated
+            .materials
+            .iter()
+            .enumerate()
+            .filter_map(|(index, material)| {
+                material.tev_stages.iter().find_map(|stage| {
+                    if stage.color_op < 8 && stage.alpha_op < 8 {
+                        return None;
+                    }
+                    Some((index, wash_konst_index(stage)))
+                })
+            })
+            .collect();
         self.mask_gpu_scene = Some(gpu_viewport::GpuViewportScene::from_preview(
             &isolated,
             target_format,
         ));
+        self.mask_gpu_preview = Some(isolated);
+        self.push_mask_wash();
+    }
+
+    /// Pushes the wash slider into the renderer's materials.
+    ///
+    /// Full coverage puts the konst at zero, so every masked texel passes the
+    /// comparison and the actor wears its authored goop whole. Sliding down
+    /// raises the konst and the coating dissolves in order of the mask's
+    /// values -- the crisp recede the game gets from the same konst.
+    fn push_mask_wash(&mut self) {
+        if self.mask_wash_materials.is_empty() {
+            return;
+        }
+        let threshold = ((1.0 - self.mask_wash_phase.clamp(0.0, 1.0)) * 255.0).round() as u8;
+        if self.mask_wash_konst == Some(threshold) {
+            return;
+        }
+        let mut indices = Vec::new();
+        if let Some(preview) = self.mask_gpu_preview.as_mut() {
+            for (material_index, konst_index) in &self.mask_wash_materials {
+                if let Some(material) = preview.materials.get_mut(*material_index) {
+                    material.tev_k_colors[*konst_index] = [threshold; 4];
+                    indices.push(*material_index);
+                }
+            }
+        }
+        self.mask_wash_konst = Some(threshold);
+        if let (Some(scene), Some(preview)) =
+            (self.mask_gpu_scene.as_ref(), self.mask_gpu_preview.as_ref())
+        {
+            scene.update_materials(preview, &indices);
+        }
     }
 
     /// A camera matching the one the goop pass rasterizes with.
@@ -1818,7 +1973,7 @@ impl SmsEditorApp {
     /// laid over a model the GPU drew.
     fn mask_goop_overlay_image(&self) -> Option<egui::ColorImage> {
         let goop_uv = self.rasterize_goop()?;
-        let threshold = (self.mask_wash_phase.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let threshold = ((1.0 - self.mask_wash_phase.clamp(0.0, 1.0)) * 255.0).round() as u8;
         // An actor that authored a wash mask is judged exactly the way the
         // game judges it: its own mask, through its own UV, against the
         // threshold. The borrowed gradient only drives actors that never
@@ -1853,7 +2008,7 @@ impl SmsEditorApp {
             return self.render_uv_inspector();
         }
         let (base, goop_uv) = self.rasterize_model()?;
-        let threshold = (self.mask_wash_phase.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let threshold = ((1.0 - self.mask_wash_phase.clamp(0.0, 1.0)) * 255.0).round() as u8;
         let mask = self.active_mask();
         let authored = self.authored_mask();
         let mut pixels = Vec::with_capacity(CANVAS * CANVAS * 4);
@@ -1863,7 +2018,7 @@ impl SmsEditorApp {
                 continue;
             };
             let mut colour = base_colour;
-            if self.mask_uv_layer == MaskUvLayer::Goop {
+            if self.mask_uv_layer == MaskUvLayer::Goop && authored.is_none() {
                 if let Some([u, v]) = goop_uv[slot] {
                     let mask_value = match &authored {
                         // The actor's own mask, in its own image space.
@@ -2204,6 +2359,7 @@ impl SmsEditorApp {
             self.mask_pitch = (self.mask_pitch + delta.y * 0.01).clamp(-1.5, 1.5);
         }
 
+        self.push_mask_wash();
         if let (Some(scene), Some(frame)) = (self.mask_gpu_scene.as_ref(), self.mask_gpu_frame(rect))
         {
             scene.set_frame(frame);
@@ -2211,6 +2367,11 @@ impl SmsEditorApp {
         }
 
         if self.mask_uv_layer != MaskUvLayer::Goop {
+            return;
+        }
+        // An authored actor washes inside the renderer itself; the overlay
+        // exists only for actors coated with the borrowed mask.
+        if !self.mask_wash_materials.is_empty() {
             return;
         }
         let Some(image) = self.mask_goop_overlay_image() else {
@@ -2276,7 +2437,7 @@ impl SmsEditorApp {
         ui.label(
             egui::RichText::new(format!(
                 "threshold K0_A \u{2248} {}  (mask > this stays coated)",
-                (self.mask_wash_phase * 255.0).round() as u16
+                ((1.0 - self.mask_wash_phase) * 255.0).round() as u16
             ))
             .small()
             .color(egui::Color32::GRAY),
