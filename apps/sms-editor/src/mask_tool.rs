@@ -588,8 +588,10 @@ impl SmsEditorApp {
         }
 
         let triangle_count = geometry.triangles.len();
+        let object_id = choice.object_id.clone();
+        self.rebuild_mask_gpu_scene(&object_id);
         self.mask_preview = Some(MaskPreview {
-            object_id: choice.object_id.clone(),
+            object_id,
             geometry,
             front_uv,
             center,
@@ -1129,6 +1131,116 @@ impl SmsEditorApp {
     }
 
     /// Composites the model preview at the current wash phase.
+    /// Isolates the chosen actor out of the stage preview and hands it to the
+    /// stage viewport's renderer.
+    ///
+    /// The actor is already in the stage's preview, materials, textures and
+    /// all, so there is nothing to rebuild: keeping only the triangles of its
+    /// model leaves exactly what the stage draws for it.
+    fn rebuild_mask_gpu_scene(&mut self, object_id: &str) {
+        self.mask_gpu_scene = None;
+        let Some(target_format) = self.gpu_target_format else {
+            return;
+        };
+        let Some(preview) = self.model_preview.as_ref() else {
+            return;
+        };
+        let Some(model_index) = preview.object_model_indices.get(object_id).copied() else {
+            return;
+        };
+        let mut isolated = preview.clone();
+        isolated
+            .triangles
+            .retain(|triangle| triangle.model_index == model_index);
+        if isolated.triangles.is_empty() {
+            return;
+        }
+        self.mask_gpu_scene = Some(gpu_viewport::GpuViewportScene::from_preview(
+            &isolated,
+            target_format,
+        ));
+    }
+
+    /// A camera matching the one the goop pass rasterizes with.
+    ///
+    /// That pass projects orthographically, so the perspective camera is placed
+    /// far enough back for the divergence to fall under a pixel and given the
+    /// focal length that reproduces its scale. Both then frame the actor
+    /// identically, and the goop overlay lands where the model is.
+    fn mask_gpu_frame(&self, rect: egui::Rect) -> Option<gpu_viewport::GpuViewportFrame> {
+        let preview = self.mask_preview.as_ref()?;
+        let side = rect.width().min(rect.height()).max(1.0);
+        let (sin_yaw, cos_yaw) = self.mask_yaw.sin_cos();
+        let (sin_pitch, cos_pitch) = self.mask_pitch.sin_cos();
+        // The orbit turns the model; the camera basis that sees the same thing
+        // is its transpose.
+        let right = [cos_yaw, 0.0, sin_yaw];
+        let up = [sin_pitch * sin_yaw, cos_pitch, -sin_pitch * cos_yaw];
+        let forward = [-cos_pitch * sin_yaw, sin_pitch, cos_pitch * cos_yaw];
+        let radius = preview.radius.max(f32::EPSILON);
+        let distance = radius * 8.0;
+        let camera_position =
+            std::array::from_fn(|axis| preview.center[axis] - forward[axis] * distance);
+        let lighting = self
+            .document
+            .as_ref()
+            .and_then(|document| document.lighting.object_lighting());
+        Some(gpu_viewport::GpuViewportFrame {
+            camera_position,
+            right,
+            up,
+            forward,
+            // The goop pass scales by 0.45 of the radius across the canvas.
+            focal: distance * 0.45 * side / radius,
+            viewport_size: [rect.width().max(1.0), rect.height().max(1.0)],
+            viewport_pan: [0.0; 2],
+            near: VIEWPORT_NEAR_CLIP,
+            animation_seconds: self.animation_started_at.elapsed().as_secs_f32(),
+            light_position: lighting
+                .map(|lighting| lighting.position)
+                .unwrap_or([200_000.0, 500_000.0, 200_000.0]),
+            light_color: lighting
+                .map(|lighting| gpu_viewport::color_u8_to_f32(lighting.color))
+                .unwrap_or([1.0; 4]),
+            ambient_color: lighting.map(|lighting| gpu_viewport::color_u8_to_f32(lighting.ambient)),
+            object_light_position: lighting
+                .map(|lighting| lighting.position)
+                .unwrap_or([200_000.0, 500_000.0, 200_000.0]),
+            object_light_color: lighting
+                .map(|lighting| gpu_viewport::color_u8_to_f32(lighting.color))
+                .unwrap_or([1.0; 4]),
+            object_ambient_color: lighting
+                .map(|lighting| gpu_viewport::color_u8_to_f32(lighting.ambient)),
+            show_grid: false,
+            death_barrier_y: None,
+        })
+    }
+
+    /// The coating alone, transparent everywhere it does not show, so it can be
+    /// laid over a model the GPU drew.
+    fn mask_goop_overlay_image(&self) -> Option<egui::ColorImage> {
+        let (base, goop_uv) = self.rasterize_model()?;
+        let threshold = (self.mask_wash_phase.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let (size, values) = self.active_mask()?;
+        let mut pixels = Vec::with_capacity(CANVAS * CANVAS * 4);
+        for slot in 0..CANVAS * CANVAS {
+            // Coverage comes from the same pass, so the coating stops at the
+            // model's silhouette rather than floating over the background.
+            let covered = base[slot].is_some();
+            let [u, v] = goop_uv[slot];
+            let shows = covered && goop_is_visible(sample_mask_bilinear(&values, size, u, v), threshold);
+            if shows {
+                pixels.extend_from_slice(&self.goop_colour(u, v));
+            } else {
+                pixels.extend_from_slice(&[0, 0, 0, 0]);
+            }
+        }
+        Some(egui::ColorImage::from_rgba_unmultiplied(
+            [CANVAS, CANVAS],
+            &pixels,
+        ))
+    }
+
     fn mask_preview_image(&self) -> Option<egui::ColorImage> {
         if self.mask_view == MaskView::Uv {
             return self.render_uv_inspector();
@@ -1398,6 +1510,12 @@ impl SmsEditorApp {
 
     /// The Mask Tool's viewport: the model or its UV layout, filling the view.
     pub(super) fn mask_tool_viewport(&mut self, ui: &mut egui::Ui) {
+        // A model is drawn by the stage viewport's renderer; a UV layout is a
+        // flat diagram this module draws itself.
+        if self.mask_view == MaskView::Model && self.mask_gpu_scene.is_some() {
+            self.mask_tool_model_viewport(ui);
+            return;
+        }
         let Some(image) = self.mask_preview_image() else {
             ui.centered_and_justified(|ui| {
                 ui.label(
@@ -1427,6 +1545,43 @@ impl SmsEditorApp {
             self.mask_yaw += delta.x * 0.01;
             self.mask_pitch = (self.mask_pitch + delta.y * 0.01).clamp(-1.5, 1.5);
         }
+    }
+
+    /// Draws the actor through the stage viewport's renderer, then lays the
+    /// authored coating over it.
+    fn mask_tool_model_viewport(&mut self, ui: &mut egui::Ui) {
+        let available = ui.available_size();
+        let side = available.x.min(available.y).max(64.0);
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::drag());
+        if response.dragged() {
+            let delta = response.drag_delta();
+            self.mask_yaw += delta.x * 0.01;
+            self.mask_pitch = (self.mask_pitch + delta.y * 0.01).clamp(-1.5, 1.5);
+        }
+
+        if let (Some(scene), Some(frame)) = (self.mask_gpu_scene.as_ref(), self.mask_gpu_frame(rect))
+        {
+            scene.set_frame(frame);
+            ui.painter().add(scene.paint_callback(rect));
+        }
+
+        if self.mask_uv_layer != MaskUvLayer::Goop {
+            return;
+        }
+        let Some(image) = self.mask_goop_overlay_image() else {
+            return;
+        };
+        let texture = self.mask_texture.get_or_insert_with(|| {
+            ui.ctx()
+                .load_texture("mask-tool-goop", image.clone(), Default::default())
+        });
+        texture.set(image, Default::default());
+        ui.painter().image(
+            texture.id(),
+            rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
     }
 
     /// The wash-cycle preview: sweeps the threshold the mask is compared to.

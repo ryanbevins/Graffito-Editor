@@ -1292,6 +1292,10 @@ struct SmsEditorApp {
     mask_goop_image: Option<(usize, usize, Vec<u8>)>,
     mask_mask_source: mask_tool::MaskTextureSource,
     mask_preview: Option<mask_tool::MaskPreview>,
+    /// The selected actor, isolated from the stage preview and handed to the
+    /// same renderer the stage viewport uses. The Mask Tool draws through it so
+    /// an actor reads here exactly as it reads in the stage.
+    mask_gpu_scene: Option<gpu_viewport::GpuViewportScene>,
     mask_texture: Option<egui::TextureHandle>,
     mask_mask: Vec<u8>,
     mask_mask_size: usize,
@@ -1627,6 +1631,7 @@ impl Default for SmsEditorApp {
             mask_goop_image: None,
             mask_mask_source: mask_tool::MaskTextureSource::Generated,
             mask_preview: None,
+            mask_gpu_scene: None,
             mask_texture: None,
             mask_mask: Vec::new(),
             mask_mask_size: 0,
