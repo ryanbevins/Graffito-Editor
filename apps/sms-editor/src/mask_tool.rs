@@ -63,7 +63,10 @@ pub(super) enum MaskUvLayer {
 pub(super) enum MaskTextureSource {
     /// Generated content: the rainbow colour map, or the borrowed mask.
     Generated,
-    /// A texture the model already carries, by index.
+    /// A texture the model already carries, by index. The pickers no longer
+    /// offer these -- a coating is a goop map, not whatever the model happens
+    /// to carry -- but the sources still resolve one.
+    #[allow(dead_code)]
     Model(usize),
     /// A retail goop style from the goop tool's catalog -- the same chocolate,
     /// oil, pink and electric surfaces the goop tool paints with.
@@ -1287,8 +1290,7 @@ impl SmsEditorApp {
         for triangle in &self.mask_gpu_triangles {
             let mut screen = [[0.0f32; 3]; 3];
             let mut behind = false;
-            for corner in 0..3 {
-                let point = triangle.vertices[corner];
+            for (corner, point) in screen.iter_mut().zip(triangle.vertices) {
                 let relative: [f32; 3] = std::array::from_fn(|axis| point[axis] - camera[axis]);
                 let x = (0..3).map(|axis| relative[axis] * right[axis]).sum::<f32>();
                 let y = (0..3).map(|axis| relative[axis] * up[axis]).sum::<f32>();
@@ -1297,7 +1299,7 @@ impl SmsEditorApp {
                     behind = true;
                     break;
                 }
-                screen[corner] = [half + x * scale / z, half - y * scale / z, z];
+                *corner = [half + x * scale / z, half - y * scale / z, z];
             }
             if behind {
                 continue;
@@ -1372,13 +1374,13 @@ impl SmsEditorApp {
         let threshold = (self.mask_wash_phase.clamp(0.0, 1.0) * 255.0).round() as u8;
         let (size, values) = self.active_mask()?;
         let mut pixels = Vec::with_capacity(CANVAS * CANVAS * 4);
-        for slot in 0..CANVAS * CANVAS {
+        for coated in goop_uv {
             // Coverage comes from the same pass, so the coating stops at the
             // model's silhouette rather than floating over the background.
-            let shows = goop_uv[slot].is_some_and(|[u, v]| {
+            let shows = coated.is_some_and(|[u, v]| {
                 goop_is_visible(sample_mask_bilinear(&values, size, u, v), threshold)
             });
-            match (shows, goop_uv[slot]) {
+            match (shows, coated) {
                 (true, Some([u, v])) => pixels.extend_from_slice(&self.goop_colour(u, v)),
                 _ => pixels.extend_from_slice(&[0, 0, 0, 0]),
             }
