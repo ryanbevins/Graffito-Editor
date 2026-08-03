@@ -52,6 +52,26 @@
 //! per-pixel compare. The front-projection-bounds UV generator feeds it (retail
 //! authored its goop UV as a front projection fit to the [0,1] canvas -- our
 //! measurement of the real UV1 confirmed it lands exactly on the unit square).
+//!
+//! # Full window layout (the target to build)
+//!
+//! A standalone window, BrawlBox Advanced Model Editor in spirit:
+//!
+//! - **Menu bar**, BrawlBox's File/Edit/View repurposed to mask concerns:
+//!   - *Actor* -- sample an actor, export.
+//!   - *Edit* -- undo/redo/clear the painted mask.
+//!   - *View* -- the UV-layer toggle (UV0 clean vs goop UV coated), wireframe.
+//!   - *Mask* -- generate goop map + example mask, play the wash cycle.
+//! - **Actor sampler at the top** -- a dropdown that samples the *loaded
+//!   stage's own hierarchy* (the enemy actors placed in the level), not the
+//!   whole catalog, so you edit goop on your stage's actors. `[TODO: the
+//!   scaffle's `mask_actor_choices` still lists the full catalog; point it at
+//!   `self.document`'s placed enemy actors.]`
+//! - **Central 3D viewport** -- the selected model, orbitable.
+//! - **UV-layer side menu** -- selecting UV0 renders clean; selecting the goop
+//!   UV renders coated (colour map masked by the goop mask).
+//! - **Generate** seeds rainbow colour + the retail 32x32 StayPakkun mask;
+//!   **Play full cycle** sweeps `K0_A` and evaluates `mask > K0_A` per pixel.
 
 use super::*;
 
