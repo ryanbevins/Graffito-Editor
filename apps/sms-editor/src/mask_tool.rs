@@ -1664,10 +1664,20 @@ impl SmsEditorApp {
         // The wash is the comparison's konst. Driving it dissolves the baked
         // goop itself -- the way the game drives it with hit points -- rather
         // than painting a second coating over the top of it.
+        // Only the materials this actor's own triangles reference count: the
+        // isolated clone keeps the whole stage's material list, and another
+        // actor's wash comparison must not mark this one as authored --
+        // BossPakkun lost his borrowed coating to BossGesso's materials.
+        let used_materials: std::collections::BTreeSet<usize> = isolated
+            .triangles
+            .iter()
+            .filter_map(|triangle| triangle.material_index)
+            .collect();
         self.mask_wash_materials = isolated
             .materials
             .iter()
             .enumerate()
+            .filter(|(index, _)| used_materials.contains(index))
             .filter_map(|(index, material)| {
                 material.tev_stages.iter().find_map(|stage| {
                     if stage.color_op < 8 && stage.alpha_op < 8 {
