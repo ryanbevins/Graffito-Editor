@@ -871,17 +871,21 @@ impl SmsEditorApp {
             });
             return Some((AuthoredMaskTexture::Stage(texture), name));
         }
-        // Authored coordinates with no resolved texture: the actor's own
-        // model supplies the mask those coordinates were authored for.
-        if !self
-            .mask_gpu_triangles
-            .iter()
-            .any(|triangle| triangle.mask_tex_coords.is_some())
-        {
-            return None;
+        if let Some(texture) = self.model_mask_texture() {
+            return Some((AuthoredMaskTexture::Model(texture), Some(texture.name.clone())));
         }
-        self.model_mask_texture()
-            .map(|texture| (AuthoredMaskTexture::Model(texture), Some(texture.name.clone())))
+        // The wash itself names its mask: `mask(goop UV) > K0_A` is a TEV
+        // comparison stage, and the stage's order says which texture it
+        // samples and through which coordinate set. Read the binding off the
+        // material directly -- it cannot be absent on a washable actor.
+        let (texture_index, _) = self.authored_goop_binding()?;
+        let texture = self
+            .mask_preview
+            .as_ref()?
+            .geometry
+            .textures
+            .get(texture_index)?;
+        Some((AuthoredMaskTexture::Model(texture), Some(texture.name.clone())))
     }
 
     /// The wash-mask texture the actor's own model carries.
@@ -893,6 +897,59 @@ impl SmsEditorApp {
             .iter()
             .find_map(|triangle| triangle.mask_texture_index)?;
         preview.geometry.textures.get(index)
+    }
+
+    /// The mask texture and coordinate set the wash comparison names.
+    ///
+    /// Washable goop is a hard threshold the game evaluates per pixel, wired
+    /// as a TEV comparison stage. Its order carries the authored binding --
+    /// the actor's own mask texture and the UV set unwrapped for it -- so
+    /// the binding is read from the material even when no preview path
+    /// resolved it into the triangle fields.
+    fn authored_goop_binding(&self) -> Option<(usize, usize)> {
+        let preview = self.mask_preview.as_ref()?;
+        for material in &preview.geometry.materials {
+            for stage in &material.tev_stages {
+                if stage.color_op < 8 && stage.alpha_op < 8 {
+                    continue;
+                }
+                let Some(map) = stage.order.tex_map else {
+                    continue;
+                };
+                let Some(coord) = stage.order.tex_coord else {
+                    continue;
+                };
+                let Some(texture_index) = material
+                    .texture_indices
+                    .get(map as usize)
+                    .copied()
+                    .flatten()
+                else {
+                    continue;
+                };
+                if preview.geometry.textures.get(texture_index).is_some() {
+                    // The comparison names a texgen slot; the vertices store
+                    // the set the slot generates from. BossGesso's wash reads
+                    // coord 2, which his material generates from stored UV1
+                    // through a texture matrix.
+                    let stored = material
+                        .tex_gens
+                        .get(coord as usize)
+                        .map(|gen| gen.source)
+                        .filter(|source| (4..=11).contains(source))
+                        .map(|source| (source - 4) as usize)
+                        .unwrap_or(coord as usize);
+                    return Some((texture_index, stored));
+                }
+            }
+        }
+        None
+    }
+
+    /// The coordinate set the wash comparison reads, where a model authors
+    /// one.
+    fn authored_goop_coord(&self) -> Option<usize> {
+        self.authored_goop_binding().map(|(_, coord)| coord)
     }
 
     /// Reads a model texture as a wash mask.
@@ -959,13 +1016,15 @@ impl SmsEditorApp {
     /// Normals are interpolated across the triangle, so curved surfaces read as
     /// curved instead of faceted.
     #[allow(clippy::type_complexity)]
-    fn rasterize_model(&self) -> Option<(Vec<Option<[u8; 4]>>, Vec<[f32; 2]>)> {
+    fn rasterize_model(&self) -> Option<(Vec<Option<[u8; 4]>>, Vec<Option<[f32; 2]>>)> {
         use sms_formats::J3dPreviewCombineMode as Combine;
 
         let preview = self.mask_preview.as_ref()?;
         let geometry = &preview.geometry;
+        let authored_coord = self.authored_goop_coord();
+        let actor_authored = self.authored_mask().is_some();
         let mut base = vec![None; CANVAS * CANVAS];
-        let mut goop_uv = vec![[0.0f32; 2]; CANVAS * CANVAS];
+        let mut goop_uv: Vec<Option<[f32; 2]>> = vec![None; CANVAS * CANVAS];
         let mut depth = vec![f32::INFINITY; CANVAS * CANVAS];
 
         for (index, triangle) in geometry.triangles.iter().enumerate() {
@@ -982,11 +1041,23 @@ impl SmsEditorApp {
                     (0.5 - view[corner][1] / preview.radius * 0.45) * (CANVAS - 1) as f32,
                 ]
             });
-            let uv = [
-                preview.front_uv[index * 3],
-                preview.front_uv[index * 3 + 1],
-                preview.front_uv[index * 3 + 2],
-            ];
+            // The goop rides the actor's own authored set. On a wired
+            // actor, a surface without that set carries no goop at all --
+            // HamuKuri's wash lives on his cap material alone. Only an actor
+            // that authored nothing is front projected.
+            let wired = triangle.mask_tex_coords.or_else(|| {
+                authored_coord
+                    .and_then(|coord| triangle.tex_coord_sets.get(coord).copied().flatten())
+            });
+            let uv = match (wired, actor_authored) {
+                (Some(set), _) => Some(set),
+                (None, true) => None,
+                (None, false) => Some([
+                    preview.front_uv[index * 3],
+                    preview.front_uv[index * 3 + 1],
+                    preview.front_uv[index * 3 + 2],
+                ]),
+            };
             let normals: Option<[[f32; 3]; 3]> = triangle.normals.map(|normals| {
                 std::array::from_fn(|corner| orbit(normals[corner], self.mask_yaw, self.mask_pitch))
             });
@@ -1060,10 +1131,12 @@ impl SmsEditorApp {
                         continue;
                     }
                     depth[slot] = pixel_depth;
-                    goop_uv[slot] = [
-                        uv[0][0] * w2 + uv[1][0] * w1 + uv[2][0] * w0,
-                        uv[0][1] * w2 + uv[1][1] * w1 + uv[2][1] * w0,
-                    ];
+                    goop_uv[slot] = uv.map(|uv| {
+                        [
+                            uv[0][0] * w2 + uv[1][0] * w1 + uv[2][0] * w0,
+                            uv[0][1] * w2 + uv[1][1] * w1 + uv[2][1] * w0,
+                        ]
+                    });
 
                     // Smooth shading: interpolate the normal, not the face.
                     let shade = match normals {
@@ -1261,15 +1334,23 @@ impl SmsEditorApp {
         // A model that authored its goop UV is inspected through it, in the
         // image space its mask ships in; the projection is only for models
         // with no authored layer.
+        let authored_coord = self.authored_goop_coord();
+        let authored_set = |triangle: &sms_formats::J3dTriangle| {
+            triangle.mask_tex_coords.or_else(|| {
+                authored_coord
+                    .and_then(|coord| triangle.tex_coord_sets.get(coord).copied().flatten())
+            })
+        };
         let authored_layout = self.mask_uv_layer == MaskUvLayer::Goop
             && self.authored_mask().is_some()
-            && self
-                .mask_gpu_triangles
+            && preview
+                .geometry
+                .triangles
                 .iter()
-                .any(|triangle| triangle.mask_tex_coords.is_some());
+                .any(|triangle| authored_set(triangle).is_some());
         if authored_layout {
-            for triangle in &self.mask_gpu_triangles {
-                let Some(uv) = triangle.mask_tex_coords else {
+            for triangle in &preview.geometry.triangles {
+                let Some(uv) = authored_set(triangle) else {
                     continue;
                 };
                 let screen: [[f32; 2]; 3] = std::array::from_fn(|corner| {
@@ -1590,8 +1671,20 @@ impl SmsEditorApp {
         let span = [max[0] - min[0], max[1] - min[1]];
 
         // The mask the authored coordinates sample, from the actor's own
-        // model, for triangles whose stage copy lost the binding.
-        let model_mask = self.model_mask_texture();
+        // model, for triangles whose stage copy lost the binding. The wash
+        // comparison's own binding stands in where no preview path resolved
+        // one at all.
+        let model_mask = self.model_mask_texture().or_else(|| {
+            self.authored_goop_binding().and_then(|(texture_index, _)| {
+                self.mask_preview
+                    .as_ref()
+                    .and_then(|preview| preview.geometry.textures.get(texture_index))
+            })
+        });
+        let authored_coord = self.authored_goop_coord();
+        // Whether this actor authored a goop layer at all. On one that did, a
+        // surface without the layer stays clean rather than front projected.
+        let actor_authored = model_mask.is_some();
         let mut uv = vec![None; CANVAS * CANVAS];
         let mut depth = vec![f32::INFINITY; CANVAS * CANVAS];
         for triangle in &self.mask_gpu_triangles {
@@ -1625,7 +1718,11 @@ impl SmsEditorApp {
             // mask texture comes from the stage copy when the binding
             // survived its load path, and from the actor's own model when it
             // did not.
-            let authored = triangle.mask_tex_coords.and_then(|set| {
+            let authored_set = triangle.mask_tex_coords.or_else(|| {
+                authored_coord
+                    .and_then(|coord| triangle.tex_coord_sets.get(coord).copied().flatten())
+            });
+            let authored = authored_set.and_then(|set| {
                 triangle
                     .mask_texture_index
                     .and_then(|index| self.mask_gpu_textures.get(index))
@@ -1633,7 +1730,7 @@ impl SmsEditorApp {
                     .or_else(|| model_mask.map(AuthoredMaskTexture::Model))
                     .map(|texture| (set, texture))
             });
-            let coat = authored.map(|(set, _)| set).unwrap_or(front);
+
 
             // The renderer cuts shapes out of quads with the texture's
             // alpha. Run the same test here, or the coating covers texels the
@@ -1696,10 +1793,21 @@ impl SmsEditorApp {
                             continue;
                         }
                     }
-                    let coat_uv = at(coat);
-                    let own_mask =
-                        authored.map(|(_, texture)| texture.value(coat_uv[0], coat_uv[1]));
-                    uv[slot] = Some((coat_uv, at(front), own_mask));
+                    uv[slot] = match (authored, actor_authored) {
+                        (Some((set, texture)), _) => {
+                            let coat_uv = at(set);
+                            Some((
+                                coat_uv,
+                                at(front),
+                                Some(texture.value(coat_uv[0], coat_uv[1])),
+                            ))
+                        }
+                        // A wired actor's un-wired surface carries no goop;
+                        // the triangle still wrote depth, so it occludes any
+                        // coating behind it.
+                        (None, true) => None,
+                        (None, false) => Some((at(front), at(front), None)),
+                    };
                 }
             }
         }
@@ -1747,6 +1855,7 @@ impl SmsEditorApp {
         let (base, goop_uv) = self.rasterize_model()?;
         let threshold = (self.mask_wash_phase.clamp(0.0, 1.0) * 255.0).round() as u8;
         let mask = self.active_mask();
+        let authored = self.authored_mask();
         let mut pixels = Vec::with_capacity(CANVAS * CANVAS * 4);
         for slot in 0..CANVAS * CANVAS {
             let Some(base_colour) = base[slot] else {
@@ -1755,10 +1864,15 @@ impl SmsEditorApp {
             };
             let mut colour = base_colour;
             if self.mask_uv_layer == MaskUvLayer::Goop {
-                if let Some((size, values)) = &mask {
-                    let [u, v] = goop_uv[slot];
-                    let mask_value = sample_mask_bilinear(values, *size, u, v);
-                    if goop_is_visible(mask_value, threshold) {
+                if let Some([u, v]) = goop_uv[slot] {
+                    let mask_value = match &authored {
+                        // The actor's own mask, in its own image space.
+                        Some((texture, _)) => Some(texture.value(u, v)),
+                        None => mask
+                            .as_ref()
+                            .map(|(size, values)| sample_mask_bilinear(values, *size, u, v)),
+                    };
+                    if mask_value.is_some_and(|value| goop_is_visible(value, threshold)) {
                         // The coating is opaque: the model underneath must not
                         // read through it, or a mask cannot be judged.
                         colour = self.goop_colour(u, v);
@@ -1936,15 +2050,33 @@ impl SmsEditorApp {
         };
         let mask_status = match self.authored_mask() {
             Some((_, name)) => {
-                let carried = self
-                    .mask_gpu_triangles
-                    .iter()
-                    .filter(|triangle| triangle.mask_tex_coords.is_some())
-                    .count();
+                let authored_coord = self.authored_goop_coord();
+                let (carried, total) = self
+                    .mask_preview
+                    .as_ref()
+                    .map(|preview| {
+                        let carried = preview
+                            .geometry
+                            .triangles
+                            .iter()
+                            .filter(|triangle| {
+                                triangle.mask_tex_coords.is_some()
+                                    || authored_coord.is_some_and(|coord| {
+                                        triangle
+                                            .tex_coord_sets
+                                            .get(coord)
+                                            .copied()
+                                            .flatten()
+                                            .is_some()
+                                    })
+                            })
+                            .count();
+                        (carried, preview.geometry.triangles.len())
+                    })
+                    .unwrap_or((0, 0));
                 format!(
-                    "authored mask '{}' via its own UV on {carried} of {} triangles",
-                    name.unwrap_or_else(|| "model's own".to_string()),
-                    self.mask_gpu_triangles.len()
+                    "authored mask '{}' via its own UV on {carried} of {total} triangles",
+                    name.unwrap_or_else(|| "model's own".to_string())
                 )
             }
             None => "no authored mask; StayPakkun default over a front projection".to_string(),
