@@ -145,6 +145,9 @@ pub(super) fn front_projection_bounds(points: &[[f32; 3]]) -> Vec<[f32; 2]> {
         .collect()
 }
 
+/// The coat UV and the sweep UV resolved at one canvas pixel.
+type GoopPixelUv = ([f32; 2], [f32; 2]);
+
 /// Whether goop shows at a texel: the game's own comparison.
 pub(super) fn goop_is_visible(mask_value: u8, threshold: u8) -> bool {
     mask_value > threshold
@@ -792,16 +795,9 @@ impl SmsEditorApp {
 
     fn active_mask(&self) -> Option<(usize, Vec<u8>)> {
         match self.mask_mask_source {
-            MaskTextureSource::Generated | MaskTextureSource::GoopStyle(_) => {
-                // A model that authored its own mask wears it; the borrowed
-                // StayPakkun mask is the default for one that never did.
-                if let Some(index) = self.authored_mask_texture_index() {
-                    let texture = self.mask_preview.as_ref()?.geometry.textures.get(index)?;
-                    return Self::mask_from_texture(texture);
-                }
-                self.mask_generated
-                    .then(|| (self.mask_mask_size, self.mask_mask.clone()))
-            }
+            MaskTextureSource::Generated | MaskTextureSource::GoopStyle(_) => self
+                .mask_generated
+                .then(|| (self.mask_mask_size, self.mask_mask.clone())),
             MaskTextureSource::Model(index) => {
                 let texture = self.mask_preview.as_ref()?.geometry.textures.get(index)?;
                 Self::mask_from_texture(texture)
@@ -1129,7 +1125,35 @@ impl SmsEditorApp {
                 }
             }
         };
+        // A model that authored its goop UV is inspected through it, in the
+        // image space its mask ships in; the projection is only for models
+        // with no authored layer.
+        let authored_layout = self.mask_uv_layer == MaskUvLayer::Goop
+            && self.authored_mask_texture_index().is_some()
+            && self
+                .mask_gpu_triangles
+                .iter()
+                .any(|triangle| triangle.mask_tex_coords.is_some());
+        if authored_layout {
+            for triangle in &self.mask_gpu_triangles {
+                let Some(uv) = triangle.mask_tex_coords else {
+                    continue;
+                };
+                let screen: [[f32; 2]; 3] = std::array::from_fn(|corner| {
+                    [
+                        uv[corner][0].clamp(0.0, 1.0) * (CANVAS - 1) as f32,
+                        uv[corner][1].clamp(0.0, 1.0) * (CANVAS - 1) as f32,
+                    ]
+                });
+                for corner in 0..3 {
+                    line(screen[corner], screen[(corner + 1) % 3]);
+                }
+            }
+        }
         for (index, triangle) in preview.geometry.triangles.iter().enumerate() {
+            if authored_layout {
+                break;
+            }
             let uv: [[f32; 2]; 3] = match self.mask_uv_layer {
                 MaskUvLayer::Goop => {
                     std::array::from_fn(|corner| preview.front_uv[index * 3 + corner])
@@ -1206,6 +1230,13 @@ impl SmsEditorApp {
             .max(f32::EPSILON);
         self.mask_gpu_bounds = Some((center, radius));
         self.mask_gpu_triangles = isolated.triangles.clone();
+        // The stage animates some models at draw time. The coating works on
+        // the triangles as they stand, so strip the animation bindings rather
+        // than letting the renderer walk the actor out from under it.
+        isolated.animated_models.clear();
+        isolated.animated_flags.clear();
+        isolated.rotating_models.clear();
+        isolated.level_transform_models.clear();
         self.mask_gpu_scene = Some(gpu_viewport::GpuViewportScene::from_preview(
             &isolated,
             target_format,
@@ -1280,7 +1311,7 @@ impl SmsEditorApp {
     /// A model that carries an authored goop UV is coated through that. Only a
     /// model without one is front-projected, which is what retail authored for
     /// StayPakkun and what [`front_projection_bounds`] reproduces.
-    fn rasterize_goop(&self) -> Option<Vec<Option<[f32; 2]>>> {
+    fn rasterize_goop(&self) -> Option<Vec<Option<GoopPixelUv>>> {
         let (center, radius) = self.mask_gpu_bounds?;
         if self.mask_gpu_triangles.is_empty() {
             return None;
@@ -1344,19 +1375,17 @@ impl SmsEditorApp {
             if behind {
                 continue;
             }
-            let coords: [[f32; 2]; 3] = match triangle.mask_tex_coords.filter(|_| authored) {
-                Some(authored) => authored,
-                None => std::array::from_fn(|corner| {
-                    std::array::from_fn(|axis| {
-                        if span[axis] > f32::EPSILON {
-                            ((triangle.vertices[corner][axis] - min[axis]) / span[axis])
-                                .clamp(0.0, 1.0)
-                        } else {
-                            0.5
-                        }
-                    })
-                }),
-            };
+            let front: [[f32; 2]; 3] = std::array::from_fn(|corner| {
+                std::array::from_fn(|axis| {
+                    if span[axis] > f32::EPSILON {
+                        ((triangle.vertices[corner][axis] - min[axis]) / span[axis])
+                            .clamp(0.0, 1.0)
+                    } else {
+                        0.5
+                    }
+                })
+            });
+            let coat = triangle.mask_tex_coords.filter(|_| authored).unwrap_or(front);
 
             let area = (screen[1][0] - screen[0][0]) * (screen[2][1] - screen[0][1])
                 - (screen[2][0] - screen[0][0]) * (screen[1][1] - screen[0][1]);
@@ -1397,10 +1426,13 @@ impl SmsEditorApp {
                         continue;
                     }
                     depth[slot] = z;
-                    uv[slot] = Some([
-                        coords[0][0] * w1 + coords[1][0] * w2 + coords[2][0] * w0,
-                        coords[0][1] * w1 + coords[1][1] * w2 + coords[2][1] * w0,
-                    ]);
+                    let at = |set: [[f32; 2]; 3]| {
+                        [
+                            set[0][0] * w1 + set[1][0] * w2 + set[2][0] * w0,
+                            set[0][1] * w1 + set[1][1] * w2 + set[2][1] * w0,
+                        ]
+                    };
+                    uv[slot] = Some((at(coat), at(front)));
                 }
             }
         }
@@ -1412,16 +1444,38 @@ impl SmsEditorApp {
     fn mask_goop_overlay_image(&self) -> Option<egui::ColorImage> {
         let goop_uv = self.rasterize_goop()?;
         let threshold = (self.mask_wash_phase.clamp(0.0, 1.0) * 255.0).round() as u8;
+        // The borrowed gradient drives the dissolve; an authored mask supplies
+        // the shape. Retail's authored masks are close to binary, so sweeping
+        // the threshold across one clears it all at once -- the gradient
+        // sweeps the wash across the body instead, and the shape clips it to
+        // what the model authored.
         let (size, values) = self.active_mask()?;
+        let shape = self
+            .authored_mask_texture_index()
+            .and_then(|index| self.mask_preview.as_ref()?.geometry.textures.get(index))
+            .and_then(Self::mask_from_texture);
         let mut pixels = Vec::with_capacity(CANVAS * CANVAS * 4);
         for coated in goop_uv {
             // Coverage comes from the same pass, so the coating stops at the
             // model's silhouette rather than floating over the background.
-            let shows = coated.is_some_and(|[u, v]| {
-                goop_is_visible(sample_mask_bilinear(&values, size, u, v), threshold)
+            let shows = coated.is_some_and(|([coat_u, coat_v], [front_u, front_v])| {
+                let swept = goop_is_visible(
+                    sample_mask_bilinear(&values, size, front_u, front_v),
+                    threshold,
+                );
+                match &shape {
+                    // Authored coordinates live in image space; the sampler
+                    // flips for the projection's y-up axis, so flip back.
+                    Some((shape_size, shape_values)) => {
+                        swept
+                            && sample_mask_bilinear(shape_values, *shape_size, coat_u, 1.0 - coat_v)
+                                > 127
+                    }
+                    None => swept,
+                }
             });
             match (shows, coated) {
-                (true, Some([u, v])) => pixels.extend_from_slice(&self.goop_colour(u, v)),
+                (true, Some(([u, v], _))) => pixels.extend_from_slice(&self.goop_colour(u, v)),
                 _ => pixels.extend_from_slice(&[0, 0, 0, 0]),
             }
         }
@@ -1616,6 +1670,30 @@ impl SmsEditorApp {
                     "Authored / StayPakkun default",
                 );
             });
+        let renderer = if self.mask_gpu_scene.is_some() {
+            "stage renderer"
+        } else {
+            "CPU fallback (no stage model found for this object)"
+        };
+        let mask_status = match self
+            .authored_mask_texture_index()
+            .and_then(|index| self.mask_preview.as_ref()?.geometry.textures.get(index))
+        {
+            Some(texture) => {
+                let carried = self
+                    .mask_gpu_triangles
+                    .iter()
+                    .filter(|triangle| triangle.mask_tex_coords.is_some())
+                    .count();
+                format!(
+                    "authored mask '{}', authored UV on {carried} of {} triangles",
+                    texture.name,
+                    self.mask_gpu_triangles.len()
+                )
+            }
+            None => "no authored mask; StayPakkun default over a front projection".to_string(),
+        };
+        ui.small(format!("{renderer} \u{2014} {mask_status}"));
 
         ui.horizontal(|ui| {
             if ui
