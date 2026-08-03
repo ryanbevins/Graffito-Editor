@@ -145,6 +145,28 @@ pub(super) fn front_projection_bounds(points: &[[f32; 3]]) -> Vec<[f32; 2]> {
         .collect()
 }
 
+/// The alpha of a stage texture at a UV, honouring its wrap modes.
+fn sample_preview_alpha(texture: &PreviewTexture, u: f32, v: f32) -> u8 {
+    let [width, height] = texture.image.size;
+    if width == 0 || height == 0 {
+        return 255;
+    }
+    let wrap = |value: f32, mode: u8, size: usize| -> usize {
+        let coordinate = match mode {
+            0 => value.clamp(0.0, 1.0),
+            2 => {
+                let folded = value.rem_euclid(2.0);
+                if folded > 1.0 { 2.0 - folded } else { folded }
+            }
+            _ => value.rem_euclid(1.0),
+        };
+        ((coordinate * size as f32) as usize).min(size - 1)
+    };
+    let x = wrap(u, texture.wrap_s, width);
+    let y = wrap(v, texture.wrap_t, height);
+    texture.image.pixels[y * width + x].a()
+}
+
 /// The coat UV and the sweep UV resolved at one canvas pixel.
 type GoopPixelUv = ([f32; 2], [f32; 2]);
 
@@ -1192,6 +1214,7 @@ impl SmsEditorApp {
         self.mask_gpu_scene = None;
         self.mask_gpu_bounds = None;
         self.mask_gpu_triangles.clear();
+        self.mask_gpu_textures.clear();
         let Some(target_format) = self.gpu_target_format else {
             return;
         };
@@ -1230,6 +1253,7 @@ impl SmsEditorApp {
             .max(f32::EPSILON);
         self.mask_gpu_bounds = Some((center, radius));
         self.mask_gpu_triangles = isolated.triangles.clone();
+        self.mask_gpu_textures = isolated.textures.clone();
         // The stage animates some models at draw time. The coating works on
         // the triangles as they stand, so strip the animation bindings rather
         // than letting the renderer walk the actor out from under it.
@@ -1387,6 +1411,15 @@ impl SmsEditorApp {
             });
             let coat = triangle.mask_tex_coords.filter(|_| authored).unwrap_or(front);
 
+            // The renderer cuts shapes out of quads with the texture's
+            // alpha. Run the same test here, or the coating covers texels the
+            // model never drew and pokes past the silhouette.
+            let cutout = triangle.alpha_compare.and_then(|compare| {
+                let texture = self.mask_gpu_textures.get(triangle.texture_index?)?;
+                let body = triangle.tex_coords.or(triangle.tex_coord_sets[0])?;
+                Some((compare, texture, body))
+            });
+
             let area = (screen[1][0] - screen[0][0]) * (screen[2][1] - screen[0][1])
                 - (screen[2][0] - screen[0][0]) * (screen[1][1] - screen[0][1]);
             if area.abs() < f32::EPSILON {
@@ -1432,6 +1465,13 @@ impl SmsEditorApp {
                             set[0][1] * w1 + set[1][1] * w2 + set[2][1] * w0,
                         ]
                     };
+                    if let Some((compare, texture, body)) = &cutout {
+                        let [u, v] = at(*body);
+                        let alpha = sample_preview_alpha(texture, u, v);
+                        if !alpha_compare_passes(compare, alpha) {
+                            continue;
+                        }
+                    }
                     uv[slot] = Some((at(coat), at(front)));
                 }
             }

@@ -1304,6 +1304,11 @@ struct SmsEditorApp {
     /// rasterized over these, so it lands on the model the renderer drew
     /// rather than on a differently placed copy of it.
     mask_gpu_triangles: Vec<PreviewTriangle>,
+    /// The stage's textures, for the coating pass to run the same alpha
+    /// cutout the renderer runs. Petey's petals are quads; their points are
+    /// cut by the texture's alpha, and a coating that skips the test coats
+    /// the whole quad and pokes past the drawn silhouette.
+    mask_gpu_textures: Vec<PreviewTexture>,
     mask_texture: Option<egui::TextureHandle>,
     mask_mask: Vec<u8>,
     mask_mask_size: usize,
@@ -1642,6 +1647,7 @@ impl Default for SmsEditorApp {
             mask_gpu_scene: None,
             mask_gpu_bounds: None,
             mask_gpu_triangles: Vec::new(),
+            mask_gpu_textures: Vec::new(),
             mask_texture: None,
             mask_mask: Vec::new(),
             mask_mask_size: 0,
