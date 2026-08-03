@@ -273,6 +273,63 @@ fn tev_channel(a: f32, b: f32, c: f32, d: f32, operation: &TevOp) -> f32 {
 /// The konst alpha a stage selects. The constant fractions are shared with the
 /// colour selectors; only the register selectors differ, there being no RGB
 /// triple to take.
+/// One GX blend factor, resolved against the incoming and stored pixels.
+///
+/// `destination_side` picks the reading of factors 2 and 3, which name the
+/// *other* pixel's colour: on the source side they are the stored colour, on
+/// the destination side the incoming one. This mirrors the split the GPU
+/// viewport makes between `gx_source_blend_factor` and
+/// `gx_destination_blend_factor`.
+fn gx_blend_factor(
+    factor: u8,
+    source: [f32; 4],
+    destination: [f32; 4],
+    destination_side: bool,
+) -> [f32; 3] {
+    let splat = |value: f32| [value, value, value];
+    let other = if destination_side { source } else { destination };
+    match factor {
+        0 => splat(0.0),
+        2 => [other[0], other[1], other[2]],
+        3 => [1.0 - other[0], 1.0 - other[1], 1.0 - other[2]],
+        4 => splat(source[3]),
+        5 => splat(1.0 - source[3]),
+        6 => splat(destination[3]),
+        7 => splat(1.0 - destination[3]),
+        _ => splat(1.0),
+    }
+}
+
+/// Composites an incoming pixel over a stored one the way the blending unit
+/// does. A decal whose material blends rather than tests its alpha is a
+/// rectangle of texture until this runs: the transparent surround is written
+/// as opaque, and cuts into the model behind it.
+fn gx_blend(
+    blend: Option<sms_formats::J3dBlendMode>,
+    source: [f32; 4],
+    destination: [f32; 4],
+) -> [f32; 3] {
+    let Some(blend) = blend else {
+        return [source[0], source[1], source[2]];
+    };
+    match blend.mode {
+        1 => {
+            let source_factor = gx_blend_factor(blend.src_factor, source, destination, false);
+            let destination_factor = gx_blend_factor(blend.dst_factor, source, destination, true);
+            std::array::from_fn(|channel| {
+                (source[channel] * source_factor[channel]
+                    + destination[channel] * destination_factor[channel])
+                    .clamp(0.0, 1.0)
+            })
+        }
+        // Subtractive blending takes the incoming pixel away from the stored.
+        3 => std::array::from_fn(|channel| (destination[channel] - source[channel]).clamp(0.0, 1.0)),
+        // A logic operation of NOOP leaves what is already there.
+        2 if blend.logic_op == 5 => [destination[0], destination[1], destination[2]],
+        _ => [source[0], source[1], source[2]],
+    }
+}
+
 fn tev_konst_alpha(selector: u8, konst_colours: &[[u8; 4]; 4]) -> f32 {
     match selector {
         0 => 1.0,
@@ -971,6 +1028,14 @@ impl SmsEditorApp {
                 .ceil() as usize)
                 .min(CANVAS - 1);
 
+            let blend_mode = triangle.blend_mode.or_else(|| {
+                triangle
+                    .texture_index
+                    .and_then(|slot| preview.material_for_texture.get(slot).copied().flatten())
+                    .or(triangle.material_index)
+                    .and_then(|index| geometry.materials.get(index))
+                    .map(|material| material.blend_mode)
+            });
             let alpha_compare = triangle.alpha_compare.or_else(|| {
                 triangle
                     .texture_index
@@ -1176,10 +1241,20 @@ impl SmsEditorApp {
                         }
                     }
 
+                    let source = [
+                        colour[0] as f32 / 255.0 * shade,
+                        colour[1] as f32 / 255.0 * shade,
+                        colour[2] as f32 / 255.0 * shade,
+                        colour[3] as f32 / 255.0,
+                    ];
+                    let destination = base[slot]
+                        .map(|stored: [u8; 4]| stored.map(|channel| channel as f32 / 255.0))
+                        .unwrap_or([0.0, 0.0, 0.0, 0.0]);
+                    let blended = gx_blend(blend_mode, source, destination);
                     base[slot] = Some([
-                        (colour[0] as f32 * shade) as u8,
-                        (colour[1] as f32 * shade) as u8,
-                        (colour[2] as f32 * shade) as u8,
+                        (blended[0] * 255.0).clamp(0.0, 255.0) as u8,
+                        (blended[1] * 255.0).clamp(0.0, 255.0) as u8,
+                        (blended[2] * 255.0).clamp(0.0, 255.0) as u8,
                         255,
                     ]);
                 }
