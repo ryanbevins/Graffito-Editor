@@ -72,6 +72,10 @@ struct MaskActorChoice {
     object_id: String,
     label: String,
     model_path: String,
+    /// The loader flags this actor's model is read with. Actors and map
+    /// geometry resolve their materials differently, so reading an actor with
+    /// the map defaults drops the colours it renders with in the stage.
+    load_flags: u32,
 }
 
 /// A loaded actor: its geometry, plus the goop UV authored for it.
@@ -260,10 +264,15 @@ impl SmsEditorApp {
             let Some(model_path) = mask_model_path(document, object) else {
                 continue;
             };
+            let load_flags = document
+                .actor_preview(object)
+                .map(|preview| preview.load_flags)
+                .unwrap_or_else(|| model_loader_flags_for_path(&model_path));
             choices.push(MaskActorChoice {
                 object_id: object.id.clone(),
                 label: format!("{} \u{2014} {}", object.factory_name, object.id),
                 model_path,
+                load_flags,
             });
         }
         choices.sort_by(|left, right| left.label.cmp(&right.label));
@@ -291,7 +300,7 @@ impl SmsEditorApp {
                 return;
             }
         };
-        let geometry = match model.geometry_preview() {
+        let geometry = match model.geometry_preview_with_loader_flags(choice.load_flags) {
             Ok(geometry) => geometry,
             Err(error) => {
                 self.log
@@ -582,7 +591,20 @@ impl SmsEditorApp {
                             })
                         },
                     );
-                    let flat = triangle.color.unwrap_or([220, 220, 225, 255]);
+                    // An actor's flat colour can come from the triangle's own
+                    // resolved colour or, failing that, its material -- only
+                    // then fall back to neutral, so a coloured actor is never
+                    // rendered plain grey.
+                    let flat = triangle
+                        .color
+                        .or_else(|| {
+                            triangle
+                                .material_index
+                                .and_then(|index| geometry.materials.get(index))
+                                .map(|material| material.material_colors[0])
+                                .filter(|colour| colour[3] > 12)
+                        })
+                        .unwrap_or([220, 220, 225, 255]);
 
                     // The same combine the stage viewport resolved for this
                     // triangle, so vertex- and material-coloured actors read
