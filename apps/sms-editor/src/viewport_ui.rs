@@ -3384,6 +3384,7 @@ pub(super) fn transform_from_gizmo_drag(
         | EditorTool::VertexPaint
         | EditorTool::Boolean
         | EditorTool::Goop
+        | EditorTool::Mask
         | EditorTool::Place => {}
     }
     transform

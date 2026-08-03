@@ -54,6 +54,7 @@ mod goop;
 mod goop_spawn;
 mod gpu_viewport;
 mod managed_build;
+mod mask_tool;
 mod model_assets;
 mod music_library;
 mod outliner;
@@ -136,6 +137,8 @@ enum EditorTool {
     Rotate,
     Scale,
     Goop,
+    /// Paints washable goop masks onto enemy actor models (Mask Tool).
+    Mask,
     Place,
 }
 
@@ -292,6 +295,7 @@ impl EditorTool {
             Self::Rotate => "Rotate",
             Self::Scale => "Scale",
             Self::Goop => "Goop",
+            Self::Mask => "Mask",
             Self::Place => "Place",
         }
     }
@@ -1272,6 +1276,10 @@ struct SmsEditorApp {
     pending_auto_refresh_root: Option<String>,
     last_auto_refresh_attempt_root: String,
     tool: EditorTool,
+    /// Mask Tool: the enemy actor factory currently loaded for painting.
+    mask_selected_actor: Option<String>,
+    mask_brush_radius: f32,
+    mask_brush_opacity: f32,
     selected_goop_layer: usize,
     goop_authoring_mode: GoopAuthoringMode,
     selected_goop_template: usize,
@@ -1590,6 +1598,9 @@ impl Default for SmsEditorApp {
             pending_auto_refresh_root: None,
             last_auto_refresh_attempt_root: String::new(),
             tool: EditorTool::Move,
+            mask_selected_actor: None,
+            mask_brush_radius: 16.0,
+            mask_brush_opacity: 1.0,
             selected_goop_layer: 0,
             goop_authoring_mode: GoopAuthoringMode::Simple,
             selected_goop_template: 0,

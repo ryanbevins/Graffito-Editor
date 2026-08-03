@@ -300,6 +300,16 @@ impl SmsEditorApp {
                     self.tool = self.tool.after_toolbar_click(EditorTool::Goop);
                 }
 
+                let mask_active = self.tool == EditorTool::Mask;
+                if ui
+                    .selectable_label(mask_active, "Mask Tool")
+                    .on_hover_text("Paint washable goop masks onto enemy actor models")
+                    .clicked()
+                {
+                    ui.close();
+                    self.tool = self.tool.after_toolbar_click(EditorTool::Mask);
+                }
+
                 let vertex_active = self.tool == EditorTool::VertexPaint;
                 if ui
                     .selectable_label(vertex_active, "Vertex Paint Tool")
@@ -1482,6 +1492,10 @@ impl SmsEditorApp {
         }
         if self.tool == EditorTool::Goop {
             self.goop_inspector_panel(ui);
+            return;
+        }
+        if self.tool == EditorTool::Mask {
+            self.mask_tool_panel(ui);
             return;
         }
         if self.content_browser_inspector_panel(ui) {
@@ -2742,7 +2756,7 @@ fn tool_shortcut(tool: EditorTool) -> &'static str {
         EditorTool::Move => "W",
         EditorTool::Rotate => "E",
         EditorTool::Scale => "R",
-        EditorTool::Goop => "Tools menu",
+        EditorTool::Goop | EditorTool::Mask => "Tools menu",
         EditorTool::Place => "Content Browser",
     }
 }
