@@ -270,6 +270,51 @@ fn tev_channel(a: f32, b: f32, c: f32, d: f32, operation: &TevOp) -> f32 {
 }
 
 /// A TEV colour input selector, ported from the shader's `color_arg`.
+/// The konst alpha a stage selects. The constant fractions are shared with the
+/// colour selectors; only the register selectors differ, there being no RGB
+/// triple to take.
+fn tev_konst_alpha(selector: u8, konst_colours: &[[u8; 4]; 4]) -> f32 {
+    match selector {
+        0 => 1.0,
+        1 => 0.875,
+        2 => 0.75,
+        3 => 0.625,
+        4 => 0.5,
+        5 => 0.375,
+        6 => 0.25,
+        7 => 0.125,
+        16..=31 => {
+            let index = ((selector - 16) & 3) as usize;
+            let channel = ((selector - 16) >> 2) as usize;
+            konst_colours[index][channel] as f32 / 255.0
+        }
+        _ => 1.0,
+    }
+}
+
+/// One alpha input to a stage. The alpha selectors are their own enumeration:
+/// where the colour side reads a register's triple or its alpha, this side has
+/// only the alpha, so the values do not line up with [`tev_colour_arg`].
+fn tev_alpha_arg(
+    selector: u8,
+    previous: [f32; 4],
+    registers: [[f32; 4]; 3],
+    texture: [f32; 4],
+    raster: [f32; 4],
+    konst: f32,
+) -> f32 {
+    match selector {
+        0 => previous[3],
+        1 => registers[0][3],
+        2 => registers[1][3],
+        3 => registers[2][3],
+        4 => texture[3],
+        5 => raster[3],
+        6 => konst,
+        _ => 0.0,
+    }
+}
+
 fn tev_colour_arg(
     selector: u8,
     previous: [f32; 4],
@@ -427,11 +472,47 @@ pub(super) fn evaluate_tev(
             std::array::from_fn(|channel| d[channel] + if passes { c[channel] } else { 0.0 })
         };
 
+        let konst_alpha = tev_konst_alpha(stage.konst_alpha, &material.tev_k_colors);
+        let alpha_arg = |selector: u8| {
+            tev_alpha_arg(selector, previous, registers, texture, raster, konst_alpha)
+        };
+        let (a, b, c, d) = (
+            alpha_arg(stage.alpha_args[0]),
+            alpha_arg(stage.alpha_args[1]),
+            alpha_arg(stage.alpha_args[2]),
+            alpha_arg(stage.alpha_args[3]),
+        );
+        let alpha = if stage.alpha_op <= 1 {
+            tev_channel(
+                a,
+                b,
+                c,
+                d,
+                &TevOp {
+                    op: stage.alpha_op,
+                    bias: stage.alpha_bias,
+                    scale: stage.alpha_scale,
+                    clamp_on: stage.alpha_clamp != 0,
+                },
+            )
+        } else {
+            let to_u8 = |value: f32| (value * 255.0).round().clamp(0.0, 255.0) as u32;
+            let passes = match stage.alpha_op {
+                9 | 11 => to_u8(a) == to_u8(b),
+                _ => to_u8(a) > to_u8(b),
+            };
+            d + if passes { c } else { 0.0 }
+        };
+
         let target = &mut match stage.color_register {
             0 => &mut previous,
             other => &mut registers[(other as usize - 1).min(2)],
         }[..3];
         target.copy_from_slice(&colour);
+        match stage.alpha_register {
+            0 => previous[3] = alpha,
+            other => registers[(other as usize - 1).min(2)][3] = alpha,
+        }
     }
 
     // The pixel engine keeps the low eight bits of the final register.
@@ -448,8 +529,25 @@ fn sample_texture(texture: &sms_formats::J3dTexturePreview, u: f32, v: f32) -> O
     if width == 0 || height == 0 || texture.rgba.len() < width * height * 4 {
         return None;
     }
-    let x = ((u.rem_euclid(1.0)) * width as f32) as usize % width;
-    let y = ((v.rem_euclid(1.0)) * height as f32) as usize % height;
+    // Honour the wrap mode the texture asks for. Sampling everything as
+    // repeat tiles a texture authored to clamp, which is what makes
+    // HamuKuri's eye appear more than once across his face.
+    let wrap = |value: f32, mode: u8, size: usize| -> usize {
+        let coordinate = match mode {
+            // GX_CLAMP: the edge texel extends outwards.
+            0 => value.clamp(0.0, 1.0),
+            // GX_MIRROR: every other repeat runs backwards.
+            2 => {
+                let folded = value.rem_euclid(2.0);
+                if folded > 1.0 { 2.0 - folded } else { folded }
+            }
+            // GX_REPEAT.
+            _ => value.rem_euclid(1.0),
+        };
+        ((coordinate * size as f32) as usize).min(size - 1)
+    };
+    let x = wrap(u, texture.wrap_s, width);
+    let y = wrap(v, texture.wrap_t, height);
     let base = (y * width + x) * 4;
     Some([
         texture.rgba[base],
@@ -938,14 +1036,6 @@ impl SmsEditorApp {
                         let v = set[0][1] * w2 + set[1][1] * w1 + set[2][1] * w0;
                         sample_texture(texture, u, v)
                     });
-                    // Cutout shapes live in the texture's alpha: a leaf is a
-                    // quad until the failing texels are discarded.
-                    if let Some(compare) = alpha_compare {
-                        let alpha = sampled.map(|sample| sample[3]).unwrap_or(255);
-                        if !alpha_compare_passes(&compare, alpha) {
-                            continue;
-                        }
-                    }
                     let vertex = triangle.vertex_colors.or(triangle.color_channels[0]).map(
                         |colors| -> [u8; 4] {
                             std::array::from_fn(|channel| {
@@ -1035,9 +1125,16 @@ impl SmsEditorApp {
                                         let source = coord
                                             .and_then(|index| material.tex_gens.get(index))
                                             .map(|gen| gen.source);
-                                        match source {
-                                            Some(19 | 20) => (shade, shade),
-                                            _ => return [1.0; 4],
+                                        match (source, tex_coords) {
+                                            (Some(19 | 20), _) => (shade, shade),
+                                            // Otherwise the model's own set is a
+                                            // better guess than white, which
+                                            // blends into stages that mix.
+                                            (_, Some(set)) => (
+                                                set[0][0] * w2 + set[1][0] * w1 + set[2][0] * w0,
+                                                set[0][1] * w2 + set[1][1] * w1 + set[2][1] * w0,
+                                            ),
+                                            (_, None) => return [1.0; 4],
                                         }
                                     }
                                 };
@@ -1064,6 +1161,20 @@ impl SmsEditorApp {
                             Combine::VertexOnly => vertex.unwrap_or(flat),
                         },
                     };
+
+                    // Cutout shapes live in the alpha the material resolves,
+                    // not in the raw texture fetch: an eye decal builds its
+                    // alpha across stages, so testing the fetch keeps the whole
+                    // quad and the decal cuts through the head behind it.
+                    if let Some(compare) = alpha_compare {
+                        let alpha = match material {
+                            Some(_) => colour[3],
+                            None => sampled.map(|sample| sample[3]).unwrap_or(255),
+                        };
+                        if !alpha_compare_passes(&compare, alpha) {
+                            continue;
+                        }
+                    }
 
                     base[slot] = Some([
                         (colour[0] as f32 * shade) as u8,
@@ -1548,6 +1659,44 @@ mod tests {
 
     /// Cutout geometry depends on the alpha test: a leaf quad is only a leaf
     /// once its transparent texels are discarded.
+    /// The alpha arg selectors are their own enumeration, not the colour one.
+    /// Reading them with the colour table puts a register's alpha where the
+    /// texture's belongs, which is how an eye decal loses its cutout.
+    #[test]
+    fn alpha_args_select_their_own_inputs() {
+        let previous = [0.0, 0.0, 0.0, 0.1];
+        let registers = [
+            [0.0, 0.0, 0.0, 0.2],
+            [0.0, 0.0, 0.0, 0.3],
+            [0.0, 0.0, 0.0, 0.4],
+        ];
+        let texture = [0.0, 0.0, 0.0, 0.5];
+        let raster = [0.0, 0.0, 0.0, 0.6];
+        let arg = |selector| {
+            tev_alpha_arg(selector, previous, registers, texture, raster, 0.7)
+        };
+        assert_eq!(arg(0), 0.1, "APREV");
+        assert_eq!(arg(1), 0.2, "A0");
+        assert_eq!(arg(2), 0.3, "A1");
+        assert_eq!(arg(3), 0.4, "A2");
+        assert_eq!(arg(4), 0.5, "TEXA -- where a cutout lives");
+        assert_eq!(arg(5), 0.6, "RASA");
+        assert_eq!(arg(6), 0.7, "KONST");
+        assert_eq!(arg(7), 0.0, "ZERO");
+    }
+
+    /// Konst alpha takes a single channel of a register, there being no triple
+    /// to read: selector 16 is K0's red, 20 its green, 28 its alpha.
+    #[test]
+    fn konst_alpha_selects_a_single_channel() {
+        let konst = [[10, 20, 30, 40], [0; 4], [0; 4], [0; 4]];
+        assert_eq!(tev_konst_alpha(0, &konst), 1.0, "the constant one");
+        assert_eq!(tev_konst_alpha(4, &konst), 0.5, "the constant half");
+        assert_eq!(tev_konst_alpha(16, &konst), 10.0 / 255.0, "K0_R");
+        assert_eq!(tev_konst_alpha(20, &konst), 20.0 / 255.0, "K0_G");
+        assert_eq!(tev_konst_alpha(28, &konst), 40.0 / 255.0, "K0_A");
+    }
+
     #[test]
     fn alpha_test_discards_transparent_texels() {
         // The common cutout setup: keep texels at or above half alpha.
