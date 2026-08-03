@@ -25,6 +25,33 @@
 //!
 //! The scaffold below stands up the actor picker and model summary. The paint
 //! surface, UV work, and material authoring are the phases that follow.
+//!
+//! # Target: a BrawlBox-style preview window
+//!
+//! The tool opens as its own window (in the style of BrawlBox's Advanced Model
+//! Editor): an actor dropdown over a live 3D model, with a **UV-layer menu**
+//! down the side. The layer you select drives what the model shows:
+//!
+//! - **UV0** selected -> the model renders clean (its normal body skin).
+//! - **the goop UV** selected -> the model renders coated in goop, composited
+//!   through that UV: the colour map over the body, masked by the goop mask.
+//!
+//! A **"Generate goop map + mask"** button seeds the goop UV with example
+//! content -- for the first version, a **rainbow** colour map and the retail
+//! **32x32 StayPakkun mask** (`H_ma_polmask1_i4`, extractable from pakun.bmd).
+//! So on a Blooper (`TGesso`) you would see it fully coated in rainbow goop.
+//!
+//! The **"Play full cycle"** button then simulates the wash on that coated
+//! preview: it sweeps the threshold `K0_A` from full coverage to clean, and the
+//! preview evaluates `visible = mask > K0_A` per pixel -- the crisp recede,
+//! following the painted mask's gradient, exactly as the game does it. Bright
+//! mask paint clings, dark clears first.
+//!
+//! Building that needs the render phase: draw the selected model in the window,
+//! composite the goop textures through the selected UV, and animate the
+//! per-pixel compare. The front-projection-bounds UV generator feeds it (retail
+//! authored its goop UV as a front projection fit to the [0,1] canvas -- our
+//! measurement of the real UV1 confirmed it lands exactly on the unit square).
 
 use super::*;
 
