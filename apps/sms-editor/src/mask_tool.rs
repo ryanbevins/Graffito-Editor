@@ -331,11 +331,6 @@ fn tev_konst_colour(selector: u8, konst_colours: &[[u8; 4]; 4]) -> [f32; 3] {
     }
 }
 
-/// Whether a texture is a toon shading ramp rather than surface colour.
-fn is_toon_ramp(name: &str) -> bool {
-    name.to_ascii_lowercase().contains("toon")
-}
-
 /// Whether a pixel survives a material's alpha test.
 ///
 /// Cutout geometry -- a leaf, a fin, a frond -- is a flat quad whose shape
@@ -1014,29 +1009,39 @@ impl SmsEditorApp {
                                     .copied()
                                     .flatten()
                                     .and_then(|index| geometry.textures.get(index));
-                                texture
-                                    // A toon ramp is a lookup table indexed by
-                                    // a coordinate the material generates from
-                                    // the normal. This preview builds only
-                                    // stored coordinates, so reading a ramp
-                                    // through one samples the wrong place and
-                                    // blows the model out. Skipping it leaves
-                                    // the stage's other input to speak.
-                                    .filter(|texture| !is_toon_ramp(&texture.name))
-                                    // The stage also names which stored
-                                    // coordinate set it reads.
-                                    .zip(
-                                        coord
-                                            .and_then(|index| {
-                                                triangle.tex_coord_sets.get(index).copied().flatten()
-                                            })
-                                            .or(tex_coords),
-                                    )
-                                    .and_then(|(texture, set)| {
-                                        let u = set[0][0] * w2 + set[1][0] * w1 + set[2][0] * w0;
-                                        let v = set[0][1] * w2 + set[1][1] * w1 + set[2][1] * w0;
-                                        sample_texture(texture, u, v)
-                                    })
+                                let Some(texture) = texture else {
+                                    return [1.0; 4];
+                                };
+                                // The stage names which coordinate set it
+                                // reads. Where the geometry stores that set,
+                                // read it.
+                                let stored = coord.and_then(|index| {
+                                    triangle.tex_coord_sets.get(index).copied().flatten()
+                                });
+                                let (u, v) = match stored {
+                                    Some(set) => (
+                                        set[0][0] * w2 + set[1][0] * w1 + set[2][0] * w0,
+                                        set[0][1] * w2 + set[1][1] * w1 + set[2][1] * w0,
+                                    ),
+                                    // Otherwise the material generates it. A
+                                    // source of COLOR0/COLOR1 lights the vertex
+                                    // and reads the result as a coordinate, the
+                                    // way a toon ramp is addressed, so the
+                                    // surface's own lighting stands in. Leaving
+                                    // such a stage at white instead injects it
+                                    // into every stage that blends rather than
+                                    // multiplies.
+                                    None => {
+                                        let source = coord
+                                            .and_then(|index| material.tex_gens.get(index))
+                                            .map(|gen| gen.source);
+                                        match source {
+                                            Some(19 | 20) => (shade, shade),
+                                            _ => return [1.0; 4],
+                                        }
+                                    }
+                                };
+                                sample_texture(texture, u, v)
                                     .map(|sample| sample.map(|c| c as f32 / 255.0))
                                     .unwrap_or([1.0; 4])
                             })
