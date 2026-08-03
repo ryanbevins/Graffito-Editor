@@ -75,6 +75,9 @@ pub(super) enum MaskTextureSource {
 
 /// One placed enemy the Mask Tool can target.
 struct MaskActorChoice {
+    /// Where the object stands in the stage, to find its model when the
+    /// preview registered it under something other than the object id.
+    position: [f32; 3],
     object_id: String,
     label: String,
     model_path: String,
@@ -540,6 +543,7 @@ impl SmsEditorApp {
                 .map(|preview| preview.load_flags)
                 .unwrap_or_else(|| model_loader_flags_for_path(&model_path));
             choices.push(MaskActorChoice {
+                position: object.transform.translation,
                 object_id: object.id.clone(),
                 label: format!("{} \u{2014} {}", object.factory_name, object.id),
                 model_path,
@@ -617,7 +621,8 @@ impl SmsEditorApp {
 
         let triangle_count = geometry.triangles.len();
         let object_id = choice.object_id.clone();
-        self.rebuild_mask_gpu_scene(&object_id);
+        let object_position = choice.position;
+        self.rebuild_mask_gpu_scene(&object_id, object_position);
         self.mask_preview = Some(MaskPreview {
             object_id,
             geometry,
@@ -1210,7 +1215,7 @@ impl SmsEditorApp {
     /// The actor is already in the stage's preview, materials, textures and
     /// all, so there is nothing to rebuild: keeping only the triangles of its
     /// model leaves exactly what the stage draws for it.
-    fn rebuild_mask_gpu_scene(&mut self, object_id: &str) {
+    fn rebuild_mask_gpu_scene(&mut self, object_id: &str, position: [f32; 3]) {
         self.mask_gpu_scene = None;
         self.mask_gpu_bounds = None;
         self.mask_gpu_triangles.clear();
@@ -1221,13 +1226,91 @@ impl SmsEditorApp {
         let Some(preview) = self.model_preview.as_ref() else {
             return;
         };
-        let Some(model_index) = preview.object_model_indices.get(object_id).copied() else {
+        // Manager-spawned enemies can register their model under a key that is
+        // not the placed object's id. The object still stands somewhere, so
+        // fall back to the model whose geometry is nearest that spot.
+        let model_index = preview
+            .object_model_indices
+            .get(object_id)
+            .copied()
+            .or_else(|| {
+                let mut sums: std::collections::BTreeMap<usize, ([f64; 3], usize)> =
+                    std::collections::BTreeMap::new();
+                for triangle in &preview.triangles {
+                    let entry = sums.entry(triangle.model_index).or_default();
+                    for vertex in triangle.vertices {
+                        for (axis, component) in vertex.iter().enumerate() {
+                            entry.0[axis] += *component as f64;
+                        }
+                    }
+                    entry.1 += 3;
+                }
+                sums.into_iter()
+                    .filter(|(_, (_, count))| *count > 0)
+                    .map(|(index, (sum, count))| {
+                        let distance = (0..3)
+                            .map(|axis| {
+                                (sum[axis] / count as f64 - position[axis] as f64).powi(2)
+                            })
+                            .sum::<f64>()
+                            .sqrt();
+                        (index, distance)
+                    })
+                    .min_by(|left, right| left.1.total_cmp(&right.1))
+                    .map(|(index, _)| index)
+            });
+        let Some(model_index) = model_index else {
             return;
         };
         let mut isolated = preview.clone();
         isolated
             .triangles
             .retain(|triangle| triangle.model_index == model_index);
+        // The model index covers more than the body: effect meshes ride along
+        // -- PoiHana's sleep Zs, billboarded sprites, particle quads. They
+        // float away from the actor, so left in they inflate the bounds the
+        // camera frames and the span the mask projects across, and the goop
+        // paints past the body. Keep the drawn body alone.
+        isolated.triangles.retain(|triangle| {
+            triangle.billboard.is_none()
+                && triangle.particle_type.is_none()
+                && triangle.render_layer == PreviewRenderLayer::Main
+        });
+        if isolated.triangles.is_empty() {
+            return;
+        }
+        // Effect geometry that slips the filters still sits away from the
+        // dense cluster of body triangles; trim by distance from it.
+        let centroids: Vec<[f32; 3]> = isolated
+            .triangles
+            .iter()
+            .map(|triangle| {
+                std::array::from_fn(|axis| {
+                    (triangle.vertices[0][axis]
+                        + triangle.vertices[1][axis]
+                        + triangle.vertices[2][axis])
+                        / 3.0
+                })
+            })
+            .collect();
+        let mean: [f32; 3] = std::array::from_fn(|axis| {
+            centroids.iter().map(|centroid| centroid[axis]).sum::<f32>()
+                / centroids.len() as f32
+        });
+        let distances: Vec<f32> = centroids
+            .iter()
+            .map(|centroid| {
+                (0..3)
+                    .map(|axis| (centroid[axis] - mean[axis]).powi(2))
+                    .sum::<f32>()
+                    .sqrt()
+            })
+            .collect();
+        let mut sorted = distances.clone();
+        sorted.sort_by(f32::total_cmp);
+        let median = sorted[sorted.len() / 2].max(f32::EPSILON);
+        let mut keep = distances.into_iter().map(|distance| distance <= median * 4.0);
+        isolated.triangles.retain(|_| keep.next().unwrap_or(true));
         if isolated.triangles.is_empty() {
             return;
         }
