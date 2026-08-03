@@ -185,6 +185,28 @@ fn sample_preview_channel(texture: &PreviewTexture, u: f32, v: f32) -> u8 {
 /// sweep UV, and the actor's own mask value where it authored one.
 type GoopPixelUv = ([f32; 2], [f32; 2], Option<u8>);
 
+/// Where an actor's wash-mask texture lives.
+#[derive(Clone, Copy)]
+enum AuthoredMaskTexture<'a> {
+    /// Resolved by the stage preview.
+    Stage(&'a PreviewTexture),
+    /// Carried by the actor's own model. Several stage load paths drop the
+    /// mask binding, so the model the Mask Tool itself loads stands in.
+    Model(&'a sms_formats::J3dTexturePreview),
+}
+
+impl AuthoredMaskTexture<'_> {
+    /// The wash value at a UV, in the mask's own image space.
+    fn value(&self, u: f32, v: f32) -> u8 {
+        match self {
+            Self::Stage(texture) => sample_preview_channel(texture, u, v),
+            Self::Model(texture) => sample_texture(texture, u, v)
+                .map(|texel| texel[0])
+                .unwrap_or(0),
+        }
+    }
+}
+
 /// Whether goop shows at a texel: the game's own comparison.
 pub(super) fn goop_is_visible(mask_value: u8, threshold: u8) -> bool {
     mask_value > threshold
@@ -804,50 +826,73 @@ impl SmsEditorApp {
     }
 
     /// The mask currently in use, as a square intensity field.
-    /// The stage texture this actor's triangles name as their wash mask,
-    /// with its name recovered from the actor's own model where it matches.
+    /// The texture this actor's wash mask lives in, and its name where one
+    /// can be recovered.
     ///
-    /// The preview pipeline resolves the mask binding per triangle, so this
-    /// is the authored layer itself rather than a texture name matched
-    /// against a guess. An actor without one -- BossPakkun -- is coated
-    /// through the borrowed StayPakkun mask and a front projection instead.
-    fn authored_mask(&self) -> Option<(usize, Option<String>)> {
-        let index = self
+    /// The stage copy names the mask per triangle when the binding survives
+    /// its load path; the actor's own model carries the binding regardless,
+    /// so it stands in when the stage copy lost it -- which it does for
+    /// StayPakkun and BossGesso. An actor with neither is coated through the
+    /// borrowed StayPakkun mask and a front projection.
+    fn authored_mask(&self) -> Option<(AuthoredMaskTexture<'_>, Option<String>)> {
+        if let Some(texture) = self
             .mask_gpu_triangles
             .iter()
-            .find(|triangle| {
-                triangle.mask_tex_coords.is_some() && triangle.mask_texture_index.is_some()
-            })
-            .and_then(|triangle| triangle.mask_texture_index)?;
-        let texture = self.mask_gpu_textures.get(index)?;
-        let [width, height] = texture.image.size;
-        // The stage texture list keeps no names; the same image inside the
-        // actor's own model does. A few texels tell same-size textures apart.
-        let name = self.mask_preview.as_ref().and_then(|preview| {
-            preview
-                .geometry
-                .textures
-                .iter()
-                .find(|candidate| {
-                    candidate.width as usize == width
-                        && candidate.height as usize == height
-                        && {
-                            let texels = (width * height).clamp(1, 16);
-                            (0..texels).all(|step| {
-                                let texel = step * (width * height) / texels;
-                                let pixel = texture.image.pixels[texel];
-                                candidate.rgba.get(texel * 4..texel * 4 + 4).is_some_and(
-                                    |rgba| {
-                                        (rgba[0] as i32 - pixel.r() as i32).abs() <= 8
-                                            && (rgba[3] as i32 - pixel.a() as i32).abs() <= 8
-                                    },
-                                )
-                            })
-                        }
-                })
-                .map(|matched| matched.name.clone())
-        });
-        Some((index, name))
+            .find_map(|triangle| triangle.mask_texture_index)
+            .and_then(|index| self.mask_gpu_textures.get(index))
+        {
+            // The stage texture list keeps no names; the same image inside
+            // the actor's own model does. A few texels tell same-size
+            // textures apart.
+            let [width, height] = texture.image.size;
+            let name = self.mask_preview.as_ref().and_then(|preview| {
+                preview
+                    .geometry
+                    .textures
+                    .iter()
+                    .find(|candidate| {
+                        candidate.width as usize == width
+                            && candidate.height as usize == height
+                            && {
+                                let texels = (width * height).clamp(1, 16);
+                                (0..texels).all(|step| {
+                                    let texel = step * (width * height) / texels;
+                                    let pixel = texture.image.pixels[texel];
+                                    candidate.rgba.get(texel * 4..texel * 4 + 4).is_some_and(
+                                        |rgba| {
+                                            (rgba[0] as i32 - pixel.r() as i32).abs() <= 8
+                                                && (rgba[3] as i32 - pixel.a() as i32).abs() <= 8
+                                        },
+                                    )
+                                })
+                            }
+                    })
+                    .map(|matched| matched.name.clone())
+            });
+            return Some((AuthoredMaskTexture::Stage(texture), name));
+        }
+        // Authored coordinates with no resolved texture: the actor's own
+        // model supplies the mask those coordinates were authored for.
+        if !self
+            .mask_gpu_triangles
+            .iter()
+            .any(|triangle| triangle.mask_tex_coords.is_some())
+        {
+            return None;
+        }
+        self.model_mask_texture()
+            .map(|texture| (AuthoredMaskTexture::Model(texture), Some(texture.name.clone())))
+    }
+
+    /// The wash-mask texture the actor's own model carries.
+    fn model_mask_texture(&self) -> Option<&sms_formats::J3dTexturePreview> {
+        let preview = self.mask_preview.as_ref()?;
+        let index = preview
+            .geometry
+            .triangles
+            .iter()
+            .find_map(|triangle| triangle.mask_texture_index)?;
+        preview.geometry.textures.get(index)
     }
 
     /// Reads a model texture as a wash mask.
@@ -1178,14 +1223,14 @@ impl SmsEditorApp {
         let authored_background = (self.mask_uv_layer == MaskUvLayer::Goop)
             .then(|| self.authored_mask())
             .flatten()
-            .and_then(|(index, _)| self.mask_gpu_textures.get(index));
+            .map(|(texture, _)| texture);
         if let Some(texture) = authored_background {
             // The map the wash actually reads, in its own orientation.
             for y in 0..CANVAS {
                 for x in 0..CANVAS {
                     let u = x as f32 / (CANVAS - 1) as f32;
                     let v = y as f32 / (CANVAS - 1) as f32;
-                    let value = sample_preview_channel(texture, u, v);
+                    let value = texture.value(u, v);
                     let shade = (value as f32 * 0.6) as u8;
                     pixels[y * CANVAS + x] = [shade, shade, shade.saturating_add(14), 255];
                 }
@@ -1217,9 +1262,11 @@ impl SmsEditorApp {
         // image space its mask ships in; the projection is only for models
         // with no authored layer.
         let authored_layout = self.mask_uv_layer == MaskUvLayer::Goop
-            && self.mask_gpu_triangles.iter().any(|triangle| {
-                triangle.mask_tex_coords.is_some() && triangle.mask_texture_index.is_some()
-            });
+            && self.authored_mask().is_some()
+            && self
+                .mask_gpu_triangles
+                .iter()
+                .any(|triangle| triangle.mask_tex_coords.is_some());
         if authored_layout {
             for triangle in &self.mask_gpu_triangles {
                 let Some(uv) = triangle.mask_tex_coords else {
@@ -1296,6 +1343,16 @@ impl SmsEditorApp {
                 let mut bounds: std::collections::BTreeMap<usize, ([f32; 3], [f32; 3])> =
                     std::collections::BTreeMap::new();
                 for triangle in &preview.triangles {
+                    // The map terrain and the sky contain every placed
+                    // object; neither can be the object's own model. Without
+                    // this, HamuKuri resolved to a slab of the map.
+                    if preview
+                        .goop_surface_model_indices
+                        .contains(&triangle.model_index)
+                        || triangle.render_layer != PreviewRenderLayer::Main
+                    {
+                        continue;
+                    }
                     let entry = bounds
                         .entry(triangle.model_index)
                         .or_insert(([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]));
@@ -1532,6 +1589,9 @@ impl SmsEditorApp {
         }
         let span = [max[0] - min[0], max[1] - min[1]];
 
+        // The mask the authored coordinates sample, from the actor's own
+        // model, for triangles whose stage copy lost the binding.
+        let model_mask = self.model_mask_texture();
         let mut uv = vec![None; CANVAS * CANVAS];
         let mut depth = vec![f32::INFINITY; CANVAS * CANVAS];
         for triangle in &self.mask_gpu_triangles {
@@ -1561,13 +1621,18 @@ impl SmsEditorApp {
                     }
                 })
             });
-            // A triangle that names its own mask and UV is coated through
-            // them: the authored layer itself, resolved by the pipeline.
-            let authored = triangle.mask_tex_coords.zip(
+            // A triangle carrying the authored UV is coated through it. The
+            // mask texture comes from the stage copy when the binding
+            // survived its load path, and from the actor's own model when it
+            // did not.
+            let authored = triangle.mask_tex_coords.and_then(|set| {
                 triangle
                     .mask_texture_index
-                    .and_then(|index| self.mask_gpu_textures.get(index)),
-            );
+                    .and_then(|index| self.mask_gpu_textures.get(index))
+                    .map(AuthoredMaskTexture::Stage)
+                    .or_else(|| model_mask.map(AuthoredMaskTexture::Model))
+                    .map(|texture| (set, texture))
+            });
             let coat = authored.map(|(set, _)| set).unwrap_or(front);
 
             // The renderer cuts shapes out of quads with the texture's
@@ -1632,9 +1697,8 @@ impl SmsEditorApp {
                         }
                     }
                     let coat_uv = at(coat);
-                    let own_mask = authored.map(|(_, texture)| {
-                        sample_preview_channel(texture, coat_uv[0], coat_uv[1])
-                    });
+                    let own_mask =
+                        authored.map(|(_, texture)| texture.value(coat_uv[0], coat_uv[1]));
                     uv[slot] = Some((coat_uv, at(front), own_mask));
                 }
             }
@@ -1875,10 +1939,7 @@ impl SmsEditorApp {
                 let carried = self
                     .mask_gpu_triangles
                     .iter()
-                    .filter(|triangle| {
-                        triangle.mask_tex_coords.is_some()
-                            && triangle.mask_texture_index.is_some()
-                    })
+                    .filter(|triangle| triangle.mask_tex_coords.is_some())
                     .count();
                 format!(
                     "authored mask '{}' via its own UV on {carried} of {} triangles",
