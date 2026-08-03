@@ -1140,6 +1140,7 @@ impl SmsEditorApp {
     fn rebuild_mask_gpu_scene(&mut self, object_id: &str) {
         self.mask_gpu_scene = None;
         self.mask_gpu_bounds = None;
+        self.mask_gpu_triangles.clear();
         let Some(target_format) = self.gpu_target_format else {
             return;
         };
@@ -1177,6 +1178,7 @@ impl SmsEditorApp {
             .fold(0.0f32, f32::max)
             .max(f32::EPSILON);
         self.mask_gpu_bounds = Some((center, radius));
+        self.mask_gpu_triangles = isolated.triangles.clone();
         self.mask_gpu_scene = Some(gpu_viewport::GpuViewportScene::from_preview(
             &isolated,
             target_format,
@@ -1236,23 +1238,149 @@ impl SmsEditorApp {
         })
     }
 
+    /// Coverage and goop UV for the actor as the renderer draws it.
+    ///
+    /// This runs over the stage's own triangles with the camera
+    /// [`Self::mask_gpu_frame`] builds, so the coating and the model agree
+    /// pixel for pixel. It resolves no colour: the renderer draws the model,
+    /// and this says only where the coating sits.
+    ///
+    /// A model that carries an authored goop UV is coated through that. Only a
+    /// model without one is front-projected, which is what retail authored for
+    /// StayPakkun and what [`front_projection_bounds`] reproduces.
+    fn rasterize_goop(&self) -> Option<Vec<Option<[f32; 2]>>> {
+        let (center, radius) = self.mask_gpu_bounds?;
+        if self.mask_gpu_triangles.is_empty() {
+            return None;
+        }
+        let (sin_yaw, cos_yaw) = self.mask_yaw.sin_cos();
+        let (sin_pitch, cos_pitch) = self.mask_pitch.sin_cos();
+        let right = [cos_yaw, 0.0, sin_yaw];
+        let up = [sin_pitch * sin_yaw, cos_pitch, -sin_pitch * cos_yaw];
+        let forward = [-cos_pitch * sin_yaw, sin_pitch, cos_pitch * cos_yaw];
+        let distance = radius * 8.0;
+        let camera: [f32; 3] =
+            std::array::from_fn(|axis| center[axis] - forward[axis] * distance);
+        // The focal length the frame uses, carried into canvas pixels. The
+        // viewport's own width cancels, so the two framings agree at any size.
+        let scale = distance * 0.45 * CANVAS as f32 / radius;
+        let half = CANVAS as f32 * 0.5;
+
+        // Where the model has no authored goop UV, project it from the front,
+        // measured over the actor as the stage holds it.
+        let mut min = [f32::INFINITY; 2];
+        let mut max = [f32::NEG_INFINITY; 2];
+        for vertex in self
+            .mask_gpu_triangles
+            .iter()
+            .flat_map(|triangle| triangle.vertices)
+        {
+            for axis in 0..2 {
+                min[axis] = min[axis].min(vertex[axis]);
+                max[axis] = max[axis].max(vertex[axis]);
+            }
+        }
+        let span = [max[0] - min[0], max[1] - min[1]];
+
+        let mut uv = vec![None; CANVAS * CANVAS];
+        let mut depth = vec![f32::INFINITY; CANVAS * CANVAS];
+        for triangle in &self.mask_gpu_triangles {
+            let mut screen = [[0.0f32; 3]; 3];
+            let mut behind = false;
+            for corner in 0..3 {
+                let point = triangle.vertices[corner];
+                let relative: [f32; 3] = std::array::from_fn(|axis| point[axis] - camera[axis]);
+                let x = (0..3).map(|axis| relative[axis] * right[axis]).sum::<f32>();
+                let y = (0..3).map(|axis| relative[axis] * up[axis]).sum::<f32>();
+                let z = (0..3).map(|axis| relative[axis] * forward[axis]).sum::<f32>();
+                if z <= 1.0 {
+                    behind = true;
+                    break;
+                }
+                screen[corner] = [half + x * scale / z, half - y * scale / z, z];
+            }
+            if behind {
+                continue;
+            }
+            let coords: [[f32; 2]; 3] = match triangle.mask_tex_coords {
+                Some(authored) => authored,
+                None => std::array::from_fn(|corner| {
+                    std::array::from_fn(|axis| {
+                        if span[axis] > f32::EPSILON {
+                            ((triangle.vertices[corner][axis] - min[axis]) / span[axis])
+                                .clamp(0.0, 1.0)
+                        } else {
+                            0.5
+                        }
+                    })
+                }),
+            };
+
+            let area = (screen[1][0] - screen[0][0]) * (screen[2][1] - screen[0][1])
+                - (screen[2][0] - screen[0][0]) * (screen[1][1] - screen[0][1]);
+            if area.abs() < f32::EPSILON {
+                continue;
+            }
+            let bound = |pick: &dyn Fn([f32; 3]) -> f32, low: bool| -> usize {
+                let values = screen.iter().map(|corner| pick(*corner));
+                if low {
+                    values.fold(f32::INFINITY, f32::min).floor().max(0.0) as usize
+                } else {
+                    (values.fold(f32::NEG_INFINITY, f32::max).ceil().max(0.0) as usize)
+                        .min(CANVAS - 1)
+                }
+            };
+            let min_x = bound(&|corner| corner[0], true);
+            let max_x = bound(&|corner| corner[0], false);
+            let min_y = bound(&|corner| corner[1], true);
+            let max_y = bound(&|corner| corner[1], false);
+
+            for y in min_y..=max_y {
+                for x in min_x..=max_x {
+                    let point = [x as f32 + 0.5, y as f32 + 0.5];
+                    let edge = |a: [f32; 3], b: [f32; 3]| {
+                        (b[0] - a[0]) * (point[1] - a[1]) - (b[1] - a[1]) * (point[0] - a[0])
+                    };
+                    let w0 = edge(screen[0], screen[1]) / area;
+                    let w1 = edge(screen[1], screen[2]) / area;
+                    let w2 = edge(screen[2], screen[0]) / area;
+                    if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                        continue;
+                    }
+                    let z = screen[0][2] * w1 + screen[1][2] * w2 + screen[2][2] * w0;
+                    let slot = y * CANVAS + x;
+                    // Nearest wins, so the coating sits on the surface facing
+                    // the camera rather than on the far side of the model.
+                    if z >= depth[slot] {
+                        continue;
+                    }
+                    depth[slot] = z;
+                    uv[slot] = Some([
+                        coords[0][0] * w1 + coords[1][0] * w2 + coords[2][0] * w0,
+                        coords[0][1] * w1 + coords[1][1] * w2 + coords[2][1] * w0,
+                    ]);
+                }
+            }
+        }
+        Some(uv)
+    }
+
     /// The coating alone, transparent everywhere it does not show, so it can be
     /// laid over a model the GPU drew.
     fn mask_goop_overlay_image(&self) -> Option<egui::ColorImage> {
-        let (base, goop_uv) = self.rasterize_model()?;
+        let goop_uv = self.rasterize_goop()?;
         let threshold = (self.mask_wash_phase.clamp(0.0, 1.0) * 255.0).round() as u8;
         let (size, values) = self.active_mask()?;
         let mut pixels = Vec::with_capacity(CANVAS * CANVAS * 4);
         for slot in 0..CANVAS * CANVAS {
             // Coverage comes from the same pass, so the coating stops at the
             // model's silhouette rather than floating over the background.
-            let covered = base[slot].is_some();
-            let [u, v] = goop_uv[slot];
-            let shows = covered && goop_is_visible(sample_mask_bilinear(&values, size, u, v), threshold);
-            if shows {
-                pixels.extend_from_slice(&self.goop_colour(u, v));
-            } else {
-                pixels.extend_from_slice(&[0, 0, 0, 0]);
+            let shows = goop_uv[slot].is_some_and(|[u, v]| {
+                goop_is_visible(sample_mask_bilinear(&values, size, u, v), threshold)
+            });
+            match (shows, goop_uv[slot]) {
+                (true, Some([u, v])) => pixels.extend_from_slice(&self.goop_colour(u, v)),
+                _ => pixels.extend_from_slice(&[0, 0, 0, 0]),
             }
         }
         Some(egui::ColorImage::from_rgba_unmultiplied(
@@ -1401,13 +1529,6 @@ impl SmsEditorApp {
                     MaskTextureSource::Generated,
                     "Rainbow (generated)",
                 );
-                for (index, name) in &textures {
-                    ui.selectable_value(
-                        &mut self.mask_colour_source,
-                        MaskTextureSource::Model(*index),
-                        name,
-                    );
-                }
                 if !goop_styles.is_empty() {
                     ui.separator();
                     ui.label(
@@ -1436,13 +1557,13 @@ impl SmsEditorApp {
 
         let mask_label = match self.mask_mask_source {
             MaskTextureSource::Generated | MaskTextureSource::GoopStyle(_) => {
-                "Generated / borrowed".to_string()
+                "Authored / StayPakkun default".to_string()
             }
             MaskTextureSource::Model(index) => textures
                 .iter()
                 .find(|(slot, _)| *slot == index)
                 .map(|(_, name)| name.clone())
-                .unwrap_or_else(|| "Generated / borrowed".to_string()),
+                .unwrap_or_else(|| "Authored / StayPakkun default".to_string()),
         };
         egui::ComboBox::from_label("Mask")
             .selected_text(mask_label)
@@ -1450,15 +1571,8 @@ impl SmsEditorApp {
                 ui.selectable_value(
                     &mut self.mask_mask_source,
                     MaskTextureSource::Generated,
-                    "Generated / borrowed",
+                    "Authored / StayPakkun default",
                 );
-                for (index, name) in &textures {
-                    ui.selectable_value(
-                        &mut self.mask_mask_source,
-                        MaskTextureSource::Model(*index),
-                        name,
-                    );
-                }
             });
 
         ui.horizontal(|ui| {

@@ -1300,6 +1300,10 @@ struct SmsEditorApp {
     /// Tool's own bounds are the model's local ones, which is not where the
     /// stage preview's copy of it stands.
     mask_gpu_bounds: Option<([f32; 3], f32)>,
+    /// The actor's triangles as the stage holds them. The coating is
+    /// rasterized over these, so it lands on the model the renderer drew
+    /// rather than on a differently placed copy of it.
+    mask_gpu_triangles: Vec<PreviewTriangle>,
     mask_texture: Option<egui::TextureHandle>,
     mask_mask: Vec<u8>,
     mask_mask_size: usize,
@@ -1637,6 +1641,7 @@ impl Default for SmsEditorApp {
             mask_preview: None,
             mask_gpu_scene: None,
             mask_gpu_bounds: None,
+            mask_gpu_triangles: Vec::new(),
             mask_texture: None,
             mask_mask: Vec::new(),
             mask_mask_size: 0,
