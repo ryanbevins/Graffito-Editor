@@ -18,36 +18,53 @@
 //! Retail authored that UV as a **front projection normalised to bounds** --
 //! measuring StayPakkun's real goop UV puts it exactly on the unit square, and
 //! front and back of the body share it (the coating is symmetric, so sharing is
-//! intended). [`front_projection_bounds`] reproduces that, and the preview
-//! below projects the model the same way, so what you paint and what you see
-//! agree by construction.
+//! intended). [`front_projection_bounds`] reproduces that. The goop UV stays a
+//! front projection however the preview camera is orbited, so what is authored
+//! never drifts with the view.
 //!
 //! # This module
 //!
-//! - An actor sampler over the **loaded stage's own hierarchy** -- the enemies
-//!   placed in your level, not the whole catalog.
-//! - A model preview rasterised on the CPU, front-projected.
-//! - A **UV layer** switch: the body layer renders the model's own skin; the
-//!   goop layer renders it coated, composited through the projected UV.
-//! - **Generate** seeds example goop: a rainbow colour map and StayPakkun's
-//!   retail 32x32 mask when the stage carries it, else a procedural stand-in.
-//! - **Play full cycle** sweeps `K0_A` so the wash recedes exactly as in game.
+//! - An actor sampler over the loaded stage's own hierarchy.
+//! - An orbitable model preview, shaded the way the stage viewport shades: the
+//!   geometry's own resolved combine mode, vertex colours and material colour,
+//!   with smooth interpolated normals.
+//! - A **UV inspector** drawing either UV set over the mask, so a layout can be
+//!   read directly -- this is how retail's goop UV was identified as a front
+//!   projection in the first place.
+//! - Assignable goop **colour** and **mask** sources: generated content, or any
+//!   texture the model already carries.
+//! - **Play full cycle** sweeps `K0_A` so the wash recedes as it does in game.
 //!
 //! Painting strokes onto the mask, and writing the authored UV and mask back
-//! into a model's material, are the phases after this one. The window is
-//! rendered inside the inspector for now; the standalone BrawlBox-style window
-//! (menu bar repurposed to Actor/Edit/View/Mask) is a presentation change over
-//! the same state.
+//! into a model's material, are the phases after this one.
 
 use super::*;
 
-/// Which UV layer the preview composites through.
+/// What the viewport shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MaskView {
+    /// The model, orbitable.
+    Model,
+    /// The selected UV layout, drawn over the mask.
+    Uv,
+}
+
+/// Which UV layer the preview composites and the inspector draws.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MaskUvLayer {
-    /// The model's own skin, through its body UV.
+    /// The model's own body UV.
     Body,
-    /// The goop mask layer, through the front-projected UV.
+    /// The goop layer's front-projected UV.
     Goop,
+}
+
+/// Where a goop texture comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MaskTextureSource {
+    /// Generated content: the rainbow colour map, or the borrowed mask.
+    Generated,
+    /// A texture the model already carries, by index.
+    Model(usize),
 }
 
 /// One placed enemy the Mask Tool can target.
@@ -57,19 +74,32 @@ struct MaskActorChoice {
     model_path: String,
 }
 
-/// A rasterised preview of one actor, front-projected.
-///
-/// Rasterising is done once per actor; sweeping the wash only re-evaluates the
-/// per-pixel comparison, so the animation stays cheap.
+/// A loaded actor: its geometry, plus the goop UV authored for it.
 pub(super) struct MaskPreview {
     object_id: String,
-    width: usize,
-    height: usize,
-    /// Shaded body colour per pixel, or `None` where nothing was drawn.
-    base: Vec<Option<[u8; 4]>>,
-    /// Front-projected UV per pixel, in `[0, 1]`.
-    goop_uv: Vec<[f32; 2]>,
+    geometry: sms_formats::J3dGeometryPreview,
+    /// Front-projected UV per triangle corner, in `[0, 1]`.
+    front_uv: Vec<[f32; 2]>,
+    center: [f32; 3],
+    radius: f32,
     triangle_count: usize,
+}
+
+impl MaskPreview {
+    /// Texture names the model carries, for the assignment dropdowns.
+    fn texture_names(&self) -> Vec<(usize, String)> {
+        self.geometry
+            .textures
+            .iter()
+            .enumerate()
+            .map(|(index, texture)| {
+                (
+                    index,
+                    format!("{} ({}x{})", texture.name, texture.width, texture.height),
+                )
+            })
+            .collect()
+    }
 }
 
 /// Projects points onto the front plane and normalises to the unit square.
@@ -107,6 +137,37 @@ pub(super) fn goop_is_visible(mask_value: u8, threshold: u8) -> bool {
     mask_value > threshold
 }
 
+/// Orbits a point around the model's centre.
+fn orbit(point: [f32; 3], yaw: f32, pitch: f32) -> [f32; 3] {
+    let (sin_yaw, cos_yaw) = yaw.sin_cos();
+    let x = point[0] * cos_yaw + point[2] * sin_yaw;
+    let z = -point[0] * sin_yaw + point[2] * cos_yaw;
+    let (sin_pitch, cos_pitch) = pitch.sin_cos();
+    let y = point[1] * cos_pitch - z * sin_pitch;
+    let z = point[1] * sin_pitch + z * cos_pitch;
+    [x, y, z]
+}
+
+/// Bilinear sample of a mask, so the wash edge follows a smooth gradient
+/// instead of stepping across a low-resolution mask's texels.
+pub(super) fn sample_mask_bilinear(mask: &[u8], size: usize, u: f32, v: f32) -> u8 {
+    if size == 0 || mask.len() < size * size {
+        return 0;
+    }
+    let x = (u.clamp(0.0, 1.0) * (size - 1) as f32).max(0.0);
+    let y = ((1.0 - v.clamp(0.0, 1.0)) * (size - 1) as f32).max(0.0);
+    let x0 = x.floor() as usize;
+    let y0 = y.floor() as usize;
+    let x1 = (x0 + 1).min(size - 1);
+    let y1 = (y0 + 1).min(size - 1);
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+    let at = |x: usize, y: usize| mask[y * size + x] as f32;
+    let top = at(x0, y0) * (1.0 - fx) + at(x1, y0) * fx;
+    let bottom = at(x0, y1) * (1.0 - fx) + at(x1, y1) * fx;
+    (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8
+}
+
 /// A rainbow stand-in colour map, so a generated coating is obviously custom.
 fn rainbow_goop(u: f32, v: f32) -> [u8; 4] {
     let hue = (u * 0.75 + v * 0.25).fract() * 6.0;
@@ -123,8 +184,7 @@ fn rainbow_goop(u: f32, v: f32) -> [u8; 4] {
     [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, 255]
 }
 
-/// A procedural mask used when the stage carries no retail mask to borrow:
-/// a smooth blob field, so the wash still recedes in a legible shape.
+/// A procedural mask used when the stage carries no retail mask to borrow.
 fn procedural_mask(size: usize) -> (usize, Vec<u8>) {
     let mut values = vec![0u8; size * size];
     for y in 0..size {
@@ -138,6 +198,52 @@ fn procedural_mask(size: usize) -> (usize, Vec<u8>) {
     }
     (size, values)
 }
+
+/// Nearest-neighbour sample of a decoded preview texture, with wrapping.
+fn sample_texture(texture: &sms_formats::J3dTexturePreview, u: f32, v: f32) -> Option<[u8; 4]> {
+    let width = texture.width as usize;
+    let height = texture.height as usize;
+    if width == 0 || height == 0 || texture.rgba.len() < width * height * 4 {
+        return None;
+    }
+    let x = ((u.rem_euclid(1.0)) * width as f32) as usize % width;
+    let y = ((v.rem_euclid(1.0)) * height as f32) as usize % height;
+    let base = (y * width + x) * 4;
+    Some([
+        texture.rgba[base],
+        texture.rgba[base + 1],
+        texture.rgba[base + 2],
+        texture.rgba[base + 3],
+    ])
+}
+
+/// The model a placed actor renders with.
+///
+/// Resolution follows the viewport's own order: an explicit preview asset hint
+/// first, then the catalog's actor preview, then an inferred hint. Checking
+/// only the catalog missed actors placed from the content browser, which carry
+/// their model as a hint.
+fn mask_model_path(
+    document: &sms_scene::StageDocument,
+    object: &sms_scene::SceneObject,
+) -> Option<String> {
+    let hint = |role: sms_scene::AssetRole| {
+        object
+            .asset_hints
+            .iter()
+            .find(|asset| asset.role == role)
+            .map(|asset| asset.path.clone())
+    };
+    hint(sms_scene::AssetRole::PreviewModel)
+        .or_else(|| {
+            document
+                .actor_preview(object)
+                .map(|preview| preview.model_path.clone())
+        })
+        .or_else(|| hint(sms_scene::AssetRole::InferredPreviewModel))
+}
+
+const CANVAS: usize = 384;
 
 impl SmsEditorApp {
     /// Enemy actors placed in the loaded stage, as sampler choices.
@@ -164,10 +270,8 @@ impl SmsEditorApp {
         choices
     }
 
-    /// Rasterises the chosen actor's model, front-projected, into a preview.
+    /// Loads the chosen actor's geometry and authors its goop UV.
     fn build_mask_preview(&mut self, choice: &MaskActorChoice) {
-        const CANVAS: usize = 320;
-
         let Some(document) = self.document.as_ref() else {
             return;
         };
@@ -201,153 +305,44 @@ impl SmsEditorApp {
             return;
         }
 
-        // Front projection over every vertex, fitted to bounds -- the same
-        // layout the generated goop UV uses.
         let corners = geometry
             .triangles
             .iter()
             .flat_map(|triangle| triangle.vertices)
             .collect::<Vec<_>>();
-        let projected = front_projection_bounds(&corners);
-
-        let mut base = vec![None; CANVAS * CANVAS];
-        let mut goop_uv = vec![[0.0f32; 2]; CANVAS * CANVAS];
-        let mut depth = vec![f32::INFINITY; CANVAS * CANVAS];
-
-        for (index, triangle) in geometry.triangles.iter().enumerate() {
-            let uv = [
-                projected[index * 3],
-                projected[index * 3 + 1],
-                projected[index * 3 + 2],
-            ];
-            // Screen space: the projection, with v flipped so up is up.
-            let screen: [[f32; 2]; 3] = std::array::from_fn(|corner| {
-                [
-                    uv[corner][0] * (CANVAS - 1) as f32,
-                    (1.0 - uv[corner][1]) * (CANVAS - 1) as f32,
-                ]
-            });
-            let z: [f32; 3] = std::array::from_fn(|corner| triangle.vertices[corner][2]);
-
-            let min_x = screen
-                .iter()
-                .map(|p| p[0])
-                .fold(f32::INFINITY, f32::min)
-                .floor()
-                .max(0.0) as usize;
-            let max_x = (screen
-                .iter()
-                .map(|p| p[0])
-                .fold(f32::NEG_INFINITY, f32::max)
-                .ceil() as usize)
-                .min(CANVAS - 1);
-            let min_y = screen
-                .iter()
-                .map(|p| p[1])
-                .fold(f32::INFINITY, f32::min)
-                .floor()
-                .max(0.0) as usize;
-            let max_y = (screen
-                .iter()
-                .map(|p| p[1])
-                .fold(f32::NEG_INFINITY, f32::max)
-                .ceil() as usize)
-                .min(CANVAS - 1);
-
-            let area = (screen[1][0] - screen[0][0]) * (screen[2][1] - screen[0][1])
-                - (screen[2][0] - screen[0][0]) * (screen[1][1] - screen[0][1]);
-            if area.abs() < f32::EPSILON {
-                continue;
-            }
-
-            // Flat shading from the face normal keeps the silhouette readable
-            // without a lighting rig.
-            let shade = triangle
-                .normals
-                .map(|normals| {
-                    let n = normals[0];
-                    let length = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2])
-                        .sqrt()
-                        .max(f32::EPSILON);
-                    (0.35 + 0.65 * (n[2] / length).abs()).clamp(0.0, 1.0)
-                })
-                .unwrap_or(0.8);
-
-            for y in min_y..=max_y {
-                for x in min_x..=max_x {
-                    let point = [x as f32 + 0.5, y as f32 + 0.5];
-                    let w0 = ((screen[1][0] - screen[0][0]) * (point[1] - screen[0][1])
-                        - (point[0] - screen[0][0]) * (screen[1][1] - screen[0][1]))
-                        / area;
-                    let w1 = ((point[0] - screen[0][0]) * (screen[2][1] - screen[0][1])
-                        - (screen[2][0] - screen[0][0]) * (point[1] - screen[0][1]))
-                        / area;
-                    let w2 = 1.0 - w0 - w1;
-                    if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
-                        continue;
-                    }
-                    let pixel_depth = z[0] * w2 + z[1] * w1 + z[2] * w0;
-                    let slot = y * CANVAS + x;
-                    if pixel_depth >= depth[slot] {
-                        continue;
-                    }
-                    depth[slot] = pixel_depth;
-
-                    let interpolated_uv = [
-                        uv[0][0] * w2 + uv[1][0] * w1 + uv[2][0] * w0,
-                        uv[0][1] * w2 + uv[1][1] * w1 + uv[2][1] * w0,
-                    ];
-                    goop_uv[slot] = interpolated_uv;
-
-                    // Body colour: the material's own texture through UV0 when
-                    // the model provides one, else flat shading.
-                    let mut colour = [
-                        (200.0 * shade) as u8,
-                        (200.0 * shade) as u8,
-                        (205.0 * shade) as u8,
-                        255,
-                    ];
-                    if let Some(texture) = triangle
-                        .material_index
-                        .and_then(|material| geometry.materials.get(material))
-                        .and_then(|material| material.texture_indices.iter().flatten().next())
-                        .and_then(|index| geometry.textures.get(*index))
-                    {
-                        if let Some(set) = triangle.tex_coord_sets[0] {
-                            let u = set[0][0] * w2 + set[1][0] * w1 + set[2][0] * w0;
-                            let v = set[0][1] * w2 + set[1][1] * w1 + set[2][1] * w0;
-                            if let Some(sample) = sample_texture(texture, u, v) {
-                                colour = [
-                                    (sample[0] as f32 * shade) as u8,
-                                    (sample[1] as f32 * shade) as u8,
-                                    (sample[2] as f32 * shade) as u8,
-                                    255,
-                                ];
-                            }
-                        }
-                    }
-                    base[slot] = Some(colour);
-                }
+        let front_uv = front_projection_bounds(&corners);
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        for point in &corners {
+            for axis in 0..3 {
+                min[axis] = min[axis].min(point[axis]);
+                max[axis] = max[axis].max(point[axis]);
             }
         }
+        let center = std::array::from_fn(|axis| (min[axis] + max[axis]) * 0.5);
+        let radius = (0..3)
+            .map(|axis| (max[axis] - min[axis]) * 0.5)
+            .fold(0.0f32, f32::max)
+            .max(f32::EPSILON);
 
+        let triangle_count = geometry.triangles.len();
         self.mask_preview = Some(MaskPreview {
             object_id: choice.object_id.clone(),
-            width: CANVAS,
-            height: CANVAS,
-            base,
-            goop_uv,
-            triangle_count: geometry.triangles.len(),
+            geometry,
+            front_uv,
+            center,
+            radius,
+            triangle_count,
         });
+        self.mask_yaw = 0.0;
+        self.mask_pitch = 0.0;
         self.log.push(format!(
-            "Mask Tool loaded {} ({} triangles).",
-            choice.label,
-            geometry.triangles.len()
+            "Mask Tool loaded {} ({triangle_count} triangles).",
+            choice.label
         ));
     }
 
-    /// Seeds the example goop: rainbow colour, and the retail StayPakkun mask
-    /// when this stage carries it.
+    /// Seeds generated goop content.
     fn generate_mask_content(&mut self) {
         let borrowed = self.retail_polmask();
         let (size, values) = borrowed.unwrap_or_else(|| procedural_mask(32));
@@ -356,10 +351,11 @@ impl SmsEditorApp {
         self.mask_generated = true;
     }
 
-    /// StayPakkun's 32x32 pollution mask, if the loaded stage carries pakun.bmd.
+    /// StayPakkun's pollution mask, if the loaded stage carries pakun.bmd.
     fn retail_polmask(&mut self) -> Option<(usize, Vec<u8>)> {
-        let document = self.document.as_ref()?;
-        let candidates = document
+        let candidates = self
+            .document
+            .as_ref()?
             .assets
             .iter()
             .filter(|asset| {
@@ -410,39 +406,312 @@ impl SmsEditorApp {
         None
     }
 
-    /// Composites the preview at the current wash phase into an image.
-    fn mask_preview_image(&self) -> Option<egui::ColorImage> {
+    /// The mask currently in use, as a square intensity field.
+    fn active_mask(&self) -> Option<(usize, Vec<u8>)> {
+        match self.mask_mask_source {
+            MaskTextureSource::Generated => self
+                .mask_generated
+                .then(|| (self.mask_mask_size, self.mask_mask.clone())),
+            MaskTextureSource::Model(index) => {
+                let texture = self.mask_preview.as_ref()?.geometry.textures.get(index)?;
+                let size = texture.width.min(texture.height) as usize;
+                if size == 0 {
+                    return None;
+                }
+                let mut values = vec![0u8; size * size];
+                for y in 0..size {
+                    for x in 0..size {
+                        let source = (y * texture.width as usize + x) * 4;
+                        values[y * size + x] = texture.rgba.get(source).copied().unwrap_or(0);
+                    }
+                }
+                Some((size, values))
+            }
+        }
+    }
+
+    /// The goop colour at a UV, from whichever source is assigned.
+    fn goop_colour(&self, u: f32, v: f32) -> [u8; 4] {
+        match self.mask_colour_source {
+            MaskTextureSource::Generated => rainbow_goop(u, v),
+            MaskTextureSource::Model(index) => self
+                .mask_preview
+                .as_ref()
+                .and_then(|preview| preview.geometry.textures.get(index))
+                .and_then(|texture| sample_texture(texture, u, v))
+                .unwrap_or_else(|| rainbow_goop(u, v)),
+        }
+    }
+
+    /// Rasterises the model at the current orbit, returning shaded colour and
+    /// the goop UV per pixel.
+    ///
+    /// Shading follows the geometry's own resolved decisions rather than a
+    /// guess: each triangle carries the combine mode, vertex colours and flat
+    /// colour the stage viewport uses, so an actor whose colour lives in its
+    /// vertices or material (rather than a texture) reads the same here.
+    /// Normals are interpolated across the triangle, so curved surfaces read as
+    /// curved instead of faceted.
+    #[allow(clippy::type_complexity)]
+    fn rasterize_model(&self) -> Option<(Vec<Option<[u8; 4]>>, Vec<[f32; 2]>)> {
+        use sms_formats::J3dPreviewCombineMode as Combine;
+
         let preview = self.mask_preview.as_ref()?;
+        let geometry = &preview.geometry;
+        let mut base = vec![None; CANVAS * CANVAS];
+        let mut goop_uv = vec![[0.0f32; 2]; CANVAS * CANVAS];
+        let mut depth = vec![f32::INFINITY; CANVAS * CANVAS];
+
+        for (index, triangle) in geometry.triangles.iter().enumerate() {
+            // Screen space follows the orbit; the goop UV stays the front
+            // projection, so authoring never drifts with the camera.
+            let view: [[f32; 3]; 3] = std::array::from_fn(|corner| {
+                let point = triangle.vertices[corner];
+                let relative = std::array::from_fn(|axis| point[axis] - preview.center[axis]);
+                orbit(relative, self.mask_yaw, self.mask_pitch)
+            });
+            let screen: [[f32; 2]; 3] = std::array::from_fn(|corner| {
+                [
+                    (view[corner][0] / preview.radius * 0.45 + 0.5) * (CANVAS - 1) as f32,
+                    (0.5 - view[corner][1] / preview.radius * 0.45) * (CANVAS - 1) as f32,
+                ]
+            });
+            let uv = [
+                preview.front_uv[index * 3],
+                preview.front_uv[index * 3 + 1],
+                preview.front_uv[index * 3 + 2],
+            ];
+            let normals: Option<[[f32; 3]; 3]> = triangle.normals.map(|normals| {
+                std::array::from_fn(|corner| orbit(normals[corner], self.mask_yaw, self.mask_pitch))
+            });
+
+            let area = (screen[1][0] - screen[0][0]) * (screen[2][1] - screen[0][1])
+                - (screen[2][0] - screen[0][0]) * (screen[1][1] - screen[0][1]);
+            if area.abs() < f32::EPSILON {
+                continue;
+            }
+            let min_x = screen
+                .iter()
+                .map(|p| p[0])
+                .fold(f32::INFINITY, f32::min)
+                .floor()
+                .max(0.0) as usize;
+            let max_x = (screen
+                .iter()
+                .map(|p| p[0])
+                .fold(f32::NEG_INFINITY, f32::max)
+                .ceil() as usize)
+                .min(CANVAS - 1);
+            let min_y = screen
+                .iter()
+                .map(|p| p[1])
+                .fold(f32::INFINITY, f32::min)
+                .floor()
+                .max(0.0) as usize;
+            let max_y = (screen
+                .iter()
+                .map(|p| p[1])
+                .fold(f32::NEG_INFINITY, f32::max)
+                .ceil() as usize)
+                .min(CANVAS - 1);
+
+            let texture = triangle
+                .texture_index
+                .and_then(|slot| geometry.textures.get(slot))
+                .or_else(|| {
+                    triangle
+                        .material_index
+                        .and_then(|material| geometry.materials.get(material))
+                        .and_then(|material| material.texture_indices.iter().flatten().next())
+                        .and_then(|slot| geometry.textures.get(*slot))
+                });
+            let tex_coords = triangle.tex_coords.or(triangle.tex_coord_sets[0]);
+
+            for y in min_y..=max_y {
+                for x in min_x..=max_x {
+                    let point = [x as f32 + 0.5, y as f32 + 0.5];
+                    let w0 = ((screen[1][0] - screen[0][0]) * (point[1] - screen[0][1])
+                        - (point[0] - screen[0][0]) * (screen[1][1] - screen[0][1]))
+                        / area;
+                    let w1 = ((point[0] - screen[0][0]) * (screen[2][1] - screen[0][1])
+                        - (screen[2][0] - screen[0][0]) * (point[1] - screen[0][1]))
+                        / area;
+                    let w2 = 1.0 - w0 - w1;
+                    if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                        continue;
+                    }
+                    let pixel_depth = view[0][2] * w2 + view[1][2] * w1 + view[2][2] * w0;
+                    let slot = y * CANVAS + x;
+                    if pixel_depth >= depth[slot] {
+                        continue;
+                    }
+                    depth[slot] = pixel_depth;
+                    goop_uv[slot] = [
+                        uv[0][0] * w2 + uv[1][0] * w1 + uv[2][0] * w0,
+                        uv[0][1] * w2 + uv[1][1] * w1 + uv[2][1] * w0,
+                    ];
+
+                    // Smooth shading: interpolate the normal, not the face.
+                    let shade = match normals {
+                        Some(normals) => {
+                            let n: [f32; 3] = std::array::from_fn(|axis| {
+                                normals[0][axis] * w2
+                                    + normals[1][axis] * w1
+                                    + normals[2][axis] * w0
+                            });
+                            let length = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2])
+                                .sqrt()
+                                .max(f32::EPSILON);
+                            (0.35 + 0.65 * (n[2] / length).abs()).clamp(0.0, 1.0)
+                        }
+                        None => 0.85,
+                    };
+
+                    let sampled = texture.zip(tex_coords).and_then(|(texture, set)| {
+                        let u = set[0][0] * w2 + set[1][0] * w1 + set[2][0] * w0;
+                        let v = set[0][1] * w2 + set[1][1] * w1 + set[2][1] * w0;
+                        sample_texture(texture, u, v)
+                    });
+                    let vertex = triangle.vertex_colors.or(triangle.color_channels[0]).map(
+                        |colors| -> [u8; 4] {
+                            std::array::from_fn(|channel| {
+                                (colors[0][channel] as f32 * w2
+                                    + colors[1][channel] as f32 * w1
+                                    + colors[2][channel] as f32 * w0)
+                                    .clamp(0.0, 255.0) as u8
+                            })
+                        },
+                    );
+                    let flat = triangle.color.unwrap_or([220, 220, 225, 255]);
+
+                    // The same combine the stage viewport resolved for this
+                    // triangle, so vertex- and material-coloured actors read
+                    // correctly instead of washing out to white.
+                    let modulate = |a: [u8; 4], b: [u8; 4]| -> [u8; 4] {
+                        std::array::from_fn(|channel| {
+                            ((a[channel] as u32 * b[channel] as u32) / 255) as u8
+                        })
+                    };
+                    let colour = match triangle.combine_mode {
+                        Combine::TextureOnly => sampled.unwrap_or(flat),
+                        Combine::TextureModulateMaterial => match sampled {
+                            Some(sample) => modulate(sample, flat),
+                            None => flat,
+                        },
+                        Combine::TextureModulateVertex => match (sampled, vertex) {
+                            (Some(sample), Some(vertex)) => modulate(sample, vertex),
+                            (Some(sample), None) => sample,
+                            (None, Some(vertex)) => vertex,
+                            (None, None) => flat,
+                        },
+                        Combine::MaterialOnly => flat,
+                        Combine::VertexOnly => vertex.unwrap_or(flat),
+                    };
+
+                    base[slot] = Some([
+                        (colour[0] as f32 * shade) as u8,
+                        (colour[1] as f32 * shade) as u8,
+                        (colour[2] as f32 * shade) as u8,
+                        255,
+                    ]);
+                }
+            }
+        }
+        Some((base, goop_uv))
+    }
+
+    /// Draws the selected UV layout over the mask, so a layout can be read.
+    fn render_uv_inspector(&self) -> Option<egui::ColorImage> {
+        let preview = self.mask_preview.as_ref()?;
+        let mask = self.active_mask();
+        let mut pixels = vec![[26u8, 26, 32, 255]; CANVAS * CANVAS];
+        if let Some((size, values)) = &mask {
+            for y in 0..CANVAS {
+                for x in 0..CANVAS {
+                    let u = x as f32 / (CANVAS - 1) as f32;
+                    let v = 1.0 - y as f32 / (CANVAS - 1) as f32;
+                    let value = sample_mask_bilinear(values, *size, u, v);
+                    let shade = (value as f32 * 0.6) as u8;
+                    pixels[y * CANVAS + x] = [shade, shade, shade.saturating_add(14), 255];
+                }
+            }
+        }
+
+        let mut line = |from: [f32; 2], to: [f32; 2]| {
+            let steps = ((to[0] - from[0]).abs().max((to[1] - from[1]).abs()) as usize).max(1);
+            for step in 0..=steps {
+                let t = step as f32 / steps as f32;
+                let x = (from[0] + (to[0] - from[0]) * t).round();
+                let y = (from[1] + (to[1] - from[1]) * t).round();
+                if x >= 0.0 && y >= 0.0 && (x as usize) < CANVAS && (y as usize) < CANVAS {
+                    pixels[y as usize * CANVAS + x as usize] = [80, 255, 120, 255];
+                }
+            }
+        };
+        for (index, triangle) in preview.geometry.triangles.iter().enumerate() {
+            let uv: [[f32; 2]; 3] = match self.mask_uv_layer {
+                MaskUvLayer::Goop => {
+                    std::array::from_fn(|corner| preview.front_uv[index * 3 + corner])
+                }
+                MaskUvLayer::Body => match triangle.tex_coords.or(triangle.tex_coord_sets[0]) {
+                    Some(set) => set,
+                    None => continue,
+                },
+            };
+            let screen: [[f32; 2]; 3] = std::array::from_fn(|corner| {
+                [
+                    uv[corner][0].clamp(0.0, 1.0) * (CANVAS - 1) as f32,
+                    (1.0 - uv[corner][1].clamp(0.0, 1.0)) * (CANVAS - 1) as f32,
+                ]
+            });
+            line(screen[0], screen[1]);
+            line(screen[1], screen[2]);
+            line(screen[2], screen[0]);
+        }
+
+        let flat = pixels.into_iter().flatten().collect::<Vec<_>>();
+        Some(egui::ColorImage::from_rgba_unmultiplied(
+            [CANVAS, CANVAS],
+            &flat,
+        ))
+    }
+
+    /// Composites the model preview at the current wash phase.
+    fn mask_preview_image(&self) -> Option<egui::ColorImage> {
+        if self.mask_view == MaskView::Uv {
+            return self.render_uv_inspector();
+        }
+        let (base, goop_uv) = self.rasterize_model()?;
         let threshold = (self.mask_wash_phase.clamp(0.0, 1.0) * 255.0).round() as u8;
-        let mut pixels = Vec::with_capacity(preview.width * preview.height * 4);
-        for slot in 0..preview.width * preview.height {
-            let Some(base) = preview.base[slot] else {
+        let mask = self.active_mask();
+        let mut pixels = Vec::with_capacity(CANVAS * CANVAS * 4);
+        for slot in 0..CANVAS * CANVAS {
+            let Some(base_colour) = base[slot] else {
                 pixels.extend_from_slice(&[24, 24, 30, 255]);
                 continue;
             };
-            let mut colour = base;
-            if self.mask_uv_layer == MaskUvLayer::Goop && self.mask_generated {
-                let [u, v] = preview.goop_uv[slot];
-                let size = self.mask_mask_size.max(1);
-                let x = ((u * size as f32) as usize).min(size - 1);
-                let y = (((1.0 - v) * size as f32) as usize).min(size - 1);
-                let mask_value = self.mask_mask.get(y * size + x).copied().unwrap_or(0);
-                if goop_is_visible(mask_value, threshold) {
-                    let goop = rainbow_goop(u, v);
-                    // Keep the model's shading under the coating so form reads.
-                    let shade = base[0].max(base[1]).max(base[2]) as f32 / 255.0;
-                    colour = [
-                        (goop[0] as f32 * (0.45 + 0.55 * shade)) as u8,
-                        (goop[1] as f32 * (0.45 + 0.55 * shade)) as u8,
-                        (goop[2] as f32 * (0.45 + 0.55 * shade)) as u8,
-                        255,
-                    ];
+            let mut colour = base_colour;
+            if self.mask_uv_layer == MaskUvLayer::Goop {
+                if let Some((size, values)) = &mask {
+                    let [u, v] = goop_uv[slot];
+                    let mask_value = sample_mask_bilinear(values, *size, u, v);
+                    if goop_is_visible(mask_value, threshold) {
+                        let goop = self.goop_colour(u, v);
+                        let shade =
+                            base_colour[0].max(base_colour[1]).max(base_colour[2]) as f32 / 255.0;
+                        colour = [
+                            (goop[0] as f32 * (0.45 + 0.55 * shade)) as u8,
+                            (goop[1] as f32 * (0.45 + 0.55 * shade)) as u8,
+                            (goop[2] as f32 * (0.45 + 0.55 * shade)) as u8,
+                            255,
+                        ];
+                    }
                 }
             }
             pixels.extend_from_slice(&colour);
         }
         Some(egui::ColorImage::from_rgba_unmultiplied(
-            [preview.width, preview.height],
+            [CANVAS, CANVAS],
             &pixels,
         ))
     }
@@ -489,7 +758,6 @@ impl SmsEditorApp {
                 self.build_mask_preview(choice);
             }
         }
-
         if self.mask_selected_actor.is_none() {
             ui.separator();
             ui.label("Pick an actor to load its model.");
@@ -498,40 +766,108 @@ impl SmsEditorApp {
 
         ui.separator();
         ui.horizontal(|ui| {
+            ui.label("View:");
+            ui.selectable_value(&mut self.mask_view, MaskView::Model, "Model");
+            ui.selectable_value(&mut self.mask_view, MaskView::Uv, "UV inspector");
+        });
+        ui.horizontal(|ui| {
             ui.label("UV layer:");
             ui.selectable_value(&mut self.mask_uv_layer, MaskUvLayer::Body, "Body (UV0)");
             ui.selectable_value(&mut self.mask_uv_layer, MaskUvLayer::Goop, "Goop");
         });
-        if self.mask_uv_layer == MaskUvLayer::Goop && !self.mask_generated {
-            ui.colored_label(
-                egui::Color32::from_rgb(255, 180, 90),
-                "Generate the goop map to see the coating.",
+        if self.mask_view == MaskView::Model {
+            ui.label(
+                egui::RichText::new("Drag in the viewport to orbit.")
+                    .small()
+                    .color(egui::Color32::GRAY),
             );
         }
+
+        ui.separator();
+        ui.heading("Goop textures");
+        let textures = self
+            .mask_preview
+            .as_ref()
+            .map(|preview| preview.texture_names())
+            .unwrap_or_default();
+
+        let colour_label = match self.mask_colour_source {
+            MaskTextureSource::Generated => "Rainbow (generated)".to_string(),
+            MaskTextureSource::Model(index) => textures
+                .iter()
+                .find(|(slot, _)| *slot == index)
+                .map(|(_, name)| name.clone())
+                .unwrap_or_else(|| "Rainbow (generated)".to_string()),
+        };
+        egui::ComboBox::from_label("Colour")
+            .selected_text(colour_label)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut self.mask_colour_source,
+                    MaskTextureSource::Generated,
+                    "Rainbow (generated)",
+                );
+                for (index, name) in &textures {
+                    ui.selectable_value(
+                        &mut self.mask_colour_source,
+                        MaskTextureSource::Model(*index),
+                        name,
+                    );
+                }
+            });
+
+        let mask_label = match self.mask_mask_source {
+            MaskTextureSource::Generated => "Generated / borrowed".to_string(),
+            MaskTextureSource::Model(index) => textures
+                .iter()
+                .find(|(slot, _)| *slot == index)
+                .map(|(_, name)| name.clone())
+                .unwrap_or_else(|| "Generated / borrowed".to_string()),
+        };
+        egui::ComboBox::from_label("Mask")
+            .selected_text(mask_label)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut self.mask_mask_source,
+                    MaskTextureSource::Generated,
+                    "Generated / borrowed",
+                );
+                for (index, name) in &textures {
+                    ui.selectable_value(
+                        &mut self.mask_mask_source,
+                        MaskTextureSource::Model(*index),
+                        name,
+                    );
+                }
+            });
 
         ui.horizontal(|ui| {
             if ui
                 .button("Generate goop map + mask")
                 .on_hover_text(
-                    "Seed a rainbow colour map and the retail 32x32 StayPakkun mask (or a \
-                     procedural stand-in if this stage has none).",
+                    "Seed a rainbow colour map and the retail StayPakkun mask (or a procedural \
+                     stand-in if this stage has none).",
                 )
                 .clicked()
             {
                 self.generate_mask_content();
+                self.mask_colour_source = MaskTextureSource::Generated;
+                self.mask_mask_source = MaskTextureSource::Generated;
                 self.mask_uv_layer = MaskUvLayer::Goop;
             }
             if ui
                 .button("Create goop UV (front projection)")
                 .on_hover_text(
-                    "The preview already projects the model this way -- retail's own goop UV is \
-                     a front projection fitted to the [0,1] canvas.",
+                    "The preview already projects this way -- retail's own goop UV is a front \
+                     projection fitted to the [0,1] canvas.",
                 )
                 .clicked()
             {
+                self.mask_view = MaskView::Uv;
+                self.mask_uv_layer = MaskUvLayer::Goop;
                 self.log.push(
-                    "The preview's goop UV is the front projection; writing it into the model's \
-                     material is the authoring phase."
+                    "Showing the front-projected goop UV; writing it into the model's material \
+                     is the authoring phase."
                         .to_string(),
                 );
             }
@@ -572,10 +908,7 @@ impl SmsEditorApp {
         }
     }
 
-    /// The Mask Tool's viewport: the loaded model, filling the stage view.
-    ///
-    /// The tool edits one model rather than the level, so while it is active it
-    /// takes the viewport over instead of leaving the stage behind it.
+    /// The Mask Tool's viewport: the model or its UV layout, filling the view.
     pub(super) fn mask_tool_viewport(&mut self, ui: &mut egui::Ui) {
         let Some(image) = self.mask_preview_image() else {
             ui.centered_and_justified(|ui| {
@@ -593,9 +926,19 @@ impl SmsEditorApp {
         texture.set(image, Default::default());
         let available = ui.available_size();
         let side = available.x.min(available.y).max(64.0);
-        ui.centered_and_justified(|ui| {
-            ui.add(egui::Image::new(&*texture).fit_to_exact_size(egui::vec2(side, side)));
+        let response = ui.centered_and_justified(|ui| {
+            ui.add(
+                egui::Image::new(&*texture)
+                    .fit_to_exact_size(egui::vec2(side, side))
+                    .sense(egui::Sense::drag()),
+            )
         });
+        // Orbit applies to the model; a UV layout is flat, so it does not turn.
+        if self.mask_view == MaskView::Model && response.inner.dragged() {
+            let delta = response.inner.drag_delta();
+            self.mask_yaw += delta.x * 0.01;
+            self.mask_pitch = (self.mask_pitch + delta.y * 0.01).clamp(-1.5, 1.5);
+        }
     }
 
     /// The wash-cycle preview: sweeps the threshold the mask is compared to.
@@ -653,50 +996,6 @@ impl SmsEditorApp {
     }
 }
 
-/// The model a placed actor renders with.
-///
-/// Resolution follows the viewport's own order: an explicit preview asset hint
-/// first, then the catalog's actor preview, then an inferred hint. Checking
-/// only the catalog missed actors placed from the content browser, which carry
-/// their model as a hint.
-fn mask_model_path(
-    document: &sms_scene::StageDocument,
-    object: &sms_scene::SceneObject,
-) -> Option<String> {
-    let hint = |role: sms_scene::AssetRole| {
-        object
-            .asset_hints
-            .iter()
-            .find(|asset| asset.role == role)
-            .map(|asset| asset.path.clone())
-    };
-    hint(sms_scene::AssetRole::PreviewModel)
-        .or_else(|| {
-            document
-                .actor_preview(object)
-                .map(|preview| preview.model_path.clone())
-        })
-        .or_else(|| hint(sms_scene::AssetRole::InferredPreviewModel))
-}
-
-/// Nearest-neighbour sample of a decoded preview texture, with wrapping.
-fn sample_texture(texture: &sms_formats::J3dTexturePreview, u: f32, v: f32) -> Option<[u8; 4]> {
-    let width = texture.width as usize;
-    let height = texture.height as usize;
-    if width == 0 || height == 0 || texture.rgba.len() < width * height * 4 {
-        return None;
-    }
-    let x = ((u.rem_euclid(1.0)) * width as f32) as usize % width;
-    let y = ((v.rem_euclid(1.0)) * height as f32) as usize % height;
-    let base = (y * width + x) * 4;
-    Some([
-        texture.rgba[base],
-        texture.rgba[base + 1],
-        texture.rgba[base + 2],
-        texture.rgba[base + 3],
-    ])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,16 +1029,36 @@ mod tests {
     /// The wash is the game's comparison: bright mask clings, dark clears.
     #[test]
     fn goop_recedes_in_mask_order_as_the_threshold_sweeps() {
-        let dark = 40u8;
-        let bright = 200u8;
-        // Fully coated: everything is above the floor.
-        assert!(goop_is_visible(dark, 0));
-        assert!(goop_is_visible(bright, 0));
-        // Mid sweep: only the bright paint still clings.
-        assert!(!goop_is_visible(dark, 128));
-        assert!(goop_is_visible(bright, 128));
-        // Clean: nothing survives the top of the range.
-        assert!(!goop_is_visible(dark, 255));
-        assert!(!goop_is_visible(bright, 255));
+        assert!(goop_is_visible(40, 0));
+        assert!(goop_is_visible(200, 0));
+        assert!(!goop_is_visible(40, 128));
+        assert!(goop_is_visible(200, 128));
+        assert!(!goop_is_visible(40, 255));
+        assert!(!goop_is_visible(200, 255));
+    }
+
+    /// Bilinear sampling is what keeps a low-resolution mask from washing off
+    /// in visible blocks: between two texels the value ramps rather than steps.
+    #[test]
+    fn mask_sampling_ramps_between_texels() {
+        let mask = vec![0, 255, 0, 255];
+        let left = sample_mask_bilinear(&mask, 2, 0.0, 0.0);
+        let middle = sample_mask_bilinear(&mask, 2, 0.5, 0.0);
+        let right = sample_mask_bilinear(&mask, 2, 1.0, 0.0);
+        assert_eq!(left, 0);
+        assert_eq!(right, 255);
+        assert!(
+            middle > 100 && middle < 155,
+            "midpoint should interpolate, got {middle}"
+        );
+    }
+
+    /// Orbiting must not distort the model: a rotation preserves length.
+    #[test]
+    fn orbit_preserves_length() {
+        let point = [3.0, 4.0, 12.0];
+        let rotated = orbit(point, 0.7, -0.4);
+        let length = |p: [f32; 3]| (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+        assert!((length(point) - length(rotated)).abs() < 1e-3);
     }
 }
