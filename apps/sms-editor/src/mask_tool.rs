@@ -1001,10 +1001,20 @@ impl SmsEditorApp {
                             let raster = vertex
                                 .map(|colour| colour.map(|channel| channel as f32 / 255.0))
                                 .unwrap_or([shade, shade, shade, 1.0]);
-                            evaluate_tev(material, raster, &|map, _coord| {
-                                geometry
-                                    .textures
+                            evaluate_tev(material, raster, &|map, coord| {
+                                // A stage names a texmap slot, and the material
+                                // maps that slot to a texture. Reading the
+                                // model's texture list by the slot instead
+                                // samples a different image: Petey's body names
+                                // slot 0, which his material maps to his skin,
+                                // while texture 0 is the leaf sheet.
+                                let texture = material
+                                    .texture_indices
                                     .get(map)
+                                    .copied()
+                                    .flatten()
+                                    .and_then(|index| geometry.textures.get(index));
+                                texture
                                     // A toon ramp is a lookup table indexed by
                                     // a coordinate the material generates from
                                     // the normal. This preview builds only
@@ -1013,7 +1023,15 @@ impl SmsEditorApp {
                                     // blows the model out. Skipping it leaves
                                     // the stage's other input to speak.
                                     .filter(|texture| !is_toon_ramp(&texture.name))
-                                    .zip(tex_coords)
+                                    // The stage also names which stored
+                                    // coordinate set it reads.
+                                    .zip(
+                                        coord
+                                            .and_then(|index| {
+                                                triangle.tex_coord_sets.get(index).copied().flatten()
+                                            })
+                                            .or(tex_coords),
+                                    )
                                     .and_then(|(texture, set)| {
                                         let u = set[0][0] * w2 + set[1][0] * w1 + set[2][0] * w0;
                                         let v = set[0][1] * w2 + set[1][1] * w1 + set[2][1] * w0;
