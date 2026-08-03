@@ -3695,7 +3695,13 @@ impl SmsEditorApp {
         let template = self.catalog_template_for(actor_factory)?;
         let clone = sms_scene::clone_enemy_manager_template(&template, manager_name, suffix, true)?;
         let cloned_manager_name = format!("{manager_name}{suffix}");
-        self.purge_cloned_character_registration(suffix)?;
+        self.purge_cloned_character_registrations(
+            &clone
+                .cloned_character_names
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+        )?;
         let summary = self.insert_catalog_enemy_manager_pool(
             &clone.template,
             actor_factory,
@@ -3713,13 +3719,17 @@ impl SmsEditorApp {
         ))
     }
 
-    /// Drops a cloned pool's character registration from the stage table.
-    ///
-    /// Removing a layer pool leaves its registration behind, and re-adding one
-    /// that resolves differently is refused as a conflicting same-name record
-    /// -- which reads as a checkbox that silently unticks itself.
-    fn purge_cloned_character_registration(&mut self, suffix: &str) -> Result<(), String> {
+    /// Drops only the requested cloned character registrations from the stage
+    /// table. Character names are exact clone outputs; suffix matching is not
+    /// safe because distinct manager pools for one layer share the suffix.
+    fn purge_cloned_character_registrations(
+        &mut self,
+        character_names: &BTreeSet<String>,
+    ) -> Result<usize, String> {
         const TABLES: &[u8] = b"map/tables.bin";
+        if character_names.is_empty() {
+            return Ok(0);
+        }
         let document = self
             .document
             .as_ref()
@@ -3728,12 +3738,15 @@ impl SmsEditorApp {
             .effective_resource_clone(TABLES)
             .map_err(|error| error.to_string())?
         else {
-            return Ok(());
+            return Ok(0);
         };
-        fn prune(record: &mut sms_formats::JDramaRecord, suffix: &str) -> bool {
+        fn prune(
+            record: &mut sms_formats::JDramaRecord,
+            character_names: &BTreeSet<String>,
+        ) -> usize {
             let sms_formats::JDramaRecordPayload::Group { children, .. } = &mut record.payload
             else {
-                return false;
+                return 0;
             };
             let before = children.len();
             children.retain(|child| {
@@ -3742,16 +3755,18 @@ impl SmsEditorApp {
                     .rsplit("::")
                     .next()
                     .unwrap_or(&child.type_name);
-                !(matches!(short, "ObjChara" | "SmplChara") && child.name.ends_with(suffix))
+                !(matches!(short, "ObjChara" | "SmplChara")
+                    && character_names.contains(&child.name))
             });
-            let mut changed = before != children.len();
+            let mut removed = before - children.len();
             for child in children {
-                changed |= prune(child, suffix);
+                removed += prune(child, character_names);
             }
-            changed
+            removed
         }
-        if !prune(&mut tables.root, suffix) {
-            return Ok(());
+        let removed = prune(&mut tables.root, character_names);
+        if removed == 0 {
+            return Ok(0);
         }
         let document = self
             .document
@@ -3761,7 +3776,56 @@ impl SmsEditorApp {
             TABLES.to_vec(),
             sms_scene::StageResourceDocument::Placement(tables),
         );
-        Ok(())
+        Ok(removed)
+    }
+
+    /// Removes the resources and character registrations owned by one cloned
+    /// manager pool. The caller removes the pool-only object and spawn flag in
+    /// the same outer undo transaction.
+    pub(super) fn remove_cloned_enemy_manager_pool_assets(
+        &mut self,
+        actor_factory: &str,
+        manager_name: &str,
+        suffix: &str,
+    ) -> Result<(usize, usize), String> {
+        let template = self.catalog_template_for(actor_factory)?;
+        let clone = sms_scene::clone_enemy_manager_template(&template, manager_name, suffix, true)?;
+        let character_names = clone
+            .cloned_character_names
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let removed_characters = self.purge_cloned_character_registrations(&character_names)?;
+        let folders = clone
+            .folder_rewrites
+            .into_iter()
+            .map(|(_, folder)| folder.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        let removed_paths = {
+            let document = self
+                .document
+                .as_ref()
+                .ok_or_else(|| "no stage is open".to_string())?;
+            document
+                .effective_resource_paths()
+                .into_iter()
+                .filter(|path| {
+                    let path = String::from_utf8_lossy(path).replace('\\', "/");
+                    let path = path.trim_matches('/').to_ascii_lowercase();
+                    folders
+                        .iter()
+                        .any(|folder| path.starts_with(&format!("{folder}/")))
+                })
+                .collect::<Vec<_>>()
+        };
+        let removed_resources = removed_paths.len();
+        let document = self
+            .document
+            .as_mut()
+            .ok_or_else(|| "no stage is open".to_string())?;
+        for path in removed_paths {
+            document.archive_edits.remove_resource(path);
+        }
+        Ok((removed_characters, removed_resources))
     }
 
     /// Archive folders a layer pool owns, derived the same way the clone is.
@@ -4991,6 +5055,64 @@ mod tests {
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         }
+    }
+
+    #[test]
+    fn cloned_character_cleanup_is_exact_not_layer_suffix_wide() {
+        let character = |name: &str| {
+            JDramaRecord::new(
+                "ObjChara",
+                name,
+                JDramaRecordPayload::Fields { fields: Vec::new() },
+            )
+            .unwrap()
+        };
+        let tables = JDramaDocument {
+            root: JDramaRecord::new(
+                "NameRefGrp",
+                "root",
+                JDramaRecordPayload::Group {
+                    fields: Vec::new(),
+                    children: vec![
+                        character("hamukuriChara_L00"),
+                        character("namekuriChara_L00"),
+                    ],
+                },
+            )
+            .unwrap(),
+        };
+        let mut document = command_test_document(Vec::new());
+        document.upsert_authored_resource(
+            b"map/tables.bin".to_vec(),
+            StageResourceDocument::Placement(tables),
+        );
+        let mut app = SmsEditorApp {
+            document: Some(document),
+            ..SmsEditorApp::default()
+        };
+
+        assert_eq!(
+            app.purge_cloned_character_registrations(&BTreeSet::from([
+                "hamukuriChara_L00".to_string()
+            ]))
+            .unwrap(),
+            1
+        );
+
+        let Some(StageResourceDocument::Placement(tables)) = app
+            .document
+            .as_ref()
+            .unwrap()
+            .effective_resource_clone(b"map/tables.bin")
+            .unwrap()
+        else {
+            panic!("updated tables");
+        };
+        let JDramaRecordPayload::Group { children, .. } = tables.root.payload else {
+            panic!("table root group");
+        };
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name, "namekuriChara_L00");
     }
 
     #[test]

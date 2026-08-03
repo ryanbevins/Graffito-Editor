@@ -2559,6 +2559,10 @@ fn set_character_reference(record: &mut JDramaRecord, value: &str) {
 /// the existing validation unchanged.
 pub struct ClonedEnemyManagerBundle {
     pub template: ObjectAuthoringTemplate,
+    /// Exact character-registration names owned by this clone. Callers use
+    /// these to replace or remove one pool without touching another pool that
+    /// happens to target the same goop layer.
+    pub cloned_character_names: Vec<String>,
     /// Source folder -> clone folder, as archive-relative paths. The clone's
     /// folder starts out empty: the caller has to place the models there, or
     /// the manager loads with no model data and the stage crashes on load.
@@ -2711,8 +2715,13 @@ pub fn clone_enemy_manager_template(
             )
         })
         .collect();
+    let cloned_character_names = character_rewrites
+        .into_iter()
+        .map(|(_, new_name)| new_name)
+        .collect();
     Ok(ClonedEnemyManagerBundle {
         template: clone,
+        cloned_character_names,
         folder_rewrites,
     })
 }
@@ -4536,9 +4545,12 @@ mod tests {
     #[test]
     fn a_cloned_manager_bundle_renames_manager_character_and_folder() {
         let template = cloneable_manager_template();
-        let clone = clone_enemy_manager_template(&template, "hamuManager", "_L01", true)
-            .unwrap()
-            .template;
+        let bundle = clone_enemy_manager_template(&template, "hamuManager", "_L01", true).unwrap();
+        assert_eq!(
+            bundle.cloned_character_names,
+            vec!["hamukuriChara_L01".to_string()]
+        );
+        let clone = bundle.template;
 
         assert_eq!(clone.dependencies[0].record.name, "hamuManager_L01");
         assert_eq!(

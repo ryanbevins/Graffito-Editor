@@ -457,7 +457,8 @@ fn build_managed_game_with_compiled_dialogue_inner(
             .map(|registry| required_goop_manager_runtime_patches(document, registry))
             .transpose()?
             .unwrap_or_default();
-        let goop_layer_bindings = crate::goop_spawn::goop_layer_spawn_bindings(document);
+        let goop_layer_bindings = crate::goop_spawn::goop_layer_spawn_bindings(document)
+            .map_err(|error| format!("Could not validate per-layer goop spawning: {error}"))?;
         let direct_boot = install_managed_runtime_patches(
             project,
             &run,

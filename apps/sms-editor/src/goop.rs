@@ -383,6 +383,22 @@ fn remove_generated_goop_map(document: &mut StageDocument) -> Result<usize, Stri
     let Some(authoring) = document.goop_authoring.as_ref() else {
         return Ok(0);
     };
+    for (index, layer) in authoring.layers.iter().enumerate() {
+        if layer.origin != GoopLayerOrigin::Generated {
+            continue;
+        }
+        let pools = crate::goop_spawn::layer_pool_manager_names(document, index);
+        if !pools.is_empty() {
+            return Err(format!(
+                "goop layer {index:02} still owns enemy pool(s) {}; remove those pools before deleting the generated map",
+                pools
+                    .iter()
+                    .map(|pool| format!("{pool:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
     let mut generated_started = false;
     for layer in &authoring.layers {
         if layer.origin == GoopLayerOrigin::Generated {
@@ -1864,48 +1880,64 @@ impl SmsEditorApp {
             }
         };
 
-        let Some(document) = &mut self.document else {
-            return;
-        };
-        let before = document.goop_authoring.clone();
-        let before_edits = document.archive_edits.clone();
-        let result = (|| -> Result<(), String> {
-            let layer = document
-                .goop_authoring
-                .as_mut()
-                .and_then(|goop| goop.layers.get_mut(self.selected_goop_layer))
-                .ok_or_else(|| "the selected goop layer no longer exists".to_string())?;
-            layer.generated_model = Some(generated_model);
-            layer.behavior = template.behavior;
-            layer.runtime.layer_type = template.behavior.runtime_code();
-            layer.style_source = Some(GoopStyleSource {
-                stage_id: template.stage_id.clone(),
-                layer_index: template.layer_index,
-                display_name: format!("{} / {}", template.stage_id, template.resource_stem),
-                behavior_code: template.behavior.runtime_code(),
-                forced_incompatible: !template.compatible,
-                resource_stem: template.resource_stem.clone(),
-            });
-            layer.metadata_dirty = true;
-            for extension in GOOP_TEMPLATE_ANIMATION_EXTENSIONS {
-                document.archive_edits.remove_resource(
-                    format!("map/pollution/{target_stem}.{extension}").into_bytes(),
-                );
+        let (before, before_edits) = {
+            let Some(document) = &mut self.document else {
+                return;
+            };
+            let before = document.goop_authoring.clone();
+            let before_edits = document.archive_edits.clone();
+            let result = (|| -> Result<(), String> {
+                let layer = document
+                    .goop_authoring
+                    .as_mut()
+                    .and_then(|goop| goop.layers.get_mut(self.selected_goop_layer))
+                    .ok_or_else(|| "the selected goop layer no longer exists".to_string())?;
+                layer.generated_model = Some(generated_model);
+                layer.behavior = template.behavior;
+                layer.runtime.layer_type = template.behavior.runtime_code();
+                layer.style_source = Some(GoopStyleSource {
+                    stage_id: template.stage_id.clone(),
+                    layer_index: template.layer_index,
+                    display_name: format!("{} / {}", template.stage_id, template.resource_stem),
+                    behavior_code: template.behavior.runtime_code(),
+                    forced_incompatible: !template.compatible,
+                    resource_stem: template.resource_stem.clone(),
+                });
+                layer.metadata_dirty = true;
+                for extension in GOOP_TEMPLATE_ANIMATION_EXTENSIONS {
+                    document.archive_edits.remove_resource(
+                        format!("map/pollution/{target_stem}.{extension}").into_bytes(),
+                    );
+                }
+                document
+                    .compile_goop_authoring()
+                    .map_err(|error| error.to_string())?;
+                copy_template_resources(document, &template, &target_stem, &active_material_name)?;
+                sync_runtime_actor_goop_textures(document, &template)?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                document.goop_authoring = before;
+                document.replace_archive_edits(before_edits);
+                self.log
+                    .push(format!("Could not change the goop retail style: {error}"));
+                return;
             }
-            document
-                .compile_goop_authoring()
-                .map_err(|error| error.to_string())?;
-            copy_template_resources(document, &template, &target_stem, &active_material_name)?;
-            sync_runtime_actor_goop_textures(document, &template)?;
-            Ok(())
-        })();
-        if let Err(error) = result {
-            document.goop_authoring = before;
-            document.replace_archive_edits(before_edits);
-            self.log
-                .push(format!("Could not change the goop retail style: {error}"));
+            (before, before_edits)
+        };
+        if let Err(error) = self.refresh_layer_pool_stain(self.selected_goop_layer) {
+            if let Some(document) = &mut self.document {
+                document.goop_authoring = before.clone();
+                document.replace_archive_edits(before_edits.clone());
+            }
+            self.log.push(format!(
+                "Could not refresh the selected layer's enemy pool after changing its style: {error}"
+            ));
             return;
         }
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
         let record = GoopUndoRecord::Snapshot(Box::new(GoopSnapshotUndo {
             before,
             after: document.goop_authoring.clone(),
@@ -2061,6 +2093,25 @@ impl SmsEditorApp {
     }
 
     fn delete_selected_goop_layer(&mut self) {
+        let pools = self
+            .document
+            .as_ref()
+            .map(|document| {
+                crate::goop_spawn::layer_pool_manager_names(document, self.selected_goop_layer)
+            })
+            .unwrap_or_default();
+        if !pools.is_empty() {
+            self.log.push(format!(
+                "Remove per-layer enemy pool(s) {} before deleting goop layer {:02}.",
+                pools
+                    .iter()
+                    .map(|pool| format!("{pool:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.selected_goop_layer
+            ));
+            return;
+        }
         let Some(document) = &mut self.document else {
             return;
         };
@@ -3901,6 +3952,27 @@ fn ray_triangle_distance(
 mod tests {
     use super::*;
 
+    fn layer_pool_object(layer_index: usize) -> SceneObject {
+        let manager_name = format!("fixtureManager_L{layer_index:02}");
+        let mut object = SceneObject::new("fixture-pool", "FixtureEnemy");
+        object.insert_source_raw_param("manager_name", manager_name.clone());
+        object.placement = Some(sms_scene::PlacementBinding::Authored(
+            sms_scene::AuthoredPlacement {
+                raw_resource_path: b"map/scene.bin".to_vec(),
+                target_group_index: 4,
+                prototype: sms_formats::JDramaRecord::new(
+                    "FixtureEnemy",
+                    "fixture-pool",
+                    sms_formats::JDramaRecordPayload::Empty,
+                )
+                .unwrap(),
+                dependencies: Vec::new(),
+                pool_only: true,
+            },
+        ));
+        object
+    }
+
     #[test]
     fn missing_goopmap_stroke_has_an_immediate_bounded_render_preview() {
         let brush = GoopBrush {
@@ -4516,6 +4588,13 @@ mod tests {
                 YmpDocument::canonical(vec![editable_layer().runtime]).unwrap(),
             ),
         );
+
+        document.objects.push(layer_pool_object(0));
+        let before = document.goop_authoring.clone();
+        let error = remove_generated_goop_map(&mut document).unwrap_err();
+        assert!(error.contains("fixtureManager_L00"));
+        assert_eq!(document.goop_authoring, before);
+        document.objects.clear();
 
         assert_eq!(remove_generated_goop_map(&mut document).unwrap(), 1);
         assert!(document.goop_authoring.as_ref().unwrap().layers.is_empty());

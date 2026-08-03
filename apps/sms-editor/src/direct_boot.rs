@@ -4071,7 +4071,9 @@ const GOOP_LAYER_GET_MANAGER_BY_NAME: u32 = 0x8003_4F20;
 const GOOP_LAYER_SPAWN_INTERVAL_BRANCH: u32 = 0x8003_45B8;
 const GOOP_LAYER_SPAWN_INTERVAL_BNE: u32 = 0x4082_02C8;
 const GOOP_LAYER_MARKER: &[u8] = b"GRAFFITO-LAYER-SPAWN-V1\0";
-const GOOP_LAYER_MAX: usize = 16;
+/// Keep the executable table aligned with the scene format's real capacity.
+/// Non-Mare stages can author all 20 retail-supported pollution layers.
+const GOOP_LAYER_MAX: usize = sms_scene::GOOP_MAX_LAYERS;
 const GOOP_LAYER_VANILLA: u32 = 0;
 const GOOP_LAYER_DEAD: u32 = 0xFFFF_FFFF;
 const MIN_GOOP_LAYER_STACK_GAP: u32 = 0x100;
@@ -4605,6 +4607,12 @@ mod goop_layer_spawn_tests {
             RuntimeGoopLayerBinding::Pool("pool".to_string()),
         )]);
         assert!(patch_sms_goop_layer_spawn_dol(&source, &bindings, false).is_err());
+    }
+
+    #[test]
+    fn the_runtime_table_covers_every_authorable_goop_layer() {
+        assert_eq!(GOOP_LAYER_MAX, sms_scene::GOOP_MAX_LAYERS);
+        assert_eq!(GOOP_LAYER_MAX, 20);
     }
 
     /// Every branch in the stub has to land inside it.

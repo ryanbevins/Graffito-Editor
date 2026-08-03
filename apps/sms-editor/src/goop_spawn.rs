@@ -571,8 +571,64 @@ fn enemy_manager_instances(
     managers
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LayerPoolInstance {
+    manager_name: String,
+    actor_factory: String,
+}
+
+fn layer_pool_suffix_for_index(layer_index: usize) -> String {
+    format!("_L{layer_index:02}")
+}
+
+fn layer_pool_index(manager_name: &str) -> Option<usize> {
+    let (_, digits) = manager_name.rsplit_once("_L")?;
+    (digits.len() == 2 && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
+fn layer_pool_instances(document: &StageDocument) -> BTreeMap<usize, Vec<LayerPoolInstance>> {
+    let mut pools = BTreeMap::<usize, Vec<LayerPoolInstance>>::new();
+    for object in &document.objects {
+        let Some(sms_scene::PlacementBinding::Authored(placement)) = &object.placement else {
+            continue;
+        };
+        if !placement.pool_only {
+            continue;
+        }
+        let Some(manager_name) = object.raw_param("manager_name") else {
+            continue;
+        };
+        let Some(layer_index) = layer_pool_index(manager_name) else {
+            continue;
+        };
+        pools
+            .entry(layer_index)
+            .or_default()
+            .push(LayerPoolInstance {
+                manager_name: manager_name.to_string(),
+                actor_factory: object.factory_name.clone(),
+            });
+    }
+    pools
+}
+
+pub(super) fn layer_pool_manager_names(
+    document: &StageDocument,
+    layer_index: usize,
+) -> Vec<String> {
+    layer_pool_instances(document)
+        .remove(&layer_index)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|pool| pool.manager_name)
+        .collect()
+}
+
 /// What each goop layer does to a spawn that lands in it, for the build's
-/// runtime patch.
+/// runtime patch. Invalid legacy states fail the build instead of silently
+/// routing through an arbitrary or orphaned pool.
 ///
 /// A styled layer with its own pool routes spawns to that pool; a styled
 /// layer without one spawns nothing, so a stage that binds any layer does not
@@ -581,26 +637,73 @@ fn enemy_manager_instances(
 /// entirely.
 pub(super) fn goop_layer_spawn_bindings(
     document: &StageDocument,
-) -> BTreeMap<usize, crate::direct_boot::RuntimeGoopLayerBinding> {
+) -> Result<BTreeMap<usize, crate::direct_boot::RuntimeGoopLayerBinding>, String> {
+    let pools = layer_pool_instances(document);
+    let Some(authoring) = document.goop_authoring.as_ref() else {
+        if pools.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        return Err("per-layer enemy pools exist but the stage has no goop layers".to_string());
+    };
+    let flagged = goop_flagged_managers(document);
+    resolve_goop_layer_spawn_bindings(
+        &authoring
+            .layers
+            .iter()
+            .map(|layer| layer.style_source.is_some())
+            .collect::<Vec<_>>(),
+        &pools,
+        &flagged,
+    )
+}
+
+fn resolve_goop_layer_spawn_bindings(
+    styled_layers: &[bool],
+    pools: &BTreeMap<usize, Vec<LayerPoolInstance>>,
+    flagged: &BTreeSet<String>,
+) -> Result<BTreeMap<usize, crate::direct_boot::RuntimeGoopLayerBinding>, String> {
     use crate::direct_boot::RuntimeGoopLayerBinding;
 
+    for (index, instances) in pools {
+        if instances.len() != 1 {
+            return Err(format!(
+                "goop layer {index:02} has {} enemy pools; each layer can route to exactly one",
+                instances.len()
+            ));
+        }
+        let Some(styled) = styled_layers.get(*index) else {
+            return Err(format!(
+                "enemy pool {:?} targets deleted goop layer {index:02}",
+                instances[0].manager_name
+            ));
+        };
+        if !styled {
+            return Err(format!(
+                "enemy pool {:?} targets unstyled goop layer {index:02}",
+                instances[0].manager_name
+            ));
+        }
+        if !flagged.contains(&instances[0].manager_name) {
+            return Err(format!(
+                "enemy pool {:?} is not enabled in StageEnemyInfo",
+                instances[0].manager_name
+            ));
+        }
+    }
+    if pools.is_empty() {
+        return Ok(BTreeMap::new());
+    }
     let mut bindings = BTreeMap::new();
-    let Some(authoring) = document.goop_authoring.as_ref() else {
-        return bindings;
-    };
-    let mut any_pool = false;
-    for (index, layer) in authoring.layers.iter().enumerate() {
-        if layer.style_source.is_none() {
+    for (index, styled) in styled_layers.iter().copied().enumerate() {
+        if !styled {
             continue;
         }
-        let suffix = format!("_L{index:02}");
-        let pool = document.objects.iter().find_map(|object| {
-            let manager = object.raw_param("manager_name")?;
-            manager.ends_with(&suffix).then(|| manager.to_string())
-        });
+        let pool = pools
+            .get(&index)
+            .and_then(|instances| instances.first())
+            .map(|instance| instance.manager_name.clone());
         match pool {
             Some(manager) => {
-                any_pool = true;
                 bindings.insert(index, RuntimeGoopLayerBinding::Pool(manager));
             }
             None => {
@@ -608,10 +711,7 @@ pub(super) fn goop_layer_spawn_bindings(
             }
         }
     }
-    if !any_pool {
-        return BTreeMap::new();
-    }
-    bindings
+    Ok(bindings)
 }
 
 pub(super) fn goop_flagged_managers(document: &StageDocument) -> BTreeSet<String> {
@@ -1019,13 +1119,12 @@ impl SmsEditorApp {
     /// for the runtime to decide. Undo reverses it.
     /// Whether a top-level archive folder belongs to a per-layer pool clone.
     ///
-    /// Pool folders are the original folder plus the lowercased layer suffix
-    /// ("hamukuri" -> "hamukuri_l00"). Stage-wide stain actions skip them:
+    /// Pool folders are the original folder plus the two-digit layer index
+    /// ("hamukuri" -> "hamukuri00"). Stage-wide stain actions skip them:
     /// each pool's look belongs to its layer, not to the stage toggle.
     fn is_layer_pool_folder(segment: &str) -> bool {
         let bytes = segment.as_bytes();
-        bytes.len() > 4
-            && bytes[bytes.len() - 4..bytes.len() - 2] == *b"_l"
+        bytes.len() > 2
             && bytes[bytes.len() - 2..]
                 .iter()
                 .all(|byte| byte.is_ascii_digit())
@@ -1036,6 +1135,11 @@ impl SmsEditorApp {
             Some(segment) => !Self::is_layer_pool_folder(segment),
             None => true,
         }
+    }
+
+    fn is_base_stain_resource(raw_resource_path: &[u8]) -> bool {
+        let path = String::from_utf8_lossy(raw_resource_path).replace('\\', "/");
+        Self::outside_layer_pool_folders(path.trim_matches('/'))
     }
 
     /// Bakes `stain` into every copied model whose archive path satisfies
@@ -1139,34 +1243,64 @@ impl SmsEditorApp {
     /// `TestChoco2` for bianco's brown -- so the layer's look is index 1.
     /// Index 0 is a stage-shaped mask and renders as a meaningless blob on a
     /// cap.
-    fn stain_for_layer(&self, layer_index: usize) -> Option<sms_formats::BtiFile> {
-        let document = self.document.as_ref()?;
+    fn stain_for_layer(&self, layer_index: usize) -> Result<sms_formats::BtiFile, String> {
+        let document = self
+            .document
+            .as_ref()
+            .ok_or_else(|| "no stage is open".to_string())?;
         let style = document
             .goop_authoring
-            .as_ref()?
+            .as_ref()
+            .ok_or_else(|| "the stage has no goop authoring data".to_string())?
             .layers
-            .get(layer_index)?
+            .get(layer_index)
+            .ok_or_else(|| format!("goop layer {layer_index:02} no longer exists"))?
             .style_source
-            .as_ref()?;
-        let template = self.retail_goop_templates.iter().find(|template| {
-            template.stage_id == style.stage_id && template.layer_index == style.layer_index
-        })?;
+            .as_ref()
+            .ok_or_else(|| format!("goop layer {layer_index:02} has no retail style"))?;
+        let template = self
+            .retail_goop_templates
+            .iter()
+            .find(|template| {
+                template.stage_id == style.stage_id && template.layer_index == style.layer_index
+            })
+            .ok_or_else(|| {
+                format!(
+                    "retail goop style {} / {} is not indexed",
+                    style.stage_id, style.layer_index
+                )
+            })?;
         let model_path = format!("map/pollution/pollution{:02}.bmd", style.layer_index);
-        let bytes = std::fs::read(&template.archive_path).ok()?;
-        let archive = sms_scene::SourceFreeStageArchive::parse(&bytes).ok()?;
-        let resource = archive.resources().iter().find(|resource| {
-            String::from_utf8_lossy(&resource.raw_path)
-                .replace('\\', "/")
-                .eq_ignore_ascii_case(&model_path)
+        let bytes = std::fs::read(&template.archive_path).map_err(|error| {
+            format!(
+                "could not read retail goop archive '{}': {error}",
+                template.archive_path.display()
+            )
         })?;
+        let archive = sms_scene::SourceFreeStageArchive::parse(&bytes)
+            .map_err(|error| format!("could not parse retail goop archive: {error}"))?;
+        let resource = archive
+            .resources()
+            .iter()
+            .find(|resource| {
+                String::from_utf8_lossy(&resource.raw_path)
+                    .replace('\\', "/")
+                    .eq_ignore_ascii_case(&model_path)
+            })
+            .ok_or_else(|| format!("retail style has no {model_path}"))?;
         let StageResourceDocument::Model(model) = &resource.document else {
-            return None;
+            return Err(format!("retail style resource {model_path} is not a model"));
         };
         let names = model.texture_names();
         // Fall back to whatever exists if a model does not follow the retail
         // three-texture layout, so an unusual style still yields something.
-        let texture_name = names.get(1).or_else(|| names.first())?;
-        model.named_texture_as_bti(texture_name).ok()
+        let texture_name = names
+            .get(1)
+            .or_else(|| names.first())
+            .ok_or_else(|| format!("retail style model {model_path} has no textures"))?;
+        model.named_texture_as_bti(texture_name).map_err(|error| {
+            format!("could not extract {texture_name:?} from {model_path}: {error}")
+        })
     }
 
     pub(super) fn bake_stu_stain(&mut self) {
@@ -1244,12 +1378,13 @@ impl SmsEditorApp {
             return false;
         };
         document.archive_edits.resources.iter().any(|edit| {
-            matches!(
+            Self::is_base_stain_resource(&edit.raw_resource_path)
+                && matches!(
                 &edit.document,
                 StageResourceDocument::Model(model)
                     if model.has_named_texture(DUMMY_TEXTURE)
                         && model.can_pin_material_konst_alpha_half(STAIN_MATERIAL)
-            )
+                )
         })
     }
 
@@ -1260,11 +1395,12 @@ impl SmsEditorApp {
             return false;
         };
         document.archive_edits.resources.iter().any(|edit| {
-            matches!(
+            Self::is_base_stain_resource(&edit.raw_resource_path)
+                && matches!(
                 &edit.document,
                 StageResourceDocument::Model(model)
                     if model.material_konst_alpha_half_is_pinned(STAIN_MATERIAL)
-            )
+                )
         })
     }
 
@@ -1332,7 +1468,7 @@ impl SmsEditorApp {
 
     /// Suffix that marks a per-layer clone of a manager bundle.
     fn layer_pool_suffix(layer_index: usize) -> String {
-        format!("_L{layer_index:02}")
+        layer_pool_suffix_for_index(layer_index)
     }
 
     /// Goop layers a per-layer pool can be bound to: index and style name.
@@ -1357,13 +1493,21 @@ impl SmsEditorApp {
     }
 
     /// Whether a per-layer pool exists for this manager and layer.
-    pub(super) fn layer_pool_exists(&self, manager_name: &str, layer_index: usize) -> bool {
+    pub(super) fn layer_pool_exists(
+        &self,
+        manager_name: &str,
+        actor_factory: &str,
+        layer_index: usize,
+    ) -> bool {
         let cloned = format!("{manager_name}{}", Self::layer_pool_suffix(layer_index));
         self.document.as_ref().is_some_and(|document| {
-            document
-                .objects
-                .iter()
-                .any(|object| object.raw_param("manager_name") == Some(cloned.as_str()))
+            layer_pool_instances(document)
+                .get(&layer_index)
+                .is_some_and(|instances| {
+                    instances.iter().any(|instance| {
+                        instance.manager_name == cloned && instance.actor_factory == actor_factory
+                    })
+                })
         })
     }
 
@@ -1377,19 +1521,84 @@ impl SmsEditorApp {
         let Some(document) = self.document.as_ref() else {
             return bindings;
         };
-        for (index, _) in self.goop_layer_choices() {
-            let suffix = Self::layer_pool_suffix(index);
-            for object in &document.objects {
-                let Some(name) = object.raw_param("manager_name") else {
-                    continue;
-                };
-                if name.ends_with(&suffix) {
-                    bindings.insert(index, name.to_string());
-                    break;
-                }
+        for (index, instances) in layer_pool_instances(document) {
+            if let [instance] = instances.as_slice() {
+                bindings.insert(index, instance.manager_name.clone());
             }
         }
         bindings
+    }
+
+    /// Re-bakes the current style into the one pool owned by this layer.
+    /// Style edits call this in the same archive-edit transaction, so undo and
+    /// redo restore both the pollution model and the matching enemy look.
+    pub(super) fn refresh_layer_pool_stain(&mut self, layer_index: usize) -> Result<usize, String> {
+        let instances = self
+            .document
+            .as_ref()
+            .and_then(|document| layer_pool_instances(document).remove(&layer_index))
+            .unwrap_or_default();
+        let [instance] = instances.as_slice() else {
+            return match instances.len() {
+                0 => Ok(0),
+                count => Err(format!(
+                    "goop layer {layer_index:02} has {count} enemy pools; remove the duplicates before refreshing its stain"
+                )),
+            };
+        };
+        let suffix = Self::layer_pool_suffix(layer_index);
+        let manager_name = instance.manager_name.strip_suffix(&suffix).ok_or_else(|| {
+            format!(
+                "pool {:?} has an invalid layer suffix",
+                instance.manager_name
+            )
+        })?;
+        let folders =
+            self.cloned_manager_folders(&instance.actor_factory, manager_name, &suffix)?;
+        let stain = self.stain_for_layer(layer_index)?;
+        Ok(self.bake_stain_into_models(
+            &stain,
+            &|path: &str| {
+                let path = path.to_ascii_lowercase();
+                folders.iter().any(|folder| {
+                    let folder = folder.to_ascii_lowercase();
+                    path == folder || path.starts_with(&format!("{folder}/"))
+                })
+            },
+            true,
+        ))
+    }
+
+    fn remove_layer_pool_instance(
+        &mut self,
+        instance: &LayerPoolInstance,
+        layer_index: usize,
+    ) -> Result<String, String> {
+        let suffix = Self::layer_pool_suffix(layer_index);
+        let manager_name = instance.manager_name.strip_suffix(&suffix).ok_or_else(|| {
+            format!(
+                "pool {:?} has an invalid layer suffix",
+                instance.manager_name
+            )
+        })?;
+        self.apply_manager_spawn(&instance.manager_name, false)?;
+        let (characters, resources) = self.remove_cloned_enemy_manager_pool_assets(
+            &instance.actor_factory,
+            manager_name,
+            &suffix,
+        )?;
+        let document = self
+            .document
+            .as_mut()
+            .ok_or_else(|| "no stage is open".to_string())?;
+        document.objects.retain(|object| {
+            !(object.factory_name == instance.actor_factory
+                && object.raw_param("manager_name") == Some(instance.manager_name.as_str()))
+        });
+        Ok(format!(
+            "Removed pool {:?}: {characters} character registration(s), {resources} cloned resource(s).",
+            instance.manager_name
+        ))
     }
 
     /// Adds or removes the pool that spawns in one goop layer.
@@ -1423,7 +1632,18 @@ impl SmsEditorApp {
                         entity.manager_name
                     )
                 })?;
-                if self.layer_pool_exists(&entity.manager_name, layer_index) {
+                let existing = self
+                    .document
+                    .as_ref()
+                    .and_then(|document| layer_pool_instances(document).remove(&layer_index))
+                    .unwrap_or_default();
+                let target_exists = matches!(
+                    existing.as_slice(),
+                    [instance]
+                        if instance.manager_name == cloned_manager
+                            && instance.actor_factory == actor_factory
+                );
+                if target_exists {
                     // An existing pool may predate the folder materialization,
                     // in which case it resolves to no models and kills the
                     // stage on load. Repair rather than trust it.
@@ -1438,6 +1658,9 @@ impl SmsEditorApp {
                         ));
                     }
                 } else {
+                    for instance in &existing {
+                        log.push(self.remove_layer_pool_instance(instance, layer_index)?);
+                    }
                     log.push(self.ensure_cloned_enemy_manager_pool(
                         actor_factory,
                         manager_factory,
@@ -1445,43 +1668,27 @@ impl SmsEditorApp {
                         &suffix,
                     )?);
                 }
-                // The pool's own model copy takes its layer's stain, so what
-                // climbs out of a layer wears that layer's look. Baking is
-                // idempotent and re-runs on repair, keeping the look current.
-                let folders =
-                    self.cloned_manager_folders(actor_factory, &entity.manager_name, &suffix)?;
-                match self.stain_for_layer(layer_index) {
-                    Some(stain) => {
-                        let baked = self.bake_stain_into_models(
-                            &stain,
-                            &|path: &str| {
-                                let path = path.to_ascii_lowercase();
-                                folders.iter().any(|folder| {
-                                    let folder = folder.to_ascii_lowercase();
-                                    path == folder || path.starts_with(&format!("{folder}/"))
-                                })
-                            },
-                            true,
-                        );
-                        log.push(format!(
-                            "Baked layer {layer_index:02}'s own look into {baked} pool model(s), \
-                             shielded from the runtime's stain replacement."
-                        ));
-                    }
-                    None => log.push(format!(
-                        "Layer {layer_index:02} has no retail stain texture available, so its \
-                         pool keeps the current look."
-                    )),
-                }
+                let baked = self.refresh_layer_pool_stain(layer_index)?;
+                log.push(format!(
+                    "Refreshed layer {layer_index:02}'s look in {baked} pool model(s)."
+                ));
                 self.apply_manager_spawn(&cloned_manager, true)?;
             } else {
-                self.apply_manager_spawn(&cloned_manager, false)?;
-                if let Some(document) = self.document.as_mut() {
-                    document.objects.retain(|object| {
-                        object.raw_param("manager_name") != Some(cloned_manager.as_str())
-                    });
+                let instances = self
+                    .document
+                    .as_ref()
+                    .and_then(|document| layer_pool_instances(document).remove(&layer_index))
+                    .unwrap_or_default();
+                let matching = instances.into_iter().find(|instance| {
+                    instance.manager_name == cloned_manager
+                        && entity
+                            .catalog_actor_factory
+                            .as_deref()
+                            .is_none_or(|factory| instance.actor_factory == factory)
+                });
+                if let Some(instance) = matching {
+                    log.push(self.remove_layer_pool_instance(&instance, layer_index)?);
                 }
-                log.extend(self.cleanup_unused_goop_manager_pools());
             }
             Ok(())
         })();
@@ -1682,7 +1889,12 @@ impl SmsEditorApp {
                          patch to route spawns.",
                     );
                     for (index, name) in &layers {
-                        let mut present = self.layer_pool_exists(&entity.manager_name, *index);
+                        let actor_factory = entity
+                            .catalog_actor_factory
+                            .as_deref()
+                            .expect("catalog-backed layer pool has an actor factory");
+                        let mut present =
+                            self.layer_pool_exists(&entity.manager_name, actor_factory, *index);
                         if ui
                             .checkbox(&mut present, format!("{index:02} {name}"))
                             .on_hover_text(format!(
@@ -1742,6 +1954,64 @@ impl SmsEditorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pool(manager_name: &str) -> LayerPoolInstance {
+        LayerPoolInstance {
+            manager_name: manager_name.to_string(),
+            actor_factory: "FixtureEnemy".to_string(),
+        }
+    }
+
+    #[test]
+    fn layer_pool_suffix_requires_the_exact_final_two_digit_form() {
+        assert_eq!(layer_pool_index("hamuManager_L00"), Some(0));
+        assert_eq!(layer_pool_index("hamuManager_L19"), Some(19));
+        assert_eq!(layer_pool_index("hamuManager_L1"), None);
+        assert_eq!(layer_pool_index("hamuManager_L001"), None);
+        assert_eq!(layer_pool_index("hamuManager_L00_extra"), None);
+    }
+
+    #[test]
+    fn runtime_bindings_reject_multiple_pools_for_one_layer() {
+        let pools = BTreeMap::from([(0, vec![pool("hamuManager_L00"), pool("nameManager_L00")])]);
+        let flagged =
+            BTreeSet::from(["hamuManager_L00".to_string(), "nameManager_L00".to_string()]);
+
+        let error = resolve_goop_layer_spawn_bindings(&[true], &pools, &flagged).unwrap_err();
+
+        assert!(error.contains("exactly one"));
+    }
+
+    #[test]
+    fn runtime_bindings_reject_a_pool_for_a_deleted_layer() {
+        let pools = BTreeMap::from([(1, vec![pool("hamuManager_L01")])]);
+        let flagged = BTreeSet::from(["hamuManager_L01".to_string()]);
+
+        let error = resolve_goop_layer_spawn_bindings(&[true], &pools, &flagged).unwrap_err();
+
+        assert!(error.contains("deleted goop layer 01"));
+    }
+
+    #[test]
+    fn runtime_bindings_cover_the_highest_authorable_layer() {
+        let pools = BTreeMap::from([(19, vec![pool("hamuManager_L19")])]);
+        let flagged = BTreeSet::from(["hamuManager_L19".to_string()]);
+
+        let bindings = resolve_goop_layer_spawn_bindings(
+            &[true; sms_scene::GOOP_MAX_LAYERS],
+            &pools,
+            &flagged,
+        )
+        .unwrap();
+
+        assert_eq!(bindings.len(), sms_scene::GOOP_MAX_LAYERS);
+        assert_eq!(
+            bindings.get(&19),
+            Some(&crate::direct_boot::RuntimeGoopLayerBinding::Pool(
+                "hamuManager_L19".to_string()
+            ))
+        );
+    }
 
     #[test]
     #[ignore = "requires SMS_BASE_ROOT with extracted retail stages"]
@@ -1877,8 +2147,8 @@ mod tests {
     /// their look belongs to their layer.
     #[test]
     fn stage_wide_stain_actions_skip_layer_pool_folders() {
-        assert!(SmsEditorApp::is_layer_pool_folder("hamukuri_l00"));
-        assert!(SmsEditorApp::is_layer_pool_folder("namekuri_l15"));
+        assert!(SmsEditorApp::is_layer_pool_folder("hamukuri00"));
+        assert!(SmsEditorApp::is_layer_pool_folder("namekuri15"));
         assert!(!SmsEditorApp::is_layer_pool_folder("hamukuri"));
         assert!(!SmsEditorApp::is_layer_pool_folder("hamukurianm"));
         assert!(!SmsEditorApp::is_layer_pool_folder("namekuri2"));
@@ -1889,7 +2159,13 @@ mod tests {
             "map/pollution/H_ma_rak.bti"
         ));
         assert!(!SmsEditorApp::outside_layer_pool_folders(
-            "hamukuri_l01/default.bmd"
+            "hamukuri01/default.bmd"
+        ));
+        assert!(SmsEditorApp::is_base_stain_resource(
+            b"hamukuri/default.bmd"
+        ));
+        assert!(!SmsEditorApp::is_base_stain_resource(
+            b"hamukuri01/default.bmd"
         ));
     }
 
