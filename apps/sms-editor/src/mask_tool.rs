@@ -65,6 +65,9 @@ pub(super) enum MaskTextureSource {
     Generated,
     /// A texture the model already carries, by index.
     Model(usize),
+    /// A retail goop style from the goop tool's catalog -- the same chocolate,
+    /// oil, pink and electric surfaces the goop tool paints with.
+    GoopStyle(usize),
 }
 
 /// One placed enemy the Mask Tool can target.
@@ -415,10 +418,97 @@ impl SmsEditorApp {
         None
     }
 
+    /// Decodes a retail goop style's surface texture, so the coating can use
+    /// the same look the goop tool paints the ground with.
+    ///
+    /// A pollution model carries the stage's coverage mask first, then the goop
+    /// material, then a shared edge map; the material at index 1 is the one
+    /// that reads as the goop.
+    fn load_goop_style(&mut self, index: usize) {
+        let Some(template) = self.retail_goop_templates.get(index) else {
+            return;
+        };
+        let label = crate::goop::goop_template_label(template, true);
+        let archive_path = template.archive_path.clone();
+        let layer_index = template.layer_index;
+        let model_path = format!("map/pollution/pollution{layer_index:02}.bmd");
+
+        let bytes = match std::fs::read(&archive_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.log
+                    .push(format!("Could not read the goop style archive: {error}"));
+                return;
+            }
+        };
+        let archive = match sms_scene::SourceFreeStageArchive::parse(&bytes) {
+            Ok(archive) => archive,
+            Err(error) => {
+                self.log
+                    .push(format!("Could not open the goop style archive: {error}"));
+                return;
+            }
+        };
+        let Some(resource) = archive.resources().iter().find(|resource| {
+            String::from_utf8_lossy(&resource.raw_path)
+                .replace('\\', "/")
+                .eq_ignore_ascii_case(&model_path)
+        }) else {
+            self.log
+                .push(format!("Goop style '{label}' has no {model_path}."));
+            return;
+        };
+        let sms_scene::StageResourceDocument::Model(model) = &resource.document else {
+            self.log.push(format!(
+                "Goop style '{label}' does not store {model_path} as a model."
+            ));
+            return;
+        };
+        let encoded = match model.to_bytes() {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.log
+                    .push(format!("Could not encode the goop style model: {error}"));
+                return;
+            }
+        };
+        let Ok(parsed) = sms_formats::J3dFile::parse(&encoded) else {
+            self.log.push(format!(
+                "Could not parse the goop style model for '{label}'."
+            ));
+            return;
+        };
+        let Ok(geometry) = parsed.geometry_preview() else {
+            self.log.push(format!(
+                "Could not read the goop style geometry for '{label}'."
+            ));
+            return;
+        };
+        // Index 1 is the goop material; index 0 is the stage's coverage mask.
+        let texture = geometry
+            .textures
+            .get(1)
+            .or_else(|| geometry.textures.first());
+        let Some(texture) = texture else {
+            self.log
+                .push(format!("Goop style '{label}' carries no texture."));
+            return;
+        };
+        self.mask_goop_image = Some((
+            texture.width as usize,
+            texture.height as usize,
+            texture.rgba.clone(),
+        ));
+        self.log.push(format!(
+            "Goop style '{label}' using '{}' ({}x{}).",
+            texture.name, texture.width, texture.height
+        ));
+    }
+
     /// The mask currently in use, as a square intensity field.
     fn active_mask(&self) -> Option<(usize, Vec<u8>)> {
         match self.mask_mask_source {
-            MaskTextureSource::Generated => self
+            MaskTextureSource::Generated | MaskTextureSource::GoopStyle(_) => self
                 .mask_generated
                 .then(|| (self.mask_mask_size, self.mask_mask.clone())),
             MaskTextureSource::Model(index) => {
@@ -443,6 +533,19 @@ impl SmsEditorApp {
     fn goop_colour(&self, u: f32, v: f32) -> [u8; 4] {
         match self.mask_colour_source {
             MaskTextureSource::Generated => rainbow_goop(u, v),
+            MaskTextureSource::GoopStyle(_) => self
+                .mask_goop_image
+                .as_ref()
+                .and_then(|(width, height, rgba)| {
+                    if *width == 0 || *height == 0 || rgba.len() < width * height * 4 {
+                        return None;
+                    }
+                    let x = ((u.rem_euclid(1.0)) * *width as f32) as usize % width;
+                    let y = ((v.rem_euclid(1.0)) * *height as f32) as usize % height;
+                    let base = (y * width + x) * 4;
+                    Some([rgba[base], rgba[base + 1], rgba[base + 2], 255])
+                })
+                .unwrap_or_else(|| rainbow_goop(u, v)),
             MaskTextureSource::Model(index) => self
                 .mask_preview
                 .as_ref()
@@ -813,6 +916,13 @@ impl SmsEditorApp {
             .map(|preview| preview.texture_names())
             .unwrap_or_default();
 
+        let goop_styles = self
+            .retail_goop_templates
+            .iter()
+            .enumerate()
+            .filter(|(_, template)| template.compatible)
+            .map(|(index, template)| (index, crate::goop::goop_template_label(template, true)))
+            .collect::<Vec<_>>();
         let colour_label = match self.mask_colour_source {
             MaskTextureSource::Generated => "Rainbow (generated)".to_string(),
             MaskTextureSource::Model(index) => textures
@@ -820,7 +930,13 @@ impl SmsEditorApp {
                 .find(|(slot, _)| *slot == index)
                 .map(|(_, name)| name.clone())
                 .unwrap_or_else(|| "Rainbow (generated)".to_string()),
+            MaskTextureSource::GoopStyle(index) => goop_styles
+                .iter()
+                .find(|(slot, _)| *slot == index)
+                .map(|(_, name)| name.clone())
+                .unwrap_or_else(|| "Goop style".to_string()),
         };
+        let mut picked_style = None;
         egui::ComboBox::from_label("Colour")
             .selected_text(colour_label)
             .show_ui(ui, |ui| {
@@ -836,10 +952,36 @@ impl SmsEditorApp {
                         name,
                     );
                 }
+                if !goop_styles.is_empty() {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("Goop styles")
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    );
+                    for (index, name) in &goop_styles {
+                        if ui
+                            .selectable_label(
+                                self.mask_colour_source == MaskTextureSource::GoopStyle(*index),
+                                name,
+                            )
+                            .clicked()
+                        {
+                            picked_style = Some(*index);
+                        }
+                    }
+                }
             });
+        if let Some(index) = picked_style {
+            self.mask_colour_source = MaskTextureSource::GoopStyle(index);
+            self.load_goop_style(index);
+            self.mask_uv_layer = MaskUvLayer::Goop;
+        }
 
         let mask_label = match self.mask_mask_source {
-            MaskTextureSource::Generated => "Generated / borrowed".to_string(),
+            MaskTextureSource::Generated | MaskTextureSource::GoopStyle(_) => {
+                "Generated / borrowed".to_string()
+            }
             MaskTextureSource::Model(index) => textures
                 .iter()
                 .find(|(slot, _)| *slot == index)

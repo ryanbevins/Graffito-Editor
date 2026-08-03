@@ -332,7 +332,10 @@ fn goop_template_choices(
     by_type.into_values().collect()
 }
 
-fn goop_template_label(template: &RetailGoopTemplate, show_retail_source: bool) -> String {
+pub(super) fn goop_template_label(
+    template: &RetailGoopTemplate,
+    show_retail_source: bool,
+) -> String {
     let semantic_type = &template.semantic_type;
     if show_retail_source {
         let incompatible = if template.compatible {
