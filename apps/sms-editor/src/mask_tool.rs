@@ -331,6 +331,11 @@ fn tev_konst_colour(selector: u8, konst_colours: &[[u8; 4]; 4]) -> [f32; 3] {
     }
 }
 
+/// Whether a texture is a toon shading ramp rather than surface colour.
+fn is_toon_ramp(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("toon")
+}
+
 /// Whether a pixel survives a material's alpha test.
 ///
 /// Cutout geometry -- a leaf, a fin, a frond -- is a flat quad whose shape
@@ -989,13 +994,25 @@ impl SmsEditorApp {
                         .filter(|material| !material.tev_stages.is_empty());
                     let colour = match material {
                         Some(material) => {
+                            // The raster colour is the lit vertex colour;
+                            // with none stored the surface's own lighting
+                            // stands in, so stages that modulate by it are not
+                            // handed flat white and blown out.
                             let raster = vertex
                                 .map(|colour| colour.map(|channel| channel as f32 / 255.0))
-                                .unwrap_or([1.0; 4]);
+                                .unwrap_or([shade, shade, shade, 1.0]);
                             evaluate_tev(material, raster, &|map, _coord| {
                                 geometry
                                     .textures
                                     .get(map)
+                                    // A toon ramp is a lookup table indexed by
+                                    // a coordinate the material generates from
+                                    // the normal. This preview builds only
+                                    // stored coordinates, so reading a ramp
+                                    // through one samples the wrong place and
+                                    // blows the model out. Skipping it leaves
+                                    // the stage's other input to speak.
+                                    .filter(|texture| !is_toon_ramp(&texture.name))
                                     .zip(tex_coords)
                                     .and_then(|(texture, set)| {
                                         let u = set[0][0] * w2 + set[1][0] * w1 + set[2][0] * w0;

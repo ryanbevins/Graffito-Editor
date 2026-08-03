@@ -5797,8 +5797,18 @@ fn probe_tev_colour() {
         .expect("geometry");
     for material in &geometry.materials {
         // Sample the ramp at mid intensity, which is what a lit body reads.
-        let colour = crate::mask_tool::evaluate_tev(material, [1.0; 4], &|_map, _coord| {
-            [0.6, 0.6, 0.6, 1.0]
+        // Ramps are skipped in the preview, so they read neutral.
+        let colour = crate::mask_tool::evaluate_tev(material, [0.75; 4], &|map, _coord| {
+            let neutral = geometry
+                .textures
+                .get(map)
+                .map(|texture| texture.name.to_ascii_lowercase().contains("toon"))
+                .unwrap_or(false);
+            if neutral {
+                [1.0; 4]
+            } else {
+                [0.6, 0.6, 0.6, 1.0]
+            }
         });
         println!(
             "[{}] {} stages -> rgb {:?}",
