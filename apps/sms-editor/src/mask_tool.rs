@@ -762,25 +762,49 @@ impl SmsEditorApp {
     }
 
     /// The mask currently in use, as a square intensity field.
+    /// The wash mask the model authored for itself, if it carries one.
+    ///
+    /// Wired actors bundle the polmask texture their wash compares against.
+    /// An actor without one -- BossPakkun -- is coated through the borrowed
+    /// StayPakkun mask and a front projection instead.
+    fn authored_mask_texture_index(&self) -> Option<usize> {
+        self.mask_preview.as_ref()?.geometry.textures.iter().position(|texture| {
+            let name = texture.name.to_ascii_lowercase();
+            name.contains("polmask") || name.contains("pol_mask")
+        })
+    }
+
+    /// Reads a model texture as a wash mask.
+    fn mask_from_texture(texture: &sms_formats::J3dTexturePreview) -> Option<(usize, Vec<u8>)> {
+        let size = texture.width.min(texture.height) as usize;
+        if size == 0 {
+            return None;
+        }
+        let mut values = vec![0u8; size * size];
+        for y in 0..size {
+            for x in 0..size {
+                let source = (y * texture.width as usize + x) * 4;
+                values[y * size + x] = texture.rgba.get(source).copied().unwrap_or(0);
+            }
+        }
+        Some((size, values))
+    }
+
     fn active_mask(&self) -> Option<(usize, Vec<u8>)> {
         match self.mask_mask_source {
-            MaskTextureSource::Generated | MaskTextureSource::GoopStyle(_) => self
-                .mask_generated
-                .then(|| (self.mask_mask_size, self.mask_mask.clone())),
+            MaskTextureSource::Generated | MaskTextureSource::GoopStyle(_) => {
+                // A model that authored its own mask wears it; the borrowed
+                // StayPakkun mask is the default for one that never did.
+                if let Some(index) = self.authored_mask_texture_index() {
+                    let texture = self.mask_preview.as_ref()?.geometry.textures.get(index)?;
+                    return Self::mask_from_texture(texture);
+                }
+                self.mask_generated
+                    .then(|| (self.mask_mask_size, self.mask_mask.clone()))
+            }
             MaskTextureSource::Model(index) => {
                 let texture = self.mask_preview.as_ref()?.geometry.textures.get(index)?;
-                let size = texture.width.min(texture.height) as usize;
-                if size == 0 {
-                    return None;
-                }
-                let mut values = vec![0u8; size * size];
-                for y in 0..size {
-                    for x in 0..size {
-                        let source = (y * texture.width as usize + x) * 4;
-                        values[y * size + x] = texture.rgba.get(source).copied().unwrap_or(0);
-                    }
-                }
-                Some((size, values))
+                Self::mask_from_texture(texture)
             }
         }
     }
@@ -1197,13 +1221,18 @@ impl SmsEditorApp {
     fn mask_gpu_frame(&self, rect: egui::Rect) -> Option<gpu_viewport::GpuViewportFrame> {
         let (center, radius) = self.mask_gpu_bounds?;
         let side = rect.width().min(rect.height()).max(1.0);
+        // The same basis the stage camera builds, so the winding the renderer
+        // culls against is the winding it expects. A mirrored basis flips
+        // every triangle and the model comes out inside out.
         let (sin_yaw, cos_yaw) = self.mask_yaw.sin_cos();
         let (sin_pitch, cos_pitch) = self.mask_pitch.sin_cos();
-        // The orbit turns the model; the camera basis that sees the same thing
-        // is its transpose.
-        let right = [cos_yaw, 0.0, sin_yaw];
-        let up = [sin_pitch * sin_yaw, cos_pitch, -sin_pitch * cos_yaw];
-        let forward = [-cos_pitch * sin_yaw, sin_pitch, cos_pitch * cos_yaw];
+        let forward = [sin_yaw * cos_pitch, sin_pitch, cos_yaw * cos_pitch];
+        let right = [-cos_yaw, 0.0, sin_yaw];
+        let up = [
+            right[1] * forward[2] - right[2] * forward[1],
+            right[2] * forward[0] - right[0] * forward[2],
+            right[0] * forward[1] - right[1] * forward[0],
+        ];
         let distance = radius * 8.0;
         let camera_position = std::array::from_fn(|axis| center[axis] - forward[axis] * distance);
         let lighting = self
@@ -1256,11 +1285,18 @@ impl SmsEditorApp {
         if self.mask_gpu_triangles.is_empty() {
             return None;
         }
+        // The same basis the stage camera builds, so the winding the renderer
+        // culls against is the winding it expects. A mirrored basis flips
+        // every triangle and the model comes out inside out.
         let (sin_yaw, cos_yaw) = self.mask_yaw.sin_cos();
         let (sin_pitch, cos_pitch) = self.mask_pitch.sin_cos();
-        let right = [cos_yaw, 0.0, sin_yaw];
-        let up = [sin_pitch * sin_yaw, cos_pitch, -sin_pitch * cos_yaw];
-        let forward = [-cos_pitch * sin_yaw, sin_pitch, cos_pitch * cos_yaw];
+        let forward = [sin_yaw * cos_pitch, sin_pitch, cos_yaw * cos_pitch];
+        let right = [-cos_yaw, 0.0, sin_yaw];
+        let up = [
+            right[1] * forward[2] - right[2] * forward[1],
+            right[2] * forward[0] - right[0] * forward[2],
+            right[0] * forward[1] - right[1] * forward[0],
+        ];
         let distance = radius * 8.0;
         let camera: [f32; 3] =
             std::array::from_fn(|axis| center[axis] - forward[axis] * distance);
@@ -1285,6 +1321,10 @@ impl SmsEditorApp {
         }
         let span = [max[0] - min[0], max[1] - min[1]];
 
+        // The authored UV pairs with the authored mask. Reading whatever
+        // second coordinate set a model happens to carry through the borrowed
+        // mask draws a pattern that belongs to neither.
+        let authored = self.authored_mask_texture_index().is_some();
         let mut uv = vec![None; CANVAS * CANVAS];
         let mut depth = vec![f32::INFINITY; CANVAS * CANVAS];
         for triangle in &self.mask_gpu_triangles {
@@ -1304,7 +1344,7 @@ impl SmsEditorApp {
             if behind {
                 continue;
             }
-            let coords: [[f32; 2]; 3] = match triangle.mask_tex_coords {
+            let coords: [[f32; 2]; 3] = match triangle.mask_tex_coords.filter(|_| authored) {
                 Some(authored) => authored,
                 None => std::array::from_fn(|corner| {
                     std::array::from_fn(|axis| {
