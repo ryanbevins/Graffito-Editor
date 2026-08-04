@@ -1285,6 +1285,9 @@ struct SmsEditorApp {
     /// Whether the wash clears the mask's dark values first rather than its
     /// bright ones, turning the coating's recede inside out.
     mask_wash_invert: bool,
+    /// What the panel reports about the selected actor's archive edit, worked
+    /// out when the actor is loaded rather than while drawing.
+    mask_edit_state: String,
     mask_uv_layer: mask_tool::MaskUvLayer,
     mask_view: mask_tool::MaskView,
     mask_yaw: f32,
@@ -1643,6 +1646,7 @@ impl Default for SmsEditorApp {
             mask_wash_phase: 1.0,
             mask_wash_playing: false,
             mask_wash_invert: false,
+            mask_edit_state: String::new(),
             mask_uv_layer: mask_tool::MaskUvLayer::Body,
             mask_view: mask_tool::MaskView::Model,
             mask_yaw: 0.0,
