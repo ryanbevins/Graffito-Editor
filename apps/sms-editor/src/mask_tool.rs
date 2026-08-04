@@ -2579,6 +2579,11 @@ impl SmsEditorApp {
         }
         self.document_dirty = dirty;
         self.flush_document_change();
+        // The edit changes the model the stage draws, and both viewports read
+        // the actor out of the stage's own preview: without rebuilding it they
+        // keep drawing the model as it was before the edit, so a baked layer
+        // shows in a build and nowhere in the editor.
+        self.rebuild_model_preview_from_document();
         self.log.push(message);
     }
 
