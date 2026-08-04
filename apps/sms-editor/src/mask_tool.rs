@@ -2168,7 +2168,14 @@ impl SmsEditorApp {
         // A model that runs no comparison has no coverage to set, so give it
         // the layer first and set the level as part of authoring it.
         if materials.is_empty() {
-            match self.author_goop_layer(&mut model, level) {
+            let parsed = match sms_formats::J3dFile::parse(&bytes) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    self.log.push(format!("Could not read the model: {error}"));
+                    return;
+                }
+            };
+            match self.author_goop_layer(&mut model, &parsed, choice.load_flags, level) {
                 Ok(count) => {
                     let Some(document) = self.document.as_mut() else {
                         return;
@@ -2241,6 +2248,8 @@ impl SmsEditorApp {
     fn author_goop_layer(
         &self,
         model: &mut sms_formats::J3dRebuildDocument,
+        model_file: &sms_formats::J3dFile,
+        load_flags: u32,
         level: u8,
     ) -> Result<usize, String> {
         let preview = self
@@ -2280,22 +2289,31 @@ impl SmsEditorApp {
             .to_bti()
             .map_err(|error| format!("Could not encode the coating: {error}"))?;
 
-        // The front projection, over the model as it stands.
-        let mut min = [f32::INFINITY; 2];
-        let mut max = [f32::NEG_INFINITY; 2];
-        for triangle in &preview.geometry.triangles {
-            for vertex in triangle.vertices {
-                for axis in 0..2 {
-                    min[axis] = min[axis].min(vertex[axis]);
-                    max[axis] = max[axis].max(vertex[axis]);
+        // The goop coordinate is stored in the vertex data rather than
+        // generated, which is how retail carries one: a generated coordinate
+        // reads the vertex position in whichever joint's space it lives, and
+        // an actor whose parts sit in different joints cannot be served by a
+        // single matrix.
+        let slot = preview
+            .geometry
+            .triangles
+            .iter()
+            .fold([false; 8], |mut used, triangle| {
+                for (slot, set) in triangle.tex_coord_sets.iter().enumerate() {
+                    used[slot] |= set.is_some();
                 }
-            }
-        }
-        let scale = std::array::from_fn(|axis| {
-            let span = max[axis] - min[axis];
-            if span > f32::EPSILON { 1.0 / span } else { 1.0 }
-        });
-        let translation: [f32; 2] = std::array::from_fn(|axis| -min[axis] * scale[axis]);
+                used
+            })
+            .iter()
+            .position(|used| !used)
+            .ok_or_else(|| "This model stores all eight coordinate sets.".to_string())?
+            as u8;
+        let matrices = model_file
+            .rest_pose_draw_matrices(load_flags)
+            .map_err(|error| format!("Could not pose the model: {error}"))?;
+        model
+            .store_front_projection_texcoord(slot, &matrices)
+            .map_err(|error| format!("Could not store the goop coordinate: {error}"))?;
 
         let mut authored = 0usize;
         let mut failures = Vec::new();
@@ -2307,8 +2325,7 @@ impl SmsEditorApp {
                 material_name: &material.name,
                 texture_name: GOOP_LAYER_TEXTURE,
                 texture: &texture,
-                scale,
-                translation,
+                coordinate_slot: slot,
                 level,
             };
             match model.add_goop_layer(&request) {

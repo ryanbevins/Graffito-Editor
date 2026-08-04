@@ -1674,7 +1674,6 @@ impl J3dFile {
         Ok(self
             .preview_draw_matrices_from_joint_matrices(&joints)?
             .into_iter()
-            .map(|matrix| matrix.map(|matrix| matrix))
             .collect())
     }
 
