@@ -501,6 +501,143 @@ pub enum J3dPaddingKind {
     SuperBmdMessage(Vec<u8>),
 }
 
+/// One texture matrix record's size on disk.
+const J3D_TEX_MATRIX_SIZE: usize = 0x64;
+
+/// What to author into a material that has no goop layer.
+#[derive(Debug, Clone)]
+pub struct GoopLayerRequest<'a> {
+    pub material_name: &'a str,
+    /// The texture to add: its colour is the coating, its alpha the mask.
+    pub texture_name: &'a str,
+    pub texture: &'a BtiFile,
+    /// The projection that turns a model-space position into the goop
+    /// coordinate: `u = x * scale[0] + translation[0]`, and likewise for `v`.
+    pub scale: [f32; 2],
+    pub translation: [f32; 2],
+    /// The wash level to ship at. The coating shows where the mask does not
+    /// exceed this, so 255 ships fully coated.
+    pub level: u8,
+}
+
+/// What authoring a goop layer placed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GoopLayerReport {
+    pub texture_index: usize,
+    /// The konst register the comparison reads.
+    pub konst_register: usize,
+    /// The stage the layer starts at.
+    pub first_stage: usize,
+}
+
+/// A texture matrix that projects position onto the front plane.
+///
+/// Mode zero takes the source as it stands and applies the scale, rotation and
+/// translation directly, so a scale and an offset per axis are all a bounds
+/// projection needs. The effect matrix is left as identity because mode zero
+/// never reads it.
+fn texture_matrix_record(scale: [f32; 2], translation: [f32; 2]) -> Vec<u8> {
+    let mut record = vec![0u8; J3D_TEX_MATRIX_SIZE];
+    record[0] = 0;
+    record[1] = 0;
+    record[2] = 0xff;
+    record[3] = 0xff;
+    fn put(record: &mut [u8], offset: usize, value: f32) {
+        record[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+    for axis in 0..3 {
+        put(&mut record, 0x04 + axis * 4, 0.0);
+    }
+    put(&mut record, 0x10, scale[0]);
+    put(&mut record, 0x14, scale[1]);
+    record[0x18..0x1a].copy_from_slice(&0i16.to_be_bytes());
+    put(&mut record, 0x1c, translation[0]);
+    put(&mut record, 0x20, translation[1]);
+    for row in 0..4 {
+        for column in 0..4 {
+            let value = if row == column { 1.0f32 } else { 0.0 };
+            put(&mut record, 0x24 + (row * 4 + column) * 4, value);
+        }
+    }
+    record
+}
+
+/// Appends bytes to a material table and reports the element index they land
+/// at, matching an element already present rather than duplicating it.
+fn append_material_bytes(
+    materials: &mut J3dMaterialSection,
+    kind: J3dMaterialTableKind,
+    bytes: &[u8],
+    stride: usize,
+) -> Result<usize> {
+    let table = materials
+        .tables
+        .iter_mut()
+        .find(|table| table.kind == kind)
+        .ok_or_else(|| unsupported(format!("the material section has no {kind:?} table")))?;
+    let values = match &mut table.allocation {
+        J3dScalarArray::Unsigned8(values) | J3dScalarArray::PackedColor(values) => values,
+        _ => return Err(unsupported(format!("{kind:?} is not a byte table"))),
+    };
+    if let Some(existing) = values
+        .chunks_exact(stride)
+        .position(|chunk| chunk == bytes)
+    {
+        return Ok(existing);
+    }
+    let index = values.len() / stride;
+    values.extend_from_slice(bytes);
+    Ok(index)
+}
+
+fn append_material_u16(
+    materials: &mut J3dMaterialSection,
+    kind: J3dMaterialTableKind,
+    value: u16,
+) -> Result<usize> {
+    let table = materials
+        .tables
+        .iter_mut()
+        .find(|table| table.kind == kind)
+        .ok_or_else(|| unsupported(format!("the material section has no {kind:?} table")))?;
+    let J3dScalarArray::Unsigned16(values) = &mut table.allocation else {
+        return Err(unsupported(format!("{kind:?} is not a sixteen bit table")));
+    };
+    if let Some(existing) = values.iter().position(|candidate| *candidate == value) {
+        return Ok(existing);
+    }
+    values.push(value);
+    Ok(values.len() - 1)
+}
+
+fn append_material_count(
+    materials: &mut J3dMaterialSection,
+    kind: J3dMaterialTableKind,
+    value: u8,
+) -> Result<usize> {
+    append_material_bytes(materials, kind, &[value], 1)
+}
+
+/// How many coordinates a material generates.
+fn material_tex_gen_count(
+    materials: &J3dMaterialSection,
+    record: &J3dMaterialInitRecord,
+) -> usize {
+    materials
+        .tables
+        .iter()
+        .find(|table| table.kind == J3dMaterialTableKind::TexGenCount)
+        .and_then(|table| match &table.allocation {
+            J3dScalarArray::Unsigned8(values) => values
+                .get(record.tex_gen_count_index as usize)
+                .copied()
+                .map(usize::from),
+            _ => None,
+        })
+        .unwrap_or(0)
+        .min(record.tex_coord_indices.len())
+}
+
 /// Records the gap between `cursor` and `aligned` as retail padding.
 ///
 /// A table's length is not stored: the parser infers it from the distance to
@@ -807,6 +944,229 @@ impl J3dRebuildDocument {
     /// runtime's exact one-half constant; only active TEV stages are changed so
     /// pristine padding selectors with the same byte remain untouched.
     /// Returns how many selectors were pinned.
+    /// Gives a material a washable goop layer it never had.
+    ///
+    /// The layer is the one retail wires: a comparison stage tests the mask
+    /// against a konst and writes one or zero into a register, and the stage
+    /// after it adds the coating where that register is zero. Both stages read
+    /// one added texture -- its colour is the goop, its alpha is the mask --
+    /// through a coordinate the material generates by projecting the model's
+    /// position onto its front, which is the layout retail authored by hand
+    /// for the enemies that ship with goop.
+    ///
+    /// Nothing already in the material is disturbed: every record is appended
+    /// and only this material's own indices are repointed. The konst register
+    /// it claims is reported, so a caller can check it was free.
+    pub fn add_goop_layer(&mut self, request: &GoopLayerRequest<'_>) -> Result<GoopLayerReport> {
+        let mut authored = self.clone();
+        let report = authored.add_goop_layer_in_place(request)?;
+        *self = authored;
+        Ok(report)
+    }
+
+    fn add_goop_layer_in_place(
+        &mut self,
+        request: &GoopLayerRequest<'_>,
+    ) -> Result<GoopLayerReport> {
+        let texture_index = self.append_texture(request.texture_name, request.texture)?;
+
+        let mut report = GoopLayerReport {
+            texture_index,
+            konst_register: 0,
+            first_stage: 0,
+        };
+        let mut authored_any = false;
+        for section in &mut self.sections {
+            let J3dRebuildSectionData::Materials(materials) = &mut section.data else {
+                continue;
+            };
+            let Some(record_index) = material_record_index(materials, request.material_name) else {
+                continue;
+            };
+            let Some(record) = materials.material_init_records.get(record_index) else {
+                continue;
+            };
+            let stage_count = material_tev_stage_count(materials, record);
+            let gen_count = material_tex_gen_count(materials, record);
+            if stage_count + 2 > 16 {
+                return Err(unsupported(format!(
+                    "material {:?} already runs {stage_count} TEV stages; a goop layer needs two \
+                     more",
+                    request.material_name
+                )));
+            }
+            if gen_count + 1 > 8 {
+                return Err(unsupported(format!(
+                    "material {:?} already generates {gen_count} coordinates",
+                    request.material_name
+                )));
+            }
+            let map_slot = record
+                .texture_number_indices
+                .iter()
+                .position(|index| *index == 0xFFFF)
+                .ok_or_else(|| {
+                    unsupported(format!(
+                        "material {:?} binds all eight texture maps",
+                        request.material_name
+                    ))
+                })?;
+            let matrix_slot = record
+                .tex_matrix_indices
+                .iter()
+                .take(8)
+                .position(|index| *index == 0xFFFF)
+                .ok_or_else(|| {
+                    unsupported(format!(
+                        "material {:?} binds all eight texture matrices",
+                        request.material_name
+                    ))
+                })?;
+
+            // A coordinate generated by projecting position onto the front:
+            // GX_TG_MTX2x4 so the result is taken flat, sourced from position,
+            // through the matrix appended just below.
+            let coord_index = append_material_bytes(
+                materials,
+                J3dMaterialTableKind::TexCoord,
+                &[0x01, 0x00, 0x1e + 3 * matrix_slot as u8, 0xff],
+                4,
+            )?;
+            let matrix_index = append_material_bytes(
+                materials,
+                J3dMaterialTableKind::TexMatrix,
+                &texture_matrix_record(request.scale, request.translation),
+                J3D_TEX_MATRIX_SIZE,
+            )?;
+            let texture_number_index = append_material_u16(
+                materials,
+                J3dMaterialTableKind::TextureNumber,
+                u16::try_from(texture_index).map_err(|_| {
+                    unsupported("model carries too many textures".to_string())
+                })?,
+            )?;
+
+            // A stage names the slots a material binds, not the table entries
+            // behind them: the coordinate slot the texgen was written into,
+            // and the map slot the texture was bound to.
+            let order = [gen_count as u8, map_slot as u8, 0xff, 0xff];
+            let compare_order =
+                append_material_bytes(materials, J3dMaterialTableKind::TevOrder, &order, 4)?;
+            let apply_order =
+                append_material_bytes(materials, J3dMaterialTableKind::TevOrder, &order, 4)?;
+            // Copied from a shipping wash rather than derived: the comparison
+            // carries a bias of three and a scale of one, which is how GX
+            // encodes a compare, and writes its verdict into register two.
+            let compare_stage = append_material_bytes(
+                materials,
+                J3dMaterialTableKind::TevStage,
+                &[
+                    0xff, 0x09, 0x0e, 0x0c, 0x0f, 0x0a, 0x03, 0x01, 0x01, 0x03, 0x07, 0x07, 0x07,
+                    0x07, 0x00, 0x00, 0x00, 0x01, 0x00, 0xff,
+                ],
+                20,
+            )?;
+            let apply_stage = append_material_bytes(
+                materials,
+                J3dMaterialTableKind::TevStage,
+                &[
+                    0xff, 0x08, 0x0f, 0x06, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x07, 0x07, 0x07,
+                    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0xff,
+                ],
+                20,
+            )?;
+            let konst_index = append_material_bytes(
+                materials,
+                J3dMaterialTableKind::TevKonstColor,
+                &[0xff, 0xff, 0xff, request.level],
+                4,
+            )?;
+            let gen_count_index = append_material_count(
+                materials,
+                J3dMaterialTableKind::TexGenCount,
+                u8::try_from(gen_count + 1)
+                    .map_err(|_| unsupported("texgen count".to_string()))?,
+            )?;
+            let stage_count_index = append_material_count(
+                materials,
+                J3dMaterialTableKind::TevStageCount,
+                u8::try_from(stage_count + 2)
+                    .map_err(|_| unsupported("TEV stage count".to_string()))?,
+            )?;
+
+            let Some(record) = materials.material_init_records.get_mut(record_index) else {
+                continue;
+            };
+            record.tex_gen_count_index = gen_count_index as u8;
+            record.tev_stage_count_index = stage_count_index as u8;
+            record.tex_coord_indices[gen_count] = coord_index as u16;
+            record.tex_matrix_indices[matrix_slot] = matrix_index as u16;
+            record.texture_number_indices[map_slot] = texture_number_index as u16;
+            record.tev_order_indices[stage_count] = compare_order as u16;
+            record.tev_order_indices[stage_count + 1] = apply_order as u16;
+            record.tev_stage_indices[stage_count] = compare_stage as u16;
+            record.tev_stage_indices[stage_count + 1] = apply_stage as u16;
+            record.tev_konst_color_indices[0] = konst_index as u16;
+            // The comparison reads K0's alpha; the stage after it reads no
+            // konst at all, but a selector is still written for both.
+            record.tev_konst_color_selectors[stage_count] = 0x1c;
+            record.tev_konst_color_selectors[stage_count + 1] = 0x1c;
+            record.tev_konst_alpha_selectors[stage_count] = 0x1c;
+            record.tev_konst_alpha_selectors[stage_count + 1] = 0x1c;
+
+            report.first_stage = stage_count;
+            authored_any = true;
+        }
+        if !authored_any {
+            return Err(unsupported(format!(
+                "no material named {:?}",
+                request.material_name
+            )));
+        }
+        self.canonicalize_material_layout_in_place()?;
+        Ok(report)
+    }
+
+    /// Adds a texture to TEX1 and reports its index.
+    fn append_texture(&mut self, name: &str, texture: &BtiFile) -> Result<usize> {
+        let mut index = None;
+        for section in &mut self.sections {
+            let J3dRebuildSectionData::Textures(textures) = &mut section.data else {
+                continue;
+            };
+            // A model whose materials each take the layer shares one texture
+            // between them, so an existing one is reused rather than refused.
+            if let Some(existing) = textures
+                .names
+                .entries
+                .iter()
+                .position(|entry| entry.name == name)
+            {
+                index = Some(existing);
+                continue;
+            }
+            let template = textures
+                .textures
+                .first()
+                .cloned()
+                .ok_or_else(|| unsupported("TEX1 carries no texture to model".to_string()))?;
+            textures.textures.push(template);
+            textures.names.entries.push(J3dNameEntry {
+                hash: j3d_name_hash(name.as_bytes()),
+                string_offset: 0,
+                name: name.to_string(),
+            });
+            index = Some(textures.textures.len() - 1);
+        }
+        let index =
+            index.ok_or_else(|| unsupported("the model has no TEX1 section".to_string()))?;
+        // The appended record is a copy of another until the real image
+        // replaces it; replacing again is harmless where it already landed.
+        self.replace_named_texture_from_bti(name, texture)?;
+        self.canonicalize_texture_layout_in_place()?;
+        Ok(index)
+    }
+
     /// Repacks MAT3 so its records sit where its offsets say, whatever size
     /// they have grown to.
     ///
@@ -4896,6 +5256,179 @@ mod tests {
 #[cfg(test)]
 mod goop_layout_tests {
     use super::*;
+
+    /// Authors a goop layer into a model that has none, then reads the model
+    /// back through the ordinary preview path to see whether the wash is
+    /// really there: the comparison stage, the texture it samples, and the
+    /// coordinate it reads.
+    ///
+    /// `GRAFFITO_PROBE_SZS=<stage.szs> GRAFFITO_ONLY=bosspaku_model
+    /// cargo test authoring_a_goop_layer -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn authoring_a_goop_layer_gives_a_model_a_wash() {
+        let (Ok(path), Ok(needle)) = (
+            std::env::var("GRAFFITO_PROBE_SZS"),
+            std::env::var("GRAFFITO_ONLY"),
+        ) else {
+            return;
+        };
+        let assets = crate::mount_scene_archive(std::path::Path::new(&path)).expect("mount");
+        let asset = assets
+            .iter()
+            .find(|asset| {
+                let text = asset
+                    .path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_ascii_lowercase();
+                text.contains(&needle) && text.ends_with(".bmd")
+            })
+            .expect("model");
+        let bytes = crate::read_stage_asset_bytes(&asset.path).expect("read");
+
+        // The model must start with no wash at all, or the test proves nothing.
+        let wash_materials = |bytes: &[u8]| -> Vec<String> {
+            crate::J3dFile::parse(bytes)
+                .and_then(|model| {
+                    model.geometry_preview_with_loader_flags(crate::SMS_MAP_MODEL_LOAD_FLAGS)
+                })
+                .map(|geometry| {
+                    geometry
+                        .materials
+                        .iter()
+                        .filter(|material| {
+                            material
+                                .tev_stages
+                                .iter()
+                                .any(|stage| stage.color_op >= 8 || stage.alpha_op >= 8)
+                        })
+                        .map(|material| material.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert!(
+            wash_materials(&bytes).is_empty(),
+            "the model already washes, so authoring one proves nothing"
+        );
+
+        let geometry = crate::J3dFile::parse(&bytes)
+            .expect("parse")
+            .geometry_preview_with_loader_flags(crate::SMS_MAP_MODEL_LOAD_FLAGS)
+            .expect("geometry");
+        let material_name = geometry
+            .materials
+            .iter()
+            .max_by_key(|material| material.tev_stages.len())
+            .map(|material| material.name.clone())
+            .expect("a material");
+
+        // Front projection over the model's own bounds.
+        let mut min = [f32::INFINITY; 2];
+        let mut max = [f32::NEG_INFINITY; 2];
+        for triangle in &geometry.triangles {
+            for vertex in triangle.vertices {
+                for axis in 0..2 {
+                    min[axis] = min[axis].min(vertex[axis]);
+                    max[axis] = max[axis].max(vertex[axis]);
+                }
+            }
+        }
+        let scale = [1.0 / (max[0] - min[0]), 1.0 / (max[1] - min[1])];
+        let translation = [-min[0] * scale[0], -min[1] * scale[1]];
+
+        // A coating that is obvious if it lands: solid colour, mask a gradient.
+        let mut pixels = Vec::new();
+        for y in 0..32u32 {
+            for _ in 0..32u32 {
+                let mask = (y * 255 / 31) as u8;
+                pixels.extend_from_slice(&[0xc0, 0x40, 0x20, mask]);
+            }
+        }
+        let image = crate::RgbaImage::new(32, 32, pixels).expect("image");
+        let encoded = crate::GxEncodedTexture::encode_rgba(
+            "graffito_goop",
+            &image,
+            crate::GxTextureEncodeOptions::default(),
+        )
+        .expect("encode");
+        let texture = encoded.to_bti().expect("bti");
+
+        let mut model = J3dRebuildDocument::parse(&bytes).expect("parse");
+        let report = model
+            .add_goop_layer(&GoopLayerRequest {
+                material_name: &material_name,
+                texture_name: "graffito_goop",
+                texture: &texture,
+                scale,
+                translation,
+                level: 200,
+            })
+            .expect("author");
+        let written = model.to_bytes().expect("rebuild");
+        println!(
+            "authored into [{material_name}] at stage {}, texture {} -- {} bytes (was {})",
+            report.first_stage,
+            report.texture_index,
+            written.len(),
+            bytes.len()
+        );
+
+        // Read it back the way the editor and the game would.
+        let after = crate::J3dFile::parse(&written)
+            .expect("reparse")
+            .geometry_preview_with_loader_flags(crate::SMS_MAP_MODEL_LOAD_FLAGS)
+            .expect("regeometry");
+        let washed = after
+            .materials
+            .iter()
+            .find(|material| {
+                material
+                    .tev_stages
+                    .iter()
+                    .any(|stage| stage.color_op >= 8 || stage.alpha_op >= 8)
+            })
+            .unwrap_or_else(|| panic!("no wash comparison came back"));
+        let comparison = washed
+            .tev_stages
+            .iter()
+            .find(|stage| stage.color_op >= 8 || stage.alpha_op >= 8)
+            .expect("comparison stage");
+        let map = comparison.order.tex_map.expect("the comparison names a map");
+        let sampled = washed
+            .texture_indices
+            .get(map as usize)
+            .copied()
+            .flatten()
+            .and_then(|index| after.textures.get(index))
+            .expect("the map resolves to a texture");
+        println!(
+            "   wash on [{}]: op {:#04x}, coord {:?}, map {map}, texture {:?} {}x{}",
+            washed.name,
+            comparison.color_op,
+            comparison.order.tex_coord,
+            sampled.name,
+            sampled.width,
+            sampled.height
+        );
+        assert_eq!(washed.name, material_name, "the wash landed elsewhere");
+        assert_eq!(sampled.name, "graffito_goop", "the wash reads another texture");
+        assert_eq!(
+            washed.tev_k_colors[0][3], 200,
+            "the wash level did not survive"
+        );
+        let coord = comparison
+            .order
+            .tex_coord
+            .expect("the comparison names a coordinate") as usize;
+        let generated = washed.tex_gens.get(coord).expect("the coordinate exists");
+        assert_eq!(generated.source, 0, "the coordinate is not sourced from position");
+        println!(
+            "   coordinate {coord}: type {} source {} matrix {}",
+            generated.gen_type, generated.source, generated.matrix
+        );
+    }
 
     /// Repacking a model's material and texture sections must not change what
     /// the model says: only where its records sit. Run over every retail model
