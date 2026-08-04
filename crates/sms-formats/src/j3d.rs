@@ -1665,7 +1665,7 @@ impl J3dFile {
         self.preview_draw_matrices_from_joint_matrices(&joint_matrices)
     }
 
-    fn preview_draw_matrices_from_joint_matrices(
+    pub(crate) fn preview_draw_matrices_from_joint_matrices(
         &self,
         joint_matrices: &[Mtx34],
     ) -> Result<Vec<Option<Mtx34>>> {
@@ -1728,7 +1728,7 @@ impl J3dFile {
         Ok(matrices)
     }
 
-    fn preview_joint_matrices(
+    pub(crate) fn preview_joint_matrices(
         &self,
         loader_flags: u32,
         animation: Option<(&J3dJointAnimation, f32)>,
