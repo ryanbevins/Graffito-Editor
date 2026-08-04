@@ -664,6 +664,14 @@ impl StageDocument {
     /// Reads a stage asset from the document's detached semantic archive when
     /// the path addresses its mounted stage source. Common files and other
     /// external assets retain the normal filesystem/archive reader behavior.
+    /// The archive-relative resource path behind an asset path, when the
+    /// asset lives inside this document's stage archive. Editing tools key
+    /// their archive edits by this path.
+    pub fn archive_resource_path_for_asset(&self, path: impl AsRef<Path>) -> Option<Vec<u8>> {
+        let source_path = self.stage_archive_source_path.as_ref()?;
+        semantic_resource_path_for_asset(source_path, path.as_ref())
+    }
+
     pub fn read_asset_bytes(&self, path: impl AsRef<Path>) -> Result<Vec<u8>> {
         let path = path.as_ref();
         if let (Some(archive), Some(source_path)) =

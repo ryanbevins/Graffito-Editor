@@ -10,6 +10,7 @@ repository.workspace = true
 bytemuck.workspace = true
 eframe.workspace = true
 egui.workspace = true
+image.workspace = true
 rfd = "0.17.2"
 regex.workspace = true
 rodio = "0.22.2"

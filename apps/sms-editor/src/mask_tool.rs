@@ -196,6 +196,14 @@ enum AuthoredMaskTexture<'a> {
 }
 
 impl AuthoredMaskTexture<'_> {
+    /// The mask's own dimensions.
+    fn size(&self) -> (usize, usize) {
+        match self {
+            Self::Stage(texture) => (texture.image.size[0], texture.image.size[1]),
+            Self::Model(texture) => (texture.width as usize, texture.height as usize),
+        }
+    }
+
     /// The wash value at a UV, in the mask's own image space.
     fn value(&self, u: f32, v: f32) -> u8 {
         match self {
@@ -2052,6 +2060,560 @@ impl SmsEditorApp {
         ))
     }
 
+    /// The actor currently selected in the Mask Tool.
+    fn selected_mask_choice(&self) -> Option<MaskActorChoice> {
+        let selected = self.mask_selected_actor.as_deref()?;
+        self.mask_actor_choices()
+            .into_iter()
+            .find(|choice| choice.object_id == selected)
+    }
+
+    /// Writes the current wash mask and its UV layout as PNGs to paint over.
+    ///
+    /// Two files land next to each other: the template -- the mask upscaled
+    /// with the goop UV wireframe over it -- and the raw mask at its native
+    /// size, for editing directly.
+    fn export_mask_paint_template(&mut self) {
+        let Some((texture, name)) = self.authored_mask() else {
+            self.log
+                .push("This actor has no authored goop mask to export.".to_string());
+            return;
+        };
+        let label = name.unwrap_or_else(|| "goop_mask".to_string());
+        let (mask_width, mask_height) = texture.size();
+        if mask_width == 0 || mask_height == 0 {
+            return;
+        }
+        // Sample the mask out before any dialog, so the borrow ends.
+        let mask_pixels: Vec<u8> = (0..mask_height)
+            .flat_map(|y| {
+                let texture = &texture;
+                (0..mask_width).map(move |x| {
+                    texture.value(
+                        (x as f32 + 0.5) / mask_width as f32,
+                        (y as f32 + 0.5) / mask_height as f32,
+                    )
+                })
+            })
+            .collect();
+        let authored_coord = self.authored_goop_coord();
+        let layouts: Vec<[[f32; 2]; 3]> = self
+            .mask_preview
+            .as_ref()
+            .map(|preview| {
+                preview
+                    .geometry
+                    .triangles
+                    .iter()
+                    .filter_map(|triangle| {
+                        triangle.mask_tex_coords.or_else(|| {
+                            authored_coord.and_then(|coord| {
+                                triangle.tex_coord_sets.get(coord).copied().flatten()
+                            })
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export Goop Paint Template")
+            .set_file_name(format!("{label}_template.png"))
+            .add_filter("PNG image", &["png"])
+            .save_file()
+        else {
+            return;
+        };
+
+        const SIZE: usize = 1024;
+        let mut template = vec![0u8; SIZE * SIZE * 4];
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let mask_x = (x * mask_width / SIZE).min(mask_width - 1);
+                let mask_y = (y * mask_height / SIZE).min(mask_height - 1);
+                let value = mask_pixels[mask_y * mask_width + mask_x];
+                let base = (y * SIZE + x) * 4;
+                template[base..base + 3].fill(value);
+                template[base + 3] = 255;
+            }
+        }
+        let mut line = |from: [f32; 2], to: [f32; 2]| {
+            let steps = ((to[0] - from[0]).abs().max((to[1] - from[1]).abs()) as usize).max(1);
+            for step in 0..=steps {
+                let t = step as f32 / steps as f32;
+                let x = (from[0] + (to[0] - from[0]) * t).round();
+                let y = (from[1] + (to[1] - from[1]) * t).round();
+                if x >= 0.0 && y >= 0.0 && (x as usize) < SIZE && (y as usize) < SIZE {
+                    let base = (y as usize * SIZE + x as usize) * 4;
+                    template[base..base + 4].copy_from_slice(&[80, 255, 120, 255]);
+                }
+            }
+        };
+        for uv in &layouts {
+            let screen: [[f32; 2]; 3] = std::array::from_fn(|corner| {
+                [
+                    uv[corner][0].clamp(0.0, 1.0) * (SIZE - 1) as f32,
+                    uv[corner][1].clamp(0.0, 1.0) * (SIZE - 1) as f32,
+                ]
+            });
+            for corner in 0..3 {
+                line(screen[corner], screen[(corner + 1) % 3]);
+            }
+        }
+        let saved = image::RgbaImage::from_raw(SIZE as u32, SIZE as u32, template)
+            .ok_or_else(|| "template buffer".to_string())
+            .and_then(|image| image.save(&path).map_err(|error| error.to_string()));
+        if let Err(error) = saved {
+            self.log.push(format!("Could not save the template: {error}"));
+            return;
+        }
+
+        // The raw mask lands next to the template, at its native size.
+        let mut mask_rgba = Vec::with_capacity(mask_pixels.len() * 4);
+        for value in &mask_pixels {
+            mask_rgba.extend_from_slice(&[*value, *value, *value, 255]);
+        }
+        let mask_path = path.with_file_name(format!("{label}.png"));
+        let saved = image::RgbaImage::from_raw(mask_width as u32, mask_height as u32, mask_rgba)
+            .ok_or_else(|| "mask buffer".to_string())
+            .and_then(|image| image.save(&mask_path).map_err(|error| error.to_string()));
+        match saved {
+            Ok(()) => self.log.push(format!(
+                "Exported the paint template and '{label}' ({mask_width}x{mask_height}) beside it."
+            )),
+            Err(error) => self.log.push(format!("Could not save the mask: {error}")),
+        }
+    }
+
+    /// Bakes the coating shown at the current coverage into the model's own
+    /// textures, permanently.
+    ///
+    /// Every texel of every body texture is composited through the same
+    /// judgment the preview makes -- the mask at the current threshold,
+    /// coloured by the selected goop source -- so what ships is what the
+    /// viewport shows. Alpha is left untouched, so cutout shapes keep their
+    /// silhouettes. A texel shared by mirrored surfaces takes the goop of
+    /// whichever covered surface touches it, which is the cost of baking into
+    /// a wrapped UV -- fine for heavy coatings, visible on sparse ones.
+    fn bake_mask_goop_layer(&mut self) {
+        let Some(choice) = self.selected_mask_choice() else {
+            self.log.push("Pick an actor first.".to_string());
+            return;
+        };
+        let threshold = ((1.0 - self.mask_wash_phase.clamp(0.0, 1.0)) * 255.0).round() as u8;
+        let authored = self.authored_mask();
+        let borrowed = self.active_mask();
+        if authored.is_none() && borrowed.is_none() {
+            self.log.push(
+                "Generate or assign a goop map and mask before baking.".to_string(),
+            );
+            return;
+        }
+
+        // Composite per texture, in each texture's own space.
+        let mut baked: std::collections::BTreeMap<usize, (String, usize, usize, Vec<u8>)> =
+            std::collections::BTreeMap::new();
+        let mut coated_texels = 0usize;
+        {
+            let Some(preview) = self.mask_preview.as_ref() else {
+                return;
+            };
+            let geometry = &preview.geometry;
+            let authored_coord = self.authored_goop_coord();
+            for (index, triangle) in geometry.triangles.iter().enumerate() {
+                let Some(texture_index) = triangle.texture_index else {
+                    continue;
+                };
+                let Some(texture) = geometry.textures.get(texture_index) else {
+                    continue;
+                };
+                let Some(body) = triangle.tex_coords.or(triangle.tex_coord_sets[0]) else {
+                    continue;
+                };
+                // The goop UV: the authored set for wired actors, the front
+                // projection for the rest.
+                let goop: [[f32; 2]; 3] = match triangle.mask_tex_coords.or_else(|| {
+                    authored_coord
+                        .and_then(|coord| triangle.tex_coord_sets.get(coord).copied().flatten())
+                }) {
+                    Some(set) => set,
+                    None => {
+                        if authored.is_some() {
+                            // A wired actor's un-wired surface stays clean.
+                            continue;
+                        }
+                        std::array::from_fn(|corner| preview.front_uv[index * 3 + corner])
+                    }
+                };
+
+                let width = texture.width as usize;
+                let height = texture.height as usize;
+                if width == 0 || height == 0 {
+                    continue;
+                }
+                let entry = baked.entry(texture_index).or_insert_with(|| {
+                    (texture.name.clone(), width, height, texture.rgba.clone())
+                });
+
+                // Rasterize in unwrapped texture space; writes fold back into
+                // the tile, so triangles straddling the tile edge land whole.
+                let target: [[f32; 2]; 3] = std::array::from_fn(|corner| {
+                    [body[corner][0] * width as f32, body[corner][1] * height as f32]
+                });
+                let area = (target[1][0] - target[0][0]) * (target[2][1] - target[0][1])
+                    - (target[2][0] - target[0][0]) * (target[1][1] - target[0][1]);
+                if area.abs() < f32::EPSILON {
+                    continue;
+                }
+                let min_x = target.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min).floor()
+                    as i64;
+                let max_x = target
+                    .iter()
+                    .map(|p| p[0])
+                    .fold(f32::NEG_INFINITY, f32::max)
+                    .ceil() as i64;
+                let min_y = target.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min).floor()
+                    as i64;
+                let max_y = target
+                    .iter()
+                    .map(|p| p[1])
+                    .fold(f32::NEG_INFINITY, f32::max)
+                    .ceil() as i64;
+                if (max_x - min_x) > 4096 || (max_y - min_y) > 4096 {
+                    continue;
+                }
+                for y in min_y..=max_y {
+                    for x in min_x..=max_x {
+                        let point = [x as f32 + 0.5, y as f32 + 0.5];
+                        let edge = |a: [f32; 2], b: [f32; 2]| {
+                            (b[0] - a[0]) * (point[1] - a[1]) - (b[1] - a[1]) * (point[0] - a[0])
+                        };
+                        let w0 = edge(target[0], target[1]) / area;
+                        let w1 = edge(target[1], target[2]) / area;
+                        let w2 = edge(target[2], target[0]) / area;
+                        if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                            continue;
+                        }
+                        let u = goop[0][0] * w1 + goop[1][0] * w2 + goop[2][0] * w0;
+                        let v = goop[0][1] * w1 + goop[1][1] * w2 + goop[2][1] * w0;
+                        let shows = match &authored {
+                            Some((texture, _)) => {
+                                goop_is_visible(texture.value(u, v), threshold)
+                            }
+                            None => borrowed.as_ref().is_some_and(|(size, values)| {
+                                goop_is_visible(
+                                    sample_mask_bilinear(values, *size, u, v),
+                                    threshold,
+                                )
+                            }),
+                        };
+                        if !shows {
+                            continue;
+                        }
+                        let colour = self.goop_colour(u, v);
+                        let tile_x = (x.rem_euclid(entry.1 as i64)) as usize;
+                        let tile_y = (y.rem_euclid(entry.2 as i64)) as usize;
+                        let base = (tile_y * entry.1 + tile_x) * 4;
+                        // Alpha stays: the cutouts that shape petals and
+                        // leaves must survive the coating.
+                        entry.3[base..base + 3].copy_from_slice(&colour[..3]);
+                        coated_texels += 1;
+                    }
+                }
+            }
+        }
+        if coated_texels == 0 {
+            self.log.push(
+                "Nothing to bake at this coverage; raise the slider first.".to_string(),
+            );
+            return;
+        }
+
+        let (raw_path, bytes) = {
+            let Some(document) = self.document.as_ref() else {
+                return;
+            };
+            let Some(raw_path) = document.archive_resource_path_for_asset(&choice.model_path)
+            else {
+                self.log.push(
+                    "This actor's model lives outside the stage archive, so it cannot be                      baked here yet."
+                        .to_string(),
+                );
+                return;
+            };
+            let bytes = match document.read_asset_bytes(&choice.model_path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.log.push(format!("Could not read the model: {error}"));
+                    return;
+                }
+            };
+            (raw_path, bytes)
+        };
+        let mut model = match sms_formats::J3dRebuildDocument::parse(&bytes) {
+            Ok(model) => model,
+            Err(error) => {
+                self.log.push(format!("Could not parse the model: {error}"));
+                return;
+            }
+        };
+        let mut replaced_textures = 0usize;
+        for (name, width, height, rgba) in baked.into_values() {
+            let rgba = match sms_formats::RgbaImage::new(width as u16, height as u16, rgba) {
+                Ok(rgba) => rgba,
+                Err(error) => {
+                    self.log.push(format!("Could not stage '{name}': {error}"));
+                    return;
+                }
+            };
+            let bti = match sms_formats::GxEncodedTexture::encode_rgba(
+                name.clone(),
+                &rgba,
+                sms_formats::GxTextureEncodeOptions::default(),
+            )
+            .and_then(|encoded| encoded.to_bti())
+            {
+                Ok(bti) => bti,
+                Err(error) => {
+                    self.log.push(format!("Could not encode '{name}': {error}"));
+                    return;
+                }
+            };
+            match model.replace_named_texture_from_bti(&name, &bti) {
+                Ok(count) => replaced_textures += count,
+                Err(error) => {
+                    self.log.push(format!("Could not bake into '{name}': {error}"));
+                    return;
+                }
+            }
+        }
+        if replaced_textures == 0 {
+            self.log.push("No texture accepted the bake.".to_string());
+            return;
+        }
+
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let before = document.archive_edits.clone();
+        document.archive_edits.replace_model(raw_path, model);
+        self.finish_mask_author_edit(
+            before,
+            format!(
+                "Baked the coating into {replaced_textures} texture(s); Ctrl+Z or Reset to                  default reverses it."
+            ),
+        );
+        // The coating is in the model now; a live overlay on top would show
+        // it twice.
+        self.mask_wash_phase = 0.0;
+        self.build_mask_preview(&choice);
+    }
+
+    /// Replaces the actor's wash mask with a painted image, as a stage
+    /// archive edit that previews immediately and ships with the build.
+    fn reimport_mask_goop_map(&mut self) {
+        let Some(choice) = self.selected_mask_choice() else {
+            self.log.push("Pick an actor first.".to_string());
+            return;
+        };
+        let Some((_, Some(mask_name))) = self.authored_mask() else {
+            self.log.push(
+                "This actor has no authored goop mask slot to replace.".to_string(),
+            );
+            return;
+        };
+        let wraps = self
+            .mask_preview
+            .as_ref()
+            .and_then(|preview| {
+                preview
+                    .geometry
+                    .textures
+                    .iter()
+                    .find(|texture| texture.name == mask_name)
+            })
+            .map(|texture| (texture.wrap_s, texture.wrap_t))
+            .unwrap_or((1, 1));
+
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Reimport Goop Map")
+            .add_filter("PNG image", &["png"])
+            .pick_file()
+        else {
+            return;
+        };
+        let painted = match image::open(&path) {
+            Ok(image) => image.to_rgba8(),
+            Err(error) => {
+                self.log.push(format!("Could not read the image: {error}"));
+                return;
+            }
+        };
+        let (width, height) = painted.dimensions();
+        if width == 0
+            || height == 0
+            || width % 8 != 0
+            || height % 8 != 0
+            || width > 1024
+            || height > 1024
+        {
+            self.log.push(format!(
+                "Goop masks must have sides that are multiples of 8, up to 1024                  ({width}x{height} given)."
+            ));
+            return;
+        }
+        // The wash reads one channel; spread it so the encoder lands on an
+        // intensity format the way the retail masks do.
+        let pixels: Vec<u8> = painted
+            .pixels()
+            .flat_map(|pixel| {
+                let value = pixel.0[0];
+                [value, value, value, value]
+            })
+            .collect();
+        let rgba = match sms_formats::RgbaImage::new(width as u16, height as u16, pixels) {
+            Ok(rgba) => rgba,
+            Err(error) => {
+                self.log.push(format!("Could not stage the image: {error}"));
+                return;
+            }
+        };
+        let mut options = sms_formats::GxTextureEncodeOptions::default();
+        options.sampler.wrap_s = wraps.0;
+        options.sampler.wrap_t = wraps.1;
+        let bti = match sms_formats::GxEncodedTexture::encode_rgba(mask_name.clone(), &rgba, options)
+            .and_then(|encoded| encoded.to_bti())
+        {
+            Ok(bti) => bti,
+            Err(error) => {
+                self.log.push(format!("Could not encode the mask: {error}"));
+                return;
+            }
+        };
+
+        let (raw_path, bytes) = {
+            let Some(document) = self.document.as_ref() else {
+                return;
+            };
+            let Some(raw_path) = document.archive_resource_path_for_asset(&choice.model_path)
+            else {
+                self.log.push(
+                    "This actor's model lives outside the stage archive, so its mask cannot                      be edited here yet."
+                        .to_string(),
+                );
+                return;
+            };
+            let bytes = match document.read_asset_bytes(&choice.model_path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.log.push(format!("Could not read the model: {error}"));
+                    return;
+                }
+            };
+            (raw_path, bytes)
+        };
+        let mut model = match sms_formats::J3dRebuildDocument::parse(&bytes) {
+            Ok(model) => model,
+            Err(error) => {
+                self.log.push(format!("Could not parse the model: {error}"));
+                return;
+            }
+        };
+        let replaced = match model.replace_named_texture_from_bti(&mask_name, &bti) {
+            Ok(count) => count,
+            Err(error) => {
+                self.log.push(format!("Could not replace '{mask_name}': {error}"));
+                return;
+            }
+        };
+        if replaced == 0 {
+            self.log
+                .push(format!("The model carries no texture named '{mask_name}'."));
+            return;
+        }
+
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let before = document.archive_edits.clone();
+        document.archive_edits.replace_model(raw_path, model);
+        self.finish_mask_author_edit(
+            before,
+            format!(
+                "Reimported '{mask_name}' at {width}x{height}; Ctrl+Z reverses it."
+            ),
+        );
+        self.build_mask_preview(&choice);
+    }
+
+    /// Drops the reimported mask, returning the actor to what its model
+    /// originally authored.
+    fn restore_mask_goop_default(&mut self) {
+        let Some(choice) = self.selected_mask_choice() else {
+            return;
+        };
+        let Some(raw_path) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.archive_resource_path_for_asset(&choice.model_path))
+        else {
+            return;
+        };
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let before = document.archive_edits.clone();
+        let count = document.archive_edits.models.len();
+        document
+            .archive_edits
+            .models
+            .retain(|edit| edit.raw_resource_path != raw_path);
+        if document.archive_edits.models.len() == count {
+            self.log
+                .push("This actor already wears its original mask.".to_string());
+            return;
+        }
+        self.finish_mask_author_edit(
+            before,
+            "Reset the actor's model to its original -- baked coatings and reimported \
+             masks dropped."
+                .to_string(),
+        );
+        self.build_mask_preview(&choice);
+    }
+
+    /// Records an archive edit for undo and marks the document dirty.
+    fn finish_mask_author_edit(&mut self, before: StageArchiveEdits, message: String) {
+        let (record, dirty) = {
+            let Some(document) = self.document.as_ref() else {
+                return;
+            };
+            (
+                ObjectUndoRecord::between(
+                    &document.objects,
+                    &document.objects,
+                    &before,
+                    &document.archive_edits,
+                ),
+                stage_document_differs_from_saved(
+                    document,
+                    &self.saved_objects,
+                    &self.saved_lighting,
+                    &self.saved_death_barrier,
+                    &self.saved_archive_edits,
+                    &self.saved_dialogue_authoring,
+                    &self.saved_dialogue_library,
+                ),
+            )
+        };
+        if !record.is_empty() {
+            self.push_undo_record(record);
+        }
+        self.document_dirty = dirty;
+        self.flush_document_change();
+        self.log.push(message);
+    }
+
     /// The inspector panel for the Mask Tool.
     pub(super) fn mask_tool_panel(&mut self, ui: &mut egui::Ui) {
         // The goop catalog is indexed lazily by whoever needs it first; the
@@ -2452,6 +3014,52 @@ impl SmsEditorApp {
             .small()
             .color(egui::Color32::GRAY),
         );
+
+        ui.separator();
+        ui.heading("Author");
+        ui.horizontal(|ui| {
+            if ui
+                .button("Export paint template\u{2026}")
+                .on_hover_text(
+                    "Save the current mask and its UV layout as PNGs to paint over",
+                )
+                .clicked()
+            {
+                self.export_mask_paint_template();
+            }
+            if ui
+                .button("Reimport goop map\u{2026}")
+                .on_hover_text(
+                    "Replace this actor's wash mask with a painted PNG; it previews here \
+                     and ships with the stage",
+                )
+                .clicked()
+            {
+                self.reimport_mask_goop_map();
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .button("Bake goop layer")
+                .on_hover_text(
+                    "Composite the coating shown at this coverage into the model's own \
+                     textures, permanently -- it ships with the stage",
+                )
+                .clicked()
+            {
+                self.bake_mask_goop_layer();
+            }
+            if ui
+                .button("Reset to default")
+                .on_hover_text(
+                    "Clear every patch this tool applied to the actor's model -- baked \
+                     coatings and reimported masks alike",
+                )
+                .clicked()
+            {
+                self.restore_mask_goop_default();
+            }
+        });
     }
 }
 
