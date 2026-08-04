@@ -1274,8 +1274,15 @@ struct SmsEditorApp {
     tool: EditorTool,
     selected_goop_layer: usize,
     goop_authoring_mode: GoopAuthoringMode,
+    simple_goop_paint_target: SimpleGoopPaintTarget,
     selected_goop_template: usize,
     goop_use_default_style: bool,
+    /// Last selected layer/style identity reflected into the type combo.
+    /// Pending new-layer choices deliberately do not update this observation.
+    goop_observed_style_selection: Option<GoopStyleSelectionIdentity>,
+    /// One-shot Simple-mode override: the next painted stroke owns a fresh,
+    /// compact adaptive layer instead of routing into an existing one.
+    goop_paint_new_layer: bool,
     show_incompatible_goop_templates: bool,
     goop_brush_radius: f32,
     goop_brush_hardness: f32,
@@ -1592,8 +1599,11 @@ impl Default for SmsEditorApp {
             tool: EditorTool::Move,
             selected_goop_layer: 0,
             goop_authoring_mode: GoopAuthoringMode::Simple,
+            simple_goop_paint_target: SimpleGoopPaintTarget::Auto,
             selected_goop_template: 0,
             goop_use_default_style: true,
+            goop_observed_style_selection: None,
+            goop_paint_new_layer: false,
             show_incompatible_goop_templates: false,
             goop_brush_radius: 200.0,
             goop_brush_hardness: 0.65,
@@ -2044,6 +2054,26 @@ impl SmsEditorApp {
         self.object_authoring_catalog_warnings = warnings;
     }
 
+    fn repair_loaded_layer_pools_after_catalog_update(&mut self) {
+        if self.document.is_none() || self.object_authoring_catalog.is_empty() {
+            return;
+        }
+        let messages = self.repair_layer_pool_resources();
+        self.log.extend(messages);
+        if let Some(document) = &mut self.document {
+            self.document_dirty = stage_document_differs_from_saved(
+                document,
+                &self.saved_objects,
+                &self.saved_lighting,
+                &self.saved_death_barrier,
+                &self.saved_archive_edits,
+                &self.saved_dialogue_authoring,
+                &self.saved_dialogue_library,
+            );
+            self.issues = document.validate();
+        }
+    }
+
     fn invalidate_object_authoring_catalog_for_changed_base_root(&mut self) {
         let Some(key) = self.object_authoring_catalog_cache_key.as_ref() else {
             return;
@@ -2418,6 +2448,7 @@ impl SmsEditorApp {
                             let refreshed_cache = object_authoring_catalog_cache
                                 .filter(|cache| expected_cache_key.as_ref() == Some(&cache.key));
                             self.install_object_authoring_catalog_cache(refreshed_cache);
+                            self.repair_loaded_layer_pools_after_catalog_update();
                             self.rebuild_model_preview_cache();
                             if self.document.is_some() {
                                 self.rebuild_model_preview_from_document();
@@ -2466,6 +2497,7 @@ impl SmsEditorApp {
                             self.install_object_authoring_catalog_cache(
                                 scan.object_authoring_catalog_cache,
                             );
+                            self.repair_loaded_layer_pools_after_catalog_update();
                             self.last_scanned_base_root = base_root;
                             if self.stage_id.trim().is_empty() {
                                 if let Some(first) = self.scene_archives.first() {
@@ -2801,8 +2833,11 @@ impl SmsEditorApp {
         self.retail_goop_templates.clear();
         self.goop_templates_indexed = false;
         self.selected_goop_layer = 0;
+        self.simple_goop_paint_target = SimpleGoopPaintTarget::Auto;
         self.selected_goop_template = 0;
         self.goop_use_default_style = true;
+        self.goop_observed_style_selection = None;
+        self.goop_paint_new_layer = false;
         self.goop_stroke = None;
         self.pending_goop_heap_confirmation = None;
         self.confirm_delete_generated_goop = false;

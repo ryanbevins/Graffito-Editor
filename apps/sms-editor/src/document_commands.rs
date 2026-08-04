@@ -2573,6 +2573,9 @@ impl SmsEditorApp {
                 }
             }
         }
+        for message in self.repair_layer_pool_resources() {
+            self.log.push(message);
+        }
         let active_goop_managers = self
             .document
             .as_ref()
@@ -3717,6 +3720,11 @@ impl SmsEditorApp {
             ));
         }
         let copied = self.materialize_cloned_manager_folders(&clone.folder_rewrites)?;
+        if copied == 0 {
+            return Ok(format!(
+                "{summary} The imported retail bundle already supplied the clone's model folder."
+            ));
+        }
         Ok(format!(
             "{summary} Copied {copied} model resource(s) into the clone's own folder."
         ))
@@ -3861,6 +3869,34 @@ impl SmsEditorApp {
     ) -> Result<usize, String> {
         let template = self.catalog_template_for(actor_factory)?;
         let clone = sms_scene::clone_enemy_manager_template(&template, manager_name, suffix, true)?;
+        // Older clones moved every file below the character folder. Some
+        // enemies also open decomp-identified absolute paths from that folder
+        // (NameKuri's brain model and jump BAS are examples), so repair the
+        // complete cloned template before trusting an already-present model
+        // directory.
+        let repaired = {
+            let document = self
+                .document
+                .as_ref()
+                .ok_or_else(|| "no stage is open".to_string())?;
+            let preflight = preflight_catalog_resources(document, &clone.template)?;
+            let deltas = catalog_resource_edit_deltas(document, preflight.writes);
+            let repaired = deltas.len();
+            if !deltas.is_empty() {
+                ObjectUndoRecord {
+                    deltas: Vec::new(),
+                    resource_deltas: deltas,
+                    route_delta: None,
+                    dialogue_delta: None,
+                }
+                .apply_forward(
+                    self.document
+                        .as_mut()
+                        .expect("the cloned-pool document was checked above"),
+                );
+            }
+            repaired
+        };
         let missing = {
             let document = self
                 .document
@@ -3881,9 +3917,10 @@ impl SmsEditorApp {
             })
         };
         if !missing {
-            return Ok(0);
+            return Ok(repaired);
         }
         self.materialize_cloned_manager_folders(&clone.folder_rewrites)
+            .map(|copied| repaired + copied)
     }
 
     /// Fills a clone's resource folder with the stage's copy of the models.
@@ -3902,29 +3939,42 @@ impl SmsEditorApp {
             .as_ref()
             .ok_or_else(|| "no stage is open".to_string())?;
         let mut sources: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-        for path in document.effective_resource_paths() {
-            let text = String::from_utf8_lossy(&path).replace('\\', "/");
-            let text = text.trim_matches('/');
-            let folded = text.to_ascii_lowercase();
-            for (from, to) in folder_rewrites {
-                if from.is_empty() {
-                    continue;
-                }
-                if folded.starts_with(&format!("{from}/")) {
+        let paths = document
+            .effective_resource_paths()
+            .into_iter()
+            .map(|path| {
+                let text = String::from_utf8_lossy(&path).replace('\\', "/");
+                let text = text.trim_matches('/').to_string();
+                let folded = text.to_ascii_lowercase();
+                (path, text, folded)
+            })
+            .collect::<Vec<_>>();
+        let mut missing = Vec::new();
+        for (from, to) in folder_rewrites {
+            if from.is_empty() {
+                continue;
+            }
+            let from_folded = from.to_ascii_lowercase();
+            let to_folded = to.to_ascii_lowercase();
+            let mut found_source = false;
+            for (path, text, folded) in &paths {
+                if folded.starts_with(&format!("{from_folded}/")) {
+                    found_source = true;
                     let rest = &text[from.len() + 1..];
                     sources.insert(path.clone(), format!("{to}/{rest}").into_bytes());
-                    break;
                 }
             }
+            let found_destination = paths
+                .iter()
+                .any(|(_, _, folded)| folded.starts_with(&format!("{to_folded}/")));
+            if !found_source && !found_destination {
+                missing.push(format!("{from} (or imported clone {to})"));
+            }
         }
-        if sources.is_empty() {
+        if !missing.is_empty() {
             return Err(format!(
-                "the stage has no resources under {} to copy into the clone's folder",
-                folder_rewrites
-                    .iter()
-                    .map(|(from, _)| from.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "the stage and retail bundle have no resources under {}",
+                missing.join(", ")
             ));
         }
 
@@ -5306,6 +5356,115 @@ mod tests {
         StageResourceDocument::Parameters(PrmFile {
             entries: Vec::new(),
         })
+    }
+
+    #[test]
+    fn clone_materializer_accepts_an_imported_destination_on_custom_stages() {
+        let mut document = command_test_document(Vec::new());
+        document.upsert_authored_resource(
+            b"bombColumWater00/fixture.prm".to_vec(),
+            empty_parameter_document(),
+        );
+        document.upsert_authored_resource(
+            b"columSand00/fixture.prm".to_vec(),
+            empty_parameter_document(),
+        );
+        let mut app = SmsEditorApp {
+            document: Some(document),
+            ..SmsEditorApp::default()
+        };
+
+        assert_eq!(
+            app.materialize_cloned_manager_folders(&[
+                ("bombcolumwater".to_string(), "bombColumWater00".to_string(),),
+                ("columsand".to_string(), "columSand00".to_string()),
+            ])
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn clone_materializer_rejects_missing_source_and_destination_resources() {
+        let mut app = SmsEditorApp {
+            document: Some(command_test_document(Vec::new())),
+            ..SmsEditorApp::default()
+        };
+
+        let error = app
+            .materialize_cloned_manager_folders(&[(
+                "hanekuri".to_string(),
+                "hanekuri00".to_string(),
+            )])
+            .unwrap_err();
+
+        assert!(error.contains("hanekuri"));
+        assert!(error.contains("hanekuri00"));
+    }
+
+    #[test]
+    #[ignore = "requires SMS_BASE_ROOT and SMS_PROJECT_ROOT with a saved NameKuri layer pool"]
+    fn saved_namekuri_layer_pool_repairs_fixed_runtime_resources() {
+        let base_root = std::env::var_os("SMS_BASE_ROOT")
+            .map(PathBuf::from)
+            .expect("set SMS_BASE_ROOT");
+        let project_root = std::env::var_os("SMS_PROJECT_ROOT")
+            .map(PathBuf::from)
+            .expect("set SMS_PROJECT_ROOT");
+        let registry = sms_schema::bundled_object_registry()
+            .expect("load bundled schema")
+            .registry;
+        let archives = sms_formats::discover_scene_archives(&base_root)
+            .expect("discover retail scene archives");
+        let catalog = sms_scene::ObjectAuthoringCatalog::build_with_base_root(
+            &archives, &registry, &base_root,
+        )
+        .catalog;
+        let mut document =
+            StageDocument::open_authored_project_stage(&base_root, "bobomb0", &project_root)
+                .expect("open saved bobomb0 project stage");
+        document.set_registry(registry.clone());
+        let mut app = SmsEditorApp {
+            registry: Some(registry),
+            object_authoring_catalog: Arc::new(catalog),
+            document: Some(document),
+            ..SmsEditorApp::default()
+        };
+
+        let messages = app.repair_layer_pool_resources();
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.starts_with("Could not repair")),
+            "{messages:?}"
+        );
+        let document = app.document.as_ref().expect("repaired document");
+        for path in [
+            b"namekuri2/brain.bmd".as_slice(),
+            b"namekuri2/bas/name_jump_start.bas".as_slice(),
+        ] {
+            assert!(
+                document.has_effective_resource(path),
+                "saved NameKuri pool did not restore {}",
+                String::from_utf8_lossy(path)
+            );
+        }
+
+        let rebuilt = document
+            .build_stage_archive()
+            .expect("build repaired stage");
+        let reopened = sms_scene::SourceFreeStageArchive::parse(&rebuilt)
+            .expect("reopen repaired stage archive");
+        for path in [
+            b"namekuri2/brain.bmd".as_slice(),
+            b"namekuri2/bas/name_jump_start.bas".as_slice(),
+        ] {
+            assert!(
+                reopened.resource(path).is_some(),
+                "rebuilt stage lost {}",
+                String::from_utf8_lossy(path)
+            );
+        }
     }
 
     fn parameter_document(name: &str, value: f32) -> StageResourceDocument {
@@ -7075,6 +7234,7 @@ mod tests {
             resources: vec![sms_scene::ObjectAuthoringResource {
                 raw_resource_path: b"fixtureanm/runtime.prm".to_vec(),
                 source_asset_path,
+                fixed_runtime_path: false,
             }],
             preview_resource_path: None,
             source_stage: "fixture0".to_string(),
@@ -7203,6 +7363,7 @@ mod tests {
             resources: vec![sms_scene::ObjectAuthoringResource {
                 raw_resource_path: raw_resource_path.clone(),
                 source_asset_path,
+                fixed_runtime_path: false,
             }],
             preview_resource_path: None,
             source_stage: "retail-source".to_string(),
@@ -7301,6 +7462,7 @@ mod tests {
             resources: vec![sms_scene::ObjectAuthoringResource {
                 raw_resource_path: raw_resource_path.clone(),
                 source_asset_path,
+                fixed_runtime_path: false,
             }],
             preview_resource_path: Some(raw_resource_path.clone()),
             source_stage: "retail-source".to_string(),
@@ -7408,6 +7570,7 @@ mod tests {
             vec![sms_scene::ObjectAuthoringResource {
                 raw_resource_path: keep_path.clone(),
                 source_asset_path: PathBuf::from("unused-keep.prm"),
+                fixed_runtime_path: false,
             }],
         );
         let inactive_template = minimal_catalog_template(
@@ -7415,6 +7578,7 @@ mod tests {
             vec![sms_scene::ObjectAuthoringResource {
                 raw_resource_path: stale_path.clone(),
                 source_asset_path: PathBuf::from("unused-stale.prm"),
+                fixed_runtime_path: false,
             }],
         );
         let mut document =
@@ -7491,6 +7655,7 @@ mod tests {
             vec![sms_scene::ObjectAuthoringResource {
                 raw_resource_path: keep_path.clone(),
                 source_asset_path: keep_source,
+                fixed_runtime_path: false,
             }],
         );
         let inactive_template = minimal_catalog_template(
@@ -7499,10 +7664,12 @@ mod tests {
                 sms_scene::ObjectAuthoringResource {
                     raw_resource_path: stale_path.clone(),
                     source_asset_path: stale_source,
+                    fixed_runtime_path: false,
                 },
                 sms_scene::ObjectAuthoringResource {
                     raw_resource_path: customized_path.clone(),
                     source_asset_path: customized_source,
+                    fixed_runtime_path: false,
                 },
             ],
         );
@@ -7630,6 +7797,7 @@ mod tests {
             resources: vec![sms_scene::ObjectAuthoringResource {
                 raw_resource_path: raw_resource_path.clone(),
                 source_asset_path,
+                fixed_runtime_path: false,
             }],
             preview_resource_path: None,
             source_stage: "fixture0".to_string(),

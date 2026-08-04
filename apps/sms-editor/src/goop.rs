@@ -8,8 +8,8 @@ use sms_formats::{
 };
 use sms_scene::{
     automatic_goop_region, balanced_goop_expansion, carve_compatible_goop_overlap_depths,
-    estimate_goop_runtime_payload, expanded_goop_region, generate_floor_depth_map,
-    generate_floor_depth_map_for_surface, generate_floor_pollution_model,
+    compact_goop_region, estimate_goop_runtime_payload, expanded_goop_region,
+    generate_floor_depth_map, generate_floor_depth_map_for_surface, generate_floor_pollution_model,
     generate_floor_pollution_model_for_surface, goop_layer_accepts_height,
     goop_runtime_layer_capacity, position_goop_region_avoiding, reproject_goop_mask,
     whole_terrain_region, GoopAuthoringDocument, GoopBehavior, GoopLayerAuthoring, GoopLayerOrigin,
@@ -73,6 +73,8 @@ pub(super) struct GoopSnapshotUndo {
     after: Option<GoopAuthoringDocument>,
     before_edits: StageArchiveEdits,
     after_edits: StageArchiveEdits,
+    before_objects: Option<Vec<SceneObject>>,
+    after_objects: Option<Vec<SceneObject>>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,12 +83,44 @@ pub(super) struct GoopStroke {
     last_world: Option<[f32; 3]>,
     pending: Vec<PendingGoopSample>,
     source_layer: Option<usize>,
+    simple_target_layer: Option<usize>,
+    force_new_layer: bool,
+}
+
+struct AdaptiveGoopStrokePlan<'a> {
+    selected_template: Option<&'a RetailGoopTemplate>,
+    source_layer: Option<usize>,
+    prefer_source_expansion: bool,
+    force_new_layer: bool,
+    samples: &'a [PendingGoopSample],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum GoopAuthoringMode {
     Simple,
     Manual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SimpleGoopPaintTarget {
+    Auto,
+    Layer(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct GoopStyleSelectionIdentity {
+    layer_index: usize,
+    source_stage: Option<String>,
+    source_layer: Option<usize>,
+}
+
+impl SimpleGoopPaintTarget {
+    fn layer(self) -> Option<usize> {
+        match self {
+            Self::Auto => None,
+            Self::Layer(index) => Some(index),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -349,6 +383,82 @@ fn goop_template_label(template: &RetailGoopTemplate, show_retail_source: bool) 
     }
 }
 
+fn chocolate_goop_template_index(templates: &[RetailGoopTemplate]) -> Option<usize> {
+    templates.iter().position(|template| {
+        template.compatible && template.semantic_type.eq_ignore_ascii_case("Chocolate")
+    })
+}
+
+fn inherited_goop_template_index(
+    stage_id: &str,
+    layer_index: usize,
+    layer: &GoopLayerAuthoring,
+    templates: &[RetailGoopTemplate],
+) -> Option<usize> {
+    layer
+        .style_source
+        .as_ref()
+        .and_then(|style| {
+            templates.iter().position(|template| {
+                template.stage_id == style.stage_id && template.layer_index == style.layer_index
+            })
+        })
+        .or_else(|| {
+            templates.iter().position(|template| {
+                template.stage_id == stage_id && template.layer_index == layer_index
+            })
+        })
+        .or_else(|| {
+            templates.iter().position(|template| {
+                template.behavior == layer.behavior
+                    && template.stage_id.eq_ignore_ascii_case(stage_id)
+            })
+        })
+}
+
+fn stage_inherited_goop_template_index(
+    stage_id: &str,
+    layers: &[GoopLayerAuthoring],
+    templates: &[RetailGoopTemplate],
+) -> Option<usize> {
+    layers
+        .iter()
+        .enumerate()
+        .find(|(_, layer)| layer.plane == GoopPlane::Floor)
+        .and_then(|(index, layer)| inherited_goop_template_index(stage_id, index, layer, templates))
+}
+
+fn should_apply_selected_goop_style(
+    selection_changed: bool,
+    has_editable_selected_layer: bool,
+    painting_new_layer: bool,
+    use_default_style: bool,
+) -> bool {
+    selection_changed && has_editable_selected_layer && !painting_new_layer && !use_default_style
+}
+
+fn goop_style_selection_identity(
+    layer_index: usize,
+    layer: &GoopLayerAuthoring,
+) -> GoopStyleSelectionIdentity {
+    GoopStyleSelectionIdentity {
+        layer_index,
+        source_stage: layer
+            .style_source
+            .as_ref()
+            .map(|source| source.stage_id.clone()),
+        source_layer: layer.style_source.as_ref().map(|source| source.layer_index),
+    }
+}
+
+fn should_sync_goop_style_selection(
+    painting_new_layer: bool,
+    observed: Option<&GoopStyleSelectionIdentity>,
+    current: Option<&GoopStyleSelectionIdentity>,
+) -> bool {
+    !painting_new_layer && observed != current
+}
+
 fn generated_goop_requires_upgrade(authoring: &GoopAuthoringDocument) -> bool {
     authoring.requires_generator_upgrade()
 }
@@ -357,7 +467,7 @@ fn clear_generated_goop_readiness_if_empty(authoring: &mut GoopAuthoringDocument
     if authoring
         .layers
         .iter()
-        .any(|layer| layer.origin == GoopLayerOrigin::Generated)
+        .any(GoopLayerAuthoring::generator_managed)
     {
         return;
     }
@@ -605,7 +715,6 @@ impl SmsEditorApp {
             self.rebuild_generated_goop_layers();
         }
         ui.heading("Goop");
-        self.gooble_spawn_section(ui);
         let document = self
             .document
             .as_mut()
@@ -622,9 +731,12 @@ impl SmsEditorApp {
                 "Manual",
             );
         });
+        if self.goop_authoring_mode != GoopAuthoringMode::Simple {
+            self.goop_paint_new_layer = false;
+        }
         ui.small(match self.goop_authoring_mode {
             GoopAuthoringMode::Simple => {
-                "Paint any floor. Graffito selects, creates, or expands goop regions automatically."
+                "Use AUTO or lock painting to one layer; Graffito still creates and expands regions as needed."
             }
             GoopAuthoringMode::Manual => {
                 "Choose regions directly. Retail wall and wave layers remain read-only."
@@ -652,31 +764,96 @@ impl SmsEditorApp {
             }
         }
         self.selected_goop_layer = self.selected_goop_layer.min(layers.len().saturating_sub(1));
-
-        let selected_generated_layer = layers
-            .get(self.selected_goop_layer)
-            .filter(|layer| layer.origin == GoopLayerOrigin::Generated);
-        if let Some(source) = selected_generated_layer.and_then(|layer| layer.style_source.as_ref())
+        if self
+            .simple_goop_paint_target
+            .layer()
+            .is_some_and(|index| !layers.get(index).is_some_and(GoopLayerAuthoring::editable))
         {
-            if let Some((index, _)) =
-                self.retail_goop_templates
-                    .iter()
-                    .enumerate()
-                    .find(|(_, template)| {
-                        template.stage_id == source.stage_id
-                            && template.layer_index == source.layer_index
-                    })
-            {
-                self.selected_goop_template = index;
+            self.simple_goop_paint_target = SimpleGoopPaintTarget::Auto;
+        }
+        if self.goop_authoring_mode == GoopAuthoringMode::Simple {
+            let selected_text =
+                simple_goop_paint_target_label(self.simple_goop_paint_target, layers.as_slice());
+            egui::ComboBox::from_label("Paint target")
+                .width(200.0)
+                .selected_text(selected_text)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.simple_goop_paint_target,
+                        SimpleGoopPaintTarget::Auto,
+                        "AUTO",
+                    );
+                    for (index, layer) in layers.iter().enumerate() {
+                        let label = simple_goop_layer_label(layer);
+                        ui.add_enabled_ui(layer.editable(), |ui| {
+                            ui.selectable_value(
+                                &mut self.simple_goop_paint_target,
+                                SimpleGoopPaintTarget::Layer(index),
+                                label,
+                            );
+                        });
+                    }
+                });
+            if let Some(index) = self.simple_goop_paint_target.layer() {
+                self.selected_goop_layer = index;
+                ui.small("Painting stays on this layer and expands it when needed.");
+            } else {
+                ui.small("AUTO selects the editable layer under the brush.");
             }
         }
+
+        let selected_style_layer = layers
+            .get(self.selected_goop_layer)
+            .filter(|layer| layer.editable());
+        let selected_style_identity = selected_style_layer
+            .map(|layer| goop_style_selection_identity(self.selected_goop_layer, layer));
+        if should_sync_goop_style_selection(
+            self.goop_paint_new_layer,
+            self.goop_observed_style_selection.as_ref(),
+            selected_style_identity.as_ref(),
+        ) {
+            if let Some(source) = selected_style_layer.and_then(|layer| layer.style_source.as_ref())
+            {
+                if let Some((index, _)) =
+                    self.retail_goop_templates
+                        .iter()
+                        .enumerate()
+                        .find(|(_, template)| {
+                            template.stage_id == source.stage_id
+                                && template.layer_index == source.layer_index
+                        })
+                {
+                    self.selected_goop_template = index;
+                    self.goop_use_default_style = false;
+                }
+            }
+            self.goop_observed_style_selection = selected_style_identity.clone();
+        }
+
+        let inherited_template_index = stage_inherited_goop_template_index(
+            &document.stage_id,
+            &layers,
+            &self.retail_goop_templates,
+        );
+        if self.goop_authoring_mode == GoopAuthoringMode::Simple
+            && self.goop_use_default_style
+            && inherited_template_index.is_none()
+        {
+            if let Some(chocolate) = chocolate_goop_template_index(&self.retail_goop_templates) {
+                self.selected_goop_template = chocolate;
+                self.goop_use_default_style = false;
+            }
+        }
+        let inheritance_available = inherited_template_index.is_some();
+        let default_style_available =
+            inheritance_available && (self.goop_paint_new_layer || selected_style_layer.is_none());
 
         ui.separator();
         ui.checkbox(
             &mut self.show_incompatible_goop_templates,
             "Show retail source variants (expert)",
         );
-        let selected_behavior = selected_generated_layer.map(|layer| layer.behavior);
+        let selected_behavior = selected_style_layer.map(|layer| layer.behavior);
         let visible_templates = goop_template_choices(
             &self.retail_goop_templates,
             self.selected_goop_template,
@@ -695,19 +872,24 @@ impl SmsEditorApp {
         };
         let previous_template = self.selected_goop_template;
         let previous_default_style = self.goop_use_default_style;
-        egui::ComboBox::from_label(if selected_generated_layer.is_some() {
+        egui::ComboBox::from_label(if self.goop_paint_new_layer {
+            "New layer type"
+        } else if selected_style_layer.is_some() {
             "Goop type"
         } else {
             "New layer type"
         })
         .selected_text(selected_text)
         .show_ui(ui, |ui| {
-            if self.goop_authoring_mode == GoopAuthoringMode::Simple
-                && ui
-                    .selectable_label(self.goop_use_default_style, "Default (inherit from map)")
-                    .clicked()
-            {
-                self.goop_use_default_style = true;
+            if self.goop_authoring_mode == GoopAuthoringMode::Simple {
+                ui.add_enabled_ui(default_style_available, |ui| {
+                    if ui
+                        .selectable_label(self.goop_use_default_style, "Default (inherit from map)")
+                        .clicked()
+                    {
+                        self.goop_use_default_style = true;
+                    }
+                });
             }
             for (index, template) in visible_templates {
                 if ui
@@ -726,13 +908,16 @@ impl SmsEditorApp {
             ui.small(
                 "New regions inherit the retail layer covering the stroke, then the stage's first floor style.",
             );
+        } else if self.goop_authoring_mode == GoopAuthoringMode::Simple && !inheritance_available {
+            ui.small("No compatible map style is available to inherit; Chocolate is the default.");
         }
-        if (self.selected_goop_template != previous_template
-            || self.goop_use_default_style != previous_default_style)
-            && selected_generated_layer.is_some()
-            && self.goop_authoring_mode == GoopAuthoringMode::Manual
-            && !self.goop_use_default_style
-        {
+        if should_apply_selected_goop_style(
+            self.selected_goop_template != previous_template
+                || self.goop_use_default_style != previous_default_style,
+            selected_style_layer.is_some(),
+            self.goop_paint_new_layer,
+            self.goop_use_default_style,
+        ) {
             self.set_selected_goop_style(self.selected_goop_template);
             return;
         }
@@ -749,6 +934,45 @@ impl SmsEditorApp {
                 egui::Color32::from_rgb(245, 180, 70),
                 "Expert override: this template is structurally or behavior-incompatible.",
             );
+        }
+        if self.goop_authoring_mode == GoopAuthoringMode::Simple {
+            let capacity = goop_runtime_layer_capacity(&document.stage_id);
+            let can_start = layers.len() < capacity
+                && self.goop_stroke.is_none()
+                && self.background_receiver.is_none()
+                && self.pending_goop_heap_confirmation.is_none();
+            if layers.len() >= capacity {
+                self.goop_paint_new_layer = false;
+            }
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Layers: {} / {capacity}", layers.len()));
+                    let label = if self.goop_paint_new_layer {
+                        "Cancel new layer"
+                    } else {
+                        "New compact layer"
+                    };
+                    if ui.add_enabled(can_start, egui::Button::new(label)).clicked() {
+                        self.goop_paint_new_layer = !self.goop_paint_new_layer;
+                        if !self.goop_paint_new_layer {
+                            self.goop_observed_style_selection = None;
+                        }
+                    }
+                });
+                if self.goop_paint_new_layer {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(120, 205, 255),
+                        "New layer armed: paint one stroke on its floor.",
+                    );
+                    ui.small(
+                        "The stroke gets a compact power-of-two region, then returns to the selected paint target.",
+                    );
+                } else {
+                    ui.small(
+                        "Use a compact layer to partition small maps; normal painting keeps selecting or expanding existing regions.",
+                    );
+                }
+            });
         }
         if self.goop_authoring_mode == GoopAuthoringMode::Manual {
             ui.checkbox(&mut self.goop_use_custom_region, "Use manual region");
@@ -945,14 +1169,6 @@ impl SmsEditorApp {
                     );
                 }
             }
-            if self.goop_authoring_mode == GoopAuthoringMode::Manual
-                && layer.origin == GoopLayerOrigin::Generated
-                && self.selected_goop_layer + 1 == layers.len()
-                && ui.button("Delete generated layer").clicked()
-            {
-                self.delete_selected_goop_layer();
-                return;
-            }
         }
         if self
             .document
@@ -976,22 +1192,49 @@ impl SmsEditorApp {
             self.confirm_delete_generated_goop = false;
         } else {
             ui.separator();
+            if layers
+                .get(self.selected_goop_layer)
+                .is_some_and(|layer| layer.origin == GoopLayerOrigin::Generated)
+            {
+                let is_last = self.selected_goop_layer + 1 == layers.len();
+                let response = ui.add_enabled(
+                    is_last && self.goop_stroke.is_none() && self.background_receiver.is_none(),
+                    egui::Button::new(
+                        egui::RichText::new(format!(
+                            "Delete Layer {:02}",
+                            self.selected_goop_layer
+                        ))
+                        .color(egui::Color32::from_rgb(255, 90, 90)),
+                    ),
+                );
+                if response
+                    .on_hover_text(if is_last {
+                        "Deletes this generated layer and its enemy pools."
+                    } else {
+                        "Delete later generated layers first so runtime layer indexes remain stable."
+                    })
+                    .clicked()
+                {
+                    self.delete_selected_goop_layer();
+                    return;
+                }
+            }
             if self.confirm_delete_generated_goop {
                 ui.colored_label(
                     egui::Color32::from_rgb(255, 90, 90),
                     format!(
-                        "Delete all {generated_count} generated goop regions and their painted masks? Imported retail regions will be preserved."
+                        "Delete all {generated_count} generated goop maps, their painted masks, and their enemy pools? Imported retail regions will be preserved."
                     ),
                 );
                 ui.horizontal(|ui| {
                     if ui
                         .button(
-                            egui::RichText::new("Confirm delete")
+                            egui::RichText::new("Confirm delete all")
                                 .color(egui::Color32::from_rgb(255, 90, 90)),
                         )
                         .clicked()
                     {
-                        self.delete_generated_goop_map();
+                        self.delete_all_generated_goop_maps();
                     }
                     if ui.button("Cancel").clicked() {
                         self.confirm_delete_generated_goop = false;
@@ -1001,7 +1244,7 @@ impl SmsEditorApp {
                 .add_enabled(
                     self.goop_stroke.is_none() && self.background_receiver.is_none(),
                     egui::Button::new(
-                        egui::RichText::new("Delete generated goop map...")
+                        egui::RichText::new("Delete all generated goop maps...")
                             .color(egui::Color32::from_rgb(255, 90, 90)),
                     ),
                 )
@@ -1010,6 +1253,8 @@ impl SmsEditorApp {
                 self.confirm_delete_generated_goop = true;
             }
         }
+        ui.separator();
+        self.gooble_spawn_section(ui);
     }
 
     pub(super) fn add_generated_goop_layer(&mut self) {
@@ -1190,11 +1435,14 @@ impl SmsEditorApp {
             after: document.goop_authoring.clone(),
             before_edits,
             after_edits: document.archive_edits.clone(),
+            before_objects: None,
+            after_objects: None,
         }));
         self.selected_goop_layer = document
             .goop_authoring
             .as_ref()
             .map_or(0, |goop| goop.layers.len().saturating_sub(1));
+        self.goop_observed_style_selection = None;
         self.push_goop_undo(record);
         self.finish_goop_document_change("Generated playable floor goop layer");
     }
@@ -1237,7 +1485,7 @@ impl SmsEditorApp {
             document.goop_authoring.as_ref().is_some_and(|goop| {
                 goop.layers
                     .iter()
-                    .any(|layer| layer.origin == GoopLayerOrigin::Generated)
+                    .any(GoopLayerAuthoring::generator_managed)
                     && goop.terrain_fingerprint != 0
             })
         });
@@ -1275,12 +1523,22 @@ impl SmsEditorApp {
         }
         let pointer = ui.input(|input| input.pointer.interact_pos());
         self.goop_cursor_world = pointer.and_then(|position| self.goop_surface_hit(rect, position));
-        if self.goop_authoring_mode == GoopAuthoringMode::Simple && self.goop_stroke.is_none() {
-            if let Some(layer) = self
-                .goop_cursor_world
-                .and_then(|world| self.automatic_goop_layer_at(world))
-            {
-                self.selected_goop_layer = layer;
+        if self.goop_authoring_mode == GoopAuthoringMode::Simple
+            && !self.goop_paint_new_layer
+            && self.goop_stroke.is_none()
+        {
+            match self.simple_goop_paint_target {
+                SimpleGoopPaintTarget::Auto => {
+                    if let Some(layer) = self
+                        .goop_cursor_world
+                        .and_then(|world| self.automatic_goop_layer_at(world))
+                    {
+                        self.selected_goop_layer = layer;
+                    }
+                }
+                SimpleGoopPaintTarget::Layer(layer) => {
+                    self.selected_goop_layer = layer;
+                }
             }
         }
         if !response.hovered() && self.goop_stroke.is_none() {
@@ -1299,12 +1557,20 @@ impl SmsEditorApp {
                         .is_some_and(GoopLayerAuthoring::editable)
                 });
             if editable {
+                let simple_target_layer = (self.goop_authoring_mode == GoopAuthoringMode::Simple)
+                    .then(|| self.simple_goop_paint_target.layer())
+                    .flatten();
                 self.goop_stroke = Some(GoopStroke {
                     changed: BTreeMap::new(),
                     last_world: None,
                     pending: Vec::new(),
-                    source_layer: (self.goop_authoring_mode == GoopAuthoringMode::Manual)
-                        .then_some(self.selected_goop_layer),
+                    source_layer: match self.goop_authoring_mode {
+                        GoopAuthoringMode::Manual => Some(self.selected_goop_layer),
+                        GoopAuthoringMode::Simple => simple_target_layer,
+                    },
+                    simple_target_layer,
+                    force_new_layer: self.goop_authoring_mode == GoopAuthoringMode::Simple
+                        && self.goop_paint_new_layer,
                 });
             }
         }
@@ -1333,6 +1599,20 @@ impl SmsEditorApp {
             .layers
             .as_slice();
         automatic_goop_layer_index(layers, self.selected_goop_layer, world)
+    }
+
+    fn goop_layer_accepts_brush(
+        &self,
+        layer_index: usize,
+        world: [f32; 3],
+        radius: f32,
+        fill_mode: bool,
+    ) -> bool {
+        self.document
+            .as_ref()
+            .and_then(|document| document.goop_authoring.as_ref())
+            .and_then(|goop| goop.layers.get(layer_index))
+            .is_some_and(|layer| goop_layer_contains_brush(layer, world, radius, fill_mode))
     }
 
     fn paint_goop_toward(&mut self, world: [f32; 3], erase: bool) -> BTreeSet<usize> {
@@ -1378,7 +1658,26 @@ impl SmsEditorApp {
                     .goop_stroke
                     .as_ref()
                     .and_then(|stroke| stroke.source_layer),
-                GoopAuthoringMode::Simple => self.automatic_goop_layer_at(sample),
+                GoopAuthoringMode::Simple => simple_goop_layer_target(
+                    self.goop_stroke
+                        .as_ref()
+                        .is_some_and(|stroke| stroke.force_new_layer),
+                    self.goop_stroke
+                        .as_ref()
+                        .and_then(|stroke| stroke.simple_target_layer),
+                    self.goop_stroke
+                        .as_ref()
+                        .and_then(|stroke| stroke.simple_target_layer)
+                        .is_some_and(|layer| {
+                            self.goop_layer_accepts_brush(
+                                layer,
+                                sample,
+                                brush.radius,
+                                self.goop_fill_mode,
+                            )
+                        }),
+                    self.automatic_goop_layer_at(sample),
+                ),
             };
             let Some(layer_index) = layer_index else {
                 if !erase {
@@ -1485,6 +1784,10 @@ impl SmsEditorApp {
             return;
         };
         if !stroke.pending.is_empty() {
+            if stroke.force_new_layer {
+                self.goop_paint_new_layer = false;
+                self.goop_observed_style_selection = None;
+            }
             self.start_adaptive_goop_job(stroke);
             return;
         }
@@ -1538,6 +1841,8 @@ impl SmsEditorApp {
             self.goop_authoring_mode == GoopAuthoringMode::Simple && self.goop_use_default_style;
         let selected_template_index = self.selected_goop_template;
         let source_layer = stroke.source_layer;
+        let prefer_source_expansion = stroke.simple_target_layer.is_some();
+        let force_new_layer = stroke.force_new_layer;
         let base_root = self.base_root.trim().to_string();
         let stage_id = working_document.stage_id.clone();
         let instances = self
@@ -1580,9 +1885,13 @@ impl SmsEditorApp {
                     &mut working_document,
                     &terrain,
                     &templates,
-                    selected_template.as_ref(),
-                    source_layer,
-                    &pending,
+                    AdaptiveGoopStrokePlan {
+                        selected_template: selected_template.as_ref(),
+                        source_layer,
+                        prefer_source_expansion,
+                        force_new_layer,
+                        samples: &pending,
+                    },
                     &task_cancel,
                 )?;
                 let undo = GoopSnapshotUndo {
@@ -1590,6 +1899,8 @@ impl SmsEditorApp {
                     after: working_document.goop_authoring.clone(),
                     before_edits,
                     after_edits: working_document.archive_edits.clone(),
+                    before_objects: None,
+                    after_objects: None,
                 };
                 Ok(Box::new(GoopAdaptiveOutcome {
                     base_root,
@@ -1668,6 +1979,7 @@ impl SmsEditorApp {
             .as_ref()
             .and_then(|document| document.goop_authoring.as_ref())
             .map_or(0, |goop| goop.layers.len().saturating_sub(1));
+        self.goop_observed_style_selection = None;
         self.push_goop_undo(record);
         self.finish_goop_document_change("Painted adaptive goop region");
     }
@@ -1766,6 +2078,8 @@ impl SmsEditorApp {
             after: document.goop_authoring.clone(),
             before_edits: before_edits.clone(),
             after_edits: document.archive_edits.clone(),
+            before_objects: None,
+            after_objects: None,
         }));
         self.push_goop_undo(record);
         self.finish_goop_document_change("Changed goop layer visibility");
@@ -1799,6 +2113,8 @@ impl SmsEditorApp {
             after: document.goop_authoring.clone(),
             before_edits,
             after_edits: document.archive_edits.clone(),
+            before_objects: None,
+            after_objects: None,
         }));
         self.push_goop_undo(record);
         self.finish_goop_document_change("Changed goop runtime behavior");
@@ -1806,6 +2122,10 @@ impl SmsEditorApp {
 
     fn set_selected_goop_style(&mut self, template_index: usize) {
         let Some(template) = self.retail_goop_templates.get(template_index).cloned() else {
+            self.log.push(
+                "Could not change the goop type: the selected retail template is unavailable."
+                    .to_string(),
+            );
             return;
         };
         let terrain = match self.final_goop_terrain_snapshot() {
@@ -1833,7 +2153,7 @@ impl SmsEditorApp {
             .as_ref()
             .and_then(|document| document.goop_authoring.as_ref())
             .and_then(|goop| goop.layers.get(self.selected_goop_layer))
-            .filter(|layer| layer.origin == GoopLayerOrigin::Generated)
+            .filter(|layer| layer.editable())
             .map(|layer| {
                 (
                     layer.runtime.clone(),
@@ -1842,6 +2162,10 @@ impl SmsEditorApp {
                 )
             })
         else {
+            self.log.push(
+                "Could not change the goop type: the selected layer is not an editable floor layer."
+                    .to_string(),
+            );
             return;
         };
         let generated_model = match surface_anchor.map_or_else(
@@ -1943,6 +2267,8 @@ impl SmsEditorApp {
             after: document.goop_authoring.clone(),
             before_edits,
             after_edits: document.archive_edits.clone(),
+            before_objects: None,
+            after_objects: None,
         }));
         self.push_goop_undo(record);
         self.finish_goop_document_change("Changed goop retail style");
@@ -2028,6 +2354,13 @@ impl SmsEditorApp {
                 } else {
                     snapshot.before.clone()
                 };
+                if let Some(objects) = if forward {
+                    snapshot.after_objects.as_ref()
+                } else {
+                    snapshot.before_objects.as_ref()
+                } {
+                    document.objects = objects.clone();
+                }
                 let archive_edits = if forward {
                     snapshot.after_edits.clone()
                 } else {
@@ -2054,70 +2387,87 @@ impl SmsEditorApp {
         self.log.push(format!("{label}."));
     }
 
-    fn delete_generated_goop_map(&mut self) {
+    fn delete_all_generated_goop_maps(&mut self) {
         self.confirm_delete_generated_goop = false;
-        let Some(document) = &mut self.document else {
+        let Some(document) = self.document.as_ref() else {
             return;
         };
         let before = document.goop_authoring.clone();
         let before_edits = document.archive_edits.clone();
-        let result = remove_generated_goop_map(document);
-        let removed = match result {
-            Ok(removed) => removed,
+        let before_objects = document.objects.clone();
+        let generated_indices = document
+            .goop_authoring
+            .as_ref()
+            .map(|authoring| {
+                authoring
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, layer)| {
+                        (layer.origin == GoopLayerOrigin::Generated).then_some(index)
+                    })
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let result = (|| -> Result<(usize, Vec<String>), String> {
+            let pool_log = self.remove_enemy_pools_for_goop_layers(&generated_indices)?;
+            let document = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no stage is open".to_string())?;
+            let removed = remove_generated_goop_map(document)?;
+            Ok((removed, pool_log))
+        })();
+        let (removed, pool_log) = match result {
+            Ok(result) => result,
             Err(error) => {
-                document.goop_authoring = before;
-                document.replace_archive_edits(before_edits);
+                if let Some(document) = self.document.as_mut() {
+                    document.goop_authoring = before;
+                    document.objects = before_objects;
+                    document.replace_archive_edits(before_edits);
+                }
                 self.log
-                    .push(format!("Could not delete generated goop map: {error}"));
+                    .push(format!("Could not delete generated goop maps: {error}"));
                 return;
             }
         };
         if removed == 0 {
             return;
         }
+        let document = self
+            .document
+            .as_ref()
+            .expect("stage remains open after deleting generated goop");
         let record = GoopUndoRecord::Snapshot(Box::new(GoopSnapshotUndo {
             before,
             after: document.goop_authoring.clone(),
             before_edits,
             after_edits: document.archive_edits.clone(),
+            before_objects: Some(before_objects),
+            after_objects: Some(document.objects.clone()),
         }));
         self.selected_goop_layer = self
             .document
             .as_ref()
             .and_then(|document| document.goop_authoring.as_ref())
             .map_or(0, |authoring| authoring.layers.len().saturating_sub(1));
+        self.simple_goop_paint_target = SimpleGoopPaintTarget::Auto;
+        self.goop_observed_style_selection = None;
         self.push_goop_undo(record);
+        self.log.extend(pool_log);
         self.finish_goop_document_change(&format!(
-            "Deleted generated goop map ({removed} regions)"
+            "Deleted all generated goop maps ({removed} regions)"
         ));
     }
 
     fn delete_selected_goop_layer(&mut self) {
-        let pools = self
-            .document
-            .as_ref()
-            .map(|document| {
-                crate::goop_spawn::layer_pool_manager_names(document, self.selected_goop_layer)
-            })
-            .unwrap_or_default();
-        if !pools.is_empty() {
-            self.log.push(format!(
-                "Remove per-layer enemy pool(s) {} before deleting goop layer {:02}.",
-                pools
-                    .iter()
-                    .map(|pool| format!("{pool:?}"))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                self.selected_goop_layer
-            ));
-            return;
-        }
-        let Some(document) = &mut self.document else {
+        let Some(document) = self.document.as_ref() else {
             return;
         };
         let before = document.goop_authoring.clone();
         let before_edits = document.archive_edits.clone();
-        let Some(authoring) = &mut document.goop_authoring else {
+        let before_objects = document.objects.clone();
+        let Some(authoring) = document.goop_authoring.as_ref() else {
             return;
         };
         if self.selected_goop_layer + 1 != authoring.layers.len()
@@ -2127,66 +2477,93 @@ impl SmsEditorApp {
                 .push("Only the last generated layer can be deleted safely.".to_string());
             return;
         }
-        let layer = authoring
-            .layers
-            .pop()
-            .expect("selected generated layer exists");
-        clear_generated_goop_readiness_if_empty(authoring);
-        let mut export_authoring = authoring.clone();
-        export_authoring.stale = false;
-        let compiled_ymp = match document.effective_resource_clone(sms_scene::GOOP_RESOURCE_PATH) {
-            Ok(Some(StageResourceDocument::PollutionMap(base))) => {
-                export_authoring.compiled_ymp_preserving(&base)
+        let layer_index = self.selected_goop_layer;
+        let result = (|| -> Result<Vec<String>, String> {
+            let pool_log =
+                self.remove_enemy_pools_for_goop_layers(&BTreeSet::from([layer_index]))?;
+            let document = self
+                .document
+                .as_mut()
+                .ok_or_else(|| "no stage is open".to_string())?;
+            let authoring = document
+                .goop_authoring
+                .as_mut()
+                .ok_or_else(|| "the stage has no goop layers".to_string())?;
+            let layer = authoring
+                .layers
+                .pop()
+                .ok_or_else(|| "the selected generated layer no longer exists".to_string())?;
+            clear_generated_goop_readiness_if_empty(authoring);
+            let mut export_authoring = authoring.clone();
+            export_authoring.stale = false;
+            let compiled_ymp = match document
+                .effective_resource_clone(sms_scene::GOOP_RESOURCE_PATH)
+                .map_err(|error| error.to_string())?
+            {
+                Some(StageResourceDocument::PollutionMap(base)) => {
+                    export_authoring.compiled_ymp_preserving(&base)
+                }
+                _ => export_authoring.compiled_ymp(),
             }
-            Ok(_) => export_authoring.compiled_ymp(),
-            Err(error) => Err(error),
-        };
-        let compiled_ymp = match compiled_ymp {
-            Ok(ymp) => ymp,
+            .map_err(|error| error.to_string())?;
+            let imported_ymp_exists = document
+                .stage_archive
+                .as_ref()
+                .is_some_and(|archive| archive.resource(sms_scene::GOOP_RESOURCE_PATH).is_some());
+            if export_authoring.layers.is_empty() && !imported_ymp_exists {
+                document
+                    .archive_edits
+                    .remove_resource(sms_scene::GOOP_RESOURCE_PATH.to_vec());
+            } else {
+                document.upsert_authored_resource(
+                    sms_scene::GOOP_RESOURCE_PATH.to_vec(),
+                    StageResourceDocument::PollutionMap(compiled_ymp),
+                );
+            }
+            for extension in ["bmp", "bmd", "btk", "btp", "bpk", "brk", "bck", "bas"] {
+                document.archive_edits.remove_resource(
+                    format!("map/pollution/{}.{extension}", layer.resource_stem).into_bytes(),
+                );
+            }
+            document
+                .compile_goop_authoring()
+                .map_err(|error| error.to_string())?;
+            document.replace_archive_edits(document.archive_edits.clone());
+            Ok(pool_log)
+        })();
+        let pool_log = match result {
+            Ok(pool_log) => pool_log,
             Err(error) => {
-                document.goop_authoring = before;
-                document.replace_archive_edits(before_edits);
+                if let Some(document) = self.document.as_mut() {
+                    document.goop_authoring = before;
+                    document.objects = before_objects;
+                    document.replace_archive_edits(before_edits);
+                }
                 self.log
                     .push(format!("Could not delete goop layer: {error}"));
                 return;
             }
         };
-        let imported_ymp_exists = document
-            .stage_archive
+        let document = self
+            .document
             .as_ref()
-            .is_some_and(|archive| archive.resource(sms_scene::GOOP_RESOURCE_PATH).is_some());
-        if export_authoring.layers.is_empty() && !imported_ymp_exists {
-            document
-                .archive_edits
-                .remove_resource(sms_scene::GOOP_RESOURCE_PATH.to_vec());
-        } else {
-            document.upsert_authored_resource(
-                sms_scene::GOOP_RESOURCE_PATH.to_vec(),
-                StageResourceDocument::PollutionMap(compiled_ymp),
-            );
-        }
-        for extension in ["bmp", "bmd", "btk", "btp", "bpk", "brk", "bck", "bas"] {
-            document.archive_edits.remove_resource(
-                format!("map/pollution/{}.{extension}", layer.resource_stem).into_bytes(),
-            );
-        }
-        if let Err(error) = document.compile_goop_authoring() {
-            document.goop_authoring = before;
-            document.replace_archive_edits(before_edits);
-            self.log
-                .push(format!("Could not delete goop layer: {error}"));
-            return;
-        }
-        document.replace_archive_edits(document.archive_edits.clone());
+            .expect("stage remains open after deleting a goop layer");
         let record = GoopUndoRecord::Snapshot(Box::new(GoopSnapshotUndo {
             before,
             after: document.goop_authoring.clone(),
             before_edits,
             after_edits: document.archive_edits.clone(),
+            before_objects: Some(before_objects),
+            after_objects: Some(document.objects.clone()),
         }));
         self.push_goop_undo(record);
         self.selected_goop_layer = self.selected_goop_layer.saturating_sub(1);
-        self.finish_goop_document_change("Deleted generated goop layer");
+        self.goop_observed_style_selection = None;
+        if self.simple_goop_paint_target == SimpleGoopPaintTarget::Layer(layer_index) {
+            self.simple_goop_paint_target = SimpleGoopPaintTarget::Auto;
+        }
+        self.log.extend(pool_log);
+        self.finish_goop_document_change(&format!("Deleted generated goop layer {layer_index:02}"));
     }
 
     /// Regenerates goop when a terrain edit has left it stale.
@@ -2306,6 +2683,8 @@ impl SmsEditorApp {
             after: outcome.document.goop_authoring.clone(),
             before_edits: outcome.before_edits,
             after_edits: outcome.document.archive_edits.clone(),
+            before_objects: None,
+            after_objects: None,
         }));
         self.document = Some(outcome.document);
         self.push_goop_undo(record);
@@ -2385,13 +2764,12 @@ impl SmsEditorApp {
                     (height.saturating_sub(1), layer.region.max_z),
                 ] {
                     let points = (0..width).map(|cell_x| {
-                        goop_cell_cleanable_surface_y(layer, cell_x, cell_y).map(|world_y| {
-                            [
-                                layer.region.min_x + (cell_x as f32 + 0.5) * cell_size,
-                                world_y + 8.0,
-                                world_z,
-                            ]
-                        })
+                        let world_y = goop_boundary_surface_y(layer, cell_x, cell_y);
+                        Some([
+                            layer.region.min_x + (cell_x as f32 + 0.5) * cell_size,
+                            world_y + 8.0,
+                            world_z,
+                        ])
                     });
                     paint_surface_polyline(painter, projection, points, boundary_stroke);
                 }
@@ -2400,13 +2778,12 @@ impl SmsEditorApp {
                     (width.saturating_sub(1), layer.region.max_x),
                 ] {
                     let points = (0..height).map(|cell_y| {
-                        goop_cell_cleanable_surface_y(layer, cell_x, cell_y).map(|world_y| {
-                            [
-                                world_x,
-                                world_y + 8.0,
-                                layer.region.min_z + (cell_y as f32 + 0.5) * cell_size,
-                            ]
-                        })
+                        let world_y = goop_boundary_surface_y(layer, cell_x, cell_y);
+                        Some([
+                            world_x,
+                            world_y + 8.0,
+                            layer.region.min_z + (cell_y as f32 + 0.5) * cell_size,
+                        ])
                     });
                     paint_surface_polyline(painter, projection, points, boundary_stroke);
                 }
@@ -2495,7 +2872,11 @@ fn default_goop_template_for_stroke(
     templates: &[RetailGoopTemplate],
     samples: &[PendingGoopSample],
 ) -> Option<RetailGoopTemplate> {
-    let layers = &document.goop_authoring.as_ref()?.layers;
+    let layers = document
+        .goop_authoring
+        .as_ref()
+        .map(|authoring| authoring.layers.as_slice())
+        .unwrap_or_default();
     let point = samples.first().map(|sample| sample.world);
     let layer = point
         .and_then(|world| {
@@ -2509,26 +2890,12 @@ fn default_goop_template_for_stroke(
                 .enumerate()
                 .find(|(_, layer)| layer.plane == GoopPlane::Floor)
         });
-    let (index, layer) = layer?;
-    layer
-        .style_source
-        .as_ref()
-        .and_then(|style| {
-            templates.iter().find(|template| {
-                template.stage_id == style.stage_id && template.layer_index == style.layer_index
-            })
-        })
-        .or_else(|| {
-            templates.iter().find(|template| {
-                template.stage_id == document.stage_id && template.layer_index == index
-            })
-        })
-        .or_else(|| {
-            templates.iter().find(|template| {
-                template.behavior == layer.behavior
-                    && template.stage_id.eq_ignore_ascii_case(&document.stage_id)
-            })
-        })
+    let inherited = layer.and_then(|(index, layer)| {
+        inherited_goop_template_index(&document.stage_id, index, layer, templates)
+    });
+    inherited
+        .or_else(|| chocolate_goop_template_index(templates))
+        .and_then(|index| templates.get(index))
         .cloned()
 }
 
@@ -2635,15 +3002,100 @@ fn final_goop_terrain_snapshot_from_document(
     })
 }
 
+type GoopExpansionPlan = (usize, sms_scene::GoopRegion, u16, u16);
+
+fn adaptive_fresh_goop_region(
+    bounds: GoopPaintBounds,
+    cell_size: f32,
+    force_compact: bool,
+    existing_layer_count: usize,
+) -> Result<(sms_scene::GoopRegion, u16, u16), String> {
+    if force_compact || existing_layer_count == 0 {
+        compact_goop_region(bounds, cell_size)
+    } else {
+        automatic_goop_region(bounds, cell_size)
+    }
+    .map_err(|error| error.to_string())
+}
+
+fn planned_goop_expansion(
+    layers: &[GoopLayerAuthoring],
+    source: Option<&(usize, GoopLayerAuthoring)>,
+    bounds: GoopPaintBounds,
+    fresh_dimensions: (usize, usize),
+    prefer_source_expansion: bool,
+) -> Result<Option<GoopExpansionPlan>, String> {
+    let Some((index, layer)) = source else {
+        return if prefer_source_expansion {
+            Err("the selected goop layer is no longer available".to_string())
+        } else {
+            Ok(None)
+        };
+    };
+    if !layer.editable() {
+        return if prefer_source_expansion {
+            Err(format!(
+                "selected goop layer {:02} is not an editable floor layer and cannot resize",
+                layer.runtime_index
+            ))
+        } else {
+            Ok(None)
+        };
+    }
+    let (region, width_log2, height_log2) = match expanded_goop_region(layer, bounds) {
+        Ok(expansion) => expansion,
+        Err(error) if prefer_source_expansion => {
+            return Err(format!(
+                "selected goop layer {:02} cannot expand: {error}",
+                layer.runtime_index
+            ));
+        }
+        Err(_) => return Ok(None),
+    };
+    let expanded_dimensions = (1usize << width_log2, 1usize << height_log2);
+    if !prefer_source_expansion
+        && !balanced_goop_expansion(
+            layer.dimensions().map_err(|error| error.to_string())?,
+            expanded_dimensions,
+            fresh_dimensions,
+        )
+    {
+        return Ok(None);
+    }
+    if let Some((_, other)) = layers.iter().enumerate().find(|(other_index, other)| {
+        *other_index != *index
+            && other.plane == GoopPlane::Floor
+            && other.behavior != layer.behavior
+            && region.overlaps(other.region)
+    }) {
+        return if prefer_source_expansion {
+            Err(format!(
+                "selected goop layer {:02} cannot expand because it would overlap incompatible layer {:02} ({})",
+                layer.runtime_index,
+                other.runtime_index,
+                other.behavior.label()
+            ))
+        } else {
+            Ok(None)
+        };
+    }
+    Ok(Some((*index, region, width_log2, height_log2)))
+}
+
 fn apply_adaptive_goop_samples(
     document: &mut StageDocument,
     terrain: &FinalGoopTerrainSnapshot,
     templates: &[RetailGoopTemplate],
-    selected_template: Option<&RetailGoopTemplate>,
-    source_layer: Option<usize>,
-    samples: &[PendingGoopSample],
+    plan: AdaptiveGoopStrokePlan<'_>,
     cancelled: &AtomicBool,
 ) -> Result<Option<String>, String> {
+    let AdaptiveGoopStrokePlan {
+        selected_template,
+        source_layer,
+        prefer_source_expansion,
+        force_new_layer,
+        samples,
+    } = plan;
     let first = samples
         .first()
         .ok_or_else(|| "adaptive goop stroke has no pending samples".to_string())?;
@@ -2652,14 +3104,17 @@ fn apply_adaptive_goop_samples(
         bounds.include(GoopPaintBounds::around(sample.world, sample.brush.radius));
     }
     let surface_anchor = GoopSurfaceAnchor { world: first.world };
-    let source = source_layer.and_then(|index| {
-        document
-            .goop_authoring
-            .as_ref()
-            .and_then(|authoring| authoring.layers.get(index))
-            .cloned()
-            .map(|layer| (index, layer))
-    });
+    let source = (!force_new_layer)
+        .then_some(source_layer)
+        .flatten()
+        .and_then(|index| {
+            document
+                .goop_authoring
+                .as_ref()
+                .and_then(|authoring| authoring.layers.get(index))
+                .cloned()
+                .map(|layer| (index, layer))
+        });
     let stage_id = document.stage_id.clone();
     let source_template = source
         .as_ref()
@@ -2688,8 +3143,12 @@ fn apply_adaptive_goop_samples(
     let cell_size = source
         .as_ref()
         .map_or(GOOP_CELL_SIZE, |(_, layer)| layer.runtime.vertical_scale);
+    let existing_layer_count = document
+        .goop_authoring
+        .as_ref()
+        .map_or(0, |authoring| authoring.layers.len());
     let (mut fresh_region, fresh_width_log2, fresh_height_log2) =
-        automatic_goop_region(bounds, cell_size).map_err(|error| error.to_string())?;
+        adaptive_fresh_goop_region(bounds, cell_size, force_new_layer, existing_layer_count)?;
     if let Some((_, source)) = &source {
         fresh_region = adjacent_goop_region(fresh_region, source, bounds);
     }
@@ -2715,34 +3174,21 @@ fn apply_adaptive_goop_samples(
     .map_err(|error| error.to_string())?;
     let fresh_dimensions = (1usize << fresh_width_log2, 1usize << fresh_height_log2);
 
-    let expansion = source
-        .as_ref()
-        .filter(|(_, layer)| layer.origin == GoopLayerOrigin::Generated)
-        .and_then(|(index, layer)| {
-            let (region, width_log2, height_log2) = expanded_goop_region(layer, bounds).ok()?;
-            let expanded_dimensions = (1usize << width_log2, 1usize << height_log2);
-            if !balanced_goop_expansion(
-                layer.dimensions().ok()?,
-                expanded_dimensions,
-                fresh_dimensions,
-            ) {
-                return None;
-            }
-            document
+    let expansion = if force_new_layer {
+        None
+    } else {
+        planned_goop_expansion(
+            &document
                 .goop_authoring
                 .as_ref()
                 .expect("adaptive goop authoring exists")
-                .layers
-                .iter()
-                .enumerate()
-                .all(|(other_index, other)| {
-                    other_index == *index
-                        || other.plane != GoopPlane::Floor
-                        || other.behavior == layer.behavior
-                        || !region.overlaps(other.region)
-                })
-                .then_some((*index, region, width_log2, height_log2))
-        });
+                .layers,
+            source.as_ref(),
+            bounds,
+            fresh_dimensions,
+            prefer_source_expansion,
+        )?
+    };
 
     let target_layer = if let Some((index, region, width_log2, height_log2)) = expansion {
         if cancelled.load(Ordering::Acquire) {
@@ -2757,7 +3203,21 @@ fn apply_adaptive_goop_samples(
         let template_model = old_layer
             .generated_model
             .clone()
-            .ok_or_else(|| "generated goop layer has no model template".to_string())?;
+            .map(Ok)
+            .unwrap_or_else(|| {
+                document
+                    .effective_resource_clone(
+                        format!("map/pollution/{}.bmd", old_layer.resource_stem).as_bytes(),
+                    )
+                    .map_err(|error| error.to_string())
+                    .and_then(|resource| match resource {
+                        Some(StageResourceDocument::Model(model)) => Ok(model),
+                        _ => Err(format!(
+                            "selected goop layer {:02} has no effective pollution model to resize",
+                            old_layer.runtime_index
+                        )),
+                    })
+            })?;
         let anchor = old_layer.surface_anchor.or(Some(surface_anchor));
         let (vertical_offset, depth_map) = generate_floor_depth_map_for_surface(
             &terrain.collision_triangles,
@@ -2995,6 +3455,12 @@ fn apply_adaptive_goop_samples(
     for sample in samples {
         paint_brush_sample(layer, &mut mask, sample.world, sample.brush, &mut changes);
     }
+    if force_new_layer && changes.is_empty() {
+        return Err(
+            "the compact layer has no paintable cells at this stroke; paint on an uncovered floor area or use Manual mode to inspect the region"
+                .to_string(),
+        );
+    }
     layer.set_mask(&mask).map_err(|error| error.to_string())?;
     let authoring = document
         .goop_authoring
@@ -3229,6 +3695,58 @@ fn automatic_goop_layer_index(
         .position(|layer| layer.editable() && goop_layer_accepts_height(layer, world))
 }
 
+fn simple_goop_layer_label(layer: &GoopLayerAuthoring) -> String {
+    format!(
+        "LAYER {:02} — {}",
+        layer.runtime_index,
+        layer.behavior.label()
+    )
+}
+
+fn simple_goop_paint_target_label(
+    target: SimpleGoopPaintTarget,
+    layers: &[GoopLayerAuthoring],
+) -> String {
+    target
+        .layer()
+        .and_then(|index| layers.get(index))
+        .map_or_else(|| "AUTO".to_string(), simple_goop_layer_label)
+}
+
+fn goop_layer_contains_brush(
+    layer: &GoopLayerAuthoring,
+    world: [f32; 3],
+    radius: f32,
+    fill_mode: bool,
+) -> bool {
+    if !layer.editable() || !goop_layer_accepts_height(layer, world) {
+        return false;
+    }
+    if fill_mode {
+        return true;
+    }
+    let bounds = GoopPaintBounds::around(world, radius);
+    bounds.min_x >= layer.region.min_x
+        && bounds.max_x <= layer.region.max_x
+        && bounds.min_z >= layer.region.min_z
+        && bounds.max_z <= layer.region.max_z
+}
+
+fn simple_goop_layer_target(
+    force_new_layer: bool,
+    explicit_layer: Option<usize>,
+    explicit_layer_accepts_sample: bool,
+    automatic_layer: Option<usize>,
+) -> Option<usize> {
+    if force_new_layer {
+        None
+    } else if let Some(layer) = explicit_layer {
+        explicit_layer_accepts_sample.then_some(layer)
+    } else {
+        automatic_layer
+    }
+}
+
 fn triangle_has_floor_projection(vertices: [[f32; 3]; 3]) -> bool {
     const MIN_VERTICAL_NORMAL_COMPONENT: f32 = 0.1;
 
@@ -3282,6 +3800,15 @@ fn goop_cell_cleanable_surface_y(layer: &GoopLayerAuthoring, x: usize, y: usize)
     (depth != 0xff).then_some(
         layer.runtime.vertical_offset + f32::from(depth) * GOOP_DEPTH_WORLD_UNITS_PER_CODE,
     )
+}
+
+/// Region edges commonly fall outside the stage floor and therefore carry
+/// Sunshine's invalid 0xff depth code. The bounds still need to remain visible
+/// so the author can see where an imported or generated layer can expand.
+/// `vertical_offset` is the correct fallback plane and differs from any valid
+/// encoded cleanability height by at most one depth-code range.
+fn goop_boundary_surface_y(layer: &GoopLayerAuthoring, x: usize, y: usize) -> f32 {
+    goop_cell_cleanable_surface_y(layer, x, y).unwrap_or(layer.runtime.vertical_offset)
 }
 
 fn goop_invalid_marker_surface_y(layer: &GoopLayerAuthoring, x: usize, y: usize) -> Option<f32> {
@@ -3509,7 +4036,7 @@ fn rebuild_goop_document(
         for layer in authoring
             .layers
             .iter_mut()
-            .filter(|layer| layer.origin == GoopLayerOrigin::Generated)
+            .filter(|layer| layer.generator_managed())
         {
             if cancelled.load(Ordering::Acquire) {
                 return Err("goop rebuild cancelled".to_string());
@@ -3990,6 +4517,8 @@ mod tests {
             last_world: Some(first_sample.world),
             pending: vec![first_sample],
             source_layer: None,
+            simple_target_layer: None,
+            force_new_layer: false,
         };
 
         let first_preview = goop_stroke_preview_samples(&first_stroke);
@@ -4008,6 +4537,8 @@ mod tests {
             last_world: Some(last_world),
             pending,
             source_layer: None,
+            simple_target_layer: None,
+            force_new_layer: false,
         };
 
         let long_preview = goop_stroke_preview_samples(&long_stroke);
@@ -4079,6 +4610,163 @@ mod tests {
             automatic_goop_layer_index(&layers, 0, [80.0, 800.0, 80.0]),
             None
         );
+    }
+
+    #[test]
+    fn simple_mode_defaults_to_auto_and_labels_explicit_layers() {
+        assert_eq!(
+            SmsEditorApp::default().simple_goop_paint_target,
+            SimpleGoopPaintTarget::Auto
+        );
+        let layer = editable_layer();
+        assert_eq!(
+            simple_goop_paint_target_label(
+                SimpleGoopPaintTarget::Auto,
+                std::slice::from_ref(&layer),
+            ),
+            "AUTO"
+        );
+        assert_eq!(
+            simple_goop_paint_target_label(SimpleGoopPaintTarget::Layer(0), &[layer]),
+            "LAYER 00 — Normal"
+        );
+    }
+
+    #[test]
+    fn simple_mode_applies_explicit_type_changes_to_the_selected_layer() {
+        assert!(should_apply_selected_goop_style(true, true, false, false));
+        assert!(!should_apply_selected_goop_style(true, true, true, false));
+        assert!(!should_apply_selected_goop_style(true, true, false, true));
+
+        let layer = editable_layer();
+        let observed = goop_style_selection_identity(0, &layer);
+        assert!(!should_sync_goop_style_selection(
+            false,
+            Some(&observed),
+            Some(&observed),
+        ));
+        assert!(!should_sync_goop_style_selection(
+            true,
+            Some(&observed),
+            None,
+        ));
+        assert!(should_sync_goop_style_selection(
+            false,
+            Some(&observed),
+            None,
+        ));
+    }
+
+    #[test]
+    fn armed_simple_layer_bypasses_an_existing_automatic_target() {
+        assert_eq!(
+            simple_goop_layer_target(false, None, false, Some(3)),
+            Some(3)
+        );
+        assert_eq!(simple_goop_layer_target(true, None, false, Some(3)), None);
+        assert_eq!(simple_goop_layer_target(true, None, false, None), None);
+    }
+
+    #[test]
+    fn simple_explicit_target_never_falls_through_to_another_layer() {
+        assert_eq!(
+            simple_goop_layer_target(false, Some(1), true, Some(3)),
+            Some(1)
+        );
+        assert_eq!(
+            simple_goop_layer_target(false, Some(1), false, Some(3)),
+            None
+        );
+    }
+
+    #[test]
+    fn selected_layer_queues_expansion_when_the_brush_crosses_its_edge() {
+        let layer = editable_layer();
+
+        assert!(goop_layer_contains_brush(
+            &layer,
+            [160.0, 0.0, 80.0],
+            20.0,
+            false
+        ));
+        assert!(!goop_layer_contains_brush(
+            &layer,
+            [300.0, 0.0, 80.0],
+            40.0,
+            false
+        ));
+        assert!(goop_layer_contains_brush(
+            &layer,
+            [300.0, 0.0, 80.0],
+            40.0,
+            true
+        ));
+    }
+
+    fn large_expandable_layer() -> GoopLayerAuthoring {
+        let mut layer = editable_layer();
+        layer.region.max_x = 10_240.0;
+        layer.region.max_z = 10_240.0;
+        layer.runtime.max_x = layer.region.max_x;
+        layer.runtime.max_z = layer.region.max_z;
+        layer.runtime.width_log2 = 8;
+        layer.runtime.height_log2 = 8;
+        layer.runtime.depth_map = vec![0; 256 * 256];
+        layer.bitmap = Some(BmpFile::new_pollution_mask(256, 256, vec![0; 256 * 256]).unwrap());
+        layer
+    }
+
+    #[test]
+    fn explicit_target_prefers_safe_expansion_over_a_balanced_neighbor() {
+        let layer = large_expandable_layer();
+        let layers = vec![layer.clone()];
+        let source = (0, layer);
+        let bounds = GoopPaintBounds::around([10_260.0, 0.0, 10_260.0], 20.0);
+
+        assert!(
+            planned_goop_expansion(&layers, Some(&source), bounds, (256, 256), false,)
+                .unwrap()
+                .is_none()
+        );
+        let (_, _, width_log2, height_log2) =
+            planned_goop_expansion(&layers, Some(&source), bounds, (256, 256), true)
+                .unwrap()
+                .expect("an explicitly selected layer should expand");
+        assert_eq!((width_log2, height_log2), (9, 9));
+    }
+
+    #[test]
+    fn explicit_target_can_expand_an_editable_imported_layer() {
+        let mut layer = large_expandable_layer();
+        layer.origin = GoopLayerOrigin::Imported;
+        let layers = vec![layer.clone()];
+        let source = (0, layer);
+        let bounds = GoopPaintBounds::around([10_260.0, 0.0, 10_260.0], 20.0);
+
+        let (_, _, width_log2, height_log2) =
+            planned_goop_expansion(&layers, Some(&source), bounds, (256, 256), true)
+                .unwrap()
+                .expect("an explicitly selected imported floor layer should expand");
+        assert_eq!((width_log2, height_log2), (9, 9));
+    }
+
+    #[test]
+    fn explicit_target_rejects_an_incompatible_expansion_overlap() {
+        let source_layer = large_expandable_layer();
+        let source = (0, source_layer.clone());
+        let mut blocker = large_expandable_layer();
+        blocker.runtime_index = 1;
+        blocker.behavior = GoopBehavior::Fire;
+        blocker.region.min_x = source_layer.region.max_x;
+        blocker.region.max_x = source_layer.region.max_x * 2.0;
+        blocker.runtime.min_x = blocker.region.min_x;
+        blocker.runtime.max_x = blocker.region.max_x;
+        let layers = vec![source_layer, blocker];
+        let bounds = GoopPaintBounds::around([10_260.0, 0.0, 5_120.0], 20.0);
+
+        let error =
+            planned_goop_expansion(&layers, Some(&source), bounds, (256, 256), true).unwrap_err();
+        assert!(error.contains("overlap incompatible layer 01"));
     }
 
     #[test]
@@ -4169,6 +4857,67 @@ mod tests {
         let selected = default_goop_template_for_stroke(&document, &templates, &samples).unwrap();
         assert_eq!(selected.stage_id, "bianco1");
         assert_eq!(selected.layer_index, 2);
+    }
+
+    #[test]
+    fn default_style_falls_back_to_chocolate_without_an_inheritable_map_style() {
+        let document = StageDocument {
+            stage_id: "custom0".to_string(),
+            base_root: PathBuf::new(),
+            assets: Vec::new(),
+            objects: Vec::new(),
+            changed_files: BTreeMap::new(),
+            stage_archive: None,
+            stage_archive_source_path: None,
+            archive_edits: StageArchiveEdits::default(),
+            registry: None,
+            route_authoring: None,
+            goop_authoring: Some(GoopAuthoringDocument::default()),
+            dialogue_authoring: None,
+            dialogue_library: Default::default(),
+            load_issues: Vec::new(),
+            lighting: Default::default(),
+            death_barrier: None,
+            actor_previews: BTreeMap::new(),
+            loaded_project: None,
+        };
+        let templates = vec![
+            retail_template("monte0", 0, GoopBehavior::Fire, "Fire"),
+            retail_template("bianco0", 0, GoopBehavior::Slippery, "Chocolate"),
+            retail_template("airport0", 0, GoopBehavior::Slippery, "Pink"),
+        ];
+        let samples = vec![PendingGoopSample {
+            world: [80.0, 0.0, 80.0],
+            brush: GoopBrush {
+                radius: 200.0,
+                hardness: 1.0,
+                opacity: 1.0,
+                erase: false,
+            },
+        }];
+
+        assert_eq!(
+            stage_inherited_goop_template_index(
+                &document.stage_id,
+                &document.goop_authoring.as_ref().unwrap().layers,
+                &templates,
+            ),
+            None
+        );
+        let selected = default_goop_template_for_stroke(&document, &templates, &samples).unwrap();
+        assert_eq!(selected.semantic_type, "Chocolate");
+    }
+
+    #[test]
+    fn the_first_automatic_layer_uses_compact_small_map_sizing() {
+        let bounds = GoopPaintBounds::around([80.0, 0.0, 80.0], 200.0);
+        let (_, first_width, first_height) =
+            adaptive_fresh_goop_region(bounds, GOOP_CELL_SIZE, false, 0).unwrap();
+        let (_, later_width, later_height) =
+            adaptive_fresh_goop_region(bounds, GOOP_CELL_SIZE, false, 1).unwrap();
+
+        assert_eq!((1usize << first_width, 1usize << first_height), (16, 16));
+        assert_eq!((1usize << later_width, 1usize << later_height), (256, 256));
     }
 
     fn synthetic_runtime_texture(fill: u8) -> sms_formats::BtiFile {
@@ -4612,6 +5361,63 @@ mod tests {
     }
 
     #[test]
+    fn goop_snapshot_undo_restores_layer_owned_enemy_pools_with_the_layer() {
+        let before_objects = vec![layer_pool_object(0)];
+        let after_objects = Vec::new();
+        let before = Some(GoopAuthoringDocument {
+            layers: vec![editable_layer()],
+            ..Default::default()
+        });
+        let after = Some(GoopAuthoringDocument::default());
+        let mut app = SmsEditorApp {
+            document: Some(StageDocument {
+                stage_id: "test".to_string(),
+                base_root: PathBuf::new(),
+                assets: Vec::new(),
+                objects: after_objects.clone(),
+                changed_files: BTreeMap::new(),
+                stage_archive: None,
+                stage_archive_source_path: None,
+                archive_edits: StageArchiveEdits::default(),
+                registry: None,
+                route_authoring: None,
+                goop_authoring: after.clone(),
+                dialogue_authoring: None,
+                dialogue_library: Default::default(),
+                load_issues: Vec::new(),
+                lighting: Default::default(),
+                death_barrier: None,
+                actor_previews: BTreeMap::new(),
+                loaded_project: None,
+            }),
+            ..SmsEditorApp::default()
+        };
+        let record = GoopUndoRecord::Snapshot(Box::new(GoopSnapshotUndo {
+            before: before.clone(),
+            after: after.clone(),
+            before_edits: StageArchiveEdits::default(),
+            after_edits: StageArchiveEdits::default(),
+            before_objects: Some(before_objects.clone()),
+            after_objects: Some(after_objects.clone()),
+        }));
+
+        app.apply_goop_undo_record(&record, false);
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.goop_authoring, before);
+        assert_eq!(document.objects, before_objects);
+        assert_eq!(
+            crate::goop_spawn::layer_pool_manager_names(document, 0),
+            vec!["fixtureManager_L00".to_string()]
+        );
+
+        app.apply_goop_undo_record(&record, true);
+        let document = app.document.as_ref().unwrap();
+        assert_eq!(document.goop_authoring, after);
+        assert_eq!(document.objects, after_objects);
+        assert!(crate::goop_spawn::layer_pool_manager_names(document, 0).is_empty());
+    }
+
+    #[test]
     fn adaptive_edit_guard_is_clone_stable_and_detects_goop_or_resource_changes() {
         let mut document = StageDocument {
             stage_id: "test".to_string(),
@@ -4650,6 +5456,8 @@ mod tests {
                 after: document.goop_authoring.clone(),
                 before_edits: document.archive_edits.clone(),
                 after_edits: document.archive_edits.clone(),
+                before_objects: None,
+                after_objects: None,
             },
             heap_warning: None,
             document: document.clone(),
@@ -4987,6 +5795,16 @@ mod tests {
             assert!(((point[0] - center[0]).hypot(point[2] - center[2]) - 60.0).abs() < 0.001);
         }
         assert!(outline.iter().any(|point| (point[1] - 128.0).abs() < 0.001));
+    }
+
+    #[test]
+    fn invalid_outer_cells_still_render_the_layer_bounds() {
+        let mut layer = editable_layer();
+        layer.runtime.vertical_offset = 321.0;
+        layer.runtime.depth_map.fill(0xff);
+
+        assert_eq!(goop_cell_cleanable_surface_y(&layer, 0, 0), None);
+        assert_eq!(goop_boundary_surface_y(&layer, 0, 0), 321.0);
     }
 
     #[test]

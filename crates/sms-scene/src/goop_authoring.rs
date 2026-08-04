@@ -26,6 +26,10 @@ pub const GOOP_MIN_MUTABLE_DEPTH: u8 = 1;
 pub const GOOP_MAX_LAYERS: usize = 20;
 pub const GOOP_MAX_DIMENSION: usize = 1024;
 pub const GOOP_AUTO_INITIAL_DIMENSION: usize = 256;
+/// Smallest square page used by the explicit Simple-mode "new layer" stroke.
+/// Eight cells keeps the runtime power-of-two layout while allowing several
+/// independently authored regions to fit on compact custom maps.
+pub const GOOP_COMPACT_INITIAL_DIMENSION: usize = 8;
 pub const GOOP_AUTHORING_FORMAT_VERSION: u32 = 12;
 /// Generated pollution resources above this size deserve an explicit warning:
 /// they consume Sunshine's fixed stage heap in addition to the map and actors.
@@ -207,6 +211,14 @@ impl GoopLayerAuthoring {
         self.plane == GoopPlane::Floor && self.bitmap.is_some()
     }
 
+    /// Whether this layer's geometry and depth resources are maintained by
+    /// the editor's generator. Imported layers become generator-managed after
+    /// their authored bounds are expanded, but remain imported so deleting
+    /// generated tail layers cannot remove the stage's original goopmap.
+    pub fn generator_managed(&self) -> bool {
+        self.origin == GoopLayerOrigin::Generated || self.generated_model.is_some()
+    }
+
     pub fn dimensions(&self) -> Result<(usize, usize)> {
         Ok(self.runtime.dimensions()?)
     }
@@ -311,7 +323,7 @@ pub fn estimate_goop_runtime_payload(
     for layer in authoring
         .layers
         .iter()
-        .filter(|layer| layer.origin == GoopLayerOrigin::Generated)
+        .filter(|layer| layer.generator_managed())
     {
         estimate.generated_layer_count += 1;
         if let Some(model) = &layer.generated_model {
@@ -365,7 +377,7 @@ fn generated_goop_resource_stems(authoring: &GoopAuthoringDocument) -> BTreeSet<
     authoring
         .layers
         .iter()
-        .filter(|layer| layer.origin == GoopLayerOrigin::Generated)
+        .filter(|layer| layer.generator_managed())
         .map(|layer| layer.resource_stem.as_str())
         .filter(|stem| !stem.is_empty())
         .collect()
@@ -419,7 +431,7 @@ impl StageDocument {
         let depth_bytes = authoring
             .layers
             .iter()
-            .filter(|layer| layer.origin == GoopLayerOrigin::Generated)
+            .filter(|layer| layer.generator_managed())
             .fold(0usize, |total, layer| {
                 total
                     .saturating_add(0x2c)
@@ -509,7 +521,7 @@ impl GoopAuthoringDocument {
             && self
                 .layers
                 .iter()
-                .any(|layer| layer.origin == GoopLayerOrigin::Generated)
+                .any(GoopLayerAuthoring::generator_managed)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -592,8 +604,7 @@ impl GoopAuthoringDocument {
         }
         for left in 0..self.layers.len() {
             for right in left + 1..self.layers.len() {
-                if (self.layers[left].origin == GoopLayerOrigin::Generated
-                    || self.layers[right].origin == GoopLayerOrigin::Generated)
+                if (self.layers[left].generator_managed() || self.layers[right].generator_managed())
                     && self.layers[left].plane == GoopPlane::Floor
                     && self.layers[right].plane == GoopPlane::Floor
                     && self.layers[left].region.overlaps(self.layers[right].region)
@@ -711,16 +722,31 @@ pub fn automatic_goop_region(
     bounds: GoopPaintBounds,
     cell_size: f32,
 ) -> Result<(GoopRegion, u16, u16)> {
+    sized_automatic_goop_region(bounds, cell_size, GOOP_AUTO_INITIAL_DIMENSION)
+}
+
+pub fn compact_goop_region(
+    bounds: GoopPaintBounds,
+    cell_size: f32,
+) -> Result<(GoopRegion, u16, u16)> {
+    sized_automatic_goop_region(bounds, cell_size, GOOP_COMPACT_INITIAL_DIMENSION)
+}
+
+fn sized_automatic_goop_region(
+    bounds: GoopPaintBounds,
+    cell_size: f32,
+    initial_dimension: usize,
+) -> Result<(GoopRegion, u16, u16)> {
     if !cell_size.is_finite() || cell_size <= 0.0 {
         return Err(SceneError::StageExport(format!(
             "automatic goop cell size must be finite and positive, got {cell_size}"
         )));
     }
     let needed_x = (((bounds.max_x - bounds.min_x).max(0.0) / cell_size).ceil() as usize)
-        .max(GOOP_AUTO_INITIAL_DIMENSION)
+        .max(initial_dimension)
         .next_power_of_two();
     let needed_z = (((bounds.max_z - bounds.min_z).max(0.0) / cell_size).ceil() as usize)
-        .max(GOOP_AUTO_INITIAL_DIMENSION)
+        .max(initial_dimension)
         .next_power_of_two();
     if needed_x > GOOP_MAX_DIMENSION || needed_z > GOOP_MAX_DIMENSION {
         return Err(SceneError::StageExport(format!(
@@ -2518,11 +2544,11 @@ impl StageDocument {
             authoring.stale |= authoring
                 .layers
                 .iter()
-                .any(|layer| layer.origin == GoopLayerOrigin::Generated);
+                .any(GoopLayerAuthoring::generator_managed);
             if !authoring
                 .layers
                 .iter()
-                .any(|layer| layer.origin == GoopLayerOrigin::Generated)
+                .any(GoopLayerAuthoring::generator_managed)
             {
                 authoring.format_version = GOOP_AUTHORING_FORMAT_VERSION;
             }
@@ -2548,7 +2574,7 @@ impl StageDocument {
         if compilable
             .layers
             .iter()
-            .any(|layer| layer.origin == GoopLayerOrigin::Generated || layer.metadata_dirty)
+            .any(|layer| layer.generator_managed() || layer.metadata_dirty)
         {
             let compiled = match self.effective_resource_clone(GOOP_RESOURCE_PATH)? {
                 Some(StageResourceDocument::PollutionMap(base)) => {
@@ -2625,7 +2651,7 @@ impl StageDocument {
             if authoring
                 .layers
                 .iter()
-                .any(|layer| layer.origin == GoopLayerOrigin::Generated)
+                .any(GoopLayerAuthoring::generator_managed)
                 && authoring.terrain_fingerprint != 0
                 && authoring.terrain_fingerprint != fingerprint
             {
@@ -2820,6 +2846,29 @@ mod tests {
         assert!(region.contains(100.0, 200.0));
         assert_eq!(region.min_x % GOOP_CELL_SIZE, 0.0);
         assert_eq!(region.min_z % GOOP_CELL_SIZE, 0.0);
+    }
+
+    #[test]
+    fn compact_regions_fit_small_maps_and_grow_with_the_stroke() {
+        let small = GoopPaintBounds::around([100.0, 0.0, 200.0], 20.0);
+        let (region, width_log2, height_log2) = compact_goop_region(small, GOOP_CELL_SIZE).unwrap();
+        assert_eq!((1usize << width_log2, 1usize << height_log2), (8, 8));
+        assert!(region.contains(100.0, 200.0));
+
+        let default_brush = GoopPaintBounds::around([100.0, 0.0, 200.0], 200.0);
+        let (_, width_log2, height_log2) =
+            compact_goop_region(default_brush, GOOP_CELL_SIZE).unwrap();
+        assert_eq!((1usize << width_log2, 1usize << height_log2), (16, 16));
+
+        let left_bounds = GoopPaintBounds::around([-200.0, 0.0, 0.0], 20.0);
+        let right_bounds = GoopPaintBounds::around([200.0, 0.0, 0.0], 20.0);
+        let (left_compact, _, _) = compact_goop_region(left_bounds, GOOP_CELL_SIZE).unwrap();
+        let (right_compact, _, _) = compact_goop_region(right_bounds, GOOP_CELL_SIZE).unwrap();
+        assert!(!left_compact.overlaps(right_compact));
+
+        let (left_automatic, _, _) = automatic_goop_region(left_bounds, GOOP_CELL_SIZE).unwrap();
+        let (right_automatic, _, _) = automatic_goop_region(right_bounds, GOOP_CELL_SIZE).unwrap();
+        assert!(left_automatic.overlaps(right_automatic));
     }
 
     #[test]

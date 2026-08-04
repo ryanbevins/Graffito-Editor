@@ -92,6 +92,7 @@ impl ObjectAuthoringCatalog {
                     Some(ObjectAuthoringResource {
                         raw_resource_path: archive_resource_path(&asset.path)?,
                         source_asset_path: asset.path.clone(),
+                        fixed_runtime_path: false,
                     })
                 })
                 .collect();
@@ -278,6 +279,10 @@ pub struct ObjectAuthoringRuntimeActorReference {
 pub struct ObjectAuthoringResource {
     pub raw_resource_path: Vec<u8>,
     pub source_asset_path: PathBuf,
+    /// The decomp opens this exact absolute stage path directly. Independent
+    /// manager pools may relocate their character-owned models, but moving a
+    /// fixed path makes the runtime lookup return null.
+    pub fixed_runtime_path: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1587,7 +1592,19 @@ fn resolve_resources(
     resolve_particle_resources(&mut out, candidate, sources, registry, &runtime_classes)?;
     add_preview_resources(&mut out, candidate, sources, registry);
     ensure_unique_resource_paths(&out, "runtime resource closure")?;
-    Ok(out.into_iter().collect())
+    let fixed_runtime_paths = registry
+        .asset_hints
+        .iter()
+        .map(|hint| normalize_text_path(&runtime_reference_archive_path(&hint.path)))
+        .collect::<BTreeSet<_>>();
+    Ok(out
+        .into_iter()
+        .map(|mut resource| {
+            resource.fixed_runtime_path =
+                fixed_runtime_paths.contains(&normalized_path(&resource.raw_resource_path));
+            resource
+        })
+        .collect())
 }
 
 fn object_resource_path(binding: &ObjectResourceBinding) -> String {
@@ -2686,6 +2703,9 @@ pub fn clone_enemy_manager_template(
     // Resource destinations move under the renamed folders so the clone writes
     // its own models instead of silently reusing the original's.
     for resource in &mut clone.resources {
+        if resource.fixed_runtime_path {
+            continue;
+        }
         // Matching is case-insensitive like the rest of the archive lookups,
         // but the rewrite keeps the original casing of everything it does not
         // replace: these paths are compared against real archive entries.
@@ -4504,6 +4524,40 @@ mod tests {
                 build.warnings.iter().take(20).collect::<Vec<_>>()
             );
         }
+
+        let namekuri = build
+            .catalog
+            .find("NameKuri")
+            .expect("NameKuri retail template");
+        for path in ["namekuri2/brain.bmd", "namekuri2/bas/name_jump_start.bas"] {
+            assert!(
+                namekuri.resources.iter().any(|resource| {
+                    normalized_path(&resource.raw_resource_path) == path
+                        && resource.fixed_runtime_path
+                }),
+                "NameKuri did not retain fixed runtime resource {path}"
+            );
+        }
+        let manager_name = namekuri
+            .dependencies
+            .iter()
+            .find(|dependency| {
+                semantic_type_name(&dependency.record.type_name) == "NameKuriManager"
+            })
+            .map(|dependency| dependency.record.name.as_str())
+            .expect("NameKuri manager dependency");
+        let clone = clone_enemy_manager_template(namekuri, manager_name, "_L00", true)
+            .expect("clone NameKuri pool")
+            .template;
+        for path in ["namekuri2/brain.bmd", "namekuri2/bas/name_jump_start.bas"] {
+            assert!(
+                clone
+                    .resources
+                    .iter()
+                    .any(|resource| { normalized_path(&resource.raw_resource_path) == path }),
+                "NameKuri clone moved fixed runtime resource {path}"
+            );
+        }
     }
 
     #[test]
@@ -4535,6 +4589,7 @@ mod tests {
             .map(|path| ObjectAuthoringResource {
                 raw_resource_path: path.as_bytes().to_vec(),
                 source_asset_path: PathBuf::from(format!("{archive}!/{path}")),
+                fixed_runtime_path: false,
             })
             .collect()
     }
@@ -4646,6 +4701,26 @@ mod tests {
         // The original is untouched, so repeated clones all derive from retail.
         assert_eq!(template.dependencies[0].record.name, "hamuManager");
         assert_eq!(raw_paths(&template.resources)[0], "hamukuri/default.bmd");
+    }
+
+    #[test]
+    fn a_clone_preserves_decomp_fixed_resource_paths() {
+        let mut template = cloneable_manager_template();
+        template.resources.push(ObjectAuthoringResource {
+            raw_resource_path: b"hamukuri/brain.bmd".to_vec(),
+            source_asset_path: PathBuf::from("bianco0.szs!/hamukuri/brain.bmd"),
+            fixed_runtime_path: true,
+        });
+        template.resources.sort();
+
+        let clone = clone_enemy_manager_template(&template, "hamuManager", "_L01", true)
+            .unwrap()
+            .template;
+        let paths = raw_paths(&clone.resources);
+
+        assert!(paths.iter().any(|path| path == "hamukuri/brain.bmd"));
+        assert!(!paths.iter().any(|path| path == "hamukuri01/brain.bmd"));
+        assert!(paths.iter().any(|path| path == "hamukuri01/default.bmd"));
     }
 
     /// HamuKuri's registration lives in global `scenecmn.bin`, so its

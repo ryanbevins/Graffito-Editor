@@ -614,6 +614,10 @@ fn layer_pool_instances(document: &StageDocument) -> BTreeMap<usize, Vec<LayerPo
     pools
 }
 
+fn is_top_level_goop_manager(manager_name: &str, managed_layer_pools: &BTreeSet<String>) -> bool {
+    !managed_layer_pools.contains(manager_name)
+}
+
 pub(super) fn layer_pool_manager_names(
     document: &StageDocument,
     layer_index: usize,
@@ -802,6 +806,11 @@ impl SmsEditorApp {
         let managers = enemy_manager_instances(document, registry);
         let catalog_choices =
             catalog_enemy_manager_choices(&self.object_authoring_catalog, registry);
+        let managed_layer_pools = layer_pool_instances(document)
+            .into_values()
+            .flatten()
+            .map(|pool| pool.manager_name)
+            .collect::<BTreeSet<_>>();
         let mut entities = Vec::new();
         let manager_names = managers
             .keys()
@@ -809,6 +818,9 @@ impl SmsEditorApp {
             .cloned()
             .collect::<BTreeSet<_>>();
         for manager_name in manager_names {
+            if !is_top_level_goop_manager(&manager_name, &managed_layer_pools) {
+                continue;
+            }
             let manager = managers.get(&manager_name);
             let choices = catalog_choices.get(&manager_name);
             let active_factory = active_pool_actor_factory(document, &manager_name);
@@ -847,6 +859,9 @@ impl SmsEditorApp {
             }
         }
         for manager_name in goop_flagged_managers(document) {
+            if !is_top_level_goop_manager(&manager_name, &managed_layer_pools) {
+                continue;
+            }
             if !entities
                 .iter()
                 .any(|entity| entity.manager_name == manager_name)
@@ -1471,7 +1486,7 @@ impl SmsEditorApp {
         layer_pool_suffix_for_index(layer_index)
     }
 
-    /// Goop layers a per-layer pool can be bound to: index and style name.
+    /// Every goop layer a cloned pool can be bound to: index and readable name.
     pub(super) fn goop_layer_choices(&self) -> Vec<(usize, String)> {
         let Some(document) = self.document.as_ref() else {
             return Vec::new();
@@ -1483,11 +1498,12 @@ impl SmsEditorApp {
             .layers
             .iter()
             .enumerate()
-            .filter_map(|(index, layer)| {
-                layer
-                    .style_source
-                    .as_ref()
-                    .map(|style| (index, style.display_name.clone()))
+            .map(|(index, layer)| {
+                let name = layer.style_source.as_ref().map_or_else(
+                    || layer.behavior.label(),
+                    |style| style.display_name.clone(),
+                );
+                (index, name)
             })
             .collect()
     }
@@ -1527,6 +1543,47 @@ impl SmsEditorApp {
             }
         }
         bindings
+    }
+
+    /// Restores resource paths required by already-saved per-layer pools.
+    /// Clone layout rules can gain newly decomp-proven fixed-path resources;
+    /// project load must reconcile them without requiring the user to remove
+    /// and recreate a checked pool.
+    pub(super) fn repair_layer_pool_resources(&mut self) -> Vec<String> {
+        let instances = self
+            .document
+            .as_ref()
+            .map(layer_pool_instances)
+            .unwrap_or_default();
+        let mut messages = Vec::new();
+        for (layer_index, instances) in instances {
+            let suffix = Self::layer_pool_suffix(layer_index);
+            for instance in instances {
+                let Some(manager_name) = instance.manager_name.strip_suffix(&suffix) else {
+                    messages.push(format!(
+                        "Could not repair layer {layer_index:02} pool {:?}: its manager name has no {suffix} suffix.",
+                        instance.manager_name
+                    ));
+                    continue;
+                };
+                match self.ensure_cloned_manager_pool_resources(
+                    &instance.actor_factory,
+                    manager_name,
+                    &suffix,
+                ) {
+                    Ok(0) => {}
+                    Ok(repaired) => messages.push(format!(
+                        "Restored {repaired} runtime resource(s) for layer {layer_index:02} pool {:?}.",
+                        instance.manager_name
+                    )),
+                    Err(error) => messages.push(format!(
+                        "Could not repair layer {layer_index:02} pool {:?}: {error}",
+                        instance.manager_name
+                    )),
+                }
+            }
+        }
+        messages
     }
 
     /// Re-bakes the current style into the one pool owned by this layer.
@@ -1599,6 +1656,24 @@ impl SmsEditorApp {
             "Removed pool {:?}: {characters} character registration(s), {resources} cloned resource(s).",
             instance.manager_name
         ))
+    }
+
+    pub(super) fn remove_enemy_pools_for_goop_layers(
+        &mut self,
+        layer_indices: &BTreeSet<usize>,
+    ) -> Result<Vec<String>, String> {
+        let mut removed = Vec::new();
+        for layer_index in layer_indices {
+            let instances = self
+                .document
+                .as_ref()
+                .and_then(|document| layer_pool_instances(document).remove(layer_index))
+                .unwrap_or_default();
+            for instance in instances {
+                removed.push(self.remove_layer_pool_instance(&instance, *layer_index)?);
+            }
+        }
+        Ok(removed)
     }
 
     /// Adds or removes the pool that spawns in one goop layer.
@@ -1804,9 +1879,22 @@ impl SmsEditorApp {
 
     /// The Spawning section of the goop inspector.
     pub(super) fn gooble_spawn_section(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
-        ui.strong("Goop enemy managers (TConductor)");
         let entities = self.goop_spawnable_entities();
+        let layers = self.goop_layer_choices();
+        egui::CollapsingHeader::new("Goop enemy managers (TConductor)")
+            .id_salt("goop-enemy-managers")
+            .default_open(false)
+            .show(ui, |ui| {
+                self.gooble_spawn_controls(ui, &entities, &layers);
+            });
+    }
+
+    fn gooble_spawn_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        entities: &[GoopSpawnEntity],
+        layers: &[(usize, String)],
+    ) {
         if entities.is_empty() {
             ui.label(
                 "No safe enemy-manager bundles were found in the decomp-derived retail catalog.",
@@ -1834,15 +1922,18 @@ impl SmsEditorApp {
             } else {
                 " (remove stale flag)"
             };
+            let mut global_toggled = None;
+            let mut layer_toggled = None;
+            egui::CollapsingHeader::new(format!(
+                "{} \u{2014} {}",
+                entity.display_name, entity.manager_name
+            ))
+            .id_salt(format!("goop-manager-{}", entity.manager_name))
+            .default_open(false)
+            .show(ui, |ui| {
             let response = ui.add_enabled(
                 entity.unavailable_reason.is_none() || flagged,
-                egui::Checkbox::new(
-                    &mut enabled,
-                    format!(
-                        "{} \u{2014} {}{}",
-                        entity.display_name, entity.manager_name, suffix
-                    ),
-                ),
+                egui::Checkbox::new(&mut enabled, format!("GLOBAL{suffix}")),
             );
             let hover = if let Some(reason) = entity.unavailable_reason {
                 if flagged {
@@ -1868,52 +1959,47 @@ impl SmsEditorApp {
             if response.on_hover_text(hover).changed()
                 && (entity.manager_present || catalog_available || !enabled)
             {
-                self.set_manager_spawns_from_goop(&entity, enabled);
+                global_toggled = Some(enabled);
             }
 
-            // Per-layer pools: one independent copy of this bundle per goop
-            // layer, so each can carry its own baked stain. Only offered for
-            // bundles the catalog can clone.
-            let layers = self.goop_layer_choices();
+            // Each layer gets one independent copy of this bundle, so it can
+            // carry its own baked stain. Only catalog bundles can be cloned.
             if catalog_available && !layers.is_empty() {
-                let mut toggled = None;
-                egui::CollapsingHeader::new(format!(
-                    "Per-layer pools \u{2014} {}",
-                    entity.display_name
-                ))
-                .id_salt(format!("layer-pools-{}", entity.manager_name))
-                .show(ui, |ui| {
-                    ui.label(
-                        "Each layer gets its own copy of this enemy's manager, character and \
-                         models, so it can wear that layer's stain. Needs the runtime layer \
-                         patch to route spawns.",
-                    );
-                    for (index, name) in &layers {
-                        let actor_factory = entity
-                            .catalog_actor_factory
-                            .as_deref()
-                            .expect("catalog-backed layer pool has an actor factory");
-                        let mut present =
-                            self.layer_pool_exists(&entity.manager_name, actor_factory, *index);
-                        if ui
-                            .checkbox(&mut present, format!("{index:02} {name}"))
-                            .on_hover_text(format!(
-                                "Adds pool {:?} for this layer.",
-                                format!(
-                                    "{}{}",
-                                    entity.manager_name,
-                                    Self::layer_pool_suffix(*index)
-                                )
-                            ))
-                            .changed()
-                        {
-                            toggled = Some((*index, present));
-                        }
+                ui.small(
+                    "Layer pools clone this manager and its models so each layer can keep its own stain.",
+                );
+                for (index, name) in layers {
+                    let actor_factory = entity
+                        .catalog_actor_factory
+                        .as_deref()
+                        .expect("catalog-backed layer pool has an actor factory");
+                    let mut present =
+                        self.layer_pool_exists(&entity.manager_name, actor_factory, *index);
+                    if ui
+                        .checkbox(
+                            &mut present,
+                            format!("LAYER {index:02} \u{2014} {name}"),
+                        )
+                        .on_hover_text(format!(
+                            "Adds pool {:?} for this layer. Needs the runtime layer patch to route spawns.",
+                            format!(
+                                "{}{}",
+                                entity.manager_name,
+                                Self::layer_pool_suffix(*index)
+                            )
+                        ))
+                        .changed()
+                    {
+                        layer_toggled = Some((*index, present));
                     }
-                });
-                if let Some((index, present)) = toggled {
-                    self.set_layer_pool(&entity, index, present);
                 }
+            }
+            });
+            if let Some(enabled) = global_toggled {
+                self.set_manager_spawns_from_goop(entity, enabled);
+            }
+            if let Some((index, present)) = layer_toggled {
+                self.set_layer_pool(entity, index, present);
             }
         }
 
@@ -1924,7 +2010,7 @@ impl SmsEditorApp {
             && ui
                 .button("Write layer spawn bindings")
                 .on_hover_text(
-                    "Writes goop-layer-bindings.json beside the managed build: the layer ->                      pool mapping the runtime layer patch reads.",
+                    "Writes goop-layer-bindings.json beside the managed build: the layer -> pool mapping the runtime layer patch reads.",
                 )
                 .clicked()
         {
@@ -1938,7 +2024,7 @@ impl SmsEditorApp {
                 .on_hover_text(
                     "Bakes the stage's stain texture into the Stu model and pins its \
                      blend, so it shows regardless of what the runtime decides. Applies \
-                     to the base pool; per-layer pools keep their own layer's stain.",
+                     to the GLOBAL pool; layer pools keep their own layer's stain.",
                 )
                 .changed()
             {
@@ -1969,6 +2055,17 @@ mod tests {
         assert_eq!(layer_pool_index("hamuManager_L1"), None);
         assert_eq!(layer_pool_index("hamuManager_L001"), None);
         assert_eq!(layer_pool_index("hamuManager_L00_extra"), None);
+    }
+
+    #[test]
+    fn managed_layer_pool_clones_are_not_top_level_enemy_choices() {
+        let managed = BTreeSet::from(["DoroHaneKuriManager_L00".to_string()]);
+
+        assert!(is_top_level_goop_manager("DoroHaneKuriManager", &managed));
+        assert!(!is_top_level_goop_manager(
+            "DoroHaneKuriManager_L00",
+            &managed
+        ));
     }
 
     #[test]

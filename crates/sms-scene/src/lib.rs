@@ -65,17 +65,18 @@ pub use dialogue_authoring::{
 };
 pub use goop_authoring::{
     automatic_goop_region, balanced_goop_expansion, carve_compatible_goop_overlap_depths,
-    estimate_goop_runtime_payload, expanded_goop_region, generate_floor_depth_map,
-    generate_floor_depth_map_for_surface, generate_floor_pollution_model,
+    compact_goop_region, estimate_goop_runtime_payload, expanded_goop_region,
+    generate_floor_depth_map, generate_floor_depth_map_for_surface, generate_floor_pollution_model,
     generate_floor_pollution_model_for_surface, goop_layer_accepts_height, goop_layers_can_overlap,
     goop_runtime_layer_capacity, position_goop_region_avoiding, reproject_goop_mask,
     terrain_fingerprint, whole_terrain_region, GoopAuthoringDocument, GoopBehavior,
     GoopLayerAuthoring, GoopLayerOrigin, GoopPaintBounds, GoopPlane, GoopRegion,
     GoopRenderTriangle, GoopRuntimePayloadEstimate, GoopStageHeapEstimate, GoopStyleSource,
     GoopSurfaceAnchor, GoopTerrainTriangle, GOOP_AUTHORING_FORMAT_VERSION,
-    GOOP_AUTO_INITIAL_DIMENSION, GOOP_CELL_SIZE, GOOP_DEPTH_WORLD_UNITS_PER_CODE,
-    GOOP_MAX_DIMENSION, GOOP_MAX_LAYERS, GOOP_RESOURCE_PATH, GOOP_RUNTIME_PAYLOAD_ERROR_BYTES,
-    GOOP_RUNTIME_PAYLOAD_WARNING_BYTES, GOOP_STAGE_HEAP_ERROR_BYTES, GOOP_STAGE_HEAP_WARNING_BYTES,
+    GOOP_AUTO_INITIAL_DIMENSION, GOOP_CELL_SIZE, GOOP_COMPACT_INITIAL_DIMENSION,
+    GOOP_DEPTH_WORLD_UNITS_PER_CODE, GOOP_MAX_DIMENSION, GOOP_MAX_LAYERS, GOOP_RESOURCE_PATH,
+    GOOP_RUNTIME_PAYLOAD_ERROR_BYTES, GOOP_RUNTIME_PAYLOAD_WARNING_BYTES,
+    GOOP_STAGE_HEAP_ERROR_BYTES, GOOP_STAGE_HEAP_WARNING_BYTES,
 };
 pub use object_authoring::{
     clone_enemy_manager_template, ClonedEnemyManagerBundle, ObjectAuthoringCatalog,
