@@ -501,6 +501,80 @@ pub enum J3dPaddingKind {
     SuperBmdMessage(Vec<u8>),
 }
 
+/// The byte width of one element of a scalar array.
+fn scalar_array_element_width(array: &J3dScalarArray) -> usize {
+    match array {
+        J3dScalarArray::Unsigned8(_) | J3dScalarArray::Signed8(_) | J3dScalarArray::PackedColor(_) => 1,
+        J3dScalarArray::Unsigned16(_) | J3dScalarArray::Signed16(_) => 2,
+        J3dScalarArray::Unsigned32(_) | J3dScalarArray::Float32Bits(_) => 4,
+    }
+}
+
+/// How many bytes a scalar array occupies once written.
+fn scalar_array_byte_len(array: &J3dScalarArray) -> usize {
+    scalar_array_len(array) * scalar_array_element_width(array)
+}
+
+fn align_up(value: usize, alignment: usize) -> usize {
+    value.div_ceil(alignment) * alignment
+}
+
+/// Repacks a name table's strings and reports the bytes it occupies.
+///
+/// Entry order and hashes are the table's own; only where each string sits is
+/// recomputed, so a table that gained an entry writes without colliding.
+fn relayout_name_table(table: &mut J3dNameTable) -> Result<usize> {
+    let mut cursor = 4 + table.entries.len() * 4;
+    for entry in &mut table.entries {
+        let (encoded, _, had_errors) = SHIFT_JIS.encode(&entry.name);
+        if had_errors {
+            return Err(unsupported(format!(
+                "name {:?} cannot be encoded as Shift-JIS",
+                entry.name
+            )));
+        }
+        entry.string_offset = u16::try_from(cursor).map_err(|_| {
+            unsupported(format!("name table is too large for {:?}", entry.name))
+        })?;
+        cursor += encoded.len() + 1;
+    }
+    Ok(cursor)
+}
+
+/// The kinds the thirty MAT3 offset slots address, in slot order.
+const MATERIAL_TABLE_KINDS: [J3dMaterialTableKind; 30] = [
+    J3dMaterialTableKind::MaterialInit,
+    J3dMaterialTableKind::MaterialRemap,
+    J3dMaterialTableKind::Names,
+    J3dMaterialTableKind::IndirectInit,
+    J3dMaterialTableKind::CullMode,
+    J3dMaterialTableKind::MaterialColor,
+    J3dMaterialTableKind::ColorChannelCount,
+    J3dMaterialTableKind::ColorChannel,
+    J3dMaterialTableKind::AmbientColor,
+    J3dMaterialTableKind::Light,
+    J3dMaterialTableKind::TexGenCount,
+    J3dMaterialTableKind::TexCoord,
+    J3dMaterialTableKind::TexCoord2,
+    J3dMaterialTableKind::TexMatrix,
+    J3dMaterialTableKind::PostTexMatrix,
+    J3dMaterialTableKind::TextureNumber,
+    J3dMaterialTableKind::TevOrder,
+    J3dMaterialTableKind::TevColor,
+    J3dMaterialTableKind::TevKonstColor,
+    J3dMaterialTableKind::TevStageCount,
+    J3dMaterialTableKind::TevStage,
+    J3dMaterialTableKind::TevSwapMode,
+    J3dMaterialTableKind::TevSwapTable,
+    J3dMaterialTableKind::Fog,
+    J3dMaterialTableKind::AlphaCompare,
+    J3dMaterialTableKind::Blend,
+    J3dMaterialTableKind::ZMode,
+    J3dMaterialTableKind::ZCompareLocation,
+    J3dMaterialTableKind::Dither,
+    J3dMaterialTableKind::NbtScale,
+];
+
 fn material_record_index(materials: &J3dMaterialSection, material_name: &str) -> Option<usize> {
     let name_index = materials
         .names
@@ -724,6 +798,143 @@ impl J3dRebuildDocument {
     /// runtime's exact one-half constant; only active TEV stages are changed so
     /// pristine padding selectors with the same byte remain untouched.
     /// Returns how many selectors were pinned.
+    /// Repacks MAT3 so its records sit where its offsets say, whatever size
+    /// they have grown to.
+    ///
+    /// Parsing keeps a section's imported layout so an untouched model
+    /// round-trips byte-for-byte, and the encoder writes back into a buffer of
+    /// exactly that size. A table that gains an entry therefore has nowhere to
+    /// go until the section is repacked: this walks the thirty offset slots in
+    /// order, places each table after the last, and resizes the section to
+    /// match. The data is untouched -- only where it lives changes.
+    pub fn canonicalize_material_layout(&mut self) -> Result<()> {
+        let mut canonical = self.clone();
+        canonical.canonicalize_material_layout_in_place()?;
+        *self = canonical;
+        Ok(())
+    }
+
+    fn canonicalize_material_layout_in_place(&mut self) -> Result<()> {
+        for section in &mut self.sections {
+            let J3dRebuildSectionData::Materials(materials) = &mut section.data else {
+                continue;
+            };
+            let mut offsets = [0u32; 30];
+            // The header runs to the end of the offset table.
+            let mut cursor = 0x0c + 30 * 4;
+            offsets[0] = u32::try_from(cursor)
+                .map_err(|_| unsupported("MAT3 init records start too far in".to_string()))?;
+            cursor += materials.material_init_records.len() * 0x14c;
+
+            for (slot, kind) in MATERIAL_TABLE_KINDS.iter().enumerate() {
+                if slot == 0 {
+                    continue;
+                }
+                if slot == 2 {
+                    let Some(names) = &mut materials.names else {
+                        continue;
+                    };
+                    cursor = align_up(cursor, 4);
+                    offsets[slot] = u32::try_from(cursor)
+                        .map_err(|_| unsupported("MAT3 name table too far in".to_string()))?;
+                    cursor += relayout_name_table(names)?;
+                    continue;
+                }
+                let Some(table) = materials.tables.iter_mut().find(|table| table.kind == *kind)
+                else {
+                    continue;
+                };
+                let length = scalar_array_byte_len(&table.allocation);
+                if length == 0 {
+                    continue;
+                }
+                // Four covers every element width these tables carry.
+                cursor = align_up(cursor, 4);
+                let offset = u32::try_from(cursor)
+                    .map_err(|_| unsupported(format!("MAT3 {kind:?} table too far in")))?;
+                table.offset = offset;
+                offsets[slot] = offset;
+                cursor += length;
+            }
+
+            materials.offsets = offsets;
+            section.declared_size = u32::try_from(align_up(cursor, 0x20))
+                .map_err(|_| unsupported("MAT3 is too large".to_string()))?;
+            // The repacked section has no imported padding left to reproduce.
+            section.padding = Vec::new();
+        }
+        Ok(())
+    }
+
+    /// Repacks TEX1 the same way, so a texture can be added to a model.
+    ///
+    /// Headers are laid out in order, then each texture's image and palette
+    /// blocks, then the name table. Every offset a record carries -- header,
+    /// image, palette -- is recomputed from where its bytes actually land.
+    pub fn canonicalize_texture_layout(&mut self) -> Result<()> {
+        let mut canonical = self.clone();
+        canonical.canonicalize_texture_layout_in_place()?;
+        *self = canonical;
+        Ok(())
+    }
+
+    fn canonicalize_texture_layout_in_place(&mut self) -> Result<()> {
+        for section in &mut self.sections {
+            let J3dRebuildSectionData::Textures(textures) = &mut section.data else {
+                continue;
+            };
+            let header_offset = 0x20usize;
+            textures.header_offset = u32::try_from(header_offset)
+                .map_err(|_| unsupported("TEX1 header offset".to_string()))?;
+            textures.texture_count = u16::try_from(textures.textures.len())
+                .map_err(|_| unsupported("TEX1 has too many textures".to_string()))?;
+
+            let mut cursor = header_offset + textures.textures.len() * 0x20;
+            for (index, texture) in textures.textures.iter_mut().enumerate() {
+                let base = header_offset + index * 0x20;
+                texture.header_relative_offset = u32::try_from(index * 0x20)
+                    .map_err(|_| unsupported("TEX1 header stride".to_string()))?;
+
+                if let Some(palette) = &mut texture.encoded_palette {
+                    cursor = align_up(cursor, 0x20);
+                    palette.absolute_section_offset = u32::try_from(cursor)
+                        .map_err(|_| unsupported("TEX1 palette offset".to_string()))?;
+                    texture.palette_offset = u32::try_from(cursor - base).map_err(|_| {
+                        unsupported("TEX1 palette sits before its header".to_string())
+                    })?;
+                    cursor += palette.bytes.len();
+                } else {
+                    texture.palette_offset = 0;
+                }
+
+                let mut image_offset = None;
+                for level in &mut texture.encoded_mip_levels {
+                    cursor = align_up(cursor, 0x20);
+                    level.absolute_section_offset = u32::try_from(cursor)
+                        .map_err(|_| unsupported("TEX1 image offset".to_string()))?;
+                    image_offset.get_or_insert(cursor);
+                    cursor += level.bytes.len();
+                }
+                texture.image_offset = match image_offset {
+                    Some(offset) => u32::try_from(offset - base).map_err(|_| {
+                        unsupported("TEX1 image sits before its header".to_string())
+                    })?,
+                    None => 0,
+                };
+            }
+
+            cursor = align_up(cursor, 4);
+            textures.name_table_offset = u32::try_from(cursor)
+                .map_err(|_| unsupported("TEX1 name table offset".to_string()))?;
+            cursor += relayout_name_table(&mut textures.names)?;
+
+            section.declared_size = u32::try_from(align_up(cursor, 0x20))
+                .map_err(|_| unsupported("TEX1 is too large".to_string()))?;
+            section.padding = Vec::new();
+        }
+        Ok(())
+    }
+
     /// Whether a material runs a wash comparison, and which konst register it
     /// compares against.
     ///
@@ -4655,5 +4866,139 @@ mod tests {
             "retail geometry resource count drifted"
         );
         eprintln!("canonical J3D geometry census rebuilt {rebuilt_count} BMD/BDL resources");
+    }
+}
+
+#[cfg(test)]
+mod goop_layout_tests {
+    use super::*;
+
+    /// Repacking a model's material and texture sections must not change what
+    /// the model says: only where its records sit. Run over every retail model
+    /// a stage archive carries, so the layout rules are checked against the
+    /// variety real files contain rather than one hand-picked case.
+    ///
+    /// `GRAFFITO_PROBE_SZS=<stage.szs> cargo test relayout_preserves -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn relayout_preserves_every_model_in_an_archive() {
+        let Ok(path) = std::env::var("GRAFFITO_PROBE_SZS") else {
+            return;
+        };
+        let assets = crate::mount_scene_archive(std::path::Path::new(&path)).expect("mount");
+        let mut checked = 0usize;
+        let mut skipped = 0usize;
+        for asset in &assets {
+            let text = asset.path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+            if !text.ends_with(".bmd") && !text.ends_with(".bdl") {
+                continue;
+            }
+            if let Ok(only) = std::env::var("GRAFFITO_ONLY") {
+                if !text.contains(&only) {
+                    continue;
+                }
+            }
+            let Ok(bytes) = crate::read_stage_asset_bytes(&asset.path) else {
+                continue;
+            };
+            let Ok(original) = J3dRebuildDocument::parse(&bytes) else {
+                skipped += 1;
+                continue;
+            };
+            let mut repacked = original.clone();
+            repacked
+                .canonicalize_material_layout()
+                .expect("material relayout");
+            repacked
+                .canonicalize_texture_layout()
+                .expect("texture relayout");
+            let written = repacked.to_bytes().expect("rebuild");
+            let reparsed = J3dRebuildDocument::parse(&written).expect("reparse");
+
+            // Compare what the sections mean, not where they sit.
+            for (before, after) in original.sections.iter().zip(&reparsed.sections) {
+                match (&before.data, &after.data) {
+                    (
+                        J3dRebuildSectionData::Materials(before),
+                        J3dRebuildSectionData::Materials(after),
+                    ) => {
+                        assert_eq!(
+                            before.material_init_records, after.material_init_records,
+                            "{text}: material records changed"
+                        );
+                        assert_eq!(
+                            before.names.as_ref().map(|names| names
+                                .entries
+                                .iter()
+                                .map(|entry| entry.name.clone())
+                                .collect::<Vec<_>>()),
+                            after.names.as_ref().map(|names| names
+                                .entries
+                                .iter()
+                                .map(|entry| entry.name.clone())
+                                .collect::<Vec<_>>()),
+                            "{text}: material names changed"
+                        );
+                        for table in &before.tables {
+                            let matching = after
+                                .tables
+                                .iter()
+                                .find(|candidate| candidate.kind == table.kind);
+                            assert_eq!(
+                                Some(&table.allocation),
+                                matching.map(|found| &found.allocation),
+                                "{text}: {:?} table changed",
+                                table.kind
+                            );
+                        }
+                    }
+                    (
+                        J3dRebuildSectionData::Textures(before),
+                        J3dRebuildSectionData::Textures(after),
+                    ) => {
+                        assert_eq!(
+                            before.texture_count, after.texture_count,
+                            "{text}: texture count changed"
+                        );
+                        for (left, right) in before.textures.iter().zip(&after.textures) {
+                            assert_eq!(left.format, right.format, "{text}: texture format");
+                            assert_eq!(left.width, right.width, "{text}: texture width");
+                            assert_eq!(left.height, right.height, "{text}: texture height");
+                            assert_eq!(
+                                left.encoded_mip_levels
+                                    .iter()
+                                    .map(|block| block.bytes.clone())
+                                    .collect::<Vec<_>>(),
+                                right
+                                    .encoded_mip_levels
+                                    .iter()
+                                    .map(|block| block.bytes.clone())
+                                    .collect::<Vec<_>>(),
+                                "{text}: texture pixels changed"
+                            );
+                        }
+                        assert_eq!(
+                            before
+                                .names
+                                .entries
+                                .iter()
+                                .map(|entry| entry.name.clone())
+                                .collect::<Vec<_>>(),
+                            after
+                                .names
+                                .entries
+                                .iter()
+                                .map(|entry| entry.name.clone())
+                                .collect::<Vec<_>>(),
+                            "{text}: texture names changed"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            checked += 1;
+        }
+        println!("relayout preserved {checked} models ({skipped} unparsed)");
+        assert!(checked > 0, "no models were checked");
     }
 }
