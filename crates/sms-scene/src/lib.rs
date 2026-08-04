@@ -883,11 +883,29 @@ impl StageDocument {
             .filter(|graph| self.route_reference_count(&graph.name) > 0)
             .map(|graph| graph.name.clone())
             .collect::<BTreeSet<_>>();
+        let is_catalog_managed = self.archive_edits.resources.iter().any(|edit| {
+            edit.raw_resource_path == raw_resource_path
+                && edit.catalog_managed
+                && matches!(&edit.document, StageResourceDocument::Rail(_))
+        });
+        let mut permitted_appended_graph_names = referenced_graph_names.clone();
+        if is_catalog_managed {
+            // The catalog merge itself is the provenance for an appended
+            // graph. Older authored objects can carry the exact typed route
+            // only in their persisted placement prototype while their clean
+            // preview parameter still contains `(null)`. Requiring a second
+            // live-object lookup in that case strands a valid catalog graph
+            // outside route authoring on every restart. The reconciler still
+            // proves that all existing graphs are byte-semantic matches and
+            // accepts additions only, so this cannot overwrite route edits.
+            permitted_appended_graph_names
+                .extend(runtime.graphs.iter().map(|graph| graph.name.clone()));
+        }
         if self
             .route_authoring
             .as_mut()
             .expect("route authoring was checked above")
-            .reconcile_appended_runtime_graphs(&runtime, &referenced_graph_names)
+            .reconcile_appended_runtime_graphs(&runtime, &permitted_appended_graph_names)
             .unwrap_or(false)
         {
             return true;
@@ -900,11 +918,6 @@ impl StageDocument {
         // contains only catalog graphs. Repair only an explicitly
         // catalog-managed edit whose every stored graph still has a live scene
         // reference. User-authored RAL conflicts remain validation errors.
-        let is_catalog_managed = self.archive_edits.resources.iter().any(|edit| {
-            edit.raw_resource_path == raw_resource_path
-                && edit.catalog_managed
-                && matches!(&edit.document, StageResourceDocument::Rail(_))
-        });
         if !is_catalog_managed
             || runtime.graphs.is_empty()
             || runtime
@@ -5022,6 +5035,62 @@ mod tests {
             runtime
         );
         assert!(!reopened
+            .validate()
+            .iter()
+            .any(|issue| issue.code == "route-authoring-overlay-mismatch"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_load_repairs_unreferenced_catalog_appended_route_graphs() {
+        let root = unique_test_project_root("load-unreferenced-catalog-route");
+        let mut base = test_route_document("poihana2");
+        base.merge_named_graphs(&test_route_document("main"), &["main".to_string()])
+            .unwrap();
+        let mut runtime = base.clone();
+        runtime
+            .merge_named_graphs(&test_route_document("ika01"), &["ika01".to_string()])
+            .unwrap();
+        let mut legacy = empty_document("bobomb0");
+        legacy.route_authoring = Some(RouteAuthoringDocument::lift(ROUTE_RESOURCE_PATH, &base));
+        legacy.archive_edits.resources.push(StageResourceEdit {
+            raw_resource_path: ROUTE_RESOURCE_PATH.to_vec(),
+            document: StageResourceDocument::Rail(runtime.clone()),
+            mode: StageResourceEditMode::Upsert,
+            catalog_managed: true,
+        });
+        legacy.queue_editor_overlay_change().unwrap();
+        project_store::save_project_folder(&legacy, &root).unwrap();
+
+        let mut reopened = empty_document("bobomb0");
+        assert!(reopened.load_project_folder(&root).unwrap());
+        assert_eq!(
+            reopened
+                .route_authoring
+                .as_ref()
+                .unwrap()
+                .compile()
+                .unwrap(),
+            runtime
+        );
+        assert!(!reopened
+            .validate()
+            .iter()
+            .any(|issue| issue.code == "route-authoring-overlay-mismatch"));
+
+        reopened.save_project_folder(&root).unwrap();
+        let mut restarted = empty_document("bobomb0");
+        assert!(restarted.load_project_folder(&root).unwrap());
+        assert_eq!(
+            restarted
+                .route_authoring
+                .as_ref()
+                .unwrap()
+                .compile()
+                .unwrap(),
+            runtime
+        );
+        assert!(!restarted
             .validate()
             .iter()
             .any(|issue| issue.code == "route-authoring-overlay-mismatch"));
