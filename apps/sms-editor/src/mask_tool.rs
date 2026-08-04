@@ -2089,146 +2089,53 @@ impl SmsEditorApp {
         );
     }
 
-    /// Bakes the coating shown at the current coverage into the model's own
-    /// textures, permanently.
+    /// Writes the coverage on the slider into the model's own wash, so the
+    /// actor ships coated at that level.
     ///
-    /// Every texel of every body texture is composited through the same
-    /// judgment the preview makes -- the mask at the current threshold,
-    /// coloured by the selected goop source -- so what ships is what the
-    /// viewport shows. Alpha is left untouched, so cutout shapes keep their
-    /// silhouettes. A texel shared by mirrored surfaces takes the goop of
-    /// whichever covered surface touches it, which is the cost of baking into
-    /// a wrapped UV -- fine for heavy coatings, visible on sparse ones.
+    /// Washable goop is a comparison the model runs per pixel: the mask is
+    /// tested against a konst, and the coating shows where it wins. Baking
+    /// sets that konst. The stage viewport reads it back through the archive
+    /// edit, and so does the game.
+    ///
+    /// Retail drives the same konst from an enemy's hit points, so a wired
+    /// enemy takes its class's level once it spawns and the baked value is
+    /// only its starting state. An actor with nothing driving it keeps what
+    /// is written here.
     fn bake_mask_goop_layer(&mut self) {
         let Some(choice) = self.selected_mask_choice() else {
             self.log.push("Pick an actor first.".to_string());
             return;
         };
-        let threshold = ((1.0 - self.mask_wash_phase.clamp(0.0, 1.0)) * 255.0).round() as u8;
-        let authored = self.authored_mask();
-        let borrowed = self.active_mask();
-        if authored.is_none() && borrowed.is_none() {
-            self.log.push(
-                "Generate or assign a goop map and mask before baking.".to_string(),
-            );
-            return;
-        }
+        // The coverage slider runs the other way from the konst: full
+        // coverage is the level nothing washes past.
+        let level = ((1.0 - self.mask_wash_phase.clamp(0.0, 1.0)) * 255.0).round() as u8;
 
-        // Composite per texture, in each texture's own space.
-        let mut baked: std::collections::BTreeMap<usize, (String, usize, usize, Vec<u8>)> =
-            std::collections::BTreeMap::new();
-        let mut coated_texels = 0usize;
-        {
-            let Some(preview) = self.mask_preview.as_ref() else {
-                return;
-            };
-            let geometry = &preview.geometry;
-            let authored_coord = self.authored_goop_coord();
-            for (index, triangle) in geometry.triangles.iter().enumerate() {
-                let Some(texture_index) = triangle.texture_index else {
-                    continue;
-                };
-                let Some(texture) = geometry.textures.get(texture_index) else {
-                    continue;
-                };
-                let Some(body) = triangle.tex_coords.or(triangle.tex_coord_sets[0]) else {
-                    continue;
-                };
-                // The goop UV: the authored set for wired actors, the front
-                // projection for the rest.
-                let goop: [[f32; 2]; 3] = match triangle.mask_tex_coords.or_else(|| {
-                    authored_coord
-                        .and_then(|coord| triangle.tex_coord_sets.get(coord).copied().flatten())
-                }) {
-                    Some(set) => set,
-                    None => {
-                        if authored.is_some() {
-                            // A wired actor's un-wired surface stays clean.
-                            continue;
-                        }
-                        std::array::from_fn(|corner| preview.front_uv[index * 3 + corner])
-                    }
-                };
-
-                let width = texture.width as usize;
-                let height = texture.height as usize;
-                if width == 0 || height == 0 {
-                    continue;
-                }
-                let entry = baked.entry(texture_index).or_insert_with(|| {
-                    (texture.name.clone(), width, height, texture.rgba.clone())
-                });
-
-                // Rasterize in unwrapped texture space; writes fold back into
-                // the tile, so triangles straddling the tile edge land whole.
-                let target: [[f32; 2]; 3] = std::array::from_fn(|corner| {
-                    [body[corner][0] * width as f32, body[corner][1] * height as f32]
-                });
-                let area = (target[1][0] - target[0][0]) * (target[2][1] - target[0][1])
-                    - (target[2][0] - target[0][0]) * (target[1][1] - target[0][1]);
-                if area.abs() < f32::EPSILON {
-                    continue;
-                }
-                let min_x = target.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min).floor()
-                    as i64;
-                let max_x = target
+        // The materials that run a comparison, named, so the model can be
+        // asked about them directly.
+        let materials: Vec<String> = self
+            .mask_preview
+            .as_ref()
+            .map(|preview| {
+                preview
+                    .geometry
+                    .materials
                     .iter()
-                    .map(|p| p[0])
-                    .fold(f32::NEG_INFINITY, f32::max)
-                    .ceil() as i64;
-                let min_y = target.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min).floor()
-                    as i64;
-                let max_y = target
-                    .iter()
-                    .map(|p| p[1])
-                    .fold(f32::NEG_INFINITY, f32::max)
-                    .ceil() as i64;
-                if (max_x - min_x) > 4096 || (max_y - min_y) > 4096 {
-                    continue;
-                }
-                for y in min_y..=max_y {
-                    for x in min_x..=max_x {
-                        let point = [x as f32 + 0.5, y as f32 + 0.5];
-                        let edge = |a: [f32; 2], b: [f32; 2]| {
-                            (b[0] - a[0]) * (point[1] - a[1]) - (b[1] - a[1]) * (point[0] - a[0])
-                        };
-                        let w0 = edge(target[0], target[1]) / area;
-                        let w1 = edge(target[1], target[2]) / area;
-                        let w2 = edge(target[2], target[0]) / area;
-                        if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
-                            continue;
-                        }
-                        let u = goop[0][0] * w1 + goop[1][0] * w2 + goop[2][0] * w0;
-                        let v = goop[0][1] * w1 + goop[1][1] * w2 + goop[2][1] * w0;
-                        let shows = match &authored {
-                            Some((texture, _)) => {
-                                goop_is_visible(texture.value(u, v), threshold)
-                            }
-                            None => borrowed.as_ref().is_some_and(|(size, values)| {
-                                goop_is_visible(
-                                    sample_mask_bilinear(values, *size, u, v),
-                                    threshold,
-                                )
-                            }),
-                        };
-                        if !shows {
-                            continue;
-                        }
-                        let colour = self.goop_colour(u, v);
-                        let tile_x = (x.rem_euclid(entry.1 as i64)) as usize;
-                        let tile_y = (y.rem_euclid(entry.2 as i64)) as usize;
-                        let base = (tile_y * entry.1 + tile_x) * 4;
-                        // Alpha stays: the cutouts that shape petals and
-                        // leaves must survive the coating.
-                        entry.3[base..base + 3].copy_from_slice(&colour[..3]);
-                        coated_texels += 1;
-                    }
-                }
-            }
-        }
-        if coated_texels == 0 {
+                    .filter(|material| {
+                        material
+                            .tev_stages
+                            .iter()
+                            .any(|stage| stage.color_op >= 8 || stage.alpha_op >= 8)
+                    })
+                    .map(|material| material.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if materials.is_empty() {
             self.log.push(
-                "Nothing to bake at this coverage; raise the slider first.".to_string(),
+                "This actor has no goop layer to bake. Its model runs no wash comparison, so \
+                 there is no coverage for the game to read -- authoring one into a model that \
+                 never had it is not wired yet."
+                    .to_string(),
             );
             return;
         }
@@ -2240,7 +2147,8 @@ impl SmsEditorApp {
             let Some(raw_path) = document.archive_resource_path_for_asset(&choice.model_path)
             else {
                 self.log.push(
-                    "This actor's model lives outside the stage archive, so it cannot be                      baked here yet."
+                    "This actor's model lives outside the stage archive, so it cannot be \
+                     baked here yet."
                         .to_string(),
                 );
                 return;
@@ -2261,38 +2169,30 @@ impl SmsEditorApp {
                 return;
             }
         };
-        let mut replaced_textures = 0usize;
-        for (name, width, height, rgba) in baked.into_values() {
-            let rgba = match sms_formats::RgbaImage::new(width as u16, height as u16, rgba) {
-                Ok(rgba) => rgba,
-                Err(error) => {
-                    self.log.push(format!("Could not stage '{name}': {error}"));
-                    return;
-                }
+
+        let mut written = 0usize;
+        for name in &materials {
+            let Some(register) = model.material_wash_konst_register(name) else {
+                continue;
             };
-            let bti = match sms_formats::GxEncodedTexture::encode_rgba(
-                name.clone(),
-                &rgba,
-                sms_formats::GxTextureEncodeOptions::default(),
-            )
-            .and_then(|encoded| encoded.to_bti())
-            {
-                Ok(bti) => bti,
-                Err(error) => {
-                    self.log.push(format!("Could not encode '{name}': {error}"));
-                    return;
-                }
-            };
-            match model.replace_named_texture_from_bti(&name, &bti) {
-                Ok(count) => replaced_textures += count,
+            match model.set_material_konst_alpha(name, register, level) {
+                Ok(count) => written += count,
                 Err(error) => {
                     self.log.push(format!("Could not bake into '{name}': {error}"));
                     return;
                 }
             }
         }
-        if replaced_textures == 0 {
-            self.log.push("No texture accepted the bake.".to_string());
+        if written == 0 {
+            self.log.push(
+                "The model's wash konst could not be located; nothing was baked.".to_string(),
+            );
+            return;
+        }
+        // Rebuilding proves the edit before it is kept.
+        if let Err(error) = model.to_bytes() {
+            self.log
+                .push(format!("The baked model would not rebuild: {error}"));
             return;
         }
 
@@ -2304,12 +2204,11 @@ impl SmsEditorApp {
         self.finish_mask_author_edit(
             before,
             format!(
-                "Baked the coating into {replaced_textures} texture(s); Ctrl+Z or Reset to                  default reverses it."
+                "Baked coverage {:.0}% into {written} material(s) as wash level {level}; the \
+                 stage carries it now.",
+                self.mask_wash_phase * 100.0
             ),
         );
-        // The coating is in the model now; a live overlay on top would show
-        // it twice.
-        self.mask_wash_phase = 0.0;
         self.build_mask_preview(&choice);
     }
 

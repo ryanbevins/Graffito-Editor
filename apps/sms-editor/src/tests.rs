@@ -5930,3 +5930,105 @@ fn probe_stain_bake() {
         }
     }
 }
+
+/// Writes a wash level into each wired actor and reads it back, so baking is
+/// proven against the real models rather than assumed.
+#[test]
+#[ignore]
+fn probe_wash_bake_roundtrip() {
+    let Ok(root) = std::env::var("GRAFFITO_PROBE_ROOT") else {
+        return;
+    };
+    let user_stage = std::env::var("GRAFFITO_PROBE_USER_SZS").unwrap_or_default();
+    let actors = [
+        ("USER", "pakkun/pakun"),
+        ("USER", "bgeso/bgeso_body"),
+        ("bianco0.szs", "hamukuri/default"),
+        ("USER", "bosspakkun/bosspaku_model"),
+    ];
+    for (scene, needle) in actors {
+        let path = if scene == "USER" {
+            std::path::PathBuf::from(&user_stage)
+        } else {
+            std::path::Path::new(&root).join("scene").join(scene)
+        };
+        let Ok(assets) = sms_formats::mount_scene_archive(&path) else {
+            continue;
+        };
+        let Some(asset) = assets.iter().find(|a| {
+            let text = a.path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+            text.contains(needle) && (text.ends_with(".bmd") || text.ends_with(".bdl"))
+        }) else {
+            println!("{needle}: not found");
+            continue;
+        };
+        let Ok(bytes) = sms_formats::read_stage_asset_bytes(&asset.path) else {
+            continue;
+        };
+        let Ok(geometry) = sms_formats::J3dFile::parse(&bytes)
+            .and_then(|model| {
+                model.geometry_preview_with_loader_flags(sms_formats::SMS_MAP_MODEL_LOAD_FLAGS)
+            })
+        else {
+            continue;
+        };
+        let wash: Vec<String> = geometry
+            .materials
+            .iter()
+            .filter(|material| {
+                material
+                    .tev_stages
+                    .iter()
+                    .any(|stage| stage.color_op >= 8 || stage.alpha_op >= 8)
+            })
+            .map(|material| material.name.clone())
+            .collect();
+        let Ok(mut model) = sms_formats::J3dRebuildDocument::parse(&bytes) else {
+            println!("{needle}: rebuild parse failed");
+            continue;
+        };
+        println!("== {needle}: wash materials {wash:?}");
+        let mut written = 0usize;
+        for name in &wash {
+            let Some(register) = model.material_wash_konst_register(name) else {
+                println!("   [{name}] no konst register found");
+                continue;
+            };
+            match model.set_material_konst_alpha(name, register, 96) {
+                Ok(count) => {
+                    println!("   [{name}] konst register {register}, wrote {count}");
+                    written += count;
+                }
+                Err(error) => println!("   [{name}] write failed: {error}"),
+            }
+        }
+        if written == 0 {
+            continue;
+        }
+        match model.to_bytes() {
+            Ok(rebuilt) => {
+                // Read the level back out through the preview pipeline.
+                let level = sms_formats::J3dFile::parse(&rebuilt)
+                    .and_then(|model| {
+                        model.geometry_preview_with_loader_flags(
+                            sms_formats::SMS_MAP_MODEL_LOAD_FLAGS,
+                        )
+                    })
+                    .ok()
+                    .and_then(|geometry| {
+                        geometry.materials.iter().find_map(|material| {
+                            wash.contains(&material.name).then(|| {
+                                material.tev_k_colors.map(|konst| konst[3])
+                            })
+                        })
+                    });
+                println!(
+                    "   rebuilt {} bytes (was {}), konst alphas now {level:?}",
+                    rebuilt.len(),
+                    bytes.len()
+                );
+            }
+            Err(error) => println!("   rebuild failed: {error}"),
+        }
+    }
+}

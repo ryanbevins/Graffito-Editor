@@ -724,6 +724,119 @@ impl J3dRebuildDocument {
     /// runtime's exact one-half constant; only active TEV stages are changed so
     /// pristine padding selectors with the same byte remain untouched.
     /// Returns how many selectors were pinned.
+    /// Whether a material runs a wash comparison, and which konst register it
+    /// compares against.
+    ///
+    /// Washable goop is a TEV comparison stage: the mask is tested against a
+    /// konst, and the coating shows where it wins. The comparison's own konst
+    /// selector names the register, so the wash level a model ships with can
+    /// be found and set without guessing.
+    pub fn material_wash_konst_register(&self, material_name: &str) -> Option<usize> {
+        for section in &self.sections {
+            let J3dRebuildSectionData::Materials(materials) = &section.data else {
+                continue;
+            };
+            let Some(record_index) = material_record_index(materials, material_name) else {
+                continue;
+            };
+            let Some(record) = materials.material_init_records.get(record_index) else {
+                continue;
+            };
+            let stage_count = material_tev_stage_count(materials, record);
+            let Some(stages) = materials
+                .tables
+                .iter()
+                .find(|table| table.kind == J3dMaterialTableKind::TevStage)
+                .and_then(|table| match &table.allocation {
+                    J3dScalarArray::Unsigned8(values) => Some(values),
+                    _ => None,
+                })
+            else {
+                continue;
+            };
+            for stage in 0..stage_count {
+                let Some(stage_index) = record.tev_stage_indices.get(stage) else {
+                    continue;
+                };
+                // A TEV stage record is twenty bytes; the colour operation
+                // sits at offset five and the alpha operation at eleven.
+                // Operations from eight up are comparisons.
+                let base = *stage_index as usize * 20;
+                let color_op = stages.get(base + 5).copied().unwrap_or(0);
+                let alpha_op = stages.get(base + 11).copied().unwrap_or(0);
+                if color_op < 8 && alpha_op < 8 {
+                    continue;
+                }
+                let selector = record
+                    .tev_konst_alpha_selectors
+                    .get(stage)
+                    .copied()
+                    .unwrap_or(0);
+                return Some(match selector {
+                    16..=31 => ((selector - 16) & 3) as usize,
+                    _ => 0,
+                });
+            }
+        }
+        None
+    }
+
+    /// Writes the wash level a material's comparison reads.
+    ///
+    /// The coating covers every texel whose mask value beats this, so zero
+    /// ships the actor fully coated and higher values ship it further washed.
+    /// Retail drives the same konst from an enemy's hit points; a model with
+    /// nothing driving it keeps whatever is written here.
+    pub fn set_material_konst_alpha(
+        &mut self,
+        material_name: &str,
+        konst_register: usize,
+        alpha: u8,
+    ) -> Result<usize> {
+        let mut written = 0usize;
+        for section in &mut self.sections {
+            let J3dRebuildSectionData::Materials(materials) = &mut section.data else {
+                continue;
+            };
+            let Some(record_index) = material_record_index(materials, material_name) else {
+                continue;
+            };
+            let Some(record) = materials.material_init_records.get(record_index) else {
+                continue;
+            };
+            let Some(konst_index) = record
+                .tev_konst_color_indices
+                .get(konst_register)
+                .copied()
+                .map(usize::from)
+            else {
+                continue;
+            };
+            let Some(table) = materials
+                .tables
+                .iter_mut()
+                .find(|table| table.kind == J3dMaterialTableKind::TevKonstColor)
+            else {
+                continue;
+            };
+            // Konst colours parse as plain bytes unless the file declares
+            // them packed; both carry the same RGBA quads.
+            let values = match &mut table.allocation {
+                J3dScalarArray::PackedColor(values) | J3dScalarArray::Unsigned8(values) => values,
+                _ => continue,
+            };
+            // Konst colours are packed RGBA bytes; the wash reads the alpha.
+            let Some(slot) = values.get_mut(konst_index * 4 + 3) else {
+                return Err(unsupported(format!(
+                    "material {material_name:?} names konst {konst_index}, past the table"
+                )));
+            };
+            *slot = alpha;
+            written += 1;
+        }
+        Ok(written)
+    }
+
     pub fn pin_material_konst_alpha_half(&mut self, material_name: &str) -> Result<usize> {
         const KONST_K0_A: u8 = 0x1C;
         const KONST_HALF: u8 = 0x04;
