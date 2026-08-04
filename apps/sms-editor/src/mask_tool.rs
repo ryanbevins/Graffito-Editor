@@ -208,8 +208,8 @@ impl AuthoredMaskTexture<'_> {
 }
 
 /// Whether goop shows at a texel: the game's own comparison.
-pub(super) fn goop_is_visible(mask_value: u8, threshold: u8) -> bool {
-    mask_value > threshold
+pub(super) fn goop_is_visible(mask_value: u8, level: u8) -> bool {
+    mask_value <= level
 }
 
 /// Orbits a point around the model's centre.
@@ -1103,7 +1103,7 @@ impl SmsEditorApp {
         let actor_authored = self.authored_mask().is_some();
         // The wash drives the comparison's konst here too, so the base render
         // carries the goop at the slider's coverage itself.
-        let wash_threshold = ((1.0 - self.mask_wash_phase.clamp(0.0, 1.0)) * 255.0).round() as u8;
+        let wash_threshold = (self.mask_wash_phase.clamp(0.0, 1.0) * 255.0).round() as u8;
         let washed_materials: Vec<sms_formats::J3dMaterial> = geometry
             .materials
             .iter()
@@ -1708,7 +1708,7 @@ impl SmsEditorApp {
         if self.mask_wash_materials.is_empty() {
             return;
         }
-        let threshold = ((1.0 - self.mask_wash_phase.clamp(0.0, 1.0)) * 255.0).round() as u8;
+        let threshold = (self.mask_wash_phase.clamp(0.0, 1.0) * 255.0).round() as u8;
         if self.mask_wash_konst == Some(threshold) {
             return;
         }
@@ -1986,7 +1986,7 @@ impl SmsEditorApp {
     /// laid over a model the GPU drew.
     fn mask_goop_overlay_image(&self) -> Option<egui::ColorImage> {
         let goop_uv = self.rasterize_goop()?;
-        let threshold = ((1.0 - self.mask_wash_phase.clamp(0.0, 1.0)) * 255.0).round() as u8;
+        let threshold = (self.mask_wash_phase.clamp(0.0, 1.0) * 255.0).round() as u8;
         // An actor that authored a wash mask is judged exactly the way the
         // game judges it: its own mask, through its own UV, against the
         // threshold. The borrowed gradient only drives actors that never
@@ -2021,7 +2021,7 @@ impl SmsEditorApp {
             return self.render_uv_inspector();
         }
         let (base, goop_uv) = self.rasterize_model()?;
-        let threshold = ((1.0 - self.mask_wash_phase.clamp(0.0, 1.0)) * 255.0).round() as u8;
+        let threshold = (self.mask_wash_phase.clamp(0.0, 1.0) * 255.0).round() as u8;
         let mask = self.active_mask();
         let authored = self.authored_mask();
         let mut pixels = Vec::with_capacity(CANVAS * CANVAS * 4);
@@ -2275,7 +2275,11 @@ impl SmsEditorApp {
         for y in 0..resolution {
             for x in 0..resolution {
                 let u = (x as f32 + 0.5) / resolution as f32;
-                let v = 1.0 - (y as f32 + 0.5) / resolution as f32;
+                // No flip: the stored coordinate puts v zero at the model's
+                // foot, and GX reads v zero from the first row written, so the
+                // rows have to run the way the preview samples them. Flipping
+                // here has the model read the goop map upside down.
+                let v = (y as f32 + 0.5) / resolution as f32;
                 let colour = self.goop_colour(u, v);
                 pixels.extend_from_slice(&[
                     colour[0],
@@ -2954,8 +2958,8 @@ impl SmsEditorApp {
         );
         ui.label(
             egui::RichText::new(format!(
-                "threshold K0_A \u{2248} {}  (mask > this stays coated)",
-                ((1.0 - self.mask_wash_phase) * 255.0).round() as u16
+                "wash level K0_A \u{2248} {}  (mask \u{2264} this stays coated)",
+                (self.mask_wash_phase * 255.0).round() as u16
             ))
             .small()
             .color(egui::Color32::GRAY),
@@ -3049,13 +3053,19 @@ mod tests {
 
     /// The wash is the game's comparison: bright mask clings, dark clears.
     #[test]
-    fn goop_recedes_in_mask_order_as_the_threshold_sweeps() {
-        assert!(goop_is_visible(40, 0));
-        assert!(goop_is_visible(200, 0));
-        assert!(!goop_is_visible(40, 128));
-        assert!(goop_is_visible(200, 128));
-        assert!(!goop_is_visible(40, 255));
-        assert!(!goop_is_visible(200, 255));
+    fn goop_recedes_in_mask_order_as_the_wash_level_falls() {
+        // The wash coats where the mask does not exceed the level, so a full
+        // level ships the actor coated and an empty one ships it clean --
+        // which is the direction retail drives from hit points.
+        assert!(goop_is_visible(40, 255));
+        assert!(goop_is_visible(200, 255));
+        assert!(!goop_is_visible(40, 0));
+        assert!(!goop_is_visible(200, 0));
+        // Between the two, the brightest mask values clear first: a texel at
+        // two hundred is gone by the time the level reaches a hundred and
+        // twenty eight, while one at forty is still coated.
+        assert!(goop_is_visible(40, 128));
+        assert!(!goop_is_visible(200, 128));
     }
 
     /// Bilinear sampling is what keeps a low-resolution mask from washing off

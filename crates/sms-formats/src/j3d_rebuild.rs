@@ -1069,7 +1069,7 @@ impl J3dRebuildDocument {
     }
 
     /// Every position the vertex arrays carry, in model units.
-    fn decoded_positions(&self) -> Result<Vec<[f32; 3]>> {
+    pub(crate) fn decoded_positions(&self) -> Result<Vec<[f32; 3]>> {
         for section in &self.sections {
             let J3dRebuildSectionData::Vertices(vertices) = &section.data else {
                 continue;
@@ -1122,7 +1122,7 @@ impl J3dRebuildDocument {
 
     /// Each vertex the display lists name, posed by the matrix its packet
     /// binds, in the order the lists name them.
-    fn posed_display_list_positions(
+    pub(crate) fn posed_display_list_positions(
         &self,
         positions: &[[f32; 3]],
         draw_matrices: &[Option<[[f32; 4]; 3]>],
@@ -1169,15 +1169,21 @@ impl J3dRebuildDocument {
                         .ok_or_else(|| {
                             unsupported("a shape names a draw it does not have".to_string())
                         })?;
+                    // A table entry of all ones means the slot keeps whatever
+                    // matrix it was last given rather than naming one, so the
+                    // nearest entry before it is the one in force. Treating it
+                    // as absent leaves those vertices in the local space of
+                    // their joint, which bends the projection around exactly
+                    // the parts that inherit.
                     let matrix_for = |slot: usize| -> Option<[[f32; 4]; 3]> {
-                        let entry = shapes
-                            .matrix_table
-                            .get(group.first_matrix as usize + slot)
-                            .copied()?;
-                        if entry == 0xFFFF {
-                            return None;
-                        }
-                        draw_matrices.get(entry as usize).copied().flatten()
+                        let first = group.first_matrix as usize;
+                        (0..=slot).rev().find_map(|candidate| {
+                            let entry = shapes.matrix_table.get(first + candidate).copied()?;
+                            if entry == 0xFFFF {
+                                return None;
+                            }
+                            draw_matrices.get(entry as usize).copied().flatten()
+                        })
                     };
                     for command in &draw.commands {
                         let J3dGxCommand::Primitive { vertices, .. } = command else {
@@ -1258,9 +1264,12 @@ impl J3dRebuildDocument {
             let Some(record_index) = material_record_index(materials, request.material_name) else {
                 continue;
             };
-            let Some(record) = materials.material_init_records.get(record_index) else {
+            // Read what the record says, then let the borrow go: the tables
+            // behind it are about to grow.
+            let Some(record) = materials.material_init_records.get(record_index).cloned() else {
                 continue;
             };
+            let record = &record;
             let stage_count = material_tev_stage_count(materials, record);
             let gen_count = material_tex_gen_count(materials, record);
             if stage_count + 3 > 16 {
@@ -1353,6 +1362,37 @@ impl J3dRebuildDocument {
                 ],
                 20,
             )?;
+            // The wash level lives in a konst register's alpha, so it has to
+            // be a register the material does not already read: writing over
+            // one it uses means the coverage slider moves whatever that stage
+            // was doing. On BossPakkun a stage takes its alpha from the same
+            // register, so lowering coverage lowered his alpha until the alpha
+            // test discarded every surface and he rendered as the inside of
+            // his mouth.
+            let konst_color_selectors = record.tev_konst_color_selectors;
+            let konst_alpha_selectors = record.tev_konst_alpha_selectors;
+            let mut claimed = [false; 4];
+            for stage in 0..stage_count {
+                for selector in [konst_color_selectors[stage], konst_alpha_selectors[stage]] {
+                    if (12..=15).contains(&selector) {
+                        claimed[(selector - 12) as usize] = true;
+                    } else if (16..=31).contains(&selector) {
+                        claimed[((selector - 16) & 3) as usize] = true;
+                    }
+                }
+            }
+            let konst_register = claimed
+                .iter()
+                .position(|used| !used)
+                .ok_or_else(|| {
+                    unsupported(format!(
+                        "material {:?} reads all four konst registers",
+                        request.material_name
+                    ))
+                })?;
+            // Alpha selectors for the four registers run from twenty eight.
+            let konst_selector = 0x1c + konst_register as u8;
+
             let konst_index = append_material_bytes(
                 materials,
                 J3dMaterialTableKind::TevKonstColor,
@@ -1385,15 +1425,16 @@ impl J3dRebuildDocument {
             record.tev_stage_indices[stage_count] = compare_stage as u16;
             record.tev_stage_indices[stage_count + 1] = clear_stage as u16;
             record.tev_stage_indices[stage_count + 2] = apply_stage as u16;
-            record.tev_konst_color_indices[0] = konst_index as u16;
+            record.tev_konst_color_indices[konst_register] = konst_index as u16;
             // The comparison reads K0's alpha; the stage after it reads no
             // konst at all, but a selector is still written for both.
             for stage in stage_count..stage_count + 3 {
-                record.tev_konst_color_selectors[stage] = 0x1c;
-                record.tev_konst_alpha_selectors[stage] = 0x1c;
+                record.tev_konst_color_selectors[stage] = konst_selector;
+                record.tev_konst_alpha_selectors[stage] = konst_selector;
             }
 
             report.first_stage = stage_count;
+            report.konst_register = konst_register;
             authored_any = true;
         }
         if !authored_any {
@@ -5964,6 +6005,99 @@ mod goop_layout_tests {
             }
         }
         println!("   geometry unchanged across {} vertices", posed_after.len());
+    }
+
+    /// The posing behind a stored goop coordinate must agree with the pose the
+    /// preview draws, or the projection twists per part: a clean front
+    /// projection cannot bend, so a bent one means some vertices went through
+    /// the wrong matrix.
+    #[test]
+    #[ignore]
+    fn posing_matches_the_preview() {
+        let (Ok(path), Ok(needle)) = (
+            std::env::var("GRAFFITO_PROBE_SZS"),
+            std::env::var("GRAFFITO_ONLY"),
+        ) else {
+            return;
+        };
+        let assets = crate::mount_scene_archive(std::path::Path::new(&path)).expect("mount");
+        let asset = assets
+            .iter()
+            .find(|asset| {
+                let text = asset
+                    .path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_ascii_lowercase();
+                text.contains(&needle) && text.ends_with(".bmd")
+            })
+            .expect("model");
+        let bytes = crate::read_stage_asset_bytes(&asset.path).expect("read");
+        let file = crate::J3dFile::parse(&bytes).expect("parse");
+        let matrices = file
+            .rest_pose_draw_matrices(crate::SMS_MAP_MODEL_LOAD_FLAGS)
+            .expect("matrices");
+        let geometry = file
+            .geometry_preview_with_loader_flags(crate::SMS_MAP_MODEL_LOAD_FLAGS)
+            .expect("geometry");
+        let document = J3dRebuildDocument::parse(&bytes).expect("rebuild parse");
+        let positions = document.decoded_positions().expect("positions");
+        let posed = document
+            .posed_display_list_positions(&positions, &matrices)
+            .expect("posed");
+
+        let mut expected: Vec<[f32; 3]> = geometry
+            .triangles
+            .iter()
+            .flat_map(|triangle| triangle.vertices)
+            .collect();
+        let mut actual = posed.clone();
+        println!(
+            "preview poses {} vertices, the writer poses {}",
+            expected.len(),
+            actual.len()
+        );
+        let key = |point: &[f32; 3]| {
+            (
+                (point[0] * 8.0).round() as i64,
+                (point[1] * 8.0).round() as i64,
+                (point[2] * 8.0).round() as i64,
+            )
+        };
+        expected.sort_by_key(key);
+        actual.sort_by_key(key);
+
+        // Both bounds first: a wrong matrix usually shows there immediately.
+        let bounds = |points: &[[f32; 3]]| {
+            let mut min = [f32::INFINITY; 3];
+            let mut max = [f32::NEG_INFINITY; 3];
+            for point in points {
+                for axis in 0..3 {
+                    min[axis] = min[axis].min(point[axis]);
+                    max[axis] = max[axis].max(point[axis]);
+                }
+            }
+            (min, max)
+        };
+        let (expected_min, expected_max) = bounds(&expected);
+        let (actual_min, actual_max) = bounds(&actual);
+        println!("   preview bounds {expected_min:?}..{expected_max:?}");
+        println!("   writer  bounds {actual_min:?}..{actual_max:?}");
+
+        let mut unmatched = 0usize;
+        for point in &actual {
+            let found = expected
+                .binary_search_by_key(&key(point), key)
+                .is_ok();
+            if !found {
+                if unmatched < 4 {
+                    println!("   unmatched {point:?}");
+                }
+                unmatched += 1;
+            }
+        }
+        println!("   {unmatched} of {} posed vertices are not in the preview", actual.len());
+        assert_eq!(unmatched, 0, "the writer poses vertices the preview does not");
     }
 
     /// Repacking a model's material and texture sections must not change what
