@@ -217,6 +217,10 @@ fn default_camera_speed() -> f32 {
 
 /// Stage-sized default for projects saved before the navigation distance was
 /// stored, matching `reset_camera`.
+fn default_mask_wash_coverage() -> f32 {
+    1.0
+}
+
 fn default_stage_geometry_clickable() -> bool {
     true
 }
@@ -255,6 +259,13 @@ pub(super) struct SmsProjectFile {
     /// existing projects behave as before.
     #[serde(default = "default_stage_geometry_clickable")]
     pub(super) stage_geometry_clickable: bool,
+    /// How much goop the Mask Tool coats an actor with, and whether the wash
+    /// clears the mask's dark values first. Authoring settings rather than
+    /// scene data, so they belong with the project rather than the stage.
+    #[serde(default = "default_mask_wash_coverage")]
+    pub(super) mask_wash_coverage: f32,
+    #[serde(default)]
+    pub(super) mask_wash_invert: bool,
 }
 
 #[derive(Deserialize)]
@@ -332,6 +343,8 @@ impl LegacySmsProjectFileV1 {
             sound_assignments: self.sound_assignments,
             launch: self.launch,
             stage_geometry_clickable: default_stage_geometry_clickable(),
+            mask_wash_coverage: default_mask_wash_coverage(),
+            mask_wash_invert: false,
         }
     }
 }
@@ -359,6 +372,8 @@ impl SmsProjectFile {
             sound_assignments: BTreeMap::new(),
             launch: ProjectLaunchConfiguration::default(),
             stage_geometry_clickable: default_stage_geometry_clickable(),
+            mask_wash_coverage: default_mask_wash_coverage(),
+            mask_wash_invert: false,
         }
     }
 

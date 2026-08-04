@@ -2626,11 +2626,45 @@ impl SmsEditorApp {
         self.log.push(message);
     }
 
+    /// Takes the wash settings from the project the first time this panel
+    /// draws for it, so a coverage and an invert survive a restart.
+    fn restore_mask_wash_settings(&mut self) {
+        let Some(project) = self.current_project.as_ref() else {
+            return;
+        };
+        let id = project.descriptor.project_id.to_string();
+        if self.mask_wash_settings_project.as_deref() == Some(id.as_str()) {
+            return;
+        }
+        self.mask_wash_phase = project.descriptor.mask_wash_coverage.clamp(0.0, 1.0);
+        self.mask_wash_invert = project.descriptor.mask_wash_invert;
+        self.mask_wash_settings_project = Some(id);
+    }
+
+    /// Keeps the project's copy in step once a control moves.
+    fn remember_mask_wash_settings(&mut self) {
+        let (coverage, invert) = (self.mask_wash_phase, self.mask_wash_invert);
+        match self.current_project.as_mut() {
+            Some(project) => {
+                if project.descriptor.mask_wash_coverage == coverage
+                    && project.descriptor.mask_wash_invert == invert
+                {
+                    return;
+                }
+                project.descriptor.mask_wash_coverage = coverage;
+                project.descriptor.mask_wash_invert = invert;
+            }
+            None => return,
+        }
+        self.persist_project_settings(false);
+    }
+
     /// The inspector panel for the Mask Tool.
     pub(super) fn mask_tool_panel(&mut self, ui: &mut egui::Ui) {
         // The goop catalog is indexed lazily by whoever needs it first; the
         // colour list offers those styles, so make sure they are loaded.
         self.ensure_goop_templates_indexed();
+        self.restore_mask_wash_settings();
         ui.heading("Mask Tool");
         ui.label(
             egui::RichText::new("Author washable goop on the enemies placed in this stage")
@@ -2972,10 +3006,15 @@ impl SmsEditorApp {
             }
         }
 
-        ui.checkbox(&mut self.mask_wash_invert, "Invert wash pattern")
+        if ui
+            .checkbox(&mut self.mask_wash_invert, "Invert wash pattern")
             .on_hover_text(
-                "Clear the mask's dark values first rather than its bright ones, turning the                  recede inside out",
-            );
+                "Clear the mask's dark values first rather than its bright ones, turning the recede inside out",
+            )
+            .changed()
+        {
+            self.remember_mask_wash_settings();
+        }
         ui.horizontal(|ui| {
             let label = if self.mask_wash_playing {
                 "Stop"
@@ -3000,11 +3039,16 @@ impl SmsEditorApp {
             }
         });
 
-        ui.add(
-            egui::Slider::new(&mut self.mask_wash_phase, 0.0..=1.0)
-                .text("Coverage")
-                .clamping(egui::SliderClamping::Always),
-        );
+        if ui
+            .add(
+                egui::Slider::new(&mut self.mask_wash_phase, 0.0..=1.0)
+                    .text("Coverage")
+                    .clamping(egui::SliderClamping::Always),
+            )
+            .drag_stopped()
+        {
+            self.remember_mask_wash_settings();
+        }
         ui.label(
             egui::RichText::new(format!(
                 "wash level K0_A \u{2248} {}  (mask \u{2264} this stays coated)",
