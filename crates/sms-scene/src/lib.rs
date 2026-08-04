@@ -674,9 +674,13 @@ impl StageDocument {
 
     pub fn read_asset_bytes(&self, path: impl AsRef<Path>) -> Result<Vec<u8>> {
         let path = path.as_ref();
-        if let (Some(archive), Some(source_path)) =
-            (&self.stage_archive, &self.stage_archive_source_path)
-        {
+        // An edit is keyed by the archive-relative path, which only needs the
+        // archive's source path to work out -- not the archive itself. Asking
+        // for both meant a document that knows where its stage came from but
+        // has not loaded it read straight past every edit to the file on disk:
+        // an authored goop layer was written, kept, and shipped in a build,
+        // while every preview showed the actor exactly as it was before.
+        if let Some(source_path) = &self.stage_archive_source_path {
             if let Some(raw_resource_path) = semantic_resource_path_for_asset(source_path, path) {
                 if raw_resource_path == b"map/map.col" && self.death_barrier.is_some() {
                     if let Some(resource) = self.effective_resource_clone(&raw_resource_path)? {
@@ -700,6 +704,10 @@ impl StageDocument {
                     return Ok(edit.document.to_bytes()?);
                 }
             }
+        }
+        if let (Some(archive), Some(source_path)) =
+            (&self.stage_archive, &self.stage_archive_source_path)
+        {
             if let Some(bytes) = read_matching_semantic_stage_asset(archive, source_path, path)? {
                 return Ok(bytes);
             }
