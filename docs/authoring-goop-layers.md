@@ -364,6 +364,81 @@ where the slot comes from the vertex's `PNMTXIDX` operand divided by three, or
 zero when the descriptor carries none. Then hold each slot across packets, as
 described above.
 
+## Keeping the model small
+
+Size is not a tidiness concern here — it is a correctness one. An actor that
+grows too far stops loading whole, and the symptom looks like a rendering bug
+rather than a size one. BossPakkun's numbers through the work, all measured:
+
+| State | Size |
+| --- | --- |
+| Untouched | 134,912 |
+| With the stored goop coordinate | 152,096 |
+| Layer added, TEX1 duplicating shared runs | 288,416 |
+| Same, with colour and mask split into two textures | 292,576 |
+| Layer added, shared runs placed once | **156,320** |
+
+The split is the instructive row. It cut the coating from one RGBA8 texture to a
+compressed colour map plus a tiny intensity mask — about a thirtieth of the
+texture data — and the model still came out **larger**. That is what ruled out a
+texture-memory explanation and pointed at the repack: the duplication dominated
+either way.
+
+### Share what retail shares
+
+Retail texture records commonly point at the **same** image data — several
+records naming one run is normal. Giving each its own copy on the way out
+roughly doubles TEX1 and is where nearly all the growth came from.
+
+`canonicalize_texture_layout` keys each run by its bytes and places it once,
+letting the records that shared it point at the same offset again, exactly as
+they did. Two rules matter:
+
+- **Share a mip chain whole or not at all.** The levels are read as one run, so
+  deduplicating a single level out of the middle scatters the chain and every
+  level behind it is read from the wrong place. The round-trip test caught this
+  on `biancoriver.bmd` immediately.
+- Palettes dedupe independently, being single blocks.
+
+### Reuse table elements too
+
+`append_material_bytes` and `append_material_u16` return the index of an
+identical element already in the table rather than appending a duplicate. On a
+model where several materials take the same layer this matters: the TEV stages,
+the orders and the texgen record are byte-identical between them, so they cost
+one entry each no matter how many materials use them.
+
+The same applies to the goop texture itself — `append_texture` returns the
+existing index when the name is already present, so a coating shared across an
+actor's materials is stored once.
+
+### Choose the format, not the resolution
+
+Format dominates. At 256 square:
+
+| Format | Cost | Notes |
+| --- | --- | --- |
+| RGBA8 | 256 KB | colour and mask in one texture forces this |
+| RGB5A3 / RGB565 | 128 KB | no compression artefacts |
+| CMPR | 32 KB | four by four blocks; visibly wrecks smooth goop swirls |
+| I8 | 64 KB | intensity only — right for a mask |
+
+Retail keeps the coating and the mask apart precisely so each can take a cheap
+format: a `polmask` is a single intensity plane at 32 square, about a kilobyte.
+That separation is the right structure even though it was not what fixed the
+size problem here.
+
+CMPR is worth a warning: it compresses in four-by-four blocks and turns smooth
+chocolate swirls blocky. If a compressed coating looks worse than an
+uncompressed one at half the resolution, prefer the smaller uncompressed one.
+
+### Only pay for the vertices you use
+
+The stored coordinate gives **each vertex occurrence** its own entry rather than
+sharing by position index. That costs more than sharing would — 1714 entries for
+BossPakkun — but it is what makes a position used by two joints safe, and eight
+bytes per occurrence is cheap against the alternative of a wrong projection.
+
 ## The numbers, and how they line up
 
 Every value in this pipeline is a byte or a normalised float, and several of the
@@ -452,6 +527,7 @@ sampled, the level surviving in the register the layer claimed.
 | What you see | Look at |
 | --- | --- |
 | Only interior surfaces render | Alpha zeroed by the comparison stage, **or** the model grew too large to load |
+| Coating looks blocky in four-by-four patches | CMPR compression; use a smaller uncompressed format |
 | Lit surfaces blow out, dark ones fine | Coating is added rather than composed |
 | Everything vanishes below ~0.3 coverage | Layer claimed a konst register the material already reads |
 | Pattern mirrored top to bottom | Coating authored with `v` flipped |
