@@ -514,14 +514,9 @@ const GX_INDEX16: u32 = 3;
 #[derive(Debug, Clone)]
 pub struct GoopLayerRequest<'a> {
     pub material_name: &'a str,
-    /// The coating's colour. Kept apart from the mask so each can take a
-    /// format that suits it: retail does the same, which is why a coating at
-    /// a useful resolution still fits the texture memory a model is given.
+    /// The texture to add: its colour is the coating, its alpha the mask.
     pub texture_name: &'a str,
     pub texture: &'a BtiFile,
-    /// The wash mask the comparison reads.
-    pub mask_texture_name: &'a str,
-    pub mask_texture: &'a BtiFile,
     /// The stored coordinate set the wash reads. Retail stores the goop UV
     /// rather than generating it, because a generated one is handed the
     /// vertex position in whichever joint's space that vertex lives.
@@ -1249,7 +1244,6 @@ impl J3dRebuildDocument {
         request: &GoopLayerRequest<'_>,
     ) -> Result<GoopLayerReport> {
         let texture_index = self.append_texture(request.texture_name, request.texture)?;
-        let mask_index = self.append_texture(request.mask_texture_name, request.mask_texture)?;
 
         let mut report = GoopLayerReport {
             texture_index,
@@ -1282,18 +1276,16 @@ impl J3dRebuildDocument {
                     request.material_name
                 )));
             }
-            let mut free = record
+            let map_slot = record
                 .texture_number_indices
                 .iter()
-                .enumerate()
-                .filter(|(_, index)| **index == 0xFFFF)
-                .map(|(slot, _)| slot);
-            let (Some(map_slot), Some(mask_map_slot)) = (free.next(), free.next()) else {
-                return Err(unsupported(format!(
-                    "material {:?} has no room for the coating and its mask",
-                    request.material_name
-                )));
-            };
+                .position(|index| *index == 0xFFFF)
+                .ok_or_else(|| {
+                    unsupported(format!(
+                        "material {:?} binds all eight texture maps",
+                        request.material_name
+                    ))
+                })?;
 
             // The coordinate is taken straight from the vertex data, the way
             // retail carries a goop UV: GX_TG_MTX2x4 through the identity
@@ -1312,31 +1304,15 @@ impl J3dRebuildDocument {
                     unsupported("model carries too many textures".to_string())
                 })?,
             )?;
-            let mask_number_index = append_material_u16(
-                materials,
-                J3dMaterialTableKind::TextureNumber,
-                u16::try_from(mask_index).map_err(|_| {
-                    unsupported("model carries too many textures".to_string())
-                })?,
-            )?;
 
             // A stage names the slots a material binds, not the table entries
             // behind them: the coordinate slot the texgen was written into,
             // and the map slot the texture was bound to.
-            // The comparison samples the mask, the stages after it sample
-            // the coating; both read the stored goop coordinate.
-            let compare_order = append_material_bytes(
-                materials,
-                J3dMaterialTableKind::TevOrder,
-                &[gen_count as u8, mask_map_slot as u8, 0xff, 0xff],
-                4,
-            )?;
-            let apply_order = append_material_bytes(
-                materials,
-                J3dMaterialTableKind::TevOrder,
-                &[gen_count as u8, map_slot as u8, 0xff, 0xff],
-                4,
-            )?;
+            let order = [gen_count as u8, map_slot as u8, 0xff, 0xff];
+            let compare_order =
+                append_material_bytes(materials, J3dMaterialTableKind::TevOrder, &order, 4)?;
+            let apply_order =
+                append_material_bytes(materials, J3dMaterialTableKind::TevOrder, &order, 4)?;
             // Copied from a shipping wash rather than derived: the comparison
             // carries a bias of three and a scale of one, which is how GX
             // encodes a compare, and writes its verdict into register two.
@@ -1403,7 +1379,6 @@ impl J3dRebuildDocument {
             record.tev_stage_count_index = stage_count_index as u8;
             record.tex_coord_indices[gen_count] = coord_index as u16;
             record.texture_number_indices[map_slot] = texture_number_index as u16;
-            record.texture_number_indices[mask_map_slot] = mask_number_index as u16;
             record.tev_order_indices[stage_count] = compare_order as u16;
             record.tev_order_indices[stage_count + 1] = apply_order as u16;
             record.tev_order_indices[stage_count + 2] = apply_order as u16;
@@ -5760,8 +5735,6 @@ mod goop_layout_tests {
                 material_name: &material_name,
                 texture_name: "graffito_goop",
                 texture: &texture,
-                mask_texture_name: "graffito_polmask",
-                mask_texture: &texture,
                 coordinate_slot: 1,
                 level: 200,
             })
@@ -5813,10 +5786,7 @@ mod goop_layout_tests {
             sampled.height
         );
         assert_eq!(washed.name, material_name, "the wash landed elsewhere");
-        assert_eq!(
-            sampled.name, "graffito_polmask",
-            "the wash compares against a texture other than its mask"
-        );
+        assert_eq!(sampled.name, "graffito_goop", "the wash reads another texture");
         assert_eq!(
             washed.tev_k_colors[0][3], 200,
             "the wash level did not survive"

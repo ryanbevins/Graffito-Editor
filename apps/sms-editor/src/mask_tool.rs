@@ -635,9 +635,6 @@ const CANVAS: usize = 384;
 /// The texture an authored goop layer carries its coating and mask in.
 const GOOP_LAYER_TEXTURE: &str = "graffito_goop";
 
-/// The texture an authored goop layer compares its wash against.
-const GOOP_LAYER_MASK: &str = "graffito_polmask";
-
 impl SmsEditorApp {
     /// Enemy actors placed in the loaded stage, as sampler choices.
     fn mask_actor_choices(&self) -> Vec<MaskActorChoice> {
@@ -2271,54 +2268,36 @@ impl SmsEditorApp {
             Some((width, height, _)) if *width > 0 && *height > 0 => (*width).max(*height),
             _ => 256,
         };
-        // GX samples a repeating texture correctly only at power of two
-        // sides, so a goop map that is, say, two hundred and fifty two wide
-        // has to be taken up to the next power of two rather than merely
-        // rounded: sampling one that is not returns nothing usable, and the
-        // alpha the wash compares against comes back as noise. The ceiling
-        // keeps the coating inside the texture memory a model of this size
-        // can expect to be given.
-        let resolution = native.next_power_of_two().clamp(32, 256);
+        // GX wants sides that are multiples of four, and there is no gain
+        // beyond the goop map's own detail.
+        let resolution = native.next_multiple_of(4).clamp(size.max(32), 512);
         let mut pixels = Vec::with_capacity(resolution * resolution * 4);
         for y in 0..resolution {
             for x in 0..resolution {
                 let u = (x as f32 + 0.5) / resolution as f32;
                 let v = 1.0 - (y as f32 + 0.5) / resolution as f32;
                 let colour = self.goop_colour(u, v);
-                pixels.extend_from_slice(&[colour[0], colour[1], colour[2], 255]);
+                pixels.extend_from_slice(&[
+                    colour[0],
+                    colour[1],
+                    colour[2],
+                    sample_mask_bilinear(&mask, size, u, v),
+                ]);
             }
         }
         let width =
             u16::try_from(resolution).map_err(|_| "The coating is too large.".to_string())?;
         let image = sms_formats::RgbaImage::new(width, width, pixels)
             .map_err(|error| format!("Could not stage the coating: {error}"))?;
-        // Compressed: the coating is colour only, and a quarter of a megabyte
-        // of texture for one map is more than a model of this size is given.
-        let options = sms_formats::GxTextureEncodeOptions {
-            encoding: sms_formats::GxTextureEncoding::Exact(sms_formats::GxTextureFormat::Cmpr),
-            ..Default::default()
-        };
-        let texture = sms_formats::GxEncodedTexture::encode_rgba(GOOP_LAYER_TEXTURE, &image, options)
-            .and_then(|encoded| encoded.to_bti())
-            .map_err(|error| format!("Could not encode the coating: {error}"))?;
-
-        // The mask keeps its own size and its own format: spread across every
-        // channel it encodes as a single intensity plane, which is what retail
-        // ships a polmask as.
-        let mut mask_pixels = Vec::with_capacity(size * size * 4);
-        for value in &mask {
-            mask_pixels.extend_from_slice(&[*value, *value, *value, *value]);
-        }
-        let mask_width = u16::try_from(size).map_err(|_| "The mask is too large.".to_string())?;
-        let mask_image = sms_formats::RgbaImage::new(mask_width, mask_width, mask_pixels)
-            .map_err(|error| format!("Could not stage the mask: {error}"))?;
-        let mask_texture = sms_formats::GxEncodedTexture::encode_rgba(
-            GOOP_LAYER_MASK,
-            &mask_image,
+        let encoded = sms_formats::GxEncodedTexture::encode_rgba(
+            GOOP_LAYER_TEXTURE,
+            &image,
             sms_formats::GxTextureEncodeOptions::default(),
         )
-        .and_then(|encoded| encoded.to_bti())
-        .map_err(|error| format!("Could not encode the mask: {error}"))?;
+        .map_err(|error| format!("Could not encode the coating: {error}"))?;
+        let texture = encoded
+            .to_bti()
+            .map_err(|error| format!("Could not encode the coating: {error}"))?;
 
         // The goop coordinate is stored in the vertex data rather than
         // generated, which is how retail carries one: a generated coordinate
@@ -2356,8 +2335,6 @@ impl SmsEditorApp {
                 material_name: &material.name,
                 texture_name: GOOP_LAYER_TEXTURE,
                 texture: &texture,
-                mask_texture_name: GOOP_LAYER_MASK,
-                mask_texture: &mask_texture,
                 coordinate_slot: slot,
                 level,
             };
