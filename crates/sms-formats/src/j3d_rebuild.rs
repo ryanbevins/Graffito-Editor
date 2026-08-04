@@ -1010,7 +1010,24 @@ impl J3dRebuildDocument {
                     },
                 );
             }
-            for draw in &mut shapes.draws {
+            // The coordinates were posed by walking the shapes and the draws
+            // each one names, so they have to be written back the same way:
+            // the draw array's own order is not that order, and writing in it
+            // hands a vertex the coordinate posed for another. The counts
+            // still agree either way, so it shows only in the picture -- as
+            // thin strips where the coordinate jumps between vertices.
+            let visits: Vec<usize> = shapes
+                .shapes
+                .iter()
+                .flat_map(|shape| {
+                    let start = shape.draw_start as usize;
+                    (0..shape.matrix_group_count as usize).map(move |offset| start + offset)
+                })
+                .collect();
+            for draw_index in visits {
+                let Some(draw) = shapes.draws.get_mut(draw_index) else {
+                    continue;
+                };
                 for command in &mut draw.commands {
                     let J3dGxCommand::Primitive { vertices, .. } = command else {
                         continue;
