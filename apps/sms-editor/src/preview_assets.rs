@@ -630,13 +630,45 @@ pub(super) fn starting_joint_animation_candidates(
     explicit_path: Option<&str>,
 ) -> Vec<String> {
     let normalized = model_path.replace('\\', "/");
-    let archive = normalized.split_once("!/").map(|(archive, _)| archive);
+    let (archive, internal_model_path) = normalized
+        .split_once("!/")
+        .map_or((None, normalized.as_str()), |(archive, internal)| {
+            (Some(archive), internal)
+        });
     let mut candidates = explicit_path
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let factory = object.factory_name.as_str();
     let mut relative_candidates = Vec::new();
+    // TSmallEnemy actors commonly use a manager model named
+    // `<family>_modelN.bmd` and select `<family>_waitN.bck` at reset. Derive
+    // the sibling animation name from the exact resolved model path, then let
+    // the asset lookup below prove that it exists. This covers shared-model
+    // subclasses such as Gesso, LandGesso, and SurfGesso without a factory
+    // table or a guessed archive folder.
+    let manager_model_wait_candidates =
+        if let Some((directory, file_name)) = internal_model_path.rsplit_once('/') {
+            let model_stem = file_name
+                .rsplit_once('.')
+                .map_or(file_name, |(stem, _)| stem);
+            let family_with_digits_trimmed =
+                model_stem.trim_end_matches(|ch: char| ch.is_ascii_digit());
+            if let Some(family) = family_with_digits_trimmed.strip_suffix("_model") {
+                if !family.is_empty() {
+                    vec![
+                        format!("{directory}/{family}_wait1.bck"),
+                        format!("{directory}/{family}_wait.bck"),
+                    ]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
     // Actor-specific animation volumes conventionally use the factory name
     // without its NPC prefix (NPCMareMB -> maremb/maremb_wait.bck). Prefer
     // that data-driven path before falling back to a shared family animation.
@@ -668,6 +700,13 @@ pub(super) fn starting_joint_animation_candidates(
         &[]
     };
     relative_candidates.extend(family_candidates.iter().map(|path| (*path).to_string()));
+    if relative_candidates.is_empty()
+        && !factory
+            .get(..3)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("npc"))
+    {
+        relative_candidates.extend(manager_model_wait_candidates);
+    }
     relative_candidates.dedup();
 
     for relative in relative_candidates {

@@ -1873,6 +1873,14 @@ fn write_len_string(bytes: &mut Vec<u8>, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Encodes a runtime object name the way the game stores it.
+///
+/// Runtime lookups compare against `TNameRef::mName` byte-for-byte, so
+/// anything written into an executable or archive has to be Shift-JIS.
+pub fn encode_shift_jis_name(value: &str) -> Option<Vec<u8>> {
+    encode_shift_jis(value).ok()
+}
+
 fn encode_shift_jis(value: &str) -> Result<Vec<u8>> {
     let (encoded, _, had_errors) = SHIFT_JIS.encode(value);
     if had_errors {

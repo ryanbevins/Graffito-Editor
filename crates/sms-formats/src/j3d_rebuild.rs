@@ -1922,6 +1922,16 @@ impl J3dRebuildDocument {
     /// BTI and grows the texture section when the imported dummy allocation is
     /// smaller than the runtime texture. The name table is retained so the
     /// game's normal `SMS_ChangeTextureAll` call remains valid and idempotent.
+    /// Renames a TEX1 texture entry, returning how many entries changed.
+    ///
+    /// Materials address textures by index, so only the lookup name moves. That
+    /// is the point: `THamuKuri::setMActorAndKeeper` force-replaces the slot it
+    /// finds by the name `H_ma_rak_dummy` every time an enemy spawns, undoing
+    /// anything baked into that slot. Renaming the slot puts a model's texture
+    /// beyond that reach, which is how a per-layer pool keeps its own look.
+    ///
+    /// Name-table hashes and string offsets are regenerated when the document
+    /// is written, so a name of any length is safe.
     pub fn rename_texture(&mut self, from: &str, to: &str) -> Result<usize> {
         let mut renamed = 0;
         for section in &mut self.sections {
@@ -1938,6 +1948,7 @@ impl J3dRebuildDocument {
         Ok(renamed)
     }
 
+    /// Texture names carried by every TEX1 section, in section order.
     pub fn texture_names(&self) -> Vec<String> {
         let mut names = Vec::new();
         for section in &self.sections {
@@ -1954,6 +1965,14 @@ impl J3dRebuildDocument {
         names
     }
 
+    /// Extracts a named texture back into a standalone BTI.
+    ///
+    /// The inverse of [`replace_named_texture_from_bti`]: a TEX1 record already
+    /// holds the same tiled GX payload and sampler fields a BTI does, so the
+    /// texture can be lifted out of a model and baked into another. Baking a
+    /// goop layer's own surface look onto a Stu cap relies on this, since a
+    /// stage carries its per-layer looks inside `pollutionNN.bmd`, not as loose
+    /// BTI files.
     pub fn named_texture_as_bti(&self, texture_name: &str) -> Result<BtiFile> {
         for section in &self.sections {
             let J3dRebuildSectionData::Textures(textures) = &section.data else {
@@ -4804,6 +4823,63 @@ fn encode_mdl3(out: &mut [u8], data: &J3dMaterialDisplayListSection) -> Result<(
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod texture_rename_tests {
+    use super::*;
+
+    /// Renaming the stain slot is what puts a per-layer pool's baked look
+    /// beyond the runtime's reach, so the lookup name must actually move while
+    /// the texture payload stays put.
+    #[test]
+    #[ignore = "requires SMS_BASE_ROOT with an extracted retail game"]
+    fn renaming_a_texture_moves_only_its_lookup_name() {
+        let base_root = match std::env::var_os("SMS_BASE_ROOT") {
+            Some(root) => std::path::PathBuf::from(root),
+            None => return,
+        };
+        let archives = crate::discover_scene_archives(&base_root).expect("discover");
+        let stage = archives
+            .iter()
+            .find(|archive| archive.stage_id == "bianco0")
+            .expect("bianco0");
+        let assets = crate::mount_scene_archive(&stage.path).expect("mount");
+        let model_bytes = assets
+            .iter()
+            .find(|asset| {
+                asset
+                    .path
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .ends_with("hamukuri/default.bmd")
+            })
+            .map(|asset| crate::read_stage_asset_bytes(&asset.path).expect("read"))
+            .expect("stu model");
+        let mut model = J3dRebuildDocument::parse(&model_bytes).expect("parse");
+        let before = model
+            .named_texture_as_bti("H_ma_rak_dummy")
+            .expect("extract before");
+
+        assert_eq!(
+            model
+                .rename_texture("H_ma_rak_dummy", "H_ma_rak_layer")
+                .unwrap(),
+            1
+        );
+        assert!(!model.has_named_texture("H_ma_rak_dummy"));
+        assert!(model.has_named_texture("H_ma_rak_layer"));
+
+        // Same pixels, reachable under the new name, and it survives a write.
+        let after = model
+            .named_texture_as_bti("H_ma_rak_layer")
+            .expect("extract after");
+        assert_eq!(before.encoded_mip_levels, after.encoded_mip_levels);
+        let encoded = model.to_bytes().expect("encode");
+        let reparsed = J3dRebuildDocument::parse(&encoded).expect("reparse");
+        assert!(reparsed.has_named_texture("H_ma_rak_layer"));
+        assert!(!reparsed.has_named_texture("H_ma_rak_dummy"));
+    }
 }
 
 #[cfg(test)]

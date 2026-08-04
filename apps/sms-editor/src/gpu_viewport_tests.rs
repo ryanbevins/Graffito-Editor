@@ -1255,6 +1255,112 @@ fn repository_authored_textured_import_renders_non_black() {
     );
 }
 
+#[test]
+#[ignore = "requires SMS_BASE_ROOT; optionally SMS_PROJECT_ROOT and SMS_STAGE_ID"]
+fn project_or_retail_gesso_previews_render_non_black() {
+    use std::path::PathBuf;
+
+    let base_root = std::env::var_os("SMS_BASE_ROOT")
+        .map(PathBuf::from)
+        .expect("set SMS_BASE_ROOT to the extracted game's root");
+    let project_root = std::env::var_os("SMS_PROJECT_ROOT").map(PathBuf::from);
+    let stage_id = std::env::var("SMS_STAGE_ID").unwrap_or_else(|_| "ricco0".to_string());
+    let registry = sms_schema::bundled_object_registry()
+        .expect("load bundled decomp schema")
+        .registry;
+    let document = if let Some(project_root) = project_root {
+        sms_scene::StageDocument::open_authored_project_stage(&base_root, &stage_id, project_root)
+            .expect("open authored project stage")
+    } else {
+        sms_scene::StageDocument::open(&base_root, &stage_id).expect("open retail stage")
+    }
+    .with_registry(registry);
+    let objects = document
+        .objects
+        .iter()
+        .filter(|object| matches!(object.factory_name.as_str(), "Gesso" | "LandGesso"))
+        .collect::<Vec<_>>();
+    assert!(!objects.is_empty(), "stage has a Gesso variant");
+    let base_preview = crate::SmsEditorApp::build_model_preview(
+        &document,
+        crate::PreviewVisibility {
+            environment: true,
+            goop: true,
+            effects: true,
+        },
+    )
+    .expect("build Gesso preview");
+    let player_lighting = document.lighting.player_lighting().unwrap();
+    let object_lighting = document.lighting.object_lighting().unwrap();
+    for object in objects {
+        assert!(object.asset_hints.iter().any(|hint| {
+            matches!(
+                hint.role,
+                sms_scene::AssetRole::PreviewModel | sms_scene::AssetRole::InferredPreviewModel
+            ) && hint
+                .path
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .ends_with("/rikugesso/geso_model1.bmd")
+        }));
+        assert_eq!(
+            document.object_preview_load_flags(object),
+            Some(0x1023_0000)
+        );
+
+        let mut preview = base_preview.clone();
+        let model_index = preview.object_model_indices[&object.id];
+        preview
+            .triangles
+            .retain(|triangle| triangle.model_index == model_index);
+        assert!(
+            !preview.triangles.is_empty(),
+            "{} has preview triangles",
+            object.factory_name
+        );
+
+        let [x, y, z] = object.transform.translation;
+        let camera_position = [x, y + 50.0, z + 400.0];
+        let image = render_preview_offscreen(
+            &preview,
+            GpuViewportFrame {
+                camera_position,
+                right: [1.0, 0.0, 0.0],
+                up: [0.0, 1.0, 0.0],
+                forward: [0.0, 0.0, -1.0],
+                focal: 350.0,
+                viewport_size: [512.0, 512.0],
+                viewport_pan: [0.0; 2],
+                near: 1.0,
+                animation_seconds: 0.0,
+                light_position: player_lighting.position,
+                light_color: color_u8_to_f32(player_lighting.color),
+                ambient_color: Some(color_u8_to_f32(player_lighting.ambient)),
+                object_light_position: object_lighting.position,
+                object_light_color: color_u8_to_f32(object_lighting.color),
+                object_ambient_color: Some(color_u8_to_f32(object_lighting.ambient)),
+                show_grid: false,
+                death_barrier_y: None,
+            },
+            [512, 512],
+        )
+        .expect("render Gesso through WGPU");
+        let colored_pixels = image
+            .pixels
+            .iter()
+            .filter(|pixel| {
+                let [red, green, blue, alpha] = pixel.to_srgba_unmultiplied();
+                alpha != 0 && (red != 0 || green != 0 || blue != 0)
+            })
+            .count();
+        assert!(
+            colored_pixels > 1_000,
+            "{} rendered black ({colored_pixels} colored pixels)",
+            object.factory_name
+        );
+    }
+}
+
 fn gpu_triangle_vertex_bytes(scene: &GpuSceneData, triangle_index: usize) -> &[u8] {
     let location = scene.triangle_vertices[triangle_index].unwrap();
     bytemuck::cast_slice(

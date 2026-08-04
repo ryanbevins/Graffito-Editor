@@ -19,10 +19,11 @@ use sms_schema::ObjectRegistry;
 
 use crate::direct_boot::{
     patch_sms_dialogue_dol, patch_sms_direct_boot_dol, patch_sms_goop_enemy_managers_dol,
-    patch_sms_sound_assignments_dol, patch_sms_stage_music_dol, RuntimeBalloonOverride,
-    RuntimeDialogueOverride, RuntimeGoopManagerPatch, RuntimeMusicRoleOverride,
-    RuntimeSoundAssignment, RuntimeSoundAssignmentKind, RuntimeStageMusicOverride,
-    RuntimeStageMusicTransition, RuntimeStageTarget,
+    patch_sms_goop_layer_spawn_dol, patch_sms_sound_assignments_dol, patch_sms_stage_music_dol,
+    RuntimeBalloonOverride, RuntimeDialogueOverride, RuntimeGoopLayerBinding,
+    RuntimeGoopManagerPatch, RuntimeMusicRoleOverride, RuntimeSoundAssignment,
+    RuntimeSoundAssignmentKind, RuntimeStageMusicOverride, RuntimeStageMusicTransition,
+    RuntimeStageTarget,
 };
 #[cfg(test)]
 use crate::project::ProjectSoundAssignment;
@@ -456,12 +457,15 @@ fn build_managed_game_with_compiled_dialogue_inner(
             .map(|registry| required_goop_manager_runtime_patches(document, registry))
             .transpose()?
             .unwrap_or_default();
+        let goop_layer_bindings = crate::goop_spawn::goop_layer_spawn_bindings(document)
+            .map_err(|error| format!("Could not validate per-layer goop spawning: {error}"))?;
         let direct_boot = install_managed_runtime_patches(
             project,
             &run,
             ManagedRuntimePatchInputs {
                 registry: document.registry.as_ref(),
                 goop_manager_patches: &goop_manager_patches,
+                goop_layer_bindings: &goop_layer_bindings,
                 dialogue_overrides: &runtime.talk,
                 balloon_overrides: &runtime.balloon,
                 direct_boot,
@@ -1339,6 +1343,7 @@ fn required_goop_manager_runtime_patches(
 struct ManagedRuntimePatchInputs<'a> {
     registry: Option<&'a ObjectRegistry>,
     goop_manager_patches: &'a BTreeSet<RuntimeGoopManagerPatch>,
+    goop_layer_bindings: &'a BTreeMap<usize, RuntimeGoopLayerBinding>,
     dialogue_overrides: &'a [RuntimeDialogueOverride],
     balloon_overrides: &'a [RuntimeBalloonOverride],
     direct_boot: Option<(RuntimeStageTarget, usize)>,
@@ -1353,6 +1358,7 @@ fn install_managed_runtime_patches(
     let ManagedRuntimePatchInputs {
         registry,
         goop_manager_patches,
+        goop_layer_bindings,
         dialogue_overrides,
         balloon_overrides,
         direct_boot,
@@ -1456,6 +1462,16 @@ fn install_managed_runtime_patches(
         .map_err(|error| {
             format!(
                 "Could not install packaged goop enemy-manager support into '{}': {error}",
+                run.run_main_dol.display()
+            )
+        })?;
+    // Per-layer goop spawning: the conductor picks a pool before it rolls a
+    // position, so binding an enemy to a goop layer needs the runtime to swap
+    // pools once the layer is known.
+    patched_bytes = patch_sms_goop_layer_spawn_dol(&patched_bytes, goop_layer_bindings, false)
+        .map_err(|error| {
+            format!(
+                "Could not install packaged per-layer goop spawning into '{}': {error}",
                 run.run_main_dol.display()
             )
         })?;
@@ -1577,6 +1593,7 @@ fn install_managed_stage_music(
         ManagedRuntimePatchInputs {
             registry: None,
             goop_manager_patches: &BTreeSet::new(),
+            goop_layer_bindings: &BTreeMap::new(),
             dialogue_overrides: &[],
             balloon_overrides: &[],
             direct_boot: None,
@@ -3622,6 +3639,7 @@ mod tests {
             ManagedRuntimePatchInputs {
                 registry: None,
                 goop_manager_patches: &BTreeSet::new(),
+                goop_layer_bindings: &BTreeMap::new(),
                 dialogue_overrides: &[override_],
                 balloon_overrides: &[],
                 direct_boot: None,
@@ -3692,6 +3710,7 @@ mod tests {
             ManagedRuntimePatchInputs {
                 registry: None,
                 goop_manager_patches: &BTreeSet::new(),
+                goop_layer_bindings: &BTreeMap::new(),
                 dialogue_overrides: &[],
                 balloon_overrides: &[],
                 direct_boot: None,
@@ -4279,6 +4298,7 @@ mod tests {
             ManagedRuntimePatchInputs {
                 registry: None,
                 goop_manager_patches: &BTreeSet::new(),
+                goop_layer_bindings: &BTreeMap::new(),
                 dialogue_overrides: &[],
                 balloon_overrides: &[],
                 direct_boot: None,
@@ -4360,6 +4380,7 @@ mod tests {
             ManagedRuntimePatchInputs {
                 registry: None,
                 goop_manager_patches: &BTreeSet::new(),
+                goop_layer_bindings: &BTreeMap::new(),
                 dialogue_overrides: &[],
                 balloon_overrides: &[],
                 direct_boot: None,

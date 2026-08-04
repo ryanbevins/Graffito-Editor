@@ -65,22 +65,24 @@ pub use dialogue_authoring::{
 };
 pub use goop_authoring::{
     automatic_goop_region, balanced_goop_expansion, carve_compatible_goop_overlap_depths,
-    estimate_goop_runtime_payload, expanded_goop_region, generate_floor_depth_map,
-    generate_floor_depth_map_for_surface, generate_floor_pollution_model,
+    compact_goop_region, estimate_goop_runtime_payload, expanded_goop_region,
+    generate_floor_depth_map, generate_floor_depth_map_for_surface, generate_floor_pollution_model,
     generate_floor_pollution_model_for_surface, goop_layer_accepts_height, goop_layers_can_overlap,
     goop_runtime_layer_capacity, position_goop_region_avoiding, reproject_goop_mask,
     terrain_fingerprint, whole_terrain_region, GoopAuthoringDocument, GoopBehavior,
     GoopLayerAuthoring, GoopLayerOrigin, GoopPaintBounds, GoopPlane, GoopRegion,
     GoopRenderTriangle, GoopRuntimePayloadEstimate, GoopStageHeapEstimate, GoopStyleSource,
     GoopSurfaceAnchor, GoopTerrainTriangle, GOOP_AUTHORING_FORMAT_VERSION,
-    GOOP_AUTO_INITIAL_DIMENSION, GOOP_CELL_SIZE, GOOP_DEPTH_WORLD_UNITS_PER_CODE,
-    GOOP_MAX_DIMENSION, GOOP_MAX_LAYERS, GOOP_RESOURCE_PATH, GOOP_RUNTIME_PAYLOAD_ERROR_BYTES,
-    GOOP_RUNTIME_PAYLOAD_WARNING_BYTES, GOOP_STAGE_HEAP_ERROR_BYTES, GOOP_STAGE_HEAP_WARNING_BYTES,
+    GOOP_AUTO_INITIAL_DIMENSION, GOOP_CELL_SIZE, GOOP_COMPACT_INITIAL_DIMENSION,
+    GOOP_DEPTH_WORLD_UNITS_PER_CODE, GOOP_MAX_DIMENSION, GOOP_MAX_LAYERS, GOOP_RESOURCE_PATH,
+    GOOP_RUNTIME_PAYLOAD_ERROR_BYTES, GOOP_RUNTIME_PAYLOAD_WARNING_BYTES,
+    GOOP_STAGE_HEAP_ERROR_BYTES, GOOP_STAGE_HEAP_WARNING_BYTES,
 };
 pub use object_authoring::{
-    ObjectAuthoringCatalog, ObjectAuthoringCatalogBuild, ObjectAuthoringCatalogWarning,
-    ObjectAuthoringDependency, ObjectAuthoringResource, ObjectAuthoringRuntimeActorReference,
-    ObjectAuthoringTableDependency, ObjectAuthoringTemplate, SHINE_QUICK_CAMERA_NAME,
+    clone_enemy_manager_template, ClonedEnemyManagerBundle, ObjectAuthoringCatalog,
+    ObjectAuthoringCatalogBuild, ObjectAuthoringCatalogWarning, ObjectAuthoringDependency,
+    ObjectAuthoringResource, ObjectAuthoringRuntimeActorReference, ObjectAuthoringTableDependency,
+    ObjectAuthoringTemplate, SHINE_QUICK_CAMERA_NAME,
 };
 pub(crate) use object_parameters::validate_object_parameter_links_with_owned_name;
 pub use object_parameters::{
@@ -725,6 +727,29 @@ impl StageDocument {
     /// Clones the semantic resource after applying the current authored
     /// overlay in export order. This lets transactional editors merge into a
     /// detached resource without consulting or mutating the imported source.
+    /// Every resource path the stage would export: the archive's own, plus
+    /// anything the project added, minus what it removed.
+    pub fn effective_resource_paths(&self) -> Vec<Vec<u8>> {
+        let mut paths: BTreeSet<Vec<u8>> = self
+            .stage_archive
+            .as_ref()
+            .map(|archive| {
+                archive
+                    .resources()
+                    .iter()
+                    .map(|resource| resource.raw_path.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for edit in &self.archive_edits.resources {
+            paths.insert(edit.raw_resource_path.clone());
+        }
+        for removed in &self.archive_edits.resource_removals {
+            paths.remove(removed);
+        }
+        paths.into_iter().collect()
+    }
+
     pub fn effective_resource_clone(
         &self,
         raw_resource_path: &[u8],
@@ -882,11 +907,29 @@ impl StageDocument {
             .filter(|graph| self.route_reference_count(&graph.name) > 0)
             .map(|graph| graph.name.clone())
             .collect::<BTreeSet<_>>();
+        let is_catalog_managed = self.archive_edits.resources.iter().any(|edit| {
+            edit.raw_resource_path == raw_resource_path
+                && edit.catalog_managed
+                && matches!(&edit.document, StageResourceDocument::Rail(_))
+        });
+        let mut permitted_appended_graph_names = referenced_graph_names.clone();
+        if is_catalog_managed {
+            // The catalog merge itself is the provenance for an appended
+            // graph. Older authored objects can carry the exact typed route
+            // only in their persisted placement prototype while their clean
+            // preview parameter still contains `(null)`. Requiring a second
+            // live-object lookup in that case strands a valid catalog graph
+            // outside route authoring on every restart. The reconciler still
+            // proves that all existing graphs are byte-semantic matches and
+            // accepts additions only, so this cannot overwrite route edits.
+            permitted_appended_graph_names
+                .extend(runtime.graphs.iter().map(|graph| graph.name.clone()));
+        }
         if self
             .route_authoring
             .as_mut()
             .expect("route authoring was checked above")
-            .reconcile_appended_runtime_graphs(&runtime, &referenced_graph_names)
+            .reconcile_appended_runtime_graphs(&runtime, &permitted_appended_graph_names)
             .unwrap_or(false)
         {
             return true;
@@ -899,11 +942,6 @@ impl StageDocument {
         // contains only catalog graphs. Repair only an explicitly
         // catalog-managed edit whose every stored graph still has a live scene
         // reference. User-authored RAL conflicts remain validation errors.
-        let is_catalog_managed = self.archive_edits.resources.iter().any(|edit| {
-            edit.raw_resource_path == raw_resource_path
-                && edit.catalog_managed
-                && matches!(&edit.document, StageResourceDocument::Rail(_))
-        });
         if !is_catalog_managed
             || runtime.graphs.is_empty()
             || runtime
@@ -1522,6 +1560,9 @@ impl StageDocument {
             .and_then(|name| registry.find_named_object_model(&object.factory_name, name))
         {
             return Some(named_model.load_flags);
+        }
+        if let Some(model) = default_enemy_manager_model(registry, &object.factory_name) {
+            return Some(model.load_flags);
         }
         let resource_name = object.raw_param("actor_tail_string")?;
         if registry.is_map_obj_factory(&object.factory_name) {
@@ -2806,7 +2847,7 @@ fn apply_registry_preview_hints(
         } else {
             None
         };
-        let binding = named_object_binding
+        let direct_binding = named_object_binding
             .or(map_static_binding)
             .or_else(|| {
                 registry
@@ -2832,15 +2873,20 @@ fn apply_registry_preview_hints(
                         (model, resource.source_file.clone())
                     })
             });
+        let manager_binding = default_enemy_manager_model(registry, &object.factory_name)
+            .map(|model| (model.model_name.clone(), model.source_file.clone()));
+        let binding_is_manager_derived = direct_binding.is_none() && manager_binding.is_some();
+        let binding = direct_binding.or(manager_binding);
         let Some((authored_model, source)) = binding else {
             continue;
         };
 
         // Once a schema binding exists, never retain a weaker basename guess,
         // including when the authored model is missing or ambiguous.
-        object
-            .asset_hints
-            .retain(|hint| hint.role != AssetRole::InferredPreviewModel);
+        object.asset_hints.retain(|hint| {
+            hint.role != AssetRole::InferredPreviewModel
+                && !(binding_is_manager_derived && hint.role == AssetRole::PreviewModel)
+        });
 
         match resolve_authored_model_path(&authored_model, &model_index) {
             ModelPathResolution::Found(path) => {
@@ -3488,6 +3534,33 @@ fn actor_manager_model_candidates<'a>(
             .collect();
     }
     manager.models.first().into_iter().collect()
+}
+
+fn default_enemy_manager_model<'a>(
+    registry: &'a ObjectRegistry,
+    factory_name: &str,
+) -> Option<&'a EnemyModelDefinition> {
+    let actor = registry.find_enemy_actor(factory_name)?;
+    let mut selected = None;
+    for manager_factory in &actor.manager_factories {
+        let Some(manager) = registry.find_enemy_manager(manager_factory) else {
+            continue;
+        };
+        let Some(model) = actor_manager_model_candidates(actor, manager)
+            .into_iter()
+            .next()
+        else {
+            continue;
+        };
+        if selected.is_some_and(|selected: &EnemyModelDefinition| {
+            !selected.model_name.eq_ignore_ascii_case(&model.model_name)
+                || selected.load_flags != model.load_flags
+        }) {
+            return None;
+        }
+        selected = Some(model);
+    }
+    selected
 }
 
 fn manager_model_tables_are_aliases(
@@ -5033,6 +5106,62 @@ mod tests {
     }
 
     #[test]
+    fn project_load_repairs_unreferenced_catalog_appended_route_graphs() {
+        let root = unique_test_project_root("load-unreferenced-catalog-route");
+        let mut base = test_route_document("poihana2");
+        base.merge_named_graphs(&test_route_document("main"), &["main".to_string()])
+            .unwrap();
+        let mut runtime = base.clone();
+        runtime
+            .merge_named_graphs(&test_route_document("ika01"), &["ika01".to_string()])
+            .unwrap();
+        let mut legacy = empty_document("bobomb0");
+        legacy.route_authoring = Some(RouteAuthoringDocument::lift(ROUTE_RESOURCE_PATH, &base));
+        legacy.archive_edits.resources.push(StageResourceEdit {
+            raw_resource_path: ROUTE_RESOURCE_PATH.to_vec(),
+            document: StageResourceDocument::Rail(runtime.clone()),
+            mode: StageResourceEditMode::Upsert,
+            catalog_managed: true,
+        });
+        legacy.queue_editor_overlay_change().unwrap();
+        project_store::save_project_folder(&legacy, &root).unwrap();
+
+        let mut reopened = empty_document("bobomb0");
+        assert!(reopened.load_project_folder(&root).unwrap());
+        assert_eq!(
+            reopened
+                .route_authoring
+                .as_ref()
+                .unwrap()
+                .compile()
+                .unwrap(),
+            runtime
+        );
+        assert!(!reopened
+            .validate()
+            .iter()
+            .any(|issue| issue.code == "route-authoring-overlay-mismatch"));
+
+        reopened.save_project_folder(&root).unwrap();
+        let mut restarted = empty_document("bobomb0");
+        assert!(restarted.load_project_folder(&root).unwrap());
+        assert_eq!(
+            restarted
+                .route_authoring
+                .as_ref()
+                .unwrap()
+                .compile()
+                .unwrap(),
+            runtime
+        );
+        assert!(!restarted
+            .validate()
+            .iter()
+            .any(|issue| issue.code == "route-authoring-overlay-mismatch"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn project_load_repairs_legacy_catalog_route_replacement() {
         let root = unique_test_project_root("load-catalog-route-replacement");
         let base = test_route_document("poihana2");
@@ -6487,6 +6616,90 @@ mod tests {
         let preview = document.actor_preview(&spawned).unwrap();
         assert_eq!(preview.model_path, "bianco0.szs!/hamukuri/default.bmd");
         assert_eq!(preview.load_flags, 0x1022_0000);
+    }
+
+    #[test]
+    fn manager_model_refresh_repairs_a_stale_catalog_projectile_preview() {
+        let mut registry = ObjectRegistry::default();
+        registry.objects.extend([
+            sms_schema::ObjectDefinition {
+                factory_name: "FixtureEnemy".to_string(),
+                class_name: "TFixtureEnemy".to_string(),
+                category: "Enemy".to_string(),
+                source: sms_schema::SchemaSource::MarNameRefGen,
+                display_name: None,
+                preview_model: None,
+                hidden: false,
+                unsafe_to_edit: false,
+            },
+            sms_schema::ObjectDefinition {
+                factory_name: "FixtureManager".to_string(),
+                class_name: "TFixtureManager".to_string(),
+                category: "Manager".to_string(),
+                source: sms_schema::SchemaSource::MarNameRefGen,
+                display_name: None,
+                preview_model: None,
+                hidden: false,
+                unsafe_to_edit: false,
+            },
+        ]);
+        registry.enemy_actors.push(EnemyActorDefinition {
+            factory_name: "FixtureEnemy".to_string(),
+            class_name: "TFixtureEnemy".to_string(),
+            model_index: None,
+            fallback_models: Vec::new(),
+            primary_model: None,
+            named_models: Vec::new(),
+            indexed_models: Vec::new(),
+            manager_factories: vec!["FixtureManager".to_string()],
+            runtime_uniform_scale: None,
+        });
+        registry.enemy_managers.push(EnemyManagerDefinition {
+            factory_name: "FixtureManager".to_string(),
+            class_name: "TFixtureManager".to_string(),
+            model_index: None,
+            spawned_actor_class: Some("TFixtureEnemy".to_string()),
+            parameter_path: None,
+            models: vec![EnemyModelDefinition {
+                model_name: "body_model1.bmd".to_string(),
+                load_flags: 0x1023_0000,
+                source_file: "fixture_enemy.cpp".to_string(),
+            }],
+        });
+        let assets = vec![
+            StageAsset {
+                path: PathBuf::from("stage.szs!/enemy/aaa_projectile.bmd"),
+                kind: StageAssetKind::Model,
+            },
+            StageAsset {
+                path: PathBuf::from("stage.szs!/enemy/body_model1.bmd"),
+                kind: StageAssetKind::Model,
+            },
+        ];
+        let mut object = SceneObject::new("fixture", "FixtureEnemy");
+        object.asset_hints.push(AssetRef {
+            path: "stage.szs!/enemy/aaa_projectile.bmd".to_string(),
+            role: AssetRole::PreviewModel,
+        });
+
+        assert!(apply_registry_preview_hints(
+            std::slice::from_mut(&mut object),
+            &assets,
+            &registry
+        )
+        .is_empty());
+        assert_eq!(
+            object.asset_hints,
+            vec![AssetRef {
+                path: "stage.szs!/enemy/body_model1.bmd".to_string(),
+                role: AssetRole::InferredPreviewModel,
+            }]
+        );
+        let document = empty_document("fixture").with_registry(registry);
+        assert_eq!(
+            document.object_preview_load_flags(&object),
+            Some(0x1023_0000)
+        );
     }
 
     #[test]

@@ -6032,3 +6032,127 @@ fn probe_wash_bake_roundtrip() {
         }
     }
 }
+
+/// Reports the format of the cap-stain decal vs the goop surface texture, to
+/// decide how to recolor one from the other.
+/// `GRAFFITO_PROBE_SZS=<stage.szs> cargo test probe_stain_formats -- --ignored
+/// --nocapture`
+#[test]
+#[ignore]
+fn probe_stain_formats() {
+    let Ok(path) = std::env::var("GRAFFITO_PROBE_SZS") else {
+        return;
+    };
+    let assets = sms_formats::mount_scene_archive(std::path::Path::new(&path)).expect("mount");
+    let read = |suffix: &str| {
+        assets
+            .iter()
+            .find(|asset| {
+                asset
+                    .path
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .ends_with(suffix)
+            })
+            .map(|asset| sms_formats::read_stage_asset_bytes(&asset.path).expect("read"))
+    };
+    if let Some(bytes) = read("h_ma_rak.bti") {
+        let bti = sms_formats::BtiFile::parse(&bytes).expect("parse bti");
+        println!(
+            "H_ma_rak.bti: {}x{} format {} palette {}",
+            bti.width, bti.height, bti.format, bti.palette_enabled
+        );
+    }
+    for suffix in ["pollution00.bmd", "pollution01.bmd"] {
+        if let Some(bytes) = read(suffix) {
+            let model = sms_formats::J3dRebuildDocument::parse(&bytes).expect("parse");
+            if let Some(name) = model.texture_names().into_iter().next() {
+                let bti = model.named_texture_as_bti(&name).expect("extract");
+                println!(
+                    "{suffix} [{name}]: {}x{} format {} palette {}",
+                    bti.width, bti.height, bti.format, bti.palette_enabled
+                );
+            }
+        }
+    }
+}
+
+/// Extracting a texture from a model and baking it back into another must
+/// preserve the pixels. `GRAFFITO_PROBE_SZS=<stage.szs>
+/// cargo test probe_texture_roundtrip -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_texture_roundtrip() {
+    let Ok(path) = std::env::var("GRAFFITO_PROBE_SZS") else {
+        return;
+    };
+    let assets = sms_formats::mount_scene_archive(std::path::Path::new(&path)).expect("mount");
+    let model_bytes = assets
+        .iter()
+        .find(|asset| {
+            asset
+                .path
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with("pollution00.bmd")
+        })
+        .map(|asset| sms_formats::read_stage_asset_bytes(&asset.path).expect("read"))
+        .expect("pollution00.bmd");
+    let model = sms_formats::J3dRebuildDocument::parse(&model_bytes).expect("parse");
+    let name = model.texture_names().into_iter().next().expect("a texture");
+    let extracted = model.named_texture_as_bti(&name).expect("extract");
+    println!(
+        "extracted {name:?}: {}x{} format {} -> {} bytes",
+        extracted.width,
+        extracted.height,
+        extracted.format,
+        extracted.encode().expect("encode").len()
+    );
+    // The extracted texture bakes into a Stu model like any stain would.
+    let stu = assets
+        .iter()
+        .find(|asset| {
+            asset
+                .path
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with("hamukuri/default.bmd")
+        })
+        .map(|asset| sms_formats::read_stage_asset_bytes(&asset.path).expect("read"));
+    if let Some(stu_bytes) = stu {
+        let mut stu = sms_formats::J3dRebuildDocument::parse(&stu_bytes).expect("parse stu");
+        let replaced = stu
+            .replace_named_texture_from_bti("H_ma_rak_dummy", &extracted)
+            .expect("bake");
+        println!("baked layer texture into {replaced} stu slot(s)");
+        assert!(replaced > 0);
+    }
+}
+
+/// Lists the textures inside a pollution model, so the per-layer stain can
+/// pull the layer's own surface look. `GRAFFITO_PROBE_SZS=<stage.szs>
+/// cargo test probe_pollution_textures -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_pollution_textures() {
+    let Ok(path) = std::env::var("GRAFFITO_PROBE_SZS") else {
+        return;
+    };
+    let assets = sms_formats::mount_scene_archive(std::path::Path::new(&path)).expect("mount");
+    for asset in &assets {
+        let name = asset
+            .path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        if !name.contains("pollution") || !name.ends_with(".bmd") {
+            continue;
+        }
+        let bytes = sms_formats::read_stage_asset_bytes(&asset.path).expect("read");
+        let Ok(model) = sms_formats::J3dRebuildDocument::parse(&bytes) else {
+            println!("{name}: (not a parseable J3D model)");
+            continue;
+        };
+        println!("{name}: textures = {:?}", model.texture_names());
+    }
+}

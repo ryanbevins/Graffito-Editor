@@ -4059,6 +4059,597 @@ fn write_be_u32(destination: &mut [u8], offset: usize, value: u32) -> Result<(),
     Ok(())
 }
 
+/// Spawn-side hook: the single `bl TPollutionManager::isPolluted` inside
+/// `TConductor::genEnemyFromPollution`, and the callee it targets.
+///
+/// Addresses are US retail (GMSE01). They are never trusted blindly: the call
+/// site is required to hold exactly the branch this expects, so a different
+/// build fails loudly instead of being corrupted.
+const GOOP_LAYER_HOOK_CALL: u32 = 0x8003_475C;
+const GOOP_LAYER_IS_POLLUTED: u32 = 0x8019_DA6C;
+const GOOP_LAYER_GET_MANAGER_BY_NAME: u32 = 0x8003_4F20;
+const GOOP_LAYER_SPAWN_INTERVAL_BRANCH: u32 = 0x8003_45B8;
+const GOOP_LAYER_SPAWN_INTERVAL_BNE: u32 = 0x4082_02C8;
+const GOOP_LAYER_MARKER: &[u8] = b"GRAFFITO-LAYER-SPAWN-V1\0";
+/// Keep the executable table aligned with the scene format's real capacity.
+/// Non-Mare stages can author all 20 retail-supported pollution layers.
+const GOOP_LAYER_MAX: usize = sms_scene::GOOP_MAX_LAYERS;
+const GOOP_LAYER_VANILLA: u32 = 0;
+const GOOP_LAYER_DEAD: u32 = 0xFFFF_FFFF;
+const MIN_GOOP_LAYER_STACK_GAP: u32 = 0x100;
+
+/// What a goop layer does to a spawn that lands inside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RuntimeGoopLayerBinding {
+    /// Keep whichever pool the conductor already chose.
+    Vanilla,
+    /// Nothing spawns in this layer.
+    Empty,
+    /// Take the spawn from this manager's pool instead.
+    Pool(String),
+}
+
+fn ppc_stw(rs: u32, d: i32, ra: u32) -> u32 {
+    36 << 26 | rs << 21 | ra << 16 | (d as u32 & 0xFFFF)
+}
+
+fn ppc_stwu(rs: u32, d: i32, ra: u32) -> u32 {
+    37 << 26 | rs << 21 | ra << 16 | (d as u32 & 0xFFFF)
+}
+
+fn ppc_lwz(rt: u32, d: i32, ra: u32) -> u32 {
+    32 << 26 | rt << 21 | ra << 16 | (d as u32 & 0xFFFF)
+}
+
+fn ppc_lfs(ft: u32, d: i32, ra: u32) -> u32 {
+    48 << 26 | ft << 21 | ra << 16 | (d as u32 & 0xFFFF)
+}
+
+fn ppc_stfs(fs: u32, d: i32, ra: u32) -> u32 {
+    52 << 26 | fs << 21 | ra << 16 | (d as u32 & 0xFFFF)
+}
+
+fn ppc_addi(rt: u32, ra: u32, imm: i32) -> u32 {
+    14 << 26 | rt << 21 | ra << 16 | (imm as u32 & 0xFFFF)
+}
+
+fn ppc_li(rt: u32, imm: i32) -> u32 {
+    ppc_addi(rt, 0, imm)
+}
+
+fn ppc_lis(rt: u32, imm: u32) -> u32 {
+    15 << 26 | rt << 21 | (imm & 0xFFFF)
+}
+
+fn ppc_ori(ra: u32, rs: u32, imm: u32) -> u32 {
+    24 << 26 | rs << 21 | ra << 16 | (imm & 0xFFFF)
+}
+
+fn ppc_cmpwi(ra: u32, imm: i32) -> u32 {
+    11 << 26 | ra << 16 | (imm as u32 & 0xFFFF)
+}
+
+fn ppc_cmplwi(ra: u32, imm: u32) -> u32 {
+    10 << 26 | ra << 16 | (imm & 0xFFFF)
+}
+
+fn ppc_cmpw(ra: u32, rb: u32) -> u32 {
+    31 << 26 | ra << 16 | rb << 11
+}
+
+fn ppc_lwzx(rt: u32, ra: u32, rb: u32) -> u32 {
+    31 << 26 | rt << 21 | ra << 16 | rb << 11 | 23 << 1
+}
+
+fn ppc_rlwinm(ra: u32, rs: u32, sh: u32, mb: u32, me: u32, rc: u32) -> u32 {
+    21 << 26 | rs << 21 | ra << 16 | sh << 11 | mb << 6 | me << 1 | rc
+}
+
+fn ppc_slwi(ra: u32, rs: u32, sh: u32) -> u32 {
+    ppc_rlwinm(ra, rs, sh, 0, 31 - sh, 0)
+}
+
+fn ppc_mr(ra: u32, rs: u32) -> u32 {
+    31 << 26 | rs << 21 | ra << 16 | rs << 11 | 444 << 1
+}
+
+const PPC_MFLR_R0: u32 = 0x7C08_02A6;
+const PPC_MTLR_R0: u32 = 0x7C08_03A6;
+const PPC_MTCTR_R12: u32 = 0x7D89_03A6;
+const PPC_BCTRL: u32 = 0x4E80_0421;
+const PPC_BLR_WORD: u32 = 0x4E80_0020;
+
+/// Labels the layer-routing stub branches between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StubLabel {
+    Loop,
+    NotFound,
+    Found,
+    Vanilla,
+    Dead,
+    Epilogue,
+}
+
+#[derive(Debug, Clone)]
+enum StubItem {
+    Word(u32),
+    Label(StubLabel),
+    Branch { kind: BranchKind, to: StubLabel },
+    Call(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchKind {
+    Always,
+    Equal,
+    NotEqual,
+    GreaterOrEqual,
+}
+
+/// Assembles the stub, resolving label branches once every address is known.
+fn assemble_goop_layer_stub(base: u32, items: &[StubItem]) -> Result<Vec<u32>, String> {
+    let mut addresses = BTreeMap::new();
+    let mut cursor = base;
+    for item in items {
+        match item {
+            StubItem::Label(label) => {
+                addresses.insert(*label, cursor);
+            }
+            _ => {
+                cursor = cursor
+                    .checked_add(4)
+                    .ok_or_else(|| "layer spawn stub overflows the address space".to_string())?;
+            }
+        }
+    }
+
+    let mut words = Vec::new();
+    let mut cursor = base;
+    for item in items {
+        let word = match item {
+            StubItem::Label(_) => continue,
+            StubItem::Word(word) => *word,
+            StubItem::Call(target) => encode_branch(cursor, *target, true)?,
+            StubItem::Branch { kind, to } => {
+                let target = *addresses
+                    .get(to)
+                    .ok_or_else(|| format!("layer spawn stub branches to an unset label {to:?}"))?;
+                match kind {
+                    BranchKind::Always => encode_branch(cursor, target, false)?,
+                    _ => {
+                        let (bo, bi) = match kind {
+                            BranchKind::Equal => (12_u32, 2_u32),
+                            BranchKind::NotEqual => (4, 2),
+                            BranchKind::GreaterOrEqual => (4, 0),
+                            BranchKind::Always => unreachable!(),
+                        };
+                        let offset = i64::from(target) - i64::from(cursor);
+                        if !(-0x8000..0x8000).contains(&offset) {
+                            return Err(
+                                "layer spawn stub conditional branch is out of range".to_string()
+                            );
+                        }
+                        16 << 26 | bo << 21 | bi << 16 | (offset as u32 & 0xFFFC)
+                    }
+                }
+            }
+        };
+        words.push(word);
+        cursor = cursor
+            .checked_add(4)
+            .ok_or_else(|| "layer spawn stub overflows the address space".to_string())?;
+    }
+    Ok(words)
+}
+
+/// The routing stub itself.
+///
+/// It replaces the conductor's `isPolluted` call, so it must answer the same
+/// question. On the way it learns *which* layer answered yes, and when that
+/// layer names a pool it swaps the caller's pending manager for that pool's.
+///
+/// Register contract, read out of the US binary rather than assumed:
+///   in  `r3` = `TPollutionManager*`, `f1`/`f2`/`f3` = the rolled x/y/z
+///   out `r3` = the polluted flag, exactly like the call it replaces
+/// `r30` (the conductor) and `r31` (the pending manager) belong to the caller
+/// and stay live across this call, so writing `r31` redirects the spawn.
+fn goop_layer_stub_items(table_address: u32) -> Vec<StubItem> {
+    use BranchKind::*;
+    use StubItem::*;
+    use StubLabel::*;
+    vec![
+        Word(PPC_MFLR_R0),
+        Word(ppc_stw(0, 4, 1)),
+        Word(ppc_stwu(1, -0x30, 1)),
+        Word(ppc_stw(3, 0x18, 1)),
+        Word(ppc_stfs(1, 0x8, 1)),
+        Word(ppc_stfs(2, 0xC, 1)),
+        Word(ppc_stfs(3, 0x10, 1)),
+        Word(ppc_li(0, 0)),
+        Word(ppc_stw(0, 0x14, 1)),
+        // for (i = 0; i < manager->layerCount; ++i)
+        Label(Loop),
+        Word(ppc_lwz(5, 0x18, 1)),
+        Word(ppc_lwz(0, 0x10, 5)),
+        Word(ppc_lwz(4, 0x14, 1)),
+        Word(ppc_cmpw(4, 0)),
+        Branch {
+            kind: GreaterOrEqual,
+            to: NotFound,
+        },
+        Word(ppc_lwz(6, 0x14, 5)),
+        Word(ppc_slwi(0, 4, 2)),
+        Word(ppc_lwzx(3, 6, 0)),
+        Word(ppc_lfs(1, 0x8, 1)),
+        Word(ppc_lfs(2, 0xC, 1)),
+        Word(ppc_lfs(3, 0x10, 1)),
+        Word(ppc_lwz(12, 0, 3)),
+        // virtual TPollutionLayer::isPolluted
+        Word(ppc_lwz(12, 0x50, 12)),
+        Word(PPC_MTCTR_R12),
+        Word(PPC_BCTRL),
+        Word(ppc_rlwinm(0, 3, 0, 24, 31, 1)),
+        Branch {
+            kind: NotEqual,
+            to: Found,
+        },
+        Word(ppc_lwz(4, 0x14, 1)),
+        Word(ppc_addi(4, 4, 1)),
+        Word(ppc_stw(4, 0x14, 1)),
+        Branch {
+            kind: Always,
+            to: Loop,
+        },
+        Label(NotFound),
+        Word(ppc_li(3, 0)),
+        Branch {
+            kind: Always,
+            to: Epilogue,
+        },
+        Label(Found),
+        Word(ppc_lwz(4, 0x14, 1)),
+        Word(ppc_cmplwi(4, GOOP_LAYER_MAX as u32)),
+        Branch {
+            kind: GreaterOrEqual,
+            to: Vanilla,
+        },
+        Word(ppc_lis(5, table_address >> 16)),
+        Word(ppc_ori(5, 5, table_address & 0xFFFF)),
+        Word(ppc_slwi(0, 4, 2)),
+        Word(ppc_lwzx(4, 5, 0)),
+        Word(ppc_cmpwi(4, 0)),
+        Branch {
+            kind: Equal,
+            to: Vanilla,
+        },
+        Word(ppc_cmpwi(4, -1)),
+        Branch {
+            kind: Equal,
+            to: Dead,
+        },
+        Word(ppc_mr(3, 30)),
+        Call(GOOP_LAYER_GET_MANAGER_BY_NAME),
+        Word(ppc_cmplwi(3, 0)),
+        Branch {
+            kind: Equal,
+            to: Vanilla,
+        },
+        Word(ppc_mr(31, 3)),
+        Label(Vanilla),
+        Word(ppc_li(3, 1)),
+        Branch {
+            kind: Always,
+            to: Epilogue,
+        },
+        Label(Dead),
+        Word(ppc_li(3, 0)),
+        Label(Epilogue),
+        Word(ppc_addi(1, 1, 0x30)),
+        Word(ppc_lwz(0, 4, 1)),
+        Word(PPC_MTLR_R0),
+        Word(PPC_BLR_WORD),
+    ]
+}
+
+/// Routes goop spawns by the layer they land in.
+///
+/// `TConductor::genEnemyFromPollution` chooses a pool *before* it rolls a
+/// position, so a stage cannot bind an enemy to a goop layer through data
+/// alone. This installs a stub on the pollution test it already performs:
+/// the layer that answers becomes the pool selector, which is what lets two
+/// layers spawn the same enemy wearing different baked stains.
+///
+/// `every_frame` removes the spawn-interval gate so results are immediately
+/// visible while authoring; it is not something a shipped stage wants.
+pub(super) fn patch_sms_goop_layer_spawn_dol(
+    source: &[u8],
+    bindings: &BTreeMap<usize, RuntimeGoopLayerBinding>,
+    every_frame: bool,
+) -> Result<Vec<u8>, String> {
+    if bindings
+        .iter()
+        .all(|(_, binding)| *binding == RuntimeGoopLayerBinding::Vanilla)
+    {
+        return Ok(source.to_vec());
+    }
+    if let Some((layer, _)) = bindings.iter().find(|(layer, _)| **layer >= GOOP_LAYER_MAX) {
+        return Err(format!(
+            "goop layer {layer} is outside the {GOOP_LAYER_MAX} layers the runtime patch routes"
+        ));
+    }
+
+    let image = parse_dol(source)?;
+    let hook_offset = usize::try_from(dol_file_offset(&image, GOOP_LAYER_HOOK_CALL)?)
+        .map_err(|_| "goop layer hook offset does not fit usize".to_string())?;
+    let expected = encode_branch(GOOP_LAYER_HOOK_CALL, GOOP_LAYER_IS_POLLUTED, true)?;
+    let found = read_be_u32(source, hook_offset)?;
+    if found != expected {
+        return Err(format!(
+            "the goop spawn hook at 0x{GOOP_LAYER_HOOK_CALL:08X} is 0x{found:08X}, not the \
+             expected 0x{expected:08X}; per-layer goop spawning supports the US retail \
+             executable"
+        ));
+    }
+
+    let text_slot = (0..DOL_TEXT_SECTION_COUNT)
+        .find(|slot| {
+            !image
+                .sections
+                .iter()
+                .any(|section| section.text && section.slot == *slot)
+        })
+        .ok_or_else(|| {
+            "The DOL has no unused text section for per-layer goop spawning".to_string()
+        })?;
+    let loaded_end = image
+        .sections
+        .iter()
+        .map(|section| section.address_end())
+        .chain(image.bss.map(|(_, end)| Ok(end)))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .ok_or_else(|| "The DOL has no loaded sections".to_string())?;
+    let stub_address = align_up_u32(loaded_end, FILE_ALIGNMENT)?;
+    let stack_top = find_stack_top(source, &image)?;
+
+    // The table follows the code, and the names follow the table, so the code
+    // is assembled twice: once to measure it, once knowing where it points.
+    let probe = assemble_goop_layer_stub(stub_address, &goop_layer_stub_items(0))?;
+    let table_address =
+        stub_address
+            .checked_add(u32::try_from(probe.len() * 4).map_err(|_| {
+                "layer spawn stub size does not fit the DOL address space".to_string()
+            })?)
+            .ok_or_else(|| "layer spawn stub range overflows u32".to_string())?;
+    let words = assemble_goop_layer_stub(stub_address, &goop_layer_stub_items(table_address))?;
+    if words.len() != probe.len() {
+        return Err("layer spawn stub changed size between assembly passes".to_string());
+    }
+    let names_address =
+        table_address
+            .checked_add(u32::try_from(GOOP_LAYER_MAX * 4).map_err(|_| {
+                "layer spawn table size does not fit the DOL address space".to_string()
+            })?)
+            .ok_or_else(|| "layer spawn table range overflows u32".to_string())?;
+
+    let mut names = Vec::new();
+    let mut table = [GOOP_LAYER_VANILLA; GOOP_LAYER_MAX];
+    for (layer, binding) in bindings {
+        table[*layer] = match binding {
+            RuntimeGoopLayerBinding::Vanilla => GOOP_LAYER_VANILLA,
+            RuntimeGoopLayerBinding::Empty => GOOP_LAYER_DEAD,
+            RuntimeGoopLayerBinding::Pool(manager) => {
+                let encoded = sms_formats::encode_shift_jis_name(manager).ok_or_else(|| {
+                    format!("manager name {manager:?} is not encodable for the runtime")
+                })?;
+                let address = names_address
+                    .checked_add(u32::try_from(names.len()).map_err(|_| {
+                        "layer spawn name table does not fit the DOL address space".to_string()
+                    })?)
+                    .ok_or_else(|| "layer spawn name range overflows u32".to_string())?;
+                names.extend_from_slice(&encoded);
+                names.push(0);
+                address
+            }
+        };
+    }
+
+    let mut payload = Vec::new();
+    for word in &words {
+        payload.extend_from_slice(&word.to_be_bytes());
+    }
+    for entry in table {
+        payload.extend_from_slice(&entry.to_be_bytes());
+    }
+    payload.extend_from_slice(&names);
+    while payload.len() % 4 != 0 {
+        payload.push(0);
+    }
+    payload.extend_from_slice(GOOP_LAYER_MARKER);
+    let payload_size = align_up_usize(payload.len(), FILE_ALIGNMENT as usize)?;
+    payload.resize(payload_size, 0);
+
+    let stub_end = stub_address
+        .checked_add(u32::try_from(payload_size).map_err(|_| {
+            "layer spawn payload size does not fit the DOL address space".to_string()
+        })?)
+        .ok_or_else(|| "layer spawn payload range overflows u32".to_string())?;
+    let safe_end = stub_end
+        .checked_add(MIN_GOOP_LAYER_STACK_GAP)
+        .ok_or_else(|| "layer spawn stack guard overflows u32".to_string())?;
+    if safe_end > stack_top {
+        return Err(format!(
+            "per-layer goop spawn payload 0x{stub_address:08X}..0x{stub_end:08X} leaves less \
+             than 0x{MIN_GOOP_LAYER_STACK_GAP:X} bytes below the original stack top \
+             0x{stack_top:08X}"
+        ));
+    }
+    reject_injected_range_overlap(&image, stub_address, stub_end)?;
+
+    let file_offset = align_up_usize(source.len(), FILE_ALIGNMENT as usize)?;
+    let mut bytes = source.to_vec();
+    bytes.resize(file_offset, 0);
+    bytes.extend_from_slice(&payload);
+
+    write_be_u32(
+        &mut bytes,
+        DOL_TEXT_FILE_OFFSETS + text_slot * 4,
+        u32::try_from(file_offset)
+            .map_err(|_| "layer spawn file offset does not fit u32".to_string())?,
+    )?;
+    write_be_u32(&mut bytes, DOL_TEXT_ADDRESSES + text_slot * 4, stub_address)?;
+    write_be_u32(
+        &mut bytes,
+        DOL_TEXT_SIZES + text_slot * 4,
+        u32::try_from(payload_size)
+            .map_err(|_| "layer spawn section size does not fit u32".to_string())?,
+    )?;
+    write_be_u32(
+        &mut bytes,
+        hook_offset,
+        encode_branch(GOOP_LAYER_HOOK_CALL, stub_address, true)?,
+    )?;
+
+    if every_frame {
+        let interval_offset =
+            usize::try_from(dol_file_offset(&image, GOOP_LAYER_SPAWN_INTERVAL_BRANCH)?)
+                .map_err(|_| "goop spawn interval offset does not fit usize".to_string())?;
+        let found = read_be_u32(source, interval_offset)?;
+        if found != GOOP_LAYER_SPAWN_INTERVAL_BNE {
+            return Err(format!(
+                "the goop spawn interval gate at 0x{GOOP_LAYER_SPAWN_INTERVAL_BRANCH:08X} is \
+                 0x{found:08X}, not the expected 0x{GOOP_LAYER_SPAWN_INTERVAL_BNE:08X}"
+            ));
+        }
+        write_be_u32(&mut bytes, interval_offset, PPC_NOP)?;
+    }
+
+    Ok(bytes)
+}
+
+/// File offset of a loaded address.
+fn dol_file_offset(image: &DolImage, address: u32) -> Result<u32, String> {
+    for section in &image.sections {
+        if address >= section.address && address < section.address_end()? {
+            return section
+                .file_offset
+                .checked_add(address - section.address)
+                .ok_or_else(|| format!("DOL offset for 0x{address:08X} overflows"));
+        }
+    }
+    Err(format!(
+        "address 0x{address:08X} is not inside any loaded DOL section"
+    ))
+}
+
+#[cfg(test)]
+mod goop_layer_spawn_tests {
+    use super::*;
+
+    /// Local diagnostic against the real US executable:
+    /// `SMS_BASE_ROOT=<extracted game> cargo test goop_layer_spawn_patches_the_local_retail_dol
+    /// -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires SMS_BASE_ROOT with an extracted US retail game"]
+    fn goop_layer_spawn_patches_the_local_retail_dol() {
+        let path =
+            std::path::PathBuf::from(std::env::var_os("SMS_BASE_ROOT").expect("SMS_BASE_ROOT"))
+                .join("sys/main.dol");
+        let source = std::fs::read(path).expect("read main.dol");
+        let bindings = BTreeMap::from([
+            (0, RuntimeGoopLayerBinding::Pool("poolA".to_string())),
+            (1, RuntimeGoopLayerBinding::Empty),
+        ]);
+        let patched = patch_sms_goop_layer_spawn_dol(&source, &bindings, false).expect("patch");
+        assert!(patched.len() > source.len(), "payload was appended");
+
+        // The hook now calls the stub rather than isPolluted.
+        let image = parse_dol(&patched).expect("parse patched");
+        let offset =
+            usize::try_from(dol_file_offset(&image, GOOP_LAYER_HOOK_CALL).unwrap()).unwrap();
+        let word = read_be_u32(&patched, offset).unwrap();
+        let vanilla = encode_branch(GOOP_LAYER_HOOK_CALL, GOOP_LAYER_IS_POLLUTED, true).unwrap();
+        assert_ne!(word, vanilla, "the hook was redirected");
+        assert!(
+            patched
+                .windows(GOOP_LAYER_MARKER.len())
+                .any(|window| window == GOOP_LAYER_MARKER),
+            "payload carries its marker"
+        );
+
+        // Patching an already-patched executable must refuse rather than
+        // stack a second stub on a redirected call site.
+        assert!(patch_sms_goop_layer_spawn_dol(&patched, &bindings, false).is_err());
+    }
+
+    /// With nothing bound the executable must come back byte-identical, so a
+    /// stage that uses no per-layer pools ships a stock DOL.
+    #[test]
+    fn an_unbound_stage_leaves_the_executable_untouched() {
+        let source = vec![0_u8; 0x120];
+        let bindings = BTreeMap::new();
+        let patched = patch_sms_goop_layer_spawn_dol(&source, &bindings, false).unwrap();
+        assert_eq!(patched, source);
+
+        let vanilla_only = BTreeMap::from([(0, RuntimeGoopLayerBinding::Vanilla)]);
+        let patched = patch_sms_goop_layer_spawn_dol(&source, &vanilla_only, false).unwrap();
+        assert_eq!(patched, source);
+    }
+
+    /// A layer index the stub's table cannot address is refused rather than
+    /// silently dropped.
+    #[test]
+    fn a_layer_beyond_the_runtime_table_is_rejected() {
+        let source = vec![0_u8; 0x120];
+        let bindings = BTreeMap::from([(
+            GOOP_LAYER_MAX,
+            RuntimeGoopLayerBinding::Pool("pool".to_string()),
+        )]);
+        assert!(patch_sms_goop_layer_spawn_dol(&source, &bindings, false).is_err());
+    }
+
+    #[test]
+    fn the_runtime_table_covers_every_authorable_goop_layer() {
+        assert_eq!(GOOP_LAYER_MAX, sms_scene::GOOP_MAX_LAYERS);
+        assert_eq!(GOOP_LAYER_MAX, 20);
+    }
+
+    /// Every branch in the stub has to land inside it.
+    #[test]
+    fn the_stub_branches_stay_inside_itself() {
+        let base = 0x8041_7800;
+        let words = assemble_goop_layer_stub(base, &goop_layer_stub_items(base + 0xDC)).unwrap();
+        let end = base + (words.len() as u32) * 4;
+        for (index, word) in words.iter().enumerate() {
+            let address = base + (index as u32) * 4;
+            let opcode = word >> 26;
+            let target = if opcode == 18 {
+                let mut offset = (word & 0x03FF_FFFC) as i32;
+                if offset & 0x0200_0000 != 0 {
+                    offset -= 0x0400_0000;
+                }
+                if word & 1 != 0 {
+                    continue; // the call out to getManagerByName
+                }
+                address.wrapping_add(offset as u32)
+            } else if opcode == 16 {
+                let mut offset = (word & 0xFFFC) as i32;
+                if offset & 0x8000 != 0 {
+                    offset -= 0x1_0000;
+                }
+                address.wrapping_add(offset as u32)
+            } else {
+                continue;
+            };
+            assert!(
+                (base..=end).contains(&target),
+                "branch at 0x{address:08X} leaves the stub: 0x{target:08X}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
