@@ -687,9 +687,16 @@ impl StageDocument {
                         return Ok(resource.to_bytes()?);
                     }
                 }
+                // Typed model edits win over general resource edits, because
+                // that is the order a build applies them in: resources first,
+                // so a later typed edit can update what they placed. Reading
+                // them the other way round returned the resource a catalogue
+                // copy had put there and never reached the model, so an
+                // authored goop layer shipped in a build and appeared in no
+                // preview.
                 if let Some(edit) = self
                     .archive_edits
-                    .resources
+                    .models
                     .iter()
                     .find(|edit| edit.raw_resource_path == raw_resource_path)
                 {
@@ -697,7 +704,7 @@ impl StageDocument {
                 }
                 if let Some(edit) = self
                     .archive_edits
-                    .models
+                    .resources
                     .iter()
                     .find(|edit| edit.raw_resource_path == raw_resource_path)
                 {
