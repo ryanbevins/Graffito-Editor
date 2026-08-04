@@ -501,18 +501,27 @@ pub enum J3dPaddingKind {
     SuperBmdMessage(Vec<u8>),
 }
 
-/// The byte width of one element of a scalar array.
-fn scalar_array_element_width(array: &J3dScalarArray) -> usize {
-    match array {
-        J3dScalarArray::Unsigned8(_) | J3dScalarArray::Signed8(_) | J3dScalarArray::PackedColor(_) => 1,
-        J3dScalarArray::Unsigned16(_) | J3dScalarArray::Signed16(_) => 2,
-        J3dScalarArray::Unsigned32(_) | J3dScalarArray::Float32Bits(_) => 4,
+/// Records the gap between `cursor` and `aligned` as retail padding.
+///
+/// A table's length is not stored: the parser infers it from the distance to
+/// the next offset, then trims a suffix that matches retail's padding message.
+/// Padding written as zeros is therefore read back as data, so an aligned gap
+/// has to carry that message for the table to reparse at its true length.
+fn record_alignment_padding(spans: &mut Vec<J3dPaddingSpan>, cursor: usize, aligned: usize) {
+    if aligned <= cursor {
+        return;
     }
-}
-
-/// How many bytes a scalar array occupies once written.
-fn scalar_array_byte_len(array: &J3dScalarArray) -> usize {
-    scalar_array_len(array) * scalar_array_element_width(array)
+    let (Ok(offset), Ok(length)) = (
+        u32::try_from(cursor),
+        u32::try_from(aligned - cursor),
+    ) else {
+        return;
+    };
+    spans.push(J3dPaddingSpan {
+        offset,
+        length,
+        kind: J3dPaddingKind::RetailMessage { phase: 0 },
+    });
 }
 
 fn align_up(value: usize, alignment: usize) -> usize {
@@ -820,6 +829,7 @@ impl J3dRebuildDocument {
                 continue;
             };
             let mut offsets = [0u32; 30];
+            let mut padding = Vec::new();
             // The header runs to the end of the offset table.
             let mut cursor = 0x0c + 30 * 4;
             offsets[0] = u32::try_from(cursor)
@@ -834,7 +844,9 @@ impl J3dRebuildDocument {
                     let Some(names) = &mut materials.names else {
                         continue;
                     };
-                    cursor = align_up(cursor, 4);
+                    let aligned = align_up(cursor, 4);
+                    record_alignment_padding(&mut padding, cursor, aligned);
+                    cursor = aligned;
                     offsets[slot] = u32::try_from(cursor)
                         .map_err(|_| unsupported("MAT3 name table too far in".to_string()))?;
                     cursor += relayout_name_table(names)?;
@@ -844,12 +856,14 @@ impl J3dRebuildDocument {
                 else {
                     continue;
                 };
-                let length = scalar_array_byte_len(&table.allocation);
+                let length = scalar_array_len(&table.allocation);
                 if length == 0 {
                     continue;
                 }
                 // Four covers every element width these tables carry.
-                cursor = align_up(cursor, 4);
+                let aligned = align_up(cursor, 4);
+                record_alignment_padding(&mut padding, cursor, aligned);
+                cursor = aligned;
                 let offset = u32::try_from(cursor)
                     .map_err(|_| unsupported(format!("MAT3 {kind:?} table too far in")))?;
                 table.offset = offset;
@@ -858,10 +872,11 @@ impl J3dRebuildDocument {
             }
 
             materials.offsets = offsets;
-            section.declared_size = u32::try_from(align_up(cursor, 0x20))
+            let size = align_up(cursor, 0x20);
+            record_alignment_padding(&mut padding, cursor, size);
+            section.declared_size = u32::try_from(size)
                 .map_err(|_| unsupported("MAT3 is too large".to_string()))?;
-            // The repacked section has no imported padding left to reproduce.
-            section.padding = Vec::new();
+            section.padding = padding;
         }
         Ok(())
     }
@@ -889,6 +904,7 @@ impl J3dRebuildDocument {
             textures.texture_count = u16::try_from(textures.textures.len())
                 .map_err(|_| unsupported("TEX1 has too many textures".to_string()))?;
 
+            let mut padding = Vec::new();
             let mut cursor = header_offset + textures.textures.len() * 0x20;
             for (index, texture) in textures.textures.iter_mut().enumerate() {
                 let base = header_offset + index * 0x20;
@@ -896,7 +912,9 @@ impl J3dRebuildDocument {
                     .map_err(|_| unsupported("TEX1 header stride".to_string()))?;
 
                 if let Some(palette) = &mut texture.encoded_palette {
-                    cursor = align_up(cursor, 0x20);
+                    let aligned = align_up(cursor, 0x20);
+                    record_alignment_padding(&mut padding, cursor, aligned);
+                    cursor = aligned;
                     palette.absolute_section_offset = u32::try_from(cursor)
                         .map_err(|_| unsupported("TEX1 palette offset".to_string()))?;
                     texture.palette_offset = u32::try_from(cursor - base).map_err(|_| {
@@ -909,7 +927,9 @@ impl J3dRebuildDocument {
 
                 let mut image_offset = None;
                 for level in &mut texture.encoded_mip_levels {
-                    cursor = align_up(cursor, 0x20);
+                    let aligned = align_up(cursor, 0x20);
+                    record_alignment_padding(&mut padding, cursor, aligned);
+                    cursor = aligned;
                     level.absolute_section_offset = u32::try_from(cursor)
                         .map_err(|_| unsupported("TEX1 image offset".to_string()))?;
                     image_offset.get_or_insert(cursor);
@@ -923,14 +943,18 @@ impl J3dRebuildDocument {
                 };
             }
 
-            cursor = align_up(cursor, 4);
+            let aligned = align_up(cursor, 4);
+            record_alignment_padding(&mut padding, cursor, aligned);
+            cursor = aligned;
             textures.name_table_offset = u32::try_from(cursor)
                 .map_err(|_| unsupported("TEX1 name table offset".to_string()))?;
             cursor += relayout_name_table(&mut textures.names)?;
 
-            section.declared_size = u32::try_from(align_up(cursor, 0x20))
+            let size = align_up(cursor, 0x20);
+            record_alignment_padding(&mut padding, cursor, size);
+            section.declared_size = u32::try_from(size)
                 .map_err(|_| unsupported("TEX1 is too large".to_string()))?;
-            section.padding = Vec::new();
+            section.padding = padding;
         }
         Ok(())
     }
@@ -4940,6 +4964,16 @@ mod goop_layout_tests {
                             "{text}: material names changed"
                         );
                         for table in &before.tables {
+                            if std::env::var("GRAFFITO_DUMP").is_ok()
+                                && table.kind == J3dMaterialTableKind::CullMode
+                            {
+                                println!(
+                                    "   CullMode variant {:?} elements {} bytes {}",
+                                    std::mem::discriminant(&table.allocation),
+                                    scalar_array_len(&table.allocation),
+                                    scalar_array_len(&table.allocation)
+                                );
+                            }
                             let matching = after
                                 .tables
                                 .iter()
