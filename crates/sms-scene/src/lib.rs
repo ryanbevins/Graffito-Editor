@@ -1524,6 +1524,9 @@ impl StageDocument {
         {
             return Some(named_model.load_flags);
         }
+        if let Some(model) = default_enemy_manager_model(registry, &object.factory_name) {
+            return Some(model.load_flags);
+        }
         let resource_name = object.raw_param("actor_tail_string")?;
         if registry.is_map_obj_factory(&object.factory_name) {
             let resource = registry.find_map_obj_resource(resource_name)?;
@@ -2807,7 +2810,7 @@ fn apply_registry_preview_hints(
         } else {
             None
         };
-        let binding = named_object_binding
+        let direct_binding = named_object_binding
             .or(map_static_binding)
             .or_else(|| {
                 registry
@@ -2833,15 +2836,20 @@ fn apply_registry_preview_hints(
                         (model, resource.source_file.clone())
                     })
             });
+        let manager_binding = default_enemy_manager_model(registry, &object.factory_name)
+            .map(|model| (model.model_name.clone(), model.source_file.clone()));
+        let binding_is_manager_derived = direct_binding.is_none() && manager_binding.is_some();
+        let binding = direct_binding.or(manager_binding);
         let Some((authored_model, source)) = binding else {
             continue;
         };
 
         // Once a schema binding exists, never retain a weaker basename guess,
         // including when the authored model is missing or ambiguous.
-        object
-            .asset_hints
-            .retain(|hint| hint.role != AssetRole::InferredPreviewModel);
+        object.asset_hints.retain(|hint| {
+            hint.role != AssetRole::InferredPreviewModel
+                && !(binding_is_manager_derived && hint.role == AssetRole::PreviewModel)
+        });
 
         match resolve_authored_model_path(&authored_model, &model_index) {
             ModelPathResolution::Found(path) => {
@@ -3489,6 +3497,33 @@ fn actor_manager_model_candidates<'a>(
             .collect();
     }
     manager.models.first().into_iter().collect()
+}
+
+fn default_enemy_manager_model<'a>(
+    registry: &'a ObjectRegistry,
+    factory_name: &str,
+) -> Option<&'a EnemyModelDefinition> {
+    let actor = registry.find_enemy_actor(factory_name)?;
+    let mut selected = None;
+    for manager_factory in &actor.manager_factories {
+        let Some(manager) = registry.find_enemy_manager(manager_factory) else {
+            continue;
+        };
+        let Some(model) = actor_manager_model_candidates(actor, manager)
+            .into_iter()
+            .next()
+        else {
+            continue;
+        };
+        if selected.is_some_and(|selected: &EnemyModelDefinition| {
+            !selected.model_name.eq_ignore_ascii_case(&model.model_name)
+                || selected.load_flags != model.load_flags
+        }) {
+            return None;
+        }
+        selected = Some(model);
+    }
+    selected
 }
 
 fn manager_model_tables_are_aliases(
@@ -6448,6 +6483,90 @@ mod tests {
         let preview = document.actor_preview(&spawned).unwrap();
         assert_eq!(preview.model_path, "bianco0.szs!/hamukuri/default.bmd");
         assert_eq!(preview.load_flags, 0x1022_0000);
+    }
+
+    #[test]
+    fn manager_model_refresh_repairs_a_stale_catalog_projectile_preview() {
+        let mut registry = ObjectRegistry::default();
+        registry.objects.extend([
+            sms_schema::ObjectDefinition {
+                factory_name: "FixtureEnemy".to_string(),
+                class_name: "TFixtureEnemy".to_string(),
+                category: "Enemy".to_string(),
+                source: sms_schema::SchemaSource::MarNameRefGen,
+                display_name: None,
+                preview_model: None,
+                hidden: false,
+                unsafe_to_edit: false,
+            },
+            sms_schema::ObjectDefinition {
+                factory_name: "FixtureManager".to_string(),
+                class_name: "TFixtureManager".to_string(),
+                category: "Manager".to_string(),
+                source: sms_schema::SchemaSource::MarNameRefGen,
+                display_name: None,
+                preview_model: None,
+                hidden: false,
+                unsafe_to_edit: false,
+            },
+        ]);
+        registry.enemy_actors.push(EnemyActorDefinition {
+            factory_name: "FixtureEnemy".to_string(),
+            class_name: "TFixtureEnemy".to_string(),
+            model_index: None,
+            fallback_models: Vec::new(),
+            primary_model: None,
+            named_models: Vec::new(),
+            indexed_models: Vec::new(),
+            manager_factories: vec!["FixtureManager".to_string()],
+            runtime_uniform_scale: None,
+        });
+        registry.enemy_managers.push(EnemyManagerDefinition {
+            factory_name: "FixtureManager".to_string(),
+            class_name: "TFixtureManager".to_string(),
+            model_index: None,
+            spawned_actor_class: Some("TFixtureEnemy".to_string()),
+            parameter_path: None,
+            models: vec![EnemyModelDefinition {
+                model_name: "body_model1.bmd".to_string(),
+                load_flags: 0x1023_0000,
+                source_file: "fixture_enemy.cpp".to_string(),
+            }],
+        });
+        let assets = vec![
+            StageAsset {
+                path: PathBuf::from("stage.szs!/enemy/aaa_projectile.bmd"),
+                kind: StageAssetKind::Model,
+            },
+            StageAsset {
+                path: PathBuf::from("stage.szs!/enemy/body_model1.bmd"),
+                kind: StageAssetKind::Model,
+            },
+        ];
+        let mut object = SceneObject::new("fixture", "FixtureEnemy");
+        object.asset_hints.push(AssetRef {
+            path: "stage.szs!/enemy/aaa_projectile.bmd".to_string(),
+            role: AssetRole::PreviewModel,
+        });
+
+        assert!(apply_registry_preview_hints(
+            std::slice::from_mut(&mut object),
+            &assets,
+            &registry
+        )
+        .is_empty());
+        assert_eq!(
+            object.asset_hints,
+            vec![AssetRef {
+                path: "stage.szs!/enemy/body_model1.bmd".to_string(),
+                role: AssetRole::InferredPreviewModel,
+            }]
+        );
+        let document = empty_document("fixture").with_registry(registry);
+        assert_eq!(
+            document.object_preview_load_flags(&object),
+            Some(0x1023_0000)
+        );
     }
 
     #[test]

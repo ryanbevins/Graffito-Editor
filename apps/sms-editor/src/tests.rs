@@ -2376,6 +2376,35 @@ fn npc_archive_models_are_supported_object_previews() {
 }
 
 #[test]
+fn manager_model_wait_animation_candidates_keep_the_exact_archive_scope() {
+    let object = SceneObject::new("gesso", "Gesso");
+    let candidates = starting_joint_animation_candidates(
+        &object,
+        r"C:\game\ricco0.szs!\rikugesso\geso_model1.bmd",
+        None,
+    );
+
+    assert_eq!(
+        &candidates[..2],
+        &[
+            "C:/game/ricco0.szs!/rikugesso/geso_wait1.bck".to_string(),
+            "C:/game/ricco0.szs!/rikugesso/geso_wait.bck".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn unrelated_model_names_do_not_invent_wait_animations() {
+    let object = SceneObject::new("map object", "MapObjBase");
+    assert!(starting_joint_animation_candidates(
+        &object,
+        "stage.szs!/mapobj/normalblock.bmd",
+        None,
+    )
+    .is_empty());
+}
+
+#[test]
 fn world_model_path_normalization_deduplicates_scene_instances() {
     let world_models = BTreeSet::from([normalized_preview_asset_path(
         r"C:\game\dolpic0.szs!/map/map/sky.bmd",

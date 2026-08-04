@@ -1881,16 +1881,19 @@ fn add_catalog_preview_hint(
     ) else {
         return;
     };
-    object
-        .asset_hints
-        .retain(|hint| hint.role != AssetRole::PreviewModel);
+    object.asset_hints.retain(|hint| {
+        !matches!(
+            hint.role,
+            AssetRole::PreviewModel | AssetRole::InferredPreviewModel
+        )
+    });
     object.asset_hints.push(AssetRef {
         path: format!(
             "{}!/{}",
             source_path.display(),
             String::from_utf8_lossy(raw_path).replace('\\', "/")
         ),
-        role: AssetRole::PreviewModel,
+        role: AssetRole::InferredPreviewModel,
     });
 }
 impl SmsEditorApp {

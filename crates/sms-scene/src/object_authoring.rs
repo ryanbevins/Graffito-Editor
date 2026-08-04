@@ -2315,6 +2315,10 @@ fn preview_resource_path(
         .or_else(|| {
             find_enemy_actor(registry, &candidate.factory_name)
                 .and_then(|actor| actor.primary_model.as_deref())
+        })
+        .or_else(|| {
+            super::default_enemy_manager_model(registry, &candidate.factory_name)
+                .map(|model| model.model_name.as_str())
         });
     preferred
         .and_then(|preferred| {
@@ -2731,7 +2735,7 @@ mod tests {
     use super::*;
     use sms_formats::{JDramaLightMap, JDramaTransform};
     use sms_schema::{
-        ActorParticleBinding, EnemyActorDefinition, EnemyManagerDefinition,
+        ActorParticleBinding, EnemyActorDefinition, EnemyManagerDefinition, EnemyModelDefinition,
         MapObjAnimationResourceDefinition, MapObjCollisionResourceDefinition,
         MapObjModelOverrideDefinition, MapObjResourceDefinition, NpcActorDefinition,
         NpcPartDefinition, NpcPartModelDefinition, NpcResourceFolderDefinition,
@@ -3946,6 +3950,64 @@ mod tests {
                 "map/pollution/H_ma_rak.bti",
                 "map/scene.ral",
             ]
+        );
+    }
+
+    #[test]
+    fn manager_backed_enemy_preview_uses_the_decomp_model_instead_of_the_first_bmd() {
+        let registry = ObjectRegistry {
+            objects: vec![
+                object("FixtureEnemy", "TFixtureEnemy"),
+                object("FixtureManager", "TFixtureManager"),
+            ],
+            enemy_actors: vec![EnemyActorDefinition {
+                factory_name: "FixtureEnemy".into(),
+                class_name: "TFixtureEnemy".into(),
+                model_index: None,
+                fallback_models: Vec::new(),
+                primary_model: None,
+                named_models: Vec::new(),
+                indexed_models: Vec::new(),
+                manager_factories: vec!["FixtureManager".into()],
+                runtime_uniform_scale: None,
+            }],
+            enemy_managers: vec![EnemyManagerDefinition {
+                factory_name: "FixtureManager".into(),
+                class_name: "TFixtureManager".into(),
+                model_index: None,
+                spawned_actor_class: Some("TFixtureEnemy".into()),
+                parameter_path: None,
+                models: vec![EnemyModelDefinition {
+                    model_name: "body_model1.bmd".into(),
+                    load_flags: 0x1023_0000,
+                    source_file: "fixture_enemy.cpp".into(),
+                }],
+            }],
+            ..ObjectRegistry::default()
+        };
+        let manager = fields("FixtureManager", "fixture manager", Vec::new());
+        let mut enemy = actor("FixtureEnemy", "fixture enemy", 1);
+        let JDramaRecordPayload::Actor { fields, .. } = &mut enemy.payload else {
+            unreachable!()
+        };
+        fields.push(field(
+            "manager_name",
+            JDramaFieldValue::String("fixture manager".into()),
+        ));
+        let mut source = source(
+            "stage",
+            document(vec![(2, vec![manager]), (4, vec![enemy])]),
+        );
+        source.resources = resources(
+            "stage.szs",
+            &["enemy/aaa_projectile.bmd", "enemy/body_model1.bmd"],
+        );
+
+        let catalog = build_from_sources(&[source], &registry);
+        let template = catalog.find("FixtureEnemy").unwrap();
+        assert_eq!(
+            template.preview_resource_path.as_deref(),
+            Some(b"enemy/body_model1.bmd".as_slice())
         );
     }
 
