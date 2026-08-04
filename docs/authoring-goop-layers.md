@@ -549,4 +549,21 @@ sampled, the level surviving in the register the layer claimed.
 - `add_goop_layer` claims one free konst register per material and will refuse
   on a material already using all four.
 - Nothing drives the konst at runtime, so a baked layer is permanent. Washing it
-  needs game code — the enemy's own class does this in retail.
+  needs game code — the enemy's own class does this in retail, and an actor that
+  never shipped with goop has no such code.
+
+  For BossPakkun the input already exists. `TBossPakkun` accumulates water hits
+  in `unk178` and tips into `TNerveBPTumbleIn` once it passes
+  `mSLWaterMarkLimit`, which defaults to 600:
+
+  ```cpp
+  if (boss->unk178 >= boss->getBossPakkunSaveParam()->mSLWaterMarkLimit.get()) {
+      spine->pushAfterCurrent(&TNerveBPTumbleIn::theNerve());
+  ```
+
+  So a wash is `K0_A = 255 - (unk178 * 255 / limit)` — the same shape as
+  StayPakkun's `mHitPoints * 255 / maxHp`, spraying him thinning the coating and
+  stopping holding it. What is missing is code to write that konst each frame:
+  a patch hooking his update, resolving his material through `getModel()`, and
+  setting the konst alpha the layer claimed. `add_goop_layer` reports which
+  register that is.
