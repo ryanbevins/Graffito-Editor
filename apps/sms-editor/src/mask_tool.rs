@@ -632,6 +632,9 @@ fn mask_model_path(
 
 const CANVAS: usize = 384;
 
+/// The texture an authored goop layer carries its coating and mask in.
+const GOOP_LAYER_TEXTURE: &str = "graffito_goop";
+
 impl SmsEditorApp {
     /// Enemy actors placed in the loaded stage, as sampler choices.
     fn mask_actor_choices(&self) -> Vec<MaskActorChoice> {
@@ -2131,15 +2134,6 @@ impl SmsEditorApp {
                     .collect()
             })
             .unwrap_or_default();
-        if materials.is_empty() {
-            self.log.push(
-                "This actor has no goop layer to bake. Its model runs no wash comparison, so \
-                 there is no coverage for the game to read -- authoring one into a model that \
-                 never had it is not wired yet."
-                    .to_string(),
-            );
-            return;
-        }
 
         let (raw_path, bytes) = {
             let Some(document) = self.document.as_ref() else {
@@ -2170,6 +2164,31 @@ impl SmsEditorApp {
                 return;
             }
         };
+
+        // A model that runs no comparison has no coverage to set, so give it
+        // the layer first and set the level as part of authoring it.
+        if materials.is_empty() {
+            match self.author_goop_layer(&mut model, level) {
+                Ok(count) => {
+                    let Some(document) = self.document.as_mut() else {
+                        return;
+                    };
+                    let before = document.archive_edits.clone();
+                    document.archive_edits.replace_model(raw_path, model);
+                    self.finish_mask_author_edit(
+                        before,
+                        format!(
+                            "Gave this actor a goop layer across {count} material(s) at coverage \
+                             {:.0}%; the stage carries it now.",
+                            self.mask_wash_phase * 100.0
+                        ),
+                    );
+                    self.build_mask_preview(&choice);
+                }
+                Err(error) => self.log.push(error),
+            }
+            return;
+        }
 
         let mut written = 0usize;
         for name in &materials {
@@ -2211,6 +2230,102 @@ impl SmsEditorApp {
             ),
         );
         self.build_mask_preview(&choice);
+    }
+
+    /// Builds a goop layer and writes it into every material the actor draws.
+    ///
+    /// The coating is the selected goop colour with the current mask in its
+    /// alpha, and the coordinate is a front projection over the model's own
+    /// bounds -- the layout retail authored for the enemies that ship with
+    /// goop, and the one the preview has been drawing all along.
+    fn author_goop_layer(
+        &self,
+        model: &mut sms_formats::J3dRebuildDocument,
+        level: u8,
+    ) -> Result<usize, String> {
+        let preview = self
+            .mask_preview
+            .as_ref()
+            .ok_or_else(|| "No actor is loaded.".to_string())?;
+        let (size, mask) = self
+            .active_mask()
+            .ok_or_else(|| "Generate or assign a goop mask before baking.".to_string())?;
+
+        // Colour from the goop source, mask in the alpha, one texel per texel
+        // of the mask so nothing is resampled.
+        let mut pixels = Vec::with_capacity(size * size * 4);
+        for y in 0..size {
+            for x in 0..size {
+                let u = (x as f32 + 0.5) / size as f32;
+                let v = 1.0 - (y as f32 + 0.5) / size as f32;
+                let colour = self.goop_colour(u, v);
+                pixels.extend_from_slice(&[
+                    colour[0],
+                    colour[1],
+                    colour[2],
+                    mask[y * size + x],
+                ]);
+            }
+        }
+        let width = u16::try_from(size).map_err(|_| "The mask is too large.".to_string())?;
+        let image = sms_formats::RgbaImage::new(width, width, pixels)
+            .map_err(|error| format!("Could not stage the coating: {error}"))?;
+        let encoded = sms_formats::GxEncodedTexture::encode_rgba(
+            GOOP_LAYER_TEXTURE,
+            &image,
+            sms_formats::GxTextureEncodeOptions::default(),
+        )
+        .map_err(|error| format!("Could not encode the coating: {error}"))?;
+        let texture = encoded
+            .to_bti()
+            .map_err(|error| format!("Could not encode the coating: {error}"))?;
+
+        // The front projection, over the model as it stands.
+        let mut min = [f32::INFINITY; 2];
+        let mut max = [f32::NEG_INFINITY; 2];
+        for triangle in &preview.geometry.triangles {
+            for vertex in triangle.vertices {
+                for axis in 0..2 {
+                    min[axis] = min[axis].min(vertex[axis]);
+                    max[axis] = max[axis].max(vertex[axis]);
+                }
+            }
+        }
+        let scale = std::array::from_fn(|axis| {
+            let span = max[axis] - min[axis];
+            if span > f32::EPSILON { 1.0 / span } else { 1.0 }
+        });
+        let translation: [f32; 2] = std::array::from_fn(|axis| -min[axis] * scale[axis]);
+
+        let mut authored = 0usize;
+        let mut failures = Vec::new();
+        for material in &preview.geometry.materials {
+            if material.tev_stages.is_empty() {
+                continue;
+            }
+            let request = sms_formats::GoopLayerRequest {
+                material_name: &material.name,
+                texture_name: GOOP_LAYER_TEXTURE,
+                texture: &texture,
+                scale,
+                translation,
+                level,
+            };
+            match model.add_goop_layer(&request) {
+                Ok(_) => authored += 1,
+                Err(error) => failures.push(format!("{}: {error}", material.name)),
+            }
+        }
+        if authored == 0 {
+            return Err(match failures.first() {
+                Some(first) => format!("No material took a goop layer ({first})."),
+                None => "This model has no material to give a goop layer to.".to_string(),
+            });
+        }
+        model
+            .to_bytes()
+            .map_err(|error| format!("The authored model would not rebuild: {error}"))?;
+        Ok(authored)
     }
 
     /// Replaces the actor's wash mask with a painted image, as a stage
