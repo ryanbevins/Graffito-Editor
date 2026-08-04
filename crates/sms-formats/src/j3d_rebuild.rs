@@ -988,7 +988,7 @@ impl J3dRebuildDocument {
             };
             let stage_count = material_tev_stage_count(materials, record);
             let gen_count = material_tex_gen_count(materials, record);
-            if stage_count + 2 > 16 {
+            if stage_count + 3 > 16 {
                 return Err(unsupported(format!(
                     "material {:?} already runs {stage_count} TEV stages; a goop layer needs two \
                      more",
@@ -1071,6 +1071,20 @@ impl J3dRebuildDocument {
                 ],
                 20,
             )?;
+            // Composing the coating takes two adds rather than one blend.
+            // The first clears the surface where the coating will land, the
+            // second adds the coating there, and together they come to
+            // `surface * C2 + coating * (1 - C2)` -- a replace, reached only
+            // through the add this model is already known to render.
+            let clear_stage = append_material_bytes(
+                materials,
+                J3dMaterialTableKind::TevStage,
+                &[
+                    0xff, 0x0f, 0x00, 0x06, 0x0f, 0x00, 0x00, 0x00, 0x01, 0x00, 0x07, 0x07, 0x07,
+                    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0xff,
+                ],
+                20,
+            )?;
             let apply_stage = append_material_bytes(
                 materials,
                 J3dMaterialTableKind::TevStage,
@@ -1095,7 +1109,7 @@ impl J3dRebuildDocument {
             let stage_count_index = append_material_count(
                 materials,
                 J3dMaterialTableKind::TevStageCount,
-                u8::try_from(stage_count + 2)
+                u8::try_from(stage_count + 3)
                     .map_err(|_| unsupported("TEV stage count".to_string()))?,
             )?;
 
@@ -1109,15 +1123,17 @@ impl J3dRebuildDocument {
             record.texture_number_indices[map_slot] = texture_number_index as u16;
             record.tev_order_indices[stage_count] = compare_order as u16;
             record.tev_order_indices[stage_count + 1] = apply_order as u16;
+            record.tev_order_indices[stage_count + 2] = apply_order as u16;
             record.tev_stage_indices[stage_count] = compare_stage as u16;
-            record.tev_stage_indices[stage_count + 1] = apply_stage as u16;
+            record.tev_stage_indices[stage_count + 1] = clear_stage as u16;
+            record.tev_stage_indices[stage_count + 2] = apply_stage as u16;
             record.tev_konst_color_indices[0] = konst_index as u16;
             // The comparison reads K0's alpha; the stage after it reads no
             // konst at all, but a selector is still written for both.
-            record.tev_konst_color_selectors[stage_count] = 0x1c;
-            record.tev_konst_color_selectors[stage_count + 1] = 0x1c;
-            record.tev_konst_alpha_selectors[stage_count] = 0x1c;
-            record.tev_konst_alpha_selectors[stage_count + 1] = 0x1c;
+            for stage in stage_count..stage_count + 3 {
+                record.tev_konst_color_selectors[stage] = 0x1c;
+                record.tev_konst_alpha_selectors[stage] = 0x1c;
+            }
 
             report.first_stage = stage_count;
             authored_any = true;
