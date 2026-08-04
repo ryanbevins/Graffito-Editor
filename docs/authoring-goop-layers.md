@@ -159,6 +159,82 @@ body — 150 of 1714 vertices, 8.8%, and everything else was already perfect.
 Fix: hold each slot's matrix across packets, updating only when a packet names a
 new one.
 
+## Finding a layer an actor already has
+
+Before authoring one, check whether the actor carries a wash already — and do
+not use the preview's per-triangle mask fields to decide. `mask_tex_coords` and
+`mask_texture_index` come from a parser heuristic that **never fires** for
+StayPakkun, BossGesso or HamuKuri: they read `0` of `N` triangles on all three,
+which is what made every early attempt conclude "no authored mask" and coat them
+with a borrowed one.
+
+The binding that cannot be absent is the wash itself. Scan the material's TEV
+stages for a comparison — `color_op >= 8 || alpha_op >= 8` — and read its order:
+
+- its **texture map** resolves through `material.texture_indices[map]` to the
+  mask the actor ships;
+- its **coordinate slot** is the set the wash reads.
+
+Measured this way, the three wired actors give up their layers immediately:
+
+| Actor | Mask | Coordinate | Coverage |
+| --- | --- | --- | --- |
+| StayPakkun (`pakun.bmd`) | `H_ma_polmask1_i4_32` | stored UV1 | all 738 triangles |
+| HamuKuri (`hamukuri/default.bmd`) | `H_ma_polmask1_i4_hamu` | stored UV1 | 132 cap triangles only |
+| BossGesso (`bgeso_body.bmd`) | `N_bgeso_yogore2` 64² | coord 2, generated from stored UV1 | 578 of 682 |
+| BossPakkun | none — no comparison stage at all | — | — |
+
+HamuKuri is worth noting: his wash lives on his **cap material alone**, which is
+why a whole-body coating looks wrong on him. On a wired actor, a surface without
+the layer should stay clean rather than fall back to a projection.
+
+BossGesso shows the other trap. His comparison names coordinate **2**, but his
+material *generates* that coordinate from stored UV1 through a texture matrix.
+Looking for a stored set at index 2 finds nothing. Follow the chain: comparison
+coordinate → `material.tex_gens[coord].source` → if the source is `4..11` it is
+stored set `source - 4`.
+
+## Getting the actor into the tool
+
+The Mask Tool draws through the stage viewport's own renderer rather than a
+second one. That decision came late and only after a long detour: a hand-written
+CPU rasterizer will keep diverging from the real pipeline, and every actor tried
+against it exposed another gap — texmap slot resolution, generated coordinates,
+the alpha half of the TEV, wrap modes. If the stage viewport draws an actor
+correctly, use it.
+
+Isolating one actor is cheap: clone the stage's `ModelPreview` and
+`triangles.retain(|t| t.model_index == index)`. Several things then have to be
+right, and each has its own symptom.
+
+**The camera basis must match `camera_frame()`.** It builds
+`right = [-cos(yaw), 0, sin(yaw)]`. Deriving `[+cos(yaw), ...]` instead mirrors
+the view, which flips every triangle's winding, so backface culling keeps the
+**interior** and discards the surfaces facing you. The model renders inside out,
+mouths lose their inner faces, and the framing skews.
+
+**The stage holds actors at their placed position.** The loaded BMD's bounds are
+in the model's own space, so aiming a camera with them points it at the stage
+origin — the actor comes out tiny and off to one side, with any overlay drawn
+around the model's own centre sitting somewhere else entirely.
+
+**A model index carries more than the body.** Effect meshes ride along —
+PoiHana's sleep Zs, billboards, particle quads — and they float away from the
+actor, inflating both the bounds the camera frames and the span a projection
+normalises across. Filter by `render_layer`, `billboard` and `particle_type`,
+then trim what remains by distance from the dense cluster of body triangles.
+
+**Strip the animation bindings.** The stage animates some models at draw time,
+so the renderer poses the actor away from the geometry an overlay was computed
+from. Clearing `animated_models`, `animated_flags`, `rotating_models` and
+`level_transform_models` on the isolated copy keeps authoring on the rest pose.
+
+**Some actors are not in the stage preview at all.** HamuKuri is spawned by his
+manager and loads per spawn, so `object_model_indices` has no entry for him. A
+nearest-model fallback is a trap: every placed object sits inside the map's
+bounds, so it will happily return a slab of terrain. Build a renderable preview
+from the model the tool itself loaded instead.
+
 ## Growing MAT3 and TEX1
 
 A model that never carried goop has nowhere to put the records it needs.
@@ -383,6 +459,11 @@ sampled, the level surviving in the register the layer claimed.
 | Thin strips, coordinate jumping per vertex | Coordinates written in a different order than they were posed |
 | One part twists, rest correct | `0xFFFF` matrix slots — hold across packets |
 | Smearing everywhere, no coverage matches | Coordinate is generated rather than stored |
+| Model renders inside out, mouths hollow | Camera basis mirrored against `camera_frame()` |
+| Actor tiny and off to one side | Camera aimed with the model's own bounds, not its placed ones |
+| Coating sits away from the model | Renderer posing an animated actor away from the rest pose |
+| Actor resolves to a slab of terrain | Nearest-model fallback; the actor is manager-spawned |
+| "No authored mask" on an actor that clearly has one | Parser mask fields; read the comparison stage instead |
 
 ## Still open
 
