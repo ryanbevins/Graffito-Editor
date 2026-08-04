@@ -2260,33 +2260,23 @@ impl SmsEditorApp {
             .active_mask()
             .ok_or_else(|| "Generate or assign a goop mask before baking.".to_string())?;
 
-        // The coating carries the goop map at its own resolution, with the
-        // mask sampled up into the alpha. Authoring at the mask's size
-        // instead -- masks are small, often thirty two square -- reduces the
-        // goop to a smear, which is nothing like what the preview composites.
-        let native = match self.mask_goop_image.as_ref() {
-            Some((width, height, _)) if *width > 0 && *height > 0 => (*width).max(*height),
-            _ => 256,
-        };
-        // GX wants sides that are multiples of four, and there is no gain
-        // beyond the goop map's own detail.
-        let resolution = native.next_multiple_of(4).clamp(size.max(32), 512);
-        let mut pixels = Vec::with_capacity(resolution * resolution * 4);
-        for y in 0..resolution {
-            for x in 0..resolution {
-                let u = (x as f32 + 0.5) / resolution as f32;
-                let v = 1.0 - (y as f32 + 0.5) / resolution as f32;
+        // Colour from the goop source, mask in the alpha, one texel per texel
+        // of the mask so nothing is resampled.
+        let mut pixels = Vec::with_capacity(size * size * 4);
+        for y in 0..size {
+            for x in 0..size {
+                let u = (x as f32 + 0.5) / size as f32;
+                let v = 1.0 - (y as f32 + 0.5) / size as f32;
                 let colour = self.goop_colour(u, v);
                 pixels.extend_from_slice(&[
                     colour[0],
                     colour[1],
                     colour[2],
-                    sample_mask_bilinear(&mask, size, u, v),
+                    mask[y * size + x],
                 ]);
             }
         }
-        let width =
-            u16::try_from(resolution).map_err(|_| "The coating is too large.".to_string())?;
+        let width = u16::try_from(size).map_err(|_| "The mask is too large.".to_string())?;
         let image = sms_formats::RgbaImage::new(width, width, pixels)
             .map_err(|error| format!("Could not stage the coating: {error}"))?;
         let encoded = sms_formats::GxEncodedTexture::encode_rgba(
