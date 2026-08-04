@@ -1665,6 +1665,19 @@ impl J3dFile {
         self.preview_draw_matrices_from_joint_matrices(&joint_matrices)
     }
 
+    /// The matrix each draw slot binds, in the model's rest pose.
+    ///
+    /// Storing a goop coordinate needs every vertex posed before it is
+    /// projected, and this is the pose the display lists index into.
+    pub fn rest_pose_draw_matrices(&self, loader_flags: u32) -> Result<Vec<Option<[[f32; 4]; 3]>>> {
+        let joints = self.preview_joint_matrices(loader_flags, None, &[])?;
+        Ok(self
+            .preview_draw_matrices_from_joint_matrices(&joints)?
+            .into_iter()
+            .map(|matrix| matrix.map(|matrix| matrix))
+            .collect())
+    }
+
     pub(crate) fn preview_draw_matrices_from_joint_matrices(
         &self,
         joint_matrices: &[Mtx34],

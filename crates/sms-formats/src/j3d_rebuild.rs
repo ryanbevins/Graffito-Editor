@@ -501,8 +501,14 @@ pub enum J3dPaddingKind {
     SuperBmdMessage(Vec<u8>),
 }
 
-/// One texture matrix record's size on disk.
-const J3D_TEX_MATRIX_SIZE: usize = 0x64;
+/// GX vertex attribute numbers used when authoring a stored coordinate.
+const GX_VA_PNMTXIDX: u32 = 0;
+const GX_VA_POS: u32 = 9;
+const GX_VA_TEX0: u8 = 13;
+/// The attribute list terminator.
+const GX_VA_NULL: u32 = 0xff;
+/// A sixteen bit index into a vertex array.
+const GX_INDEX16: u32 = 3;
 
 /// What to author into a material that has no goop layer.
 #[derive(Debug, Clone)]
@@ -511,10 +517,10 @@ pub struct GoopLayerRequest<'a> {
     /// The texture to add: its colour is the coating, its alpha the mask.
     pub texture_name: &'a str,
     pub texture: &'a BtiFile,
-    /// The projection that turns a model-space position into the goop
-    /// coordinate: `u = x * scale[0] + translation[0]`, and likewise for `v`.
-    pub scale: [f32; 2],
-    pub translation: [f32; 2],
+    /// The stored coordinate set the wash reads. Retail stores the goop UV
+    /// rather than generating it, because a generated one is handed the
+    /// vertex position in whichever joint's space that vertex lives.
+    pub coordinate_slot: u8,
     /// The wash level to ship at. The coating shows where the mask does not
     /// exceed this, so 255 ships fully coated.
     pub level: u8,
@@ -528,38 +534,6 @@ pub struct GoopLayerReport {
     pub konst_register: usize,
     /// The stage the layer starts at.
     pub first_stage: usize,
-}
-
-/// A texture matrix that projects position onto the front plane.
-///
-/// Mode zero takes the source as it stands and applies the scale, rotation and
-/// translation directly, so a scale and an offset per axis are all a bounds
-/// projection needs. The effect matrix is left as identity because mode zero
-/// never reads it.
-fn texture_matrix_record(scale: [f32; 2], translation: [f32; 2]) -> Vec<u8> {
-    let mut record = vec![0u8; J3D_TEX_MATRIX_SIZE];
-    record[0] = 0;
-    record[1] = 0;
-    record[2] = 0xff;
-    record[3] = 0xff;
-    fn put(record: &mut [u8], offset: usize, value: f32) {
-        record[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
-    }
-    for axis in 0..3 {
-        put(&mut record, 0x04 + axis * 4, 0.0);
-    }
-    put(&mut record, 0x10, scale[0]);
-    put(&mut record, 0x14, scale[1]);
-    record[0x18..0x1a].copy_from_slice(&0i16.to_be_bytes());
-    put(&mut record, 0x1c, translation[0]);
-    put(&mut record, 0x20, translation[1]);
-    for row in 0..4 {
-        for column in 0..4 {
-            let value = if row == column { 1.0f32 } else { 0.0 };
-            put(&mut record, 0x24 + (row * 4 + column) * 4, value);
-        }
-    }
-    record
 }
 
 /// Appends bytes to a material table and reports the element index they land
@@ -944,6 +918,307 @@ impl J3dRebuildDocument {
     /// runtime's exact one-half constant; only active TEV stages are changed so
     /// pristine padding selectors with the same byte remain untouched.
     /// Returns how many selectors were pinned.
+    /// Stores a front-projected goop coordinate in the model's vertex data.
+    ///
+    /// This is how retail carries a goop UV: StayPakkun's is a second stored
+    /// set, not a generated one, which is why his survives a jointed model. A
+    /// generated coordinate is handed the vertex position in whichever joint's
+    /// space that vertex lives, so one matrix cannot serve a model whose parts
+    /// sit in different frames. A stored coordinate travels with the vertex
+    /// and has no such trouble.
+    ///
+    /// Each vertex occurrence receives its own entry, so a position shared
+    /// between joints cannot pull two projections into one slot. The
+    /// projection matches the preview's: the posed model's `x` and `y`,
+    /// normalised to its bounds.
+    pub fn store_front_projection_texcoord(
+        &mut self,
+        slot: u8,
+        draw_matrices: &[Option<[[f32; 4]; 3]>],
+    ) -> Result<usize> {
+        let mut stored = self.clone();
+        let count = stored.store_front_projection_texcoord_in_place(slot, draw_matrices)?;
+        *self = stored;
+        Ok(count)
+    }
+
+    fn store_front_projection_texcoord_in_place(
+        &mut self,
+        slot: u8,
+        draw_matrices: &[Option<[[f32; 4]; 3]>],
+    ) -> Result<usize> {
+        let attribute = u32::from(GX_VA_TEX0 + slot);
+        let positions = self.decoded_positions()?;
+
+        // Pose every vertex the display lists name, in the order they name
+        // them, so the coordinates can be written back in the same walk.
+        let posed = self.posed_display_list_positions(&positions, draw_matrices)?;
+        if posed.is_empty() {
+            return Err(unsupported(
+                "the model's display lists name no vertices".to_string(),
+            ));
+        }
+        let mut min = [f32::INFINITY; 2];
+        let mut max = [f32::NEG_INFINITY; 2];
+        for point in &posed {
+            for axis in 0..2 {
+                min[axis] = min[axis].min(point[axis]);
+                max[axis] = max[axis].max(point[axis]);
+            }
+        }
+        let span = [max[0] - min[0], max[1] - min[1]];
+        let coordinates: Vec<[f32; 2]> = posed
+            .iter()
+            .map(|point| {
+                std::array::from_fn(|axis| {
+                    if span[axis] > f32::EPSILON {
+                        ((point[axis] - min[axis]) / span[axis]).clamp(0.0, 1.0)
+                    } else {
+                        0.5
+                    }
+                })
+            })
+            .collect();
+
+        // Write the coordinate index into every vertex, in that same walk.
+        let mut written = 0usize;
+        for section in &mut self.sections {
+            let J3dRebuildSectionData::Shapes(shapes) = &mut section.data else {
+                continue;
+            };
+            for descriptors in &mut shapes.vertex_descriptor_sets {
+                let already = descriptors
+                    .descriptors
+                    .iter()
+                    .any(|descriptor| descriptor.attribute == attribute);
+                if already {
+                    return Err(unsupported(format!(
+                        "the model already stores texture coordinate {slot}"
+                    )));
+                }
+                // The terminating descriptor keeps its place at the end.
+                let end = descriptors
+                    .descriptors
+                    .iter()
+                    .position(|descriptor| descriptor.attribute == GX_VA_NULL)
+                    .unwrap_or(descriptors.descriptors.len());
+                descriptors.descriptors.insert(
+                    end,
+                    J3dVertexDescriptor {
+                        attribute,
+                        input_type: GX_INDEX16,
+                    },
+                );
+            }
+            for draw in &mut shapes.draws {
+                for command in &mut draw.commands {
+                    let J3dGxCommand::Primitive { vertices, .. } = command else {
+                        continue;
+                    };
+                    for vertex in vertices {
+                        let index = u16::try_from(written).map_err(|_| {
+                            unsupported("more vertices than a coordinate array can index".to_string())
+                        })?;
+                        vertex.push(J3dGxVertexOperand::Index16(index));
+                        written += 1;
+                    }
+                }
+            }
+        }
+        if written != coordinates.len() {
+            return Err(unsupported(format!(
+                "posed {} vertices but wrote {written} coordinates",
+                coordinates.len()
+            )));
+        }
+
+        // Declare the array and its format.
+        for section in &mut self.sections {
+            let J3dRebuildSectionData::Vertices(vertices) = &mut section.data else {
+                continue;
+            };
+            vertices.formats.retain(|format| format.attribute != GX_VA_NULL);
+            vertices.formats.push(J3dVertexAttributeFormat {
+                attribute,
+                component_count: 1,
+                component_type: 4,
+                fractional_bits: 0,
+                reserved: [0; 3],
+            });
+            vertices.formats.push(J3dVertexAttributeFormat {
+                attribute: GX_VA_NULL,
+                component_count: 1,
+                component_type: 0,
+                fractional_bits: 0,
+                reserved: [0; 3],
+            });
+            let mut values = Vec::with_capacity(coordinates.len() * 2);
+            for coordinate in &coordinates {
+                values.push(coordinate[0].to_bits());
+                values.push(coordinate[1].to_bits());
+            }
+            vertices.arrays.push(J3dVertexArray {
+                attribute: J3dVertexArrayAttribute::TexCoord(slot),
+                offset: 0,
+                values: J3dScalarArray::Float32Bits(values),
+            });
+        }
+
+        self.canonicalize_geometry_layout_in_place()?;
+        Ok(written)
+    }
+
+    /// Every position the vertex arrays carry, in model units.
+    fn decoded_positions(&self) -> Result<Vec<[f32; 3]>> {
+        for section in &self.sections {
+            let J3dRebuildSectionData::Vertices(vertices) = &section.data else {
+                continue;
+            };
+            let format = vertices
+                .formats
+                .iter()
+                .find(|format| format.attribute == GX_VA_POS)
+                .ok_or_else(|| unsupported("VTX1 declares no position format".to_string()))?;
+            let array = vertices
+                .arrays
+                .iter()
+                .find(|array| array.attribute == J3dVertexArrayAttribute::Position)
+                .ok_or_else(|| unsupported("VTX1 carries no position array".to_string()))?;
+            let stride = if format.component_count == 0 { 2 } else { 3 };
+            let scale = 1.0 / (1u32 << format.fractional_bits) as f32;
+            let scalars: Vec<f32> = match &array.values {
+                J3dScalarArray::Float32Bits(values) => {
+                    values.iter().map(|bits| f32::from_bits(*bits)).collect()
+                }
+                J3dScalarArray::Signed16(values) => {
+                    values.iter().map(|value| *value as f32 * scale).collect()
+                }
+                J3dScalarArray::Unsigned16(values) => {
+                    values.iter().map(|value| *value as f32 * scale).collect()
+                }
+                J3dScalarArray::Signed8(values) => {
+                    values.iter().map(|value| *value as f32 * scale).collect()
+                }
+                J3dScalarArray::Unsigned8(values) | J3dScalarArray::PackedColor(values) => {
+                    values.iter().map(|value| *value as f32 * scale).collect()
+                }
+                J3dScalarArray::Unsigned32(values) => {
+                    values.iter().map(|value| *value as f32 * scale).collect()
+                }
+            };
+            return Ok(scalars
+                .chunks(stride)
+                .map(|chunk| {
+                    [
+                        chunk.first().copied().unwrap_or(0.0),
+                        chunk.get(1).copied().unwrap_or(0.0),
+                        chunk.get(2).copied().unwrap_or(0.0),
+                    ]
+                })
+                .collect());
+        }
+        Err(unsupported("the model has no VTX1 section".to_string()))
+    }
+
+    /// Each vertex the display lists name, posed by the matrix its packet
+    /// binds, in the order the lists name them.
+    fn posed_display_list_positions(
+        &self,
+        positions: &[[f32; 3]],
+        draw_matrices: &[Option<[[f32; 4]; 3]>],
+    ) -> Result<Vec<[f32; 3]>> {
+        let mut posed = Vec::new();
+        for section in &self.sections {
+            let J3dRebuildSectionData::Shapes(shapes) = &section.data else {
+                continue;
+            };
+            for shape in &shapes.shapes {
+                let set = shapes
+                    .vertex_descriptor_sets
+                    .iter()
+                    .find(|set| set.relative_offset == shape.vertex_descriptor_offset)
+                    .ok_or_else(|| {
+                        unsupported("a shape names no vertex descriptor set".to_string())
+                    })?;
+                // Which operand carries the position, and whether each vertex
+                // names its own matrix.
+                let carried: Vec<&J3dVertexDescriptor> = set
+                    .descriptors
+                    .iter()
+                    .filter(|descriptor| {
+                        descriptor.attribute != GX_VA_NULL && descriptor.input_type != 0
+                    })
+                    .collect();
+                let position_operand = carried
+                    .iter()
+                    .position(|descriptor| descriptor.attribute == GX_VA_POS)
+                    .ok_or_else(|| unsupported("a shape carries no position".to_string()))?;
+                let matrix_operand = carried
+                    .iter()
+                    .position(|descriptor| descriptor.attribute == GX_VA_PNMTXIDX);
+
+                let groups = shape.matrix_group_start as usize
+                    ..shape.matrix_group_start as usize + shape.matrix_group_count as usize;
+                for (offset, group_index) in groups.enumerate() {
+                    let group = shapes.matrix_groups.get(group_index).ok_or_else(|| {
+                        unsupported("a shape names a matrix group it does not have".to_string())
+                    })?;
+                    let draw = shapes
+                        .draws
+                        .get(shape.draw_start as usize + offset)
+                        .ok_or_else(|| {
+                            unsupported("a shape names a draw it does not have".to_string())
+                        })?;
+                    let matrix_for = |slot: usize| -> Option<[[f32; 4]; 3]> {
+                        let entry = shapes
+                            .matrix_table
+                            .get(group.first_matrix as usize + slot)
+                            .copied()?;
+                        if entry == 0xFFFF {
+                            return None;
+                        }
+                        draw_matrices.get(entry as usize).copied().flatten()
+                    };
+                    for command in &draw.commands {
+                        let J3dGxCommand::Primitive { vertices, .. } = command else {
+                            continue;
+                        };
+                        for vertex in vertices {
+                            let index = match vertex.get(position_operand) {
+                                Some(J3dGxVertexOperand::Index16(index)) => *index as usize,
+                                Some(J3dGxVertexOperand::Index8(index)) => *index as usize,
+                                Some(J3dGxVertexOperand::DirectU8(index)) => *index as usize,
+                                None => {
+                                    return Err(unsupported(
+                                        "a vertex carries no position operand".to_string(),
+                                    ))
+                                }
+                            };
+                            let slot = match matrix_operand.and_then(|at| vertex.get(at)) {
+                                // A matrix index counts in threes.
+                                Some(J3dGxVertexOperand::DirectU8(value)) => *value as usize / 3,
+                                Some(J3dGxVertexOperand::Index8(value)) => *value as usize / 3,
+                                Some(J3dGxVertexOperand::Index16(value)) => *value as usize / 3,
+                                None => 0,
+                            };
+                            let local = positions.get(index).copied().unwrap_or([0.0; 3]);
+                            posed.push(match matrix_for(slot) {
+                                Some(matrix) => std::array::from_fn(|row| {
+                                    matrix[row][0] * local[0]
+                                        + matrix[row][1] * local[1]
+                                        + matrix[row][2] * local[2]
+                                        + matrix[row][3]
+                                }),
+                                None => local,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(posed)
+    }
+
     /// Gives a material a washable goop layer it never had.
     ///
     /// The layer is the one retail wires: a comparison stage tests the mask
@@ -1011,32 +1286,16 @@ impl J3dRebuildDocument {
                         request.material_name
                     ))
                 })?;
-            let matrix_slot = record
-                .tex_matrix_indices
-                .iter()
-                .take(8)
-                .position(|index| *index == 0xFFFF)
-                .ok_or_else(|| {
-                    unsupported(format!(
-                        "material {:?} binds all eight texture matrices",
-                        request.material_name
-                    ))
-                })?;
 
-            // A coordinate generated by projecting position onto the front:
-            // GX_TG_MTX2x4 so the result is taken flat, sourced from position,
-            // through the matrix appended just below.
+            // The coordinate is taken straight from the vertex data, the way
+            // retail carries a goop UV: GX_TG_MTX2x4 through the identity
+            // matrix, sourced from the stored set. No texture matrix is
+            // needed, and StayPakkun's material has none either.
             let coord_index = append_material_bytes(
                 materials,
                 J3dMaterialTableKind::TexCoord,
-                &[0x01, 0x00, 0x1e + 3 * matrix_slot as u8, 0xff],
+                &[0x01, 0x04 + request.coordinate_slot, 0x3c, 0xff],
                 4,
-            )?;
-            let matrix_index = append_material_bytes(
-                materials,
-                J3dMaterialTableKind::TexMatrix,
-                &texture_matrix_record(request.scale, request.translation),
-                J3D_TEX_MATRIX_SIZE,
             )?;
             let texture_number_index = append_material_u16(
                 materials,
@@ -1119,7 +1378,6 @@ impl J3dRebuildDocument {
             record.tex_gen_count_index = gen_count_index as u8;
             record.tev_stage_count_index = stage_count_index as u8;
             record.tex_coord_indices[gen_count] = coord_index as u16;
-            record.tex_matrix_indices[matrix_slot] = matrix_index as u16;
             record.texture_number_indices[map_slot] = texture_number_index as u16;
             record.tev_order_indices[stage_count] = compare_order as u16;
             record.tev_order_indices[stage_count + 1] = apply_order as u16;
@@ -5345,20 +5603,6 @@ mod goop_layout_tests {
             .map(|material| material.name.clone())
             .expect("a material");
 
-        // Front projection over the model's own bounds.
-        let mut min = [f32::INFINITY; 2];
-        let mut max = [f32::NEG_INFINITY; 2];
-        for triangle in &geometry.triangles {
-            for vertex in triangle.vertices {
-                for axis in 0..2 {
-                    min[axis] = min[axis].min(vertex[axis]);
-                    max[axis] = max[axis].max(vertex[axis]);
-                }
-            }
-        }
-        let scale = [1.0 / (max[0] - min[0]), 1.0 / (max[1] - min[1])];
-        let translation = [-min[0] * scale[0], -min[1] * scale[1]];
-
         // A coating that is obvious if it lands: solid colour, mask a gradient.
         let mut pixels = Vec::new();
         for y in 0..32u32 {
@@ -5377,13 +5621,21 @@ mod goop_layout_tests {
         let texture = encoded.to_bti().expect("bti");
 
         let mut model = J3dRebuildDocument::parse(&bytes).expect("parse");
+        // The coordinate is stored in the vertex data first; the layer then
+        // reads it, the way retail carries a goop UV.
+        let matrices = crate::J3dFile::parse(&bytes)
+            .expect("parse")
+            .rest_pose_draw_matrices(crate::SMS_MAP_MODEL_LOAD_FLAGS)
+            .expect("draw matrices");
+        model
+            .store_front_projection_texcoord(1, &matrices)
+            .expect("store the coordinate");
         let report = model
             .add_goop_layer(&GoopLayerRequest {
                 material_name: &material_name,
                 texture_name: "graffito_goop",
                 texture: &texture,
-                scale,
-                translation,
+                coordinate_slot: 1,
                 level: 200,
             })
             .expect("author");
@@ -5444,11 +5696,136 @@ mod goop_layout_tests {
             .tex_coord
             .expect("the comparison names a coordinate") as usize;
         let generated = washed.tex_gens.get(coord).expect("the coordinate exists");
-        assert_eq!(generated.source, 0, "the coordinate is not sourced from position");
+        assert_eq!(
+            generated.source, 5,
+            "the coordinate is not sourced from the stored set"
+        );
         println!(
             "   coordinate {coord}: type {} source {} matrix {}",
             generated.gen_type, generated.source, generated.matrix
         );
+    }
+
+    /// Stores a goop coordinate in a model's vertex data and reads it back,
+    /// checking it lands on the unit square across every joint -- which is the
+    /// thing a generated coordinate cannot do.
+    #[test]
+    #[ignore]
+    fn storing_a_goop_coordinate_spans_the_model() {
+        let (Ok(path), Ok(needle)) = (
+            std::env::var("GRAFFITO_PROBE_SZS"),
+            std::env::var("GRAFFITO_ONLY"),
+        ) else {
+            return;
+        };
+        let assets = crate::mount_scene_archive(std::path::Path::new(&path)).expect("mount");
+        let asset = assets
+            .iter()
+            .find(|asset| {
+                let text = asset
+                    .path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_ascii_lowercase();
+                text.contains(&needle) && text.ends_with(".bmd")
+            })
+            .expect("model");
+        let bytes = crate::read_stage_asset_bytes(&asset.path).expect("read");
+        let file = crate::J3dFile::parse(&bytes).expect("parse");
+        let matrices = file
+            .rest_pose_draw_matrices(crate::SMS_MAP_MODEL_LOAD_FLAGS)
+            .expect("draw matrices");
+        println!("{} draw matrices", matrices.len());
+
+        let before = file
+            .geometry_preview_with_loader_flags(crate::SMS_MAP_MODEL_LOAD_FLAGS)
+            .expect("geometry");
+        let mut populated = [0usize; 8];
+        for triangle in &before.triangles {
+            for (slot, set) in triangle.tex_coord_sets.iter().enumerate() {
+                if set.is_some() {
+                    populated[slot] += 1;
+                }
+            }
+        }
+        println!("before: coord sets populated {populated:?}");
+        let slot = populated
+            .iter()
+            .position(|count| *count == 0)
+            .expect("a free coordinate slot") as u8;
+
+        let mut model = J3dRebuildDocument::parse(&bytes).expect("rebuild parse");
+        let written = model
+            .store_front_projection_texcoord(slot, &matrices)
+            .expect("store");
+        let rebuilt = model.to_bytes().expect("rebuild");
+        println!(
+            "stored {written} coordinates into slot {slot}: {} bytes (was {})",
+            rebuilt.len(),
+            bytes.len()
+        );
+
+        let after = crate::J3dFile::parse(&rebuilt)
+            .expect("reparse")
+            .geometry_preview_with_loader_flags(crate::SMS_MAP_MODEL_LOAD_FLAGS)
+            .expect("regeometry");
+        assert_eq!(
+            after.triangles.len(),
+            before.triangles.len(),
+            "the geometry changed"
+        );
+
+        let mut min = [f32::INFINITY; 2];
+        let mut max = [f32::NEG_INFINITY; 2];
+        let mut carried = 0usize;
+        for triangle in &after.triangles {
+            let Some(set) = triangle.tex_coord_sets[slot as usize] else {
+                continue;
+            };
+            carried += 1;
+            for corner in set {
+                for axis in 0..2 {
+                    min[axis] = min[axis].min(corner[axis]);
+                    max[axis] = max[axis].max(corner[axis]);
+                }
+            }
+        }
+        println!(
+            "after: {carried} of {} triangles carry slot {slot}, range {min:?}..{max:?}",
+            after.triangles.len()
+        );
+        assert_eq!(carried, after.triangles.len(), "not every triangle stored one");
+        for axis in 0..2 {
+            assert!(min[axis] >= -0.001, "axis {axis} runs below zero: {min:?}");
+            assert!(max[axis] <= 1.001, "axis {axis} runs past one: {max:?}");
+            assert!(
+                max[axis] - min[axis] > 0.8,
+                "axis {axis} covers only {:.2} of the square, so the projection did not span \
+                 the model",
+                max[axis] - min[axis]
+            );
+        }
+
+        // The vertices must still sit where they did, or the pose was misread.
+        let posed_before: Vec<[f32; 3]> = before
+            .triangles
+            .iter()
+            .flat_map(|triangle| triangle.vertices)
+            .collect();
+        let posed_after: Vec<[f32; 3]> = after
+            .triangles
+            .iter()
+            .flat_map(|triangle| triangle.vertices)
+            .collect();
+        for (left, right) in posed_before.iter().zip(&posed_after) {
+            for axis in 0..3 {
+                assert!(
+                    (left[axis] - right[axis]).abs() < 0.01,
+                    "a vertex moved: {left:?} became {right:?}"
+                );
+            }
+        }
+        println!("   geometry unchanged across {} vertices", posed_after.len());
     }
 
     /// Repacking a model's material and texture sections must not change what
