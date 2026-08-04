@@ -35,8 +35,9 @@
 //!   texture the model already carries.
 //! - **Play full cycle** sweeps `K0_A` so the wash recedes as it does in game.
 //!
-//! Painting strokes onto the mask, and writing the authored UV and mask back
-//! into a model's material, are the phases after this one.
+//! Masks are painted in a modelling tool rather than here: the glTF round
+//! trip carries the model out with its goop coordinate and brings the painted
+//! result back.
 
 use super::*;
 
@@ -2808,24 +2809,6 @@ impl SmsEditorApp {
                 );
             }
         });
-
-        ui.separator();
-        ui.heading("Brush");
-        ui.add(
-            egui::Slider::new(&mut self.mask_brush_radius, 1.0..=64.0)
-                .text("Radius")
-                .clamping(egui::SliderClamping::Always),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.mask_brush_opacity, 0.0..=1.0)
-                .text("Opacity")
-                .clamping(egui::SliderClamping::Always),
-        );
-        ui.label(
-            egui::RichText::new("Painting strokes onto the mask is the next phase.")
-                .small()
-                .color(egui::Color32::GRAY),
-        );
 
         ui.separator();
         ui.heading("Wash");

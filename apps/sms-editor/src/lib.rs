@@ -1278,8 +1278,6 @@ struct SmsEditorApp {
     tool: EditorTool,
     /// Mask Tool: the enemy actor factory currently loaded for painting.
     mask_selected_actor: Option<String>,
-    mask_brush_radius: f32,
-    mask_brush_opacity: f32,
     /// Wash preview: 1.0 = fully coated, 0.0 = clean. The scalar the game
     /// compares the mask against (K0_A), normalized.
     mask_wash_phase: f32,
@@ -1642,8 +1640,6 @@ impl Default for SmsEditorApp {
             last_auto_refresh_attempt_root: String::new(),
             tool: EditorTool::Move,
             mask_selected_actor: None,
-            mask_brush_radius: 16.0,
-            mask_brush_opacity: 1.0,
             mask_wash_phase: 1.0,
             mask_wash_playing: false,
             mask_wash_invert: false,
