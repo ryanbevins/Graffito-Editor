@@ -1061,8 +1061,13 @@ impl J3dRebuildDocument {
                 materials,
                 J3dMaterialTableKind::TevStage,
                 &[
+                    // The alpha inputs end in APREV rather than the ZERO a
+                    // shipping wash carries there: that wash runs first and
+                    // later stages rebuild the alpha behind it, while this
+                    // layer is appended last, so zeroing the alpha would fail
+                    // the alpha test and discard the surface entirely.
                     0xff, 0x09, 0x0e, 0x0c, 0x0f, 0x0a, 0x03, 0x01, 0x01, 0x03, 0x07, 0x07, 0x07,
-                    0x07, 0x00, 0x00, 0x00, 0x01, 0x00, 0xff,
+                    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0xff,
                 ],
                 20,
             )?;
