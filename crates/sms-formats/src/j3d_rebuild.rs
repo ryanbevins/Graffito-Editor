@@ -1174,6 +1174,12 @@ impl J3dRebuildDocument {
                     .iter()
                     .position(|descriptor| descriptor.attribute == GX_VA_PNMTXIDX);
 
+                // A slot keeps the matrix it was last loaded with until a
+                // packet names a new one, and an entry of all ones is a slot
+                // saying nothing rather than naming nothing: the matrix in
+                // force is the one an earlier packet put in that same slot,
+                // not whatever sits beside it in this one.
+                let mut in_force: Vec<Option<[[f32; 4]; 3]>> = vec![None; 16];
                 let groups = shape.matrix_group_start as usize
                     ..shape.matrix_group_start as usize + shape.matrix_group_count as usize;
                 for (offset, group_index) in groups.enumerate() {
@@ -1192,16 +1198,20 @@ impl J3dRebuildDocument {
                     // as absent leaves those vertices in the local space of
                     // their joint, which bends the projection around exactly
                     // the parts that inherit.
-                    let matrix_for = |slot: usize| -> Option<[[f32; 4]; 3]> {
-                        let first = group.first_matrix as usize;
-                        (0..=slot).rev().find_map(|candidate| {
-                            let entry = shapes.matrix_table.get(first + candidate).copied()?;
-                            if entry == 0xFFFF {
-                                return None;
-                            }
-                            draw_matrices.get(entry as usize).copied().flatten()
-                        })
-                    };
+                    let first = group.first_matrix as usize;
+                    for slot in 0..group.matrix_count as usize {
+                        let Some(entry) = shapes.matrix_table.get(first + slot).copied() else {
+                            continue;
+                        };
+                        if entry == 0xFFFF {
+                            continue;
+                        }
+                        if let Some(slot_matrix) = in_force.get_mut(slot) {
+                            *slot_matrix = draw_matrices.get(entry as usize).copied().flatten();
+                        }
+                    }
+                    let matrix_for =
+                        |slot: usize| -> Option<[[f32; 4]; 3]> { in_force.get(slot).copied().flatten() };
                     for command in &draw.commands {
                         let J3dGxCommand::Primitive { vertices, .. } = command else {
                             continue;
