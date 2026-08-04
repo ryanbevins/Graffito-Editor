@@ -2776,7 +2776,46 @@ impl SmsEditorApp {
             }
             None => "no authored mask; StayPakkun default over a front projection".to_string(),
         };
+        // Whether an edit for this actor is actually in the document, and
+        // whether reading the model back returns one that washes. A layer that
+        // shows in a build and not here is one of those two failing, and
+        // guessing which has cost more than reporting it.
+        let edit_state = self
+            .selected_mask_choice()
+            .and_then(|choice| {
+                let document = self.document.as_ref()?;
+                let raw = document.archive_resource_path_for_asset(&choice.model_path)?;
+                let stored = document
+                    .archive_edits
+                    .models
+                    .iter()
+                    .any(|edit| edit.raw_resource_path == raw);
+                let reads_back = document
+                    .read_asset_bytes(&choice.model_path)
+                    .ok()
+                    .and_then(|bytes| sms_formats::J3dFile::parse(&bytes).ok())
+                    .and_then(|model| {
+                        model
+                            .geometry_preview_with_loader_flags(choice.load_flags)
+                            .ok()
+                    })
+                    .is_some_and(|geometry| {
+                        geometry.materials.iter().any(|material| {
+                            material
+                                .tev_stages
+                                .iter()
+                                .any(|stage| stage.color_op >= 8 || stage.alpha_op >= 8)
+                        })
+                    });
+                Some(format!(
+                    "edit stored: {}   model reads back washable: {}",
+                    if stored { "yes" } else { "no" },
+                    if reads_back { "yes" } else { "no" }
+                ))
+            })
+            .unwrap_or_else(|| "this actor has no archive path".to_string());
         ui.small(format!("{renderer} \u{2014} {mask_status}"));
+        ui.small(edit_state);
 
         ui.horizontal(|ui| {
             if ui
