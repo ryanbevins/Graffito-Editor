@@ -1075,7 +1075,14 @@ impl J3dRebuildDocument {
                 materials,
                 J3dMaterialTableKind::TevStage,
                 &[
-                    0xff, 0x08, 0x0f, 0x06, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x07, 0x07, 0x07,
+                    // Blend rather than add: the coating replaces what is
+                    // under it where the comparison says so. Adding it instead
+                    // leaves the surface beneath showing through and saturates
+                    // anything already bright.
+                    //
+                    // out = TEXC * (1 - C2) + CPREV * C2, so the coating shows
+                    // where the comparison wrote zero.
+                    0xff, 0x08, 0x00, 0x06, 0x0f, 0x00, 0x00, 0x00, 0x01, 0x00, 0x07, 0x07, 0x07,
                     0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0xff,
                 ],
                 20,
