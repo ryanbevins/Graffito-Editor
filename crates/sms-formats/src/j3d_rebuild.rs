@@ -998,7 +998,7 @@ impl J3dRebuildDocument {
                 // Operations from eight up are comparisons.
                 let base = *stage_index as usize * 20;
                 let color_op = stages.get(base + 5).copied().unwrap_or(0);
-                let alpha_op = stages.get(base + 11).copied().unwrap_or(0);
+                let alpha_op = stages.get(base + 0x0e).copied().unwrap_or(0);
                 if color_op < 8 && alpha_op < 8 {
                     continue;
                 }

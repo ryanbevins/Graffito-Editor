@@ -2106,9 +2106,10 @@ impl SmsEditorApp {
             self.log.push("Pick an actor first.".to_string());
             return;
         };
-        // The coverage slider runs the other way from the konst: full
-        // coverage is the level nothing washes past.
-        let level = ((1.0 - self.mask_wash_phase.clamp(0.0, 1.0)) * 255.0).round() as u8;
+        // The wash compares the mask against this konst and coats where the
+        // mask does not exceed it, so the konst rises with coverage: retail
+        // drives it from hit points, full health fully coated.
+        let level = (self.mask_wash_phase.clamp(0.0, 1.0) * 255.0).round() as u8;
 
         // The materials that run a comparison, named, so the model can be
         // asked about them directly.
