@@ -159,6 +159,189 @@ body — 150 of 1714 vertices, 8.8%, and everything else was already perfect.
 Fix: hold each slot's matrix across packets, updating only when a packet names a
 new one.
 
+## Growing MAT3 and TEX1
+
+A model that never carried goop has nowhere to put the records it needs.
+BossPakkun's MAT3 had **twenty spare bytes** against roughly a hundred and
+thirty required, and his TEX1 thirty two against a whole texture. So before any
+of the above could happen, the sections had to be able to grow.
+
+### Why they could not
+
+`encode_section` allocates `vec![0; section.declared_size]` — the size the file
+was parsed with — and every encoder writes back at the offsets the records
+carry. That is deliberate: it is what lets an untouched retail model round-trip
+byte for byte. It also means **anything that grows must be repacked first**.
+
+Both encoders turn out to be purely offset-driven, so repacking is a walk:
+
+- `encode_mat3` writes the count at `0x08`, thirty offsets at `0x0c`, the init
+  records at `offsets[0] + i * 0x14c`, the name table at `offsets[2]`, and each
+  table at its own `table.offset`.
+- `encode_tex1` writes the count at `0x08`, `header_offset` at `0x0c`, the name
+  table offset at `0x10`, a `0x20`-byte header per texture, then the image and
+  palette blocks at their absolute offsets.
+
+`canonicalize_material_layout` and `canonicalize_texture_layout` recompute those
+offsets and the section size from the data. They follow the pattern
+`canonicalize_geometry_layout` already used for VTX1 and SHP1.
+
+### Two things that will bite
+
+**`scalar_array_len` returns bytes, not elements.** It multiplies by the element
+width internally. Multiplying again gives every table two to four times its real
+size, which silently corrupts the layout — `CullMode` went in as three `u32` and
+came back as twelve. Cost about an hour to find.
+
+**A table's length is not stored.** The parser infers it from the distance to the
+next offset, then trims a suffix matching retail's padding message, the literal
+string `"This is padding data to alignment."`. Alignment gaps written as zeros
+are therefore read back as **data**. Every gap the repack introduces must carry
+that message — see `record_alignment_padding`.
+
+The offset slot order is fixed and given by `MATERIAL_TABLE_KINDS`: slot zero is
+the init records, slot one the remap, slot two the names, and slots three
+onward the tables in the order that array lists them. Slots for absent tables
+are zero.
+
+### Appending to a material
+
+`append_material_bytes`, `append_material_u16` and `append_material_count` push
+onto the relevant table and return the **element index**, reusing an identical
+element already present rather than duplicating it. Nothing existing is
+disturbed: every record is appended and only the named material's own indices
+are repointed, so other materials keep their entries.
+
+The material init record is a set of index arrays into those shared tables, and
+this is where the sharpest trap lives:
+
+> **A TEV order names the *slots a material binds*, not the table entries behind
+> them.** Its coordinate field is the texgen slot and its map field is the
+> texture map slot. Writing the table index there resolves to a neighbouring
+> coordinate and looks almost right — which is exactly how it presented.
+
+The same distinction applies to `texture_number_indices` and
+`tex_coord_indices`: those arrays are indexed **by slot** and hold **table
+indices**.
+
+Counts live in their own tables. `tex_gen_count_index` and
+`tev_stage_count_index` are indices into `TexGenCount` and `TevStageCount`, so
+raising a count means appending a new count value and repointing, never editing
+in place — the value is shared with every other material that happens to use it.
+
+### Record layouts, as confirmed against retail
+
+Taken from the parser rather than from documentation, and worth trusting over
+memory:
+
+**TEV stage, twenty bytes.** `[1..5]` colour args a,b,c,d; `[5]` colour op;
+`[6]` bias; `[7]` scale; `[8]` clamp; `[9]` register; `[0x0a..0x0e]` alpha args;
+`[0x0e]` **alpha op**; `[0x0f]` bias; `[0x10]` scale; `[0x11]` clamp; `[0x12]`
+register. Bytes `[0]` and `[0x13]` are `0xff`.
+
+The alpha op is at `0x0e`, **not** `0x0b`. Reading it at eleven picks up an
+alpha argument instead, and a konst-register scan built on that only works by
+luck when the material happens to compare on the colour side.
+
+**TEV order, four bytes.** `[0]` coordinate slot, `[1]` map slot, `[2]` colour
+channel, `[3]` padding.
+
+**Texgen, four bytes.** `[0]` type — `1` is `MTX2x4`, `10` is `SRTG`; `[1]`
+source — `0` is position, `4..11` are stored sets `TEX0..TEX7`, `19` and `20`
+are the lit colour channels; `[2]` matrix — `0x1e` is `TEXMTX0` stepping by
+three, `0x3c` is identity; `[3]` padding.
+
+**Texture matrix, one hundred bytes.** `[0]` projection, `[1]` mode with the
+top bit meaning Maya, `[4..0x10]` centre, `[0x10..0x18]` scale, `[0x18]`
+rotation, `[0x1c..0x24]` translation, `[0x24..0x64]` a four by four effect
+matrix. A stored coordinate needs none of this — the layer as it stands reads
+the vertex data through the identity matrix, as StayPakkun does.
+
+**Konst selectors.** Colour and alpha selectors sit in the init record at
+`0x9c + stage` and `0xac + stage`. Values `12..15` are the four registers'
+colour triples; `16..31` are single channels, index `(sel - 16) & 3` and channel
+`(sel - 16) >> 2`. So **`0x1c` is K0's alpha**, and the other registers' alphas
+follow at `0x1d`, `0x1e`, `0x1f`.
+
+### Writing a stored coordinate
+
+Adding a coordinate set touches vertex data, which is the one place a mistake
+corrupts rather than merely looks wrong. It is less work than it sounds because
+display lists are already decoded into typed operands:
+
+1. Append the attribute to **every** vertex descriptor set, before the
+   terminator, as `GX_INDEX16`.
+2. Append one `Index16` operand to every vertex, in the **same traversal** the
+   coordinates were posed in.
+3. Declare the array in the VAT — attribute `13 + slot`, two components,
+   `f32` — keeping the terminator last.
+4. Push the coordinates as an `f32` array on VTX1.
+5. `canonicalize_geometry_layout`.
+
+Each vertex **occurrence** gets its own entry rather than sharing by position
+index, so a position used by two joints cannot pull two projections into one
+slot.
+
+Posing a vertex needs the matrix its packet binds: `matrix_table[group
+.first_matrix + slot]` indexes the draw matrices from `rest_pose_draw_matrices`,
+where the slot comes from the vertex's `PNMTXIDX` operand divided by three, or
+zero when the descriptor carries none. Then hold each slot across packets, as
+described above.
+
+## The numbers, and how they line up
+
+Every value in this pipeline is a byte or a normalised float, and several of the
+bugs above were conversions between them going the wrong way.
+
+**Coverage to konst.** The slider runs `0.0..=1.0`; the wash level written into
+the model is `coverage * 255`, rounded. Full coverage is `255`, clean is `0`.
+Emphatically **not** its complement — writing `(1 - coverage) * 255` bakes a
+clean model at full coverage, which is how that bug presented.
+
+**Mask to coating.** The mask is a byte per texel. The comparison coats where
+`mask <= level`, so a texel of `200` clears once the level falls below two
+hundred, while one of `40` survives almost to the end. The brightest mask values
+therefore clear **first**. Inverting the wash flips the value (`255 - v`) rather
+than the comparison, because a baked model carries its comparison fixed once
+written — flipping the comparison would change the preview only.
+
+**Position to coordinate.** The projection is a bounds-normalised front
+projection over the **posed** model:
+
+```
+u = (x - min_x) / (max_x - min_x)
+v = (y - min_y) / (max_y - min_y)
+```
+
+clamped to `0..=1`, with a degenerate axis collapsing to `0.5`. Bounds are taken
+over the posed vertices the display lists actually name, not over the model's
+declared bounds, so unreferenced or stray geometry cannot widen them. Retail's
+own goop UV measures out to exactly this — StayPakkun's sits on the unit square
+with front and back sharing it.
+
+**Coordinate to texture row.** GX reads `v = 0` from the **first row written**,
+and the projection puts `v = 0` at the model's foot. So row zero of the coating
+must hold what the preview samples at `v = 0`. Authoring with `v = 1 - y/res`
+inverts it.
+
+**Texture dimensions.** Sides want to be powers of two; the coating is taken to
+the goop map's own resolution and the mask keeps its native size, usually
+thirty-two square. Format matters more than dimensions for size: one RGBA8
+texture at 256 square is a quarter of a megabyte, which is why retail keeps
+colour and mask apart, each in a format that suits it.
+
+**Tolerances used in the tests**, so a future change knows what is considered
+agreement:
+
+- posed positions are keyed at eighth-unit resolution (`round(v * 8)`) when
+  comparing against the preview, which is tight for model units in the hundreds;
+- a stored coordinate must land within `0.02` of the projection of its own
+  triangle's corners;
+- the projection must span more than `0.8` of the unit square on both axes,
+  which catches a projection that collapsed;
+- posed vertices are allowed to differ from the preview by under fifteen per
+  cent, to permit billboarded geometry; BossPakkun now sits at zero.
+
 ## The tests, and what each is for
 
 These caught more than reasoning did, and each earned its place.
