@@ -1284,6 +1284,9 @@ struct SmsEditorApp {
     /// compares the mask against (K0_A), normalized.
     mask_wash_phase: f32,
     mask_wash_playing: bool,
+    /// Whether the wash clears the mask's dark values first rather than its
+    /// bright ones, turning the coating's recede inside out.
+    mask_wash_invert: bool,
     mask_uv_layer: mask_tool::MaskUvLayer,
     mask_view: mask_tool::MaskView,
     mask_yaw: f32,
@@ -1643,6 +1646,7 @@ impl Default for SmsEditorApp {
             mask_brush_opacity: 1.0,
             mask_wash_phase: 1.0,
             mask_wash_playing: false,
+            mask_wash_invert: false,
             mask_uv_layer: mask_tool::MaskUvLayer::Body,
             mask_view: mask_tool::MaskView::Model,
             mask_yaw: 0.0,

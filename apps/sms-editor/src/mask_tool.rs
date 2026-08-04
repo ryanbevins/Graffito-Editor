@@ -2927,6 +2927,10 @@ impl SmsEditorApp {
             }
         }
 
+        ui.checkbox(&mut self.mask_wash_invert, "Invert wash pattern")
+            .on_hover_text(
+                "Clear the mask's dark values first rather than its bright ones, turning the                  recede inside out",
+            );
         ui.horizontal(|ui| {
             let label = if self.mask_wash_playing {
                 "Stop"
