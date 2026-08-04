@@ -4192,6 +4192,46 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A model edit is how an authored goop layer reaches a build, and it has
+    /// to survive a save and a reopen or the editor shows the actor clean
+    /// while the build still carries the layer.
+    #[test]
+    fn project_round_trip_keeps_a_model_edit() {
+        let root = unique_test_project_root("model-edit-round-trip");
+        let mut saved = empty_document("dolpic");
+        saved.objects = vec![SceneObject::new("edited-object", "Coin")];
+
+        // A minimal but real rebuild document: an untouched model parses and
+        // re-serialises, which is all the edit has to carry.
+        let model = sms_formats::J3dRebuildDocument {
+            file_type: *b"bmd3",
+            version_tag: *b"SVR1",
+            reserved_words: [0xffff_ffff; 3],
+            declared_section_count: 0,
+            sections: Vec::new(),
+        };
+        saved
+            .archive_edits
+            .replace_model(b"bosspakkun/bosspaku_model.bmd".to_vec(), model.clone());
+        saved.queue_editor_overlay_change().unwrap();
+        saved.save_project_folder(&root).unwrap();
+
+        let mut reopened = empty_document("dolpic");
+        assert!(reopened.load_project_folder(&root).unwrap());
+        assert_eq!(
+            reopened.archive_edits.models.len(),
+            1,
+            "the model edit did not survive the round trip"
+        );
+        assert_eq!(
+            reopened.archive_edits.models[0].raw_resource_path,
+            b"bosspakkun/bosspaku_model.bmd".to_vec()
+        );
+        assert_eq!(reopened.archive_edits.models[0].document, model);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn project_round_trip_loads_the_saved_stage_overlay() {
         let root = unique_test_project_root("overlay-round-trip");
