@@ -1058,6 +1058,21 @@ impl SmsEditorApp {
         }
     }
 
+    /// How a mask value reads for the wash.
+    ///
+    /// Inverting turns the recede inside out: what the coating clears first
+    /// becomes what it holds longest. The mask is flipped rather than the
+    /// comparison, because a model carries its comparison fixed once written,
+    /// so flipping the values is what keeps a baked coating behaving the way
+    /// the preview showed it.
+    fn mask_reading(&self, value: u8) -> u8 {
+        if self.mask_wash_invert {
+            255 - value
+        } else {
+            value
+        }
+    }
+
     /// The goop colour at a UV, from whichever source is assigned.
     fn goop_colour(&self, u: f32, v: f32) -> [u8; 4] {
         match self.mask_colour_source {
@@ -1997,10 +2012,10 @@ impl SmsEditorApp {
             // Coverage comes from the same pass, so the coating stops at the
             // model's silhouette rather than floating over the background.
             let shows = coated.is_some_and(|(_, [front_u, front_v], own_mask)| match own_mask {
-                Some(value) => goop_is_visible(value, threshold),
+                Some(value) => goop_is_visible(self.mask_reading(value), threshold),
                 None => borrowed.as_ref().is_some_and(|(size, values)| {
                     goop_is_visible(
-                        sample_mask_bilinear(values, *size, front_u, front_v),
+                        self.mask_reading(sample_mask_bilinear(values, *size, front_u, front_v)),
                         threshold,
                     )
                 }),
@@ -2040,7 +2055,9 @@ impl SmsEditorApp {
                             .as_ref()
                             .map(|(size, values)| sample_mask_bilinear(values, *size, u, v)),
                     };
-                    if mask_value.is_some_and(|value| goop_is_visible(value, threshold)) {
+                    if mask_value
+                        .is_some_and(|value| goop_is_visible(self.mask_reading(value), threshold))
+                    {
                         // The coating is opaque: the model underneath must not
                         // read through it, or a mask cannot be judged.
                         colour = self.goop_colour(u, v);
@@ -2285,7 +2302,7 @@ impl SmsEditorApp {
                     colour[0],
                     colour[1],
                     colour[2],
-                    sample_mask_bilinear(&mask, size, u, v),
+                    self.mask_reading(sample_mask_bilinear(&mask, size, u, v)),
                 ]);
             }
         }
