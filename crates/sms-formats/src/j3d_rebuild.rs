@@ -1545,34 +1545,72 @@ impl J3dRebuildDocument {
 
             let mut padding = Vec::new();
             let mut cursor = header_offset + textures.textures.len() * 0x20;
+            // Retail shares image data between texture records -- several
+            // records naming one block is common, and duplicating it on the
+            // way out roughly doubles the section. A model that grows that far
+            // no longer loads whole. Place each distinct block once and let the
+            // records that share it point at the same bytes, as they did.
+            let mut placed: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
             for (index, texture) in textures.textures.iter_mut().enumerate() {
                 let base = header_offset + index * 0x20;
                 texture.header_relative_offset = u32::try_from(index * 0x20)
                     .map_err(|_| unsupported("TEX1 header stride".to_string()))?;
 
                 if let Some(palette) = &mut texture.encoded_palette {
-                    let aligned = align_up(cursor, 0x20);
-                    record_alignment_padding(&mut padding, cursor, aligned);
-                    cursor = aligned;
-                    palette.absolute_section_offset = u32::try_from(cursor)
-                        .map_err(|_| unsupported("TEX1 palette offset".to_string()))?;
-                    texture.palette_offset = u32::try_from(cursor - base).map_err(|_| {
-                        unsupported("TEX1 palette sits before its header".to_string())
-                    })?;
-                    cursor += palette.bytes.len();
+                    let offset = match placed.get(&palette.bytes) {
+                        Some(offset) => *offset,
+                        None => {
+                            let aligned = align_up(cursor, 0x20);
+                            record_alignment_padding(&mut padding, cursor, aligned);
+                            cursor = aligned;
+                            let offset = u32::try_from(cursor)
+                                .map_err(|_| unsupported("TEX1 palette offset".to_string()))?;
+                            cursor += palette.bytes.len();
+                            placed.insert(palette.bytes.clone(), offset);
+                            offset
+                        }
+                    };
+                    palette.absolute_section_offset = offset;
+                    texture.palette_offset =
+                        u32::try_from(offset as usize - base).map_err(|_| {
+                            unsupported("TEX1 palette sits before its header".to_string())
+                        })?;
                 } else {
                     texture.palette_offset = 0;
                 }
 
+                // A mip chain is read as one run, so it is shared whole or
+                // not at all: deduplicating a single level out of the middle
+                // would scatter the chain and the levels behind it would be
+                // read from the wrong place.
+                let chain: Vec<u8> = texture
+                    .encoded_mip_levels
+                    .iter()
+                    .flat_map(|level| level.bytes.iter().copied())
+                    .collect();
+                let start = match placed.get(&chain) {
+                    Some(offset) => *offset as usize,
+                    None => {
+                        let aligned = align_up(cursor, 0x20);
+                        record_alignment_padding(&mut padding, cursor, aligned);
+                        cursor = aligned;
+                        let start = cursor;
+                        cursor += chain.len();
+                        if !chain.is_empty() {
+                            let offset = u32::try_from(start)
+                                .map_err(|_| unsupported("TEX1 image offset".to_string()))?;
+                            placed.insert(chain, offset);
+                        }
+                        start
+                    }
+                };
                 let mut image_offset = None;
+                let mut level_cursor = start;
                 for level in &mut texture.encoded_mip_levels {
-                    let aligned = align_up(cursor, 0x20);
-                    record_alignment_padding(&mut padding, cursor, aligned);
-                    cursor = aligned;
-                    level.absolute_section_offset = u32::try_from(cursor)
+                    level.absolute_section_offset = u32::try_from(level_cursor)
                         .map_err(|_| unsupported("TEX1 image offset".to_string()))?;
-                    image_offset.get_or_insert(cursor);
-                    cursor += level.bytes.len();
+                    image_offset.get_or_insert(level_cursor);
+                    level_cursor += level.bytes.len();
                 }
                 texture.image_offset = match image_offset {
                     Some(offset) => u32::try_from(offset - base).map_err(|_| {
