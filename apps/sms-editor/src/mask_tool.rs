@@ -196,14 +196,6 @@ enum AuthoredMaskTexture<'a> {
 }
 
 impl AuthoredMaskTexture<'_> {
-    /// The mask's own dimensions.
-    fn size(&self) -> (usize, usize) {
-        match self {
-            Self::Stage(texture) => (texture.image.size[0], texture.image.size[1]),
-            Self::Model(texture) => (texture.width as usize, texture.height as usize),
-        }
-    }
-
     /// The wash value at a UV, in the mask's own image space.
     fn value(&self, u: f32, v: f32) -> u8 {
         match self {
@@ -2068,121 +2060,33 @@ impl SmsEditorApp {
             .find(|choice| choice.object_id == selected)
     }
 
-    /// Writes the current wash mask and its UV layout as PNGs to paint over.
+    /// Writes the actor as glTF, carrying both UV sets and the textures that
+    /// ride each.
     ///
-    /// Two files land next to each other: the template -- the mask upscaled
-    /// with the goop UV wireframe over it -- and the raw mask at its native
-    /// size, for editing directly.
-    fn export_mask_paint_template(&mut self) {
-        let Some((texture, name)) = self.authored_mask() else {
-            self.log
-                .push("This actor has no authored goop mask to export.".to_string());
-            return;
-        };
-        let label = name.unwrap_or_else(|| "goop_mask".to_string());
-        let (mask_width, mask_height) = texture.size();
-        if mask_width == 0 || mask_height == 0 {
-            return;
-        }
-        // Sample the mask out before any dialog, so the borrow ends.
-        let mask_pixels: Vec<u8> = (0..mask_height)
-            .flat_map(|y| {
-                let texture = &texture;
-                (0..mask_width).map(move |x| {
-                    texture.value(
-                        (x as f32 + 0.5) / mask_width as f32,
-                        (y as f32 + 0.5) / mask_height as f32,
-                    )
-                })
-            })
-            .collect();
-        let authored_coord = self.authored_goop_coord();
-        let layouts: Vec<[[f32; 2]; 3]> = self
-            .mask_preview
-            .as_ref()
-            .map(|preview| {
-                preview
-                    .geometry
-                    .triangles
-                    .iter()
-                    .filter_map(|triangle| {
-                        triangle.mask_tex_coords.or_else(|| {
-                            authored_coord.and_then(|coord| {
-                                triangle.tex_coord_sets.get(coord).copied().flatten()
-                            })
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+    /// Not wired yet. The intent is a file that opens in Blender ready to
+    /// paint: `TEXCOORD_0` with the body texture on it, `TEXCOORD_1` with the
+    /// goop mask on it -- the model's authored goop set where it has one, the
+    /// front projection where it does not -- so the unwrap being painted is
+    /// the unwrap the wash reads.
+    fn export_mask_gltf(&mut self) {
+        self.log.push(
+            "Export glTF is not wired yet: it will pack the body UV and the goop UV as \
+             separate sets, each with its own texture."
+                .to_string(),
+        );
+    }
 
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Export Goop Paint Template")
-            .set_file_name(format!("{label}_template.png"))
-            .add_filter("PNG image", &["png"])
-            .save_file()
-        else {
-            return;
-        };
-
-        const SIZE: usize = 1024;
-        let mut template = vec![0u8; SIZE * SIZE * 4];
-        for y in 0..SIZE {
-            for x in 0..SIZE {
-                let mask_x = (x * mask_width / SIZE).min(mask_width - 1);
-                let mask_y = (y * mask_height / SIZE).min(mask_height - 1);
-                let value = mask_pixels[mask_y * mask_width + mask_x];
-                let base = (y * SIZE + x) * 4;
-                template[base..base + 3].fill(value);
-                template[base + 3] = 255;
-            }
-        }
-        let mut line = |from: [f32; 2], to: [f32; 2]| {
-            let steps = ((to[0] - from[0]).abs().max((to[1] - from[1]).abs()) as usize).max(1);
-            for step in 0..=steps {
-                let t = step as f32 / steps as f32;
-                let x = (from[0] + (to[0] - from[0]) * t).round();
-                let y = (from[1] + (to[1] - from[1]) * t).round();
-                if x >= 0.0 && y >= 0.0 && (x as usize) < SIZE && (y as usize) < SIZE {
-                    let base = (y as usize * SIZE + x as usize) * 4;
-                    template[base..base + 4].copy_from_slice(&[80, 255, 120, 255]);
-                }
-            }
-        };
-        for uv in &layouts {
-            let screen: [[f32; 2]; 3] = std::array::from_fn(|corner| {
-                [
-                    uv[corner][0].clamp(0.0, 1.0) * (SIZE - 1) as f32,
-                    uv[corner][1].clamp(0.0, 1.0) * (SIZE - 1) as f32,
-                ]
-            });
-            for corner in 0..3 {
-                line(screen[corner], screen[(corner + 1) % 3]);
-            }
-        }
-        let saved = image::RgbaImage::from_raw(SIZE as u32, SIZE as u32, template)
-            .ok_or_else(|| "template buffer".to_string())
-            .and_then(|image| image.save(&path).map_err(|error| error.to_string()));
-        if let Err(error) = saved {
-            self.log.push(format!("Could not save the template: {error}"));
-            return;
-        }
-
-        // The raw mask lands next to the template, at its native size.
-        let mut mask_rgba = Vec::with_capacity(mask_pixels.len() * 4);
-        for value in &mask_pixels {
-            mask_rgba.extend_from_slice(&[*value, *value, *value, 255]);
-        }
-        let mask_path = path.with_file_name(format!("{label}.png"));
-        let saved = image::RgbaImage::from_raw(mask_width as u32, mask_height as u32, mask_rgba)
-            .ok_or_else(|| "mask buffer".to_string())
-            .and_then(|image| image.save(&mask_path).map_err(|error| error.to_string()));
-        match saved {
-            Ok(()) => self.log.push(format!(
-                "Exported the paint template and '{label}' ({mask_width}x{mask_height}) beside it."
-            )),
-            Err(error) => self.log.push(format!("Could not save the mask: {error}")),
-        }
+    /// Takes a re-unwrapped goop UV back out of an edited glTF.
+    ///
+    /// Not wired yet. The carrier is the glTF's own `TEXCOORD_n`, which keeps
+    /// per-vertex correspondence with positions and indices, so the new set
+    /// can be matched back onto the model's vertices by position. Re-unwrap
+    /// without remodelling and the match is exact.
+    fn reimport_mask_uv(&mut self) {
+        self.log.push(
+            "Reimport UV is not wired yet: it will read the goop set from an edited glTF."
+                .to_string(),
+        );
     }
 
     /// Bakes the coating shown at the current coverage into the model's own
@@ -3019,16 +2923,7 @@ impl SmsEditorApp {
         ui.heading("Author");
         ui.horizontal(|ui| {
             if ui
-                .button("Export paint template\u{2026}")
-                .on_hover_text(
-                    "Save the current mask and its UV layout as PNGs to paint over",
-                )
-                .clicked()
-            {
-                self.export_mask_paint_template();
-            }
-            if ui
-                .button("Reimport goop map\u{2026}")
+                .button("Reimport goop mask\u{2026}")
                 .on_hover_text(
                     "Replace this actor's wash mask with a painted PNG; it previews here \
                      and ships with the stage",
@@ -3036,6 +2931,23 @@ impl SmsEditorApp {
                 .clicked()
             {
                 self.reimport_mask_goop_map();
+            }
+            if ui
+                .button("Reimport UV\u{2026}")
+                .on_hover_text("Read a re-unwrapped goop UV back out of an edited glTF")
+                .clicked()
+            {
+                self.reimport_mask_uv();
+            }
+            if ui
+                .button("Export glTF\u{2026}")
+                .on_hover_text(
+                    "Write the actor with both UV sets: the body texture on UV0, the goop \
+                     mask on the goop set",
+                )
+                .clicked()
+            {
+                self.export_mask_gltf();
             }
         });
         ui.horizontal(|ui| {
