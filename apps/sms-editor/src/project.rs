@@ -268,6 +268,8 @@ pub(super) struct SmsProjectFile {
     pub(super) mask_wash_invert: bool,
     #[serde(default = "washable_default")]
     pub(super) mask_bake_washable: bool,
+    #[serde(default = "resistance_default")]
+    pub(super) mask_wash_resistance: u32,
 }
 
 #[derive(Deserialize)]
@@ -348,6 +350,7 @@ impl LegacySmsProjectFileV1 {
             mask_wash_coverage: default_mask_wash_coverage(),
             mask_wash_invert: false,
             mask_bake_washable: true,
+            mask_wash_resistance: 4,
         }
     }
 }
@@ -378,6 +381,7 @@ impl SmsProjectFile {
             mask_wash_coverage: default_mask_wash_coverage(),
             mask_wash_invert: false,
             mask_bake_washable: true,
+            mask_wash_resistance: 4,
         }
     }
 
@@ -1336,4 +1340,9 @@ secondary_wave_scene_id = 516
 /// A layer is authored to be washed off unless the author says otherwise.
 fn washable_default() -> bool {
     true
+}
+
+/// Four water hits per step: slow enough to watch, fast enough to finish.
+fn resistance_default() -> u32 {
+    4
 }

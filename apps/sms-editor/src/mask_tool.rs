@@ -998,6 +998,25 @@ impl SmsEditorApp {
         preview.geometry.textures.get(index)
     }
 
+    /// Which konst register the authored wash compares against.
+    ///
+    /// The bake claims whichever register the material has spare, so it is
+    /// often not K0 -- LandGesso already spends K0 and K1 and its layer lands
+    /// on K2. Anything driving the wash from outside the editor, a DOL patch
+    /// especially, has to write the register the layer actually reads, so the
+    /// panel names it rather than assuming.
+    fn authored_wash_konst(&self) -> Option<u8> {
+        let preview = self.mask_preview.as_ref()?;
+        for material in &preview.geometry.materials {
+            for stage in &material.tev_stages {
+                if stage_is_wash_comparison(stage) {
+                    return Some(stage.konst_alpha - 0x1c);
+                }
+            }
+        }
+        None
+    }
+
     /// The mask texture and coordinate set the wash comparison names.
     ///
     /// Washable goop is a hard threshold the game evaluates per pixel, wired
@@ -2843,24 +2862,31 @@ impl SmsEditorApp {
         self.mask_wash_phase = project.descriptor.mask_wash_coverage.clamp(0.0, 1.0);
         self.mask_wash_invert = project.descriptor.mask_wash_invert;
         self.mask_bake_washable = project.descriptor.mask_bake_washable;
+        self.mask_wash_resistance = project.descriptor.mask_wash_resistance.max(1);
         self.mask_wash_settings_project = Some(id);
     }
 
     /// Keeps the project's copy in step once a control moves.
     fn remember_mask_wash_settings(&mut self) {
-        let (coverage, invert, washable) =
-            (self.mask_wash_phase, self.mask_wash_invert, self.mask_bake_washable);
+        let (coverage, invert, washable, resistance) = (
+            self.mask_wash_phase,
+            self.mask_wash_invert,
+            self.mask_bake_washable,
+            self.mask_wash_resistance,
+        );
         match self.current_project.as_mut() {
             Some(project) => {
                 if project.descriptor.mask_wash_coverage == coverage
                     && project.descriptor.mask_wash_invert == invert
                     && project.descriptor.mask_bake_washable == washable
+                    && project.descriptor.mask_wash_resistance == resistance
                 {
                     return;
                 }
                 project.descriptor.mask_wash_coverage = coverage;
                 project.descriptor.mask_wash_invert = invert;
                 project.descriptor.mask_bake_washable = washable;
+                project.descriptor.mask_wash_resistance = resistance;
             }
             None => return,
         }
@@ -3247,6 +3273,23 @@ impl SmsEditorApp {
             }
         });
 
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.mask_wash_resistance)
+                        .range(1..=4096)
+                        .speed(1.0),
+                )
+                .on_hover_text(
+                    "Water hits per step of the wash. Independent of the level above,                      so how stubborn a coating is does not depend on how much of it                      there is",
+                )
+                .changed()
+            {
+                self.remember_mask_wash_settings();
+            }
+            ui.label("Resistance");
+        });
+
         if ui
             .add(
                 egui::Slider::new(&mut self.mask_wash_phase, 0.0..=1.0)
@@ -3259,7 +3302,8 @@ impl SmsEditorApp {
         }
         ui.label(
             egui::RichText::new(format!(
-                "wash level K0_A \u{2248} {}  (mask \u{2264} this stays coated)",
+                "wash level K{}_A \u{2248} {}  (mask \u{2264} this stays coated)",
+                self.authored_wash_konst().map_or_else(|| "?".to_string(), |r| r.to_string()),
                 (self.mask_wash_phase * 255.0).round() as u16
             ))
             .small()
@@ -3336,13 +3380,16 @@ impl SmsEditorApp {
                 let level = (self.mask_wash_phase.clamp(0.0, 1.0) * 255.0).round() as u8;
                 if self.mask_bake_washable {
                     format!(
-                        "bakes at {:.0}% (K0_A {level}) and washes down from there",
-                        self.mask_wash_phase * 100.0
+                        "bakes at {:.0}% (K{}_A {level}), washes down every {} water hits",
+                        self.mask_wash_phase * 100.0,
+                        self.authored_wash_konst().map_or_else(|| "?".to_string(), |r| r.to_string()),
+                        self.mask_wash_resistance
                     )
                 } else {
                     format!(
-                        "bakes at {:.0}% (K0_A {level}) and stays put",
-                        self.mask_wash_phase * 100.0
+                        "bakes at {:.0}% (K{}_A {level}) and stays put",
+                        self.mask_wash_phase * 100.0,
+                        self.authored_wash_konst().map_or_else(|| "?".to_string(), |r| r.to_string())
                     )
                 }
             })

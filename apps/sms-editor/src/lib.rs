@@ -1295,6 +1295,10 @@ struct SmsEditorApp {
     /// Whether the baked layer ships fully coated for the runtime to wash off,
     /// rather than frozen at the coverage the preview is showing.
     mask_bake_washable: bool,
+    /// How many water hits the runtime takes per step of the wash. Independent
+    /// of the level the layer is baked at, so a lightly coated actor can still
+    /// be stubborn to clean.
+    mask_wash_resistance: u32,
     mask_bake_tpose: bool,
     /// Where the idle animation is held while the layer is authored, in
     /// seconds. The preview holds this frame rather than running on the wall
@@ -1673,6 +1677,7 @@ impl Default for SmsEditorApp {
             mask_wash_invert: false,
             mask_author_status: String::new(),
             mask_bake_washable: true,
+            mask_wash_resistance: 4,
             mask_bake_tpose: true,
             mask_idle_frame: 0.0,
             mask_wash_settings_project: None,
