@@ -87,7 +87,6 @@ fn stage_is_wash_comparison(stage: &sms_formats::J3dTevStage) -> bool {
     (stage.color_op >= 8 || stage.alpha_op >= 8) && (0x1c..=0x1f).contains(&stage.konst_alpha)
 }
 
-
 /// One placed enemy the Mask Tool can target.
 struct MaskActorChoice {
     /// Where the object stands in the stage, to find its model when the
@@ -2021,7 +2020,6 @@ impl SmsEditorApp {
                     .map(|texture| (set, texture))
             });
 
-
             // The renderer cuts shapes out of quads with the texture's
             // alpha. Run the same test here, or the coating covers texels the
             // model never drew and pokes past the silhouette.
@@ -2265,6 +2263,11 @@ impl SmsEditorApp {
         // The wash compares the mask against this konst and coats where the
         // mask does not exceed it, so the konst rises with coverage: retail
         // drives it from hit points, full health fully coated.
+        // The coverage slider is the threshold either way: it is the konst the
+        // comparison is baked against, so it decides how much coating the actor
+        // wears the moment it spawns. Washable does not override that -- it is
+        // where the runtime starts counting down from, so authoring a
+        // half-coated actor gives a half-length wash rather than a full one.
         let level = (self.mask_wash_phase.clamp(0.0, 1.0) * 255.0).round() as u8;
 
         // The materials that run a comparison, named, so the model can be
@@ -2839,21 +2842,25 @@ impl SmsEditorApp {
         }
         self.mask_wash_phase = project.descriptor.mask_wash_coverage.clamp(0.0, 1.0);
         self.mask_wash_invert = project.descriptor.mask_wash_invert;
+        self.mask_bake_washable = project.descriptor.mask_bake_washable;
         self.mask_wash_settings_project = Some(id);
     }
 
     /// Keeps the project's copy in step once a control moves.
     fn remember_mask_wash_settings(&mut self) {
-        let (coverage, invert) = (self.mask_wash_phase, self.mask_wash_invert);
+        let (coverage, invert, washable) =
+            (self.mask_wash_phase, self.mask_wash_invert, self.mask_bake_washable);
         match self.current_project.as_mut() {
             Some(project) => {
                 if project.descriptor.mask_wash_coverage == coverage
                     && project.descriptor.mask_wash_invert == invert
+                    && project.descriptor.mask_bake_washable == washable
                 {
                     return;
                 }
                 project.descriptor.mask_wash_coverage = coverage;
                 project.descriptor.mask_wash_invert = invert;
+                project.descriptor.mask_bake_washable = washable;
             }
             None => return,
         }
@@ -3315,6 +3322,33 @@ impl SmsEditorApp {
         );
 
         ui.heading("Author");
+        if ui
+            .checkbox(&mut self.mask_bake_washable, "Washable")
+            .on_hover_text(
+                "Bake the coating fully applied so FLUDD can wash it off in play,                  rather than freezing it at the coverage shown above",
+            )
+            .changed()
+        {
+            self.remember_mask_wash_settings();
+        }
+        ui.label(
+            egui::RichText::new({
+                let level = (self.mask_wash_phase.clamp(0.0, 1.0) * 255.0).round() as u8;
+                if self.mask_bake_washable {
+                    format!(
+                        "bakes at {:.0}% (K0_A {level}) and washes down from there",
+                        self.mask_wash_phase * 100.0
+                    )
+                } else {
+                    format!(
+                        "bakes at {:.0}% (K0_A {level}) and stays put",
+                        self.mask_wash_phase * 100.0
+                    )
+                }
+            })
+            .small()
+            .weak(),
+        );
         ui.horizontal(|ui| {
             if ui
                 .button("Reimport goop mask\u{2026}")

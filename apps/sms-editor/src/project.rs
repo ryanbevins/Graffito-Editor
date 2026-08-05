@@ -266,6 +266,8 @@ pub(super) struct SmsProjectFile {
     pub(super) mask_wash_coverage: f32,
     #[serde(default)]
     pub(super) mask_wash_invert: bool,
+    #[serde(default = "washable_default")]
+    pub(super) mask_bake_washable: bool,
 }
 
 #[derive(Deserialize)]
@@ -345,6 +347,7 @@ impl LegacySmsProjectFileV1 {
             stage_geometry_clickable: default_stage_geometry_clickable(),
             mask_wash_coverage: default_mask_wash_coverage(),
             mask_wash_invert: false,
+            mask_bake_washable: true,
         }
     }
 }
@@ -374,6 +377,7 @@ impl SmsProjectFile {
             stage_geometry_clickable: default_stage_geometry_clickable(),
             mask_wash_coverage: default_mask_wash_coverage(),
             mask_wash_invert: false,
+            mask_bake_washable: true,
         }
     }
 
@@ -1327,4 +1331,9 @@ secondary_wave_scene_id = 516
         assert_eq!(reopened.entries(), recents.entries());
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+/// A layer is authored to be washed off unless the author says otherwise.
+fn washable_default() -> bool {
+    true
 }
