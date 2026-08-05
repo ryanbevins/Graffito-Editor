@@ -572,6 +572,34 @@ fn catalog_resource_edit_deltas(
         .collect()
 }
 
+fn refresh_registry_derived_object_fields_with_resource_deltas(
+    document: &StageDocument,
+    object: &mut SceneObject,
+    registry: &ObjectRegistry,
+    resource_deltas: &[ResourceEditDelta],
+) {
+    if resource_deltas.is_empty() {
+        document.refresh_registry_derived_object_fields(std::slice::from_mut(object), registry);
+        return;
+    }
+
+    // Catalog placement imports resources in the same undo transaction as the
+    // object. Resolve derived preview metadata against that post-transaction
+    // view so an exact catalog hint is not discarded merely because its model
+    // write has not reached the live document yet.
+    let mut effective_document = document.clone();
+    effective_document.set_authored_resource_overlay_states(resource_deltas.iter().map(|delta| {
+        (
+            delta.raw_resource_path.clone(),
+            delta.after.edit.clone(),
+            delta.after.edit_index,
+            delta.after.removal_index,
+        )
+    }));
+    effective_document
+        .refresh_registry_derived_object_fields(std::slice::from_mut(object), registry);
+}
+
 #[derive(Default)]
 struct CatalogResourceRepair {
     resource_writes: usize,
@@ -1760,9 +1788,14 @@ fn prepare_catalog_enemy_manager_pool(
         return Err("catalog enemy did not produce an authored placement".to_string());
     };
     placement.pool_only = true;
-    add_catalog_preview_hint(&mut object, document, template);
-    document.refresh_registry_derived_object_fields(std::slice::from_mut(&mut object), registry);
     let resource_deltas = catalog_resource_edit_deltas(document, preflight.writes);
+    add_catalog_preview_hint(&mut object, document, template);
+    refresh_registry_derived_object_fields_with_resource_deltas(
+        document,
+        &mut object,
+        registry,
+        &resource_deltas,
+    );
     Ok(PreparedCatalogEnemyManagerPool {
         object,
         resource_deltas,
@@ -2836,8 +2869,14 @@ impl SmsEditorApp {
                 has_resolved_routes || has_authored_routes,
             )
         });
-        let catalog_template = same_stage_template
-            .is_none()
+        let same_stage_template_is_known_unrenderable =
+            same_stage_template.as_ref().is_some_and(|template| {
+                self.model_preview
+                    .as_ref()
+                    .is_some_and(|preview| !preview.object_model_indices.contains_key(&template.id))
+            });
+        let catalog_template = (same_stage_template.is_none()
+            || same_stage_template_is_known_unrenderable)
             .then(|| self.object_authoring_catalog.find(&factory_name).cloned())
             .flatten();
         let mut catalog_log = None;
@@ -2895,8 +2934,6 @@ impl SmsEditorApp {
             let mut object = SceneObject::new(id.clone(), factory_name.clone());
             object.placement = Some(sms_scene::PlacementBinding::Existing(address));
             object
-        } else if let Some(template) = same_stage_template {
-            duplicate_object_for_spawn(template, id.clone(), translation, self.registry.as_ref())
         } else if let Some(template) = catalog_template {
             let preflight = match preflight_catalog_resources(
                 self.document.as_ref().expect("document was checked above"),
@@ -2950,6 +2987,8 @@ impl SmsEditorApp {
                 authored_resource_count
             ));
             object
+        } else if let Some(template) = same_stage_template {
+            duplicate_object_for_spawn(template, id.clone(), translation, self.registry.as_ref())
         } else {
             self.log.push(format!(
                 "Could not place class '{factory_name}': this stage has no typed instance to duplicate and the retail authoring catalog has no template."
@@ -2967,13 +3006,12 @@ impl SmsEditorApp {
             return;
         }
         if let Some(registry) = self.registry.as_ref() {
-            self.document
-                .as_ref()
-                .expect("document was checked above")
-                .refresh_registry_derived_object_fields(
-                    std::slice::from_mut(&mut object),
-                    registry,
-                );
+            refresh_registry_derived_object_fields_with_resource_deltas(
+                self.document.as_ref().expect("document was checked above"),
+                &mut object,
+                registry,
+                &catalog_resource_deltas,
+            );
         }
 
         self.next_object_serial = next_object_serial;
@@ -3072,16 +3110,16 @@ impl SmsEditorApp {
                 template.transform.translation,
             );
         }
-        let catalog_template = same_stage_template
-            .is_none()
-            .then(|| self.object_authoring_catalog.find(factory_name).cloned())
-            .flatten();
+        // A same-stage instance without a rendered model is not a valid
+        // placement template. This commonly happens after an older build added
+        // an enemy without importing its model bundle. Fall back to the retail
+        // catalog so the drag proxy and the subsequent placement can repair the
+        // level instead of cloning the broken instance forever.
+        let catalog_template = self.object_authoring_catalog.find(factory_name).cloned();
         let mut preview_document = document.clone();
 
         let mut object = if matches!(factory_name, "Mario" | "Sky") {
             SceneObject::new(preview_id.clone(), factory_name.to_string())
-        } else if let Some(template) = same_stage_template {
-            duplicate_object_for_spawn(template, preview_id.clone(), origin, self.registry.as_ref())
         } else if let Some(template) = catalog_template {
             let preflight = preflight_catalog_resources(document, &template)?;
             let mut object = object_from_catalog_template(
@@ -3101,6 +3139,8 @@ impl SmsEditorApp {
             .apply_forward(&mut preview_document);
             add_catalog_preview_hint(&mut object, &preview_document, &template);
             object
+        } else if let Some(template) = same_stage_template {
+            duplicate_object_for_spawn(template, preview_id.clone(), origin, self.registry.as_ref())
         } else {
             return Err(
                 "this stage has no typed instance to duplicate and the retail authoring catalog has no template"
@@ -5147,7 +5187,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires SMS_BASE_ROOT with extracted retail stages"]
-    fn retail_shared_basename_enemies_build_catalog_drag_preview_geometry() {
+    fn retail_enemy_catalog_placement_previews_and_spawns_are_renderable() {
         let base_root = std::env::var_os("SMS_BASE_ROOT")
             .map(PathBuf::from)
             .expect("set SMS_BASE_ROOT to the extracted game's root");
@@ -5162,40 +5202,215 @@ mod tests {
             &archives, &registry, &base_root,
         );
         let targets = ["HamuKuri", "PoiHana", "MameGesso"];
-        let document = StageDocument::open(&base_root, "dolpic0")
+        let mut retail_document = StageDocument::open(&base_root, "dolpic0")
             .expect("open retail dolpic0")
             .with_registry(registry.clone());
-        assert!(document
+        assert!(retail_document
             .objects
             .iter()
             .all(|object| !targets.contains(&object.factory_name.as_str())));
+        let bootstrap_resources =
+            sms_scene::BLANK_STAGE_BOOTSTRAP_REQUIREMENTS.map(|requirement| {
+                let proxy = sms_authoring::built_in_blank_stage_proxy(requirement.raw_path);
+                let bytes = match requirement.kind {
+                    sms_scene::BlankStageBootstrapKind::Model => proxy.compile_bmd().unwrap(),
+                    sms_scene::BlankStageBootstrapKind::Collision => {
+                        proxy.collision.as_ref().unwrap().to_col_bytes().unwrap()
+                    }
+                };
+                sms_scene::BlankStageBootstrapResource {
+                    raw_path: requirement.raw_path.to_vec(),
+                    bytes,
+                }
+            });
+        let bootstrap =
+            sms_scene::BlankStageBootstrapManifest::from_authored_bytes(bootstrap_resources)
+                .unwrap();
+        let authored_archive = sms_scene::BlankStagePreset {
+            target_slot: "custom0".to_string(),
+            ..sms_scene::BlankStagePreset::default()
+        }
+        .build(bootstrap)
+        .unwrap();
+        let mut authored_document =
+            StageDocument::from_authored_archive(&base_root, "custom0", authored_archive)
+                .unwrap()
+                .with_registry(registry.clone());
+        let catalog = Arc::new(build.catalog);
+        for document in [&mut retail_document, &mut authored_document] {
+            for factory_name in targets {
+                let template = catalog.find(factory_name).unwrap();
+                let preflight = preflight_catalog_resources(document, template).unwrap();
+                let object = object_from_catalog_template(
+                    format!("broken-{factory_name}"),
+                    factory_name.to_string(),
+                    [0.0; 3],
+                    template,
+                    &preflight.graph_name_rewrites,
+                )
+                .unwrap();
+                document.objects.push(object);
+            }
+        }
+
+        for (context, document) in [("retail", retail_document), ("authored", authored_document)] {
+            let model_preview = SmsEditorApp::build_model_preview(
+                &document,
+                PreviewVisibility {
+                    environment: true,
+                    goop: true,
+                    effects: false,
+                },
+            );
+            for factory_name in targets {
+                assert!(
+                    model_preview.as_ref().is_none_or(|preview| {
+                        !preview
+                            .object_model_indices
+                            .contains_key(&format!("broken-{factory_name}"))
+                    }),
+                    "{context} broken {factory_name} fixture must be unrenderable"
+                );
+            }
+            let mut app = SmsEditorApp {
+                registry: Some(registry.clone()),
+                document: Some(document),
+                object_authoring_catalog: Arc::clone(&catalog),
+                model_preview,
+                ..SmsEditorApp::default()
+            };
+            for factory_name in targets {
+                let template = app
+                    .object_authoring_catalog
+                    .find(factory_name)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("retail catalog contains {factory_name}"));
+                assert_eq!(
+                    template
+                        .preview_resource_path
+                        .as_deref()
+                        .map(|path| String::from_utf8_lossy(path).to_ascii_lowercase()),
+                    Some(format!("{}/default.bmd", factory_name.to_ascii_lowercase()))
+                );
+                let geometry = app
+                    .build_object_drag_preview_geometry(factory_name)
+                    .unwrap_or_else(|error| {
+                        panic!("build {context} {factory_name} drag preview: {error}")
+                    });
+                assert!(
+                    !geometry.triangles.is_empty(),
+                    "{context} {factory_name} drag preview geometry"
+                );
+
+                let before_count = app.document.as_ref().unwrap().objects.len();
+                app.spawn_object_at(factory_name.to_string(), [0.0; 3]);
+                let document = app.document.as_ref().unwrap();
+                assert_eq!(
+                    document.objects.len(),
+                    before_count + 1,
+                    "{context} {factory_name} placement"
+                );
+                let object_id = app.selected_object_id.as_ref().unwrap();
+                let object = document
+                    .objects
+                    .iter()
+                    .find(|object| object.id == *object_id)
+                    .unwrap();
+                let expected_model_path = format!(
+                    "!/{}",
+                    String::from_utf8_lossy(template.preview_resource_path.as_ref().unwrap())
+                        .replace('\\', "/")
+                );
+                assert!(
+                    object.asset_hints.iter().any(|hint| {
+                        hint.role == AssetRole::PreviewModel
+                            && hint
+                                .path
+                                .to_ascii_lowercase()
+                                .ends_with(&expected_model_path.to_ascii_lowercase())
+                    }),
+                    "{context} {factory_name} retains its exact catalog preview hint"
+                );
+                assert!(
+                    document.has_effective_resource(
+                        template.preview_resource_path.as_ref().unwrap().as_slice()
+                    ),
+                    "{context} {factory_name} imports its model resource"
+                );
+                let preview = SmsEditorApp::build_model_preview(
+                    document,
+                    PreviewVisibility {
+                        environment: true,
+                        goop: true,
+                        effects: false,
+                    },
+                )
+                .unwrap_or_else(|| panic!("build {context} {factory_name} placed preview"));
+                assert!(
+                    preview.object_model_indices.contains_key(object_id),
+                    "{context} {factory_name} placed object is renderable"
+                );
+            }
+        }
+
+        let document = StageDocument::open(&base_root, "dolpic0")
+            .expect("open retail dolpic0 for the full enemy preview census")
+            .with_registry(registry.clone());
+        let catalogued_enemy_factories = registry
+            .enemy_actors
+            .iter()
+            .map(|actor| actor.factory_name.as_str())
+            .filter(|factory_name| {
+                catalog
+                    .find(factory_name)
+                    .is_some_and(|template| template.preview_resource_path.is_some())
+            })
+            .collect::<BTreeSet<_>>();
+        let mut enemy_factories = BTreeSet::new();
+        let mut preflight_failures = BTreeMap::new();
+        for factory_name in catalogued_enemy_factories {
+            let template = catalog.find(factory_name).unwrap();
+            match preflight_catalog_resources(&document, template) {
+                Ok(_) => {
+                    enemy_factories.insert(factory_name);
+                }
+                Err(error) => {
+                    preflight_failures.insert(factory_name, error);
+                }
+            }
+        }
+        assert_eq!(
+            preflight_failures.keys().copied().collect::<Vec<_>>(),
+            ["Yumbo"],
+            "unexpected retail enemy placement preflight failures: {preflight_failures:#?}"
+        );
+        assert!(
+            preflight_failures["Yumbo"].contains("required RAL graph \"100\" was not found"),
+            "Yumbo's known retail catalog limitation changed: {preflight_failures:#?}"
+        );
+        assert!(
+            enemy_factories.len() >= 60,
+            "retail enemy preview census unexpectedly contains only {} factories",
+            enemy_factories.len()
+        );
         let app = SmsEditorApp {
-            registry: Some(registry),
+            registry: Some(registry.clone()),
             document: Some(document),
-            object_authoring_catalog: Arc::new(build.catalog),
+            object_authoring_catalog: Arc::clone(&catalog),
             ..SmsEditorApp::default()
         };
-
-        for factory_name in targets {
-            let template = app
-                .object_authoring_catalog
-                .find(factory_name)
-                .unwrap_or_else(|| panic!("retail catalog contains {factory_name}"));
-            assert_eq!(
-                template
-                    .preview_resource_path
-                    .as_deref()
-                    .map(|path| String::from_utf8_lossy(path).to_ascii_lowercase()),
-                Some(format!("{}/default.bmd", factory_name.to_ascii_lowercase()))
-            );
-            let geometry = app
-                .build_object_drag_preview_geometry(factory_name)
-                .unwrap_or_else(|error| panic!("build {factory_name} drag preview: {error}"));
-            assert!(
-                !geometry.triangles.is_empty(),
-                "{factory_name} drag preview geometry"
-            );
-        }
+        let failures = enemy_factories
+            .iter()
+            .filter_map(|factory_name| {
+                app.build_object_drag_preview_geometry(factory_name)
+                    .err()
+                    .map(|error| format!("{factory_name}: {error}"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            failures.is_empty(),
+            "retail enemy drag preview failures: {failures:#?}"
+        );
     }
 
     #[test]
