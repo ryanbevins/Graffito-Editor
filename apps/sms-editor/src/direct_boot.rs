@@ -6434,6 +6434,18 @@ fn goop_bge(words: i32) -> u32 {
     16 << 26 | 4 << 21 | ((words * 4) as u32 & 0xFFFC)
 }
 
+fn goop_lhz(rt: u32, d: i32, ra: u32) -> u32 {
+    40 << 26 | rt << 21 | ra << 16 | (d as u32 & 0xFFFF)
+}
+
+fn goop_mr(ra: u32, rs: u32) -> u32 {
+    31 << 26 | rs << 21 | ra << 16 | rs << 11 | 444 << 1
+}
+
+/// `J3DModel::mModelData`, then `J3DModelData::mMaterialNum`.
+const GOOP_MODEL_DATA_OFFSET: i32 = 0x04;
+const GOOP_MATERIAL_NUM_OFFSET: i32 = 0x24;
+
 const GOOP_MFLR_R0: u32 = 0x7C08_02A6;
 const GOOP_MTLR_R0: u32 = 0x7C08_03A6;
 
@@ -6492,12 +6504,35 @@ fn build_goop_wash_stub(
     words.push(goop_lwz(3, 0x20, 1));
     let get_model_call = words.len();
     words.push(0);
-    words.push(goop_li(4, 0));
+    // Bind every material, the way retail does (pakkun.cpp:946). Binding only
+    // the first covers a single-material actor and leaves the rest of a bigger
+    // one untouched: LandGesso draws from one material and washed, PoiHana
+    // draws from three and did not.
+    words.push(goop_stw(3, 0x2C, 1));
+    words.push(goop_lwz(10, GOOP_MODEL_DATA_OFFSET, 3));
+    words.push(goop_lhz(10, GOOP_MATERIAL_NUM_OFFSET, 10));
+    words.push(goop_stw(10, 0x1C, 1));
+    words.push(goop_li(9, 0));
+    words.push(goop_stw(9, 0x18, 1));
+    let bind_loop = words.len();
+    words.push(goop_lwz(9, 0x18, 1));
+    words.push(goop_lwz(10, 0x1C, 1));
+    words.push(goop_cmpw(9, 10));
+    let to_bound = words.len();
+    words.push(0); // bge bound
+    words.push(goop_lwz(3, 0x2C, 1));
+    words.push(goop_mr(4, 9));
     words.push(goop_li(5, kcolor));
     words.push(goop_lwz(11, 0x28, 1));
     words.push(goop_addi(6, 11, 4));
     let init_call = words.len();
     words.push(0);
+    words.push(goop_lwz(9, 0x18, 1));
+    words.push(goop_addi(9, 9, 1));
+    words.push(goop_stw(9, 0x18, 1));
+    words.push(goop_b(bind_loop as i32 - words.len() as i32));
+    let bound = words.len();
+    words[to_bound] = goop_bge(bound as i32 - to_bound as i32);
     let to_done_claim = words.len();
     words.push(0);
 
