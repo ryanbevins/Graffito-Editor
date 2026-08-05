@@ -74,6 +74,20 @@ pub(super) enum MaskTextureSource {
     GoopStyle(usize),
 }
 
+/// Whether a TEV stage is the wash's comparison: `mask(goop UV) > K0_A`.
+///
+/// A compare op on its own is not enough to say so. A toon ramp compares too,
+/// and reading one as a wash sends the bake down the "set the level on the
+/// wash this model already has" path for an actor that has no wash at all --
+/// nothing gets authored, the level lands in a konst the material was already
+/// using, and the readback names the ramp as the goop mask. The wash is the
+/// comparison that takes its level from a konst register's alpha, which is the
+/// register the coverage slider drives.
+fn stage_is_wash_comparison(stage: &sms_formats::J3dTevStage) -> bool {
+    (stage.color_op >= 8 || stage.alpha_op >= 8) && (0x1c..=0x1f).contains(&stage.konst_alpha)
+}
+
+
 /// One placed enemy the Mask Tool can target.
 struct MaskActorChoice {
     /// Where the object stands in the stage, to find its model when the
@@ -688,7 +702,13 @@ impl SmsEditorApp {
                 return;
             }
         };
-        let geometry = match model.geometry_preview_with_loader_flags(choice.load_flags) {
+        let posed = self.mask_pose_animation(choice);
+        let geometry = match match posed.as_ref() {
+            Some((animation, frame)) => {
+                model.geometry_preview_with_pose_frame(choice.load_flags, animation, *frame)
+            }
+            None => model.geometry_preview_with_loader_flags(choice.load_flags),
+        } {
             Ok(geometry) => geometry,
             Err(error) => {
                 self.log
@@ -990,7 +1010,7 @@ impl SmsEditorApp {
         let preview = self.mask_preview.as_ref()?;
         for material in &preview.geometry.materials {
             for stage in &material.tev_stages {
-                if stage.color_op < 8 && stage.alpha_op < 8 {
+                if !stage_is_wash_comparison(stage) {
                     continue;
                 }
                 let Some(map) = stage.order.tex_map else {
@@ -1128,7 +1148,7 @@ impl SmsEditorApp {
                 let Some(stage) = material
                     .tev_stages
                     .iter()
-                    .find(|stage| stage.color_op >= 8 || stage.alpha_op >= 8)
+                    .find(|stage| stage_is_wash_comparison(stage))
                 else {
                     return material.clone();
                 };
@@ -1543,7 +1563,7 @@ impl SmsEditorApp {
                     material
                         .tev_stages
                         .iter()
-                        .any(|stage| stage.color_op >= 8 || stage.alpha_op >= 8)
+                        .any(stage_is_wash_comparison)
                 })
             });
         self.mask_edit_state = format!(
@@ -1635,8 +1655,50 @@ impl SmsEditorApp {
                     .min_by(|left, right| left.1.total_cmp(&right.1))
                     .map(|(index, _)| index)
             });
-        let mut isolated = if let Some(model_index) = model_index {
+        // The stage instance can only carry the pose when it is the same walk of
+        // the same triangles the tool posed. It is not always: an actor whose
+        // stage model index gathers more than the body -- BossPakkun brings its
+        // tornado and pollution balls along -- counts differently, and pairing
+        // two walks of different lengths would corrupt the geometry. Those
+        // actors draw from the tool's own posed preview instead, so the pose
+        // applies to every actor rather than only the single-model ones.
+        let stage_carries_pose = model_index.is_some_and(|model_index| {
+            preview
+                .triangles
+                .iter()
+                .filter(|triangle| triangle.model_index == model_index)
+                .count()
+                == geometry.triangles.len()
+        });
+        let mut isolated = if let Some(model_index) =
+            model_index.filter(|_| stage_carries_pose)
+        {
             let mut isolated = preview.clone();
+        // The stage instance carries the stage's pose baked into its vertices,
+        // so the tool drew whatever the idle happened to be doing while the
+        // bake projected a pose of its own. Take the positions from the
+        // geometry this tool posed, keeping the stage's materials and textures
+        // so the shading stays what it was. Same model, same walk, so the
+        // triangles line up one for one; if they ever do not, leave the stage's
+        // alone rather than pair them up wrongly.
+        // This is the tool's own clone: the stage viewport and the runtime are
+        // untouched and get whatever the bake writes. Only this viewport
+        // follows the pose, which is what the projection is judged against.
+        // Counts already agree, so the walks pair one for one: take the tool's
+        // posed positions and keep the stage's materials, so only the pose
+        // changes and the shading stays as the stage renders it.
+        {
+            let mut posed = geometry.triangles.iter();
+            for triangle in isolated
+                .triangles
+                .iter_mut()
+                .filter(|triangle| triangle.model_index == model_index)
+            {
+                if let Some(source) = posed.next() {
+                    triangle.vertices = source.vertices;
+                }
+            }
+        }
         isolated
             .triangles
             .retain(|triangle| triangle.model_index == model_index);
@@ -1743,7 +1805,7 @@ impl SmsEditorApp {
             .filter(|(index, _)| used_materials.contains(index))
             .filter_map(|(index, material)| {
                 material.tev_stages.iter().find_map(|stage| {
-                    if stage.color_op < 8 && stage.alpha_op < 8 {
+                    if !stage_is_wash_comparison(stage) {
                         return None;
                     }
                     Some((index, wash_konst_index(stage)))
@@ -2118,6 +2180,35 @@ impl SmsEditorApp {
     }
 
     /// The actor currently selected in the Mask Tool.
+    /// The pose a goop layer is authored in: the model's rest pose, or its idle
+    /// animation held at the frame the slider names.
+    ///
+    /// A goop coordinate is a projection over posed vertices, so the pose is
+    /// part of the result -- the same actor bent differently unwraps
+    /// differently. The preview and the bake read this one choice so the
+    /// coating lands where it was shown rather than in whatever pose the stage
+    /// happened to be drawing.
+    fn mask_pose_animation(
+        &self,
+        choice: &MaskActorChoice,
+    ) -> Option<(sms_formats::J3dJointAnimation, f32)> {
+        if self.mask_bake_tpose {
+            return None;
+        }
+        let document = self.document.as_ref()?;
+        let object = document
+            .objects
+            .iter()
+            .find(|object| object.id == choice.object_id)?;
+        let (animation, rate) = crate::preview_assets::starting_joint_animation(
+            document,
+            object,
+            &choice.model_path,
+        )?;
+        let frame = animation.playback_frame(self.mask_idle_frame * rate);
+        Some((animation, frame))
+    }
+
     fn selected_mask_choice(&self) -> Option<MaskActorChoice> {
         let selected = self.mask_selected_actor.as_deref()?;
         self.mask_actor_choices()
@@ -2190,7 +2281,7 @@ impl SmsEditorApp {
                         material
                             .tev_stages
                             .iter()
-                            .any(|stage| stage.color_op >= 8 || stage.alpha_op >= 8)
+                            .any(stage_is_wash_comparison)
                     })
                     .map(|material| material.name.clone())
                     .collect()
@@ -2237,7 +2328,14 @@ impl SmsEditorApp {
                     return;
                 }
             };
-            match self.author_goop_layer(&mut model, &parsed, choice.load_flags, level) {
+            let posed = self.mask_pose_animation(&choice);
+            match self.author_goop_layer(
+                &mut model,
+                &parsed,
+                choice.load_flags,
+                level,
+                posed.as_ref().map(|(animation, frame)| (animation, *frame)),
+            ) {
                 Ok(count) => {
                     let Some(document) = self.document.as_mut() else {
                         return;
@@ -2254,7 +2352,9 @@ impl SmsEditorApp {
                     );
                     self.build_mask_preview(&choice);
                 }
-                Err(error) => self.log.push(error),
+                Err(error) => {
+                    self.log.push(error)
+                }
             }
             return;
         }
@@ -2313,6 +2413,7 @@ impl SmsEditorApp {
         model_file: &sms_formats::J3dFile,
         load_flags: u32,
         level: u8,
+        posed: Option<(&sms_formats::J3dJointAnimation, f32)>,
     ) -> Result<usize, String> {
         let preview = self
             .mask_preview
@@ -2370,22 +2471,30 @@ impl SmsEditorApp {
         // reads the vertex position in whichever joint's space it lives, and
         // an actor whose parts sit in different joints cannot be served by a
         // single matrix.
-        let slot = preview
-            .geometry
-            .triangles
-            .iter()
-            .fold([false; 8], |mut used, triangle| {
+        // What the preview shows is what the materials sample, and a model can
+        // store a coordinate nothing reads -- LandGesso keeps a UV1 for its
+        // BTK while no stage samples it. Authoring over such a slot is refused
+        // by the writer, so take the union of what is sampled and what is
+        // actually stored.
+        let mut used = preview.geometry.triangles.iter().fold(
+            [false; 8],
+            |mut used, triangle| {
                 for (slot, set) in triangle.tex_coord_sets.iter().enumerate() {
                     used[slot] |= set.is_some();
                 }
                 used
-            })
+            },
+        );
+        for (slot, stored) in model.stored_texcoord_slots().iter().enumerate() {
+            used[slot] |= *stored;
+        }
+        let slot = used
             .iter()
             .position(|used| !used)
             .ok_or_else(|| "This model stores all eight coordinate sets.".to_string())?
             as u8;
         let matrices = model_file
-            .rest_pose_draw_matrices(load_flags)
+            .preview_draw_matrices(load_flags, posed, &[])
             .map_err(|error| format!("Could not pose the model: {error}"))?;
         model
             .store_front_projection_texcoord(slot, &matrices)
@@ -2560,27 +2669,106 @@ impl SmsEditorApp {
 
     /// Drops the reimported mask, returning the actor to what its model
     /// originally authored.
+    /// The actor's model as the retail game ships it.
+    ///
+    /// Reset has to restore the model, not merely drop the edit layered over
+    /// it. A custom stage keeps its own copy of every actor in the project's
+    /// resource list, so once a coating is baked into that copy there is
+    /// nothing underneath to fall back to -- which is why the goop survived
+    /// every reset. The untouched model is still in the retail archives the
+    /// stage was built from, found by the same archive-internal path.
+    ///
+    /// Returns `None` rather than a guess: reset refuses instead of clearing
+    /// when no pristine copy can be proven, because the resource list is also
+    /// where the stage keeps its only copy of the model.
+    fn pristine_model_bytes(&self, internal_path: &str) -> Option<Vec<u8>> {
+        let document = self.document.as_ref()?;
+        let archives = sms_formats::discover_scene_archives(&document.base_root).ok()?;
+        for archive in archives {
+            let candidate = format!("{}!/{}", archive.path.display(), internal_path);
+            let Ok(bytes) = sms_formats::read_stage_asset_bytes(&candidate) else {
+                continue;
+            };
+            // Prove it before it goes anywhere near the project.
+            if sms_formats::J3dFile::parse(&bytes).is_ok() {
+                return Some(bytes);
+            }
+        }
+        None
+    }
+
     fn restore_mask_goop_default(&mut self) {
         let Some(choice) = self.selected_mask_choice() else {
             return;
         };
+        // Both of these used to return in silence, which is indistinguishable
+        // from a button that does nothing at all: the path is only worked out
+        // for a document that knows where its stage archive came from.
         let Some(raw_path) = self
             .document
             .as_ref()
             .and_then(|document| document.archive_resource_path_for_asset(&choice.model_path))
         else {
+            self.log.push(
+                "This actor's model lives outside the stage archive, so there is no edit to \
+                 reset."
+                    .to_string(),
+            );
             return;
         };
         let Some(document) = self.document.as_mut() else {
+            self.log
+                .push("No stage is open, so there is nothing to reset.".to_string());
             return;
         };
         let before = document.archive_edits.clone();
+        // Only the model edit, never the resource edit. On a custom stage the
+        // resource list is not a pile of overrides to shed -- it is where the
+        // stage keeps its own content, the actor's base model included. Clearing
+        // it here deleted the model this reset was meant to restore, and every
+        // later read fell through to a stage archive that a custom stage never
+        // wrote to disk.
         let count = document.archive_edits.models.len();
         document
             .archive_edits
             .models
             .retain(|edit| edit.raw_resource_path != raw_path);
-        if document.archive_edits.models.len() == count {
+
+        // Dropping the edit is only half of it. On a custom stage the resource
+        // list holds the stage's own copy of the model, and a baked coating
+        // lives in that copy -- so restore it from retail rather than leaving
+        // whatever the last bake wrote.
+        let internal = String::from_utf8_lossy(&raw_path).into_owned();
+        let mut restored = false;
+        if let Some(pristine) = self.pristine_model_bytes(&internal) {
+            if let Some(document) = self.document.as_mut() {
+                if let Some(edit) = document
+                    .archive_edits
+                    .resources
+                    .iter_mut()
+                    .find(|edit| edit.raw_resource_path == raw_path)
+                {
+                    match sms_scene::StageResourceDocument::parse_for_path(&raw_path, &pristine) {
+                        Ok(document) => {
+                            edit.document = document;
+                            restored = true;
+                        }
+                        Err(error) => {
+                            // Say so rather than restore nothing quietly: the
+                            // actor keeps whatever it was wearing, and a reset
+                            // that reports success would be a lie.
+                            self.log.push(format!(
+                                "The retail model for this actor could not be read back:                                  {error}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        if document.archive_edits.models.len() == count && !restored {
             self.log
                 .push("This actor already wears its original mask.".to_string());
             return;
@@ -2591,11 +2779,24 @@ impl SmsEditorApp {
              masks dropped."
                 .to_string(),
         );
+        // Reset clears the actor, not merely its stored edit. The tool paints a
+        // coating of its own -- a generated mask, or StayPakkun's borrowed
+        // default over a front projection -- and that overlay outlives the edit.
+        // Dropping the edit alone left the goop sitting on screen, which is why
+        // the button read as inert even on the runs where it worked.
+        self.mask_generated = false;
+        self.mask_mask_source = MaskTextureSource::Generated;
         self.build_mask_preview(&choice);
     }
 
     /// Records an archive edit for undo and marks the document dirty.
     fn finish_mask_author_edit(&mut self, before: StageArchiveEdits, message: String) {
+        // The stage viewport keeps its own copy of every actor, built when the
+        // document loaded. An authoring edit changes the resource underneath it
+        // and nothing told it to look again, so a reset restored the retail
+        // model while the screen kept drawing the coated one -- and the tool,
+        // which clones that same cache to draw its preview, kept drawing it too.
+        self.rebuild_model_preview_from_document();
         let (record, dirty) = {
             let Some(document) = self.document.as_ref() else {
                 return;
@@ -3059,6 +3260,60 @@ impl SmsEditorApp {
         );
 
         ui.separator();
+        ui.heading("Pose");
+        // A goop coordinate is a projection over posed vertices, so the pose is
+        // part of what gets baked. Holding a frame is what makes the result
+        // repeatable: left on the wall clock, the same button gives a different
+        // unwrap every time it is pressed.
+        if ui
+            .checkbox(&mut self.mask_bake_tpose, "T-pose (ignore the idle)")
+            .changed()
+        {
+            // The pose is baked into the preview geometry, so changing it has
+            // to reload the actor rather than just redraw it.
+            if let Some(choice) = self.selected_mask_choice() {
+                self.build_mask_preview(&choice);
+            }
+        }
+        // Rebuilding re-reads and re-parses the model, so it waits for the drag
+        // to end. On `changed()` it ran every frame the slider moved and the
+        // viewport stopped answering, which reads as a frozen tool.
+        if ui
+            .add_enabled(
+                !self.mask_bake_tpose,
+                egui::Slider::new(&mut self.mask_idle_frame, 0.0..=8.0)
+                    .text("Idle frame")
+                    .clamping(egui::SliderClamping::Always),
+            )
+            .drag_stopped()
+        {
+            // The pose is baked into the preview geometry, so changing it has
+            // to reload the actor rather than just redraw it.
+            if let Some(choice) = self.selected_mask_choice() {
+                self.build_mask_preview(&choice);
+            }
+        }
+        ui.label(
+            egui::RichText::new(if self.mask_bake_tpose {
+                "baking against the model's rest pose".to_string()
+            } else {
+                // Saying which frame is held is only true if an idle was found
+                // at all; without one the controls sit over the rest pose and
+                // moving them changes nothing, which reads as a dead slider.
+                match self
+                    .selected_mask_choice()
+                    .and_then(|choice| self.mask_pose_animation(&choice))
+                {
+                    Some((_, frame)) => {
+                        format!("baking against the idle held at frame {frame:.1}")
+                    }
+                    None => "no idle animation resolved for this actor -- rest pose".to_string(),
+                }
+            })
+            .small()
+            .weak(),
+        );
+
         ui.heading("Author");
         ui.horizontal(|ui| {
             if ui
@@ -3098,7 +3353,9 @@ impl SmsEditorApp {
                 )
                 .clicked()
             {
+                let said = self.log.len();
                 self.bake_mask_goop_layer();
+                self.mask_author_status = self.log[said..].join(" ");
             }
             if ui
                 .button("Reset to default")
@@ -3108,9 +3365,21 @@ impl SmsEditorApp {
                 )
                 .clicked()
             {
+                let said = self.log.len();
                 self.restore_mask_goop_default();
+                self.mask_author_status = self.log[said..].join(" ");
             }
         });
+        // Authoring reported itself only to the Console, which is a different
+        // panel and often shut: a refusal there is indistinguishable from a
+        // button that does nothing. Say it where the button was pressed.
+        if !self.mask_author_status.is_empty() {
+            ui.label(
+                egui::RichText::new(self.mask_author_status.clone())
+                    .small()
+                    .weak(),
+            );
+        }
     }
 }
 

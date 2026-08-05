@@ -1285,6 +1285,18 @@ struct SmsEditorApp {
     /// Whether the wash clears the mask's dark values first rather than its
     /// bright ones, turning the coating's recede inside out.
     mask_wash_invert: bool,
+    /// Whether the goop layer is authored against the model's rest pose rather
+    /// than the idle animation it is standing in. A goop coordinate is a
+    /// projection over posed vertices, so the pose it is baked in is part of
+    /// the result: the same actor bent differently unwraps differently.
+    /// What the last bake or reset actually did, shown beside the buttons that
+    /// did it rather than only in the Console panel.
+    mask_author_status: String,
+    mask_bake_tpose: bool,
+    /// Where the idle animation is held while the layer is authored, in
+    /// seconds. The preview holds this frame rather than running on the wall
+    /// clock, so what is baked is what was on screen.
+    mask_idle_frame: f32,
     /// The project whose wash settings have been taken, so they are restored
     /// once rather than on every frame the panel draws.
     mask_wash_settings_project: Option<String>,
@@ -1656,6 +1668,9 @@ impl Default for SmsEditorApp {
             mask_wash_phase: 1.0,
             mask_wash_playing: false,
             mask_wash_invert: false,
+            mask_author_status: String::new(),
+            mask_bake_tpose: true,
+            mask_idle_frame: 0.0,
             mask_wash_settings_project: None,
             mask_edit_state: String::new(),
             mask_uv_layer: mask_tool::MaskUvLayer::Body,

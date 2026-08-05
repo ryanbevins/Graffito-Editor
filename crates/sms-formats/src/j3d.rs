@@ -993,6 +993,22 @@ impl J3dFile {
         self.geometry_preview_with_pose(loader_flags, Some((animation, frame)), &[])
     }
 
+    /// The geometry posed at an animation frame that has already been worked
+    /// out, rather than at one derived from elapsed time.
+    ///
+    /// Authoring holds a frame still and bakes against it, so it needs to name
+    /// the frame directly; [`Self::preview_draw_matrices`] takes the same
+    /// frame, which is what keeps the coating and the model it was projected
+    /// over in the same pose.
+    pub fn geometry_preview_with_pose_frame(
+        &self,
+        loader_flags: u32,
+        animation: &J3dJointAnimation,
+        frame: f32,
+    ) -> Result<J3dGeometryPreview> {
+        self.geometry_preview_with_pose(loader_flags, Some((animation, frame)), &[])
+    }
+
     pub fn geometry_preview_with_joint_overrides(
         &self,
         loader_flags: u32,
@@ -1655,7 +1671,13 @@ impl J3dFile {
         }
     }
 
-    fn preview_draw_matrices(
+    /// The matrix each draw slot binds, in whatever pose is asked for.
+    ///
+    /// Storing a goop coordinate projects every vertex in the pose it is
+    /// standing in, so the pose the coordinate is baked against has to be the
+    /// same one the preview drew. `animation` carries a frame, not seconds --
+    /// see [`J3dJointAnimation::playback_frame`].
+    pub fn preview_draw_matrices(
         &self,
         loader_flags: u32,
         animation: Option<(&J3dJointAnimation, f32)>,

@@ -931,6 +931,31 @@ impl J3dRebuildDocument {
     /// between joints cannot pull two projections into one slot. The
     /// projection matches the preview's: the posed model's `x` and `y`,
     /// normalised to its bounds.
+    /// Which texture coordinate sets the vertex data already stores.
+    ///
+    /// A model can carry a coordinate no material reads, so the geometry
+    /// preview is not a reliable guide: it reports what is sampled, and
+    /// authoring onto a slot that is merely unsampled overwrites data the
+    /// model still holds. Ask the shapes instead.
+    pub fn stored_texcoord_slots(&self) -> [bool; 8] {
+        let mut stored = [false; 8];
+        for section in &self.sections {
+            let J3dRebuildSectionData::Shapes(shapes) = &section.data else {
+                continue;
+            };
+            for descriptors in &shapes.vertex_descriptor_sets {
+                for descriptor in &descriptors.descriptors {
+                    for (slot, seen) in stored.iter_mut().enumerate() {
+                        if descriptor.attribute == u32::from(GX_VA_TEX0 + slot as u8) {
+                            *seen = true;
+                        }
+                    }
+                }
+            }
+        }
+        stored
+    }
+
     pub fn store_front_projection_texcoord(
         &mut self,
         slot: u8,
@@ -1752,10 +1777,15 @@ impl J3dRebuildDocument {
                     .get(stage)
                     .copied()
                     .unwrap_or(0);
-                return Some(match selector {
-                    16..=31 => ((selector - 16) & 3) as usize,
-                    _ => 0,
-                });
+                // A comparison that reads no konst alpha is not a wash. A toon
+                // ramp compares too, and answering register zero for one hands
+                // the coverage slider a register the material already uses --
+                // which is how baking onto an unwashed actor wrecked its
+                // shading instead of coating it.
+                match selector {
+                    16..=31 => return Some(((selector - 16) & 3) as usize),
+                    _ => continue,
+                }
             }
         }
         None
@@ -6352,5 +6382,107 @@ mod goop_layout_tests {
         }
         println!("relayout preserved {checked} models ({skipped} unparsed)");
         assert!(checked > 0, "no models were checked");
+    }
+}
+
+#[cfg(test)]
+mod bake_repro {
+    #[test]
+    #[ignore = "needs SMS_REPRO_BMD pointing at an extracted model"]
+    fn rebuild_parse_reports_why_it_refuses_a_model() {
+        let path = std::env::var("SMS_REPRO_BMD").expect("set SMS_REPRO_BMD");
+        let bytes = std::fs::read(&path).expect("read the model");
+        match crate::J3dRebuildDocument::parse(&bytes) {
+            Ok(_) => println!("REBUILD PARSE: ok"),
+            Err(error) => println!("REBUILD PARSE FAILED: {error}"),
+        }
+        match crate::J3dFile::parse(&bytes) {
+            Ok(_) => println!("J3DFILE PARSE: ok"),
+            Err(error) => println!("J3DFILE PARSE FAILED: {error}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "needs SMS_BASE_ROOT pointing at the extracted retail game"]
+    fn a_pristine_actor_model_can_be_recovered_from_retail() {
+        let base_root = std::env::var("SMS_BASE_ROOT").expect("set SMS_BASE_ROOT");
+        let internal = std::env::var("SMS_INTERNAL_PATH")
+            .unwrap_or_else(|_| "rikugesso/geso_model1.bmd".to_string());
+        let archives =
+            crate::discover_scene_archives(&base_root).expect("discover retail archives");
+        let mut found = 0usize;
+        for archive in archives {
+            let candidate = format!("{}!/{}", archive.path.display(), internal);
+            let Ok(bytes) = crate::read_stage_asset_bytes(&candidate) else {
+                continue;
+            };
+            let parses = crate::J3dFile::parse(&bytes).is_ok();
+            let stored = crate::J3dRebuildDocument::parse(&bytes)
+                .map(|model| model.stored_texcoord_slots())
+                .unwrap_or([false; 8]);
+            println!(
+                "  {} -> {} bytes, parses={parses}, stored slots={:?}",
+                archive.stage_id,
+                bytes.len(),
+                &stored[..4]
+            );
+            found += 1;
+            if found >= 4 {
+                break;
+            }
+        }
+        println!("PRISTINE COPIES FOUND: {found}");
+        assert!(found > 0, "no retail archive carries {internal}");
+    }
+
+    #[test]
+    #[ignore = "needs SMS_REPRO_BMD pointing at an extracted model"]
+    fn authoring_a_goop_layer_reports_why_it_refuses() {
+        let path = std::env::var("SMS_REPRO_BMD").expect("set SMS_REPRO_BMD");
+        let bytes = std::fs::read(&path).expect("read the model");
+        let parsed = crate::J3dFile::parse(&bytes).expect("parse");
+        let mut model = crate::J3dRebuildDocument::parse(&bytes).expect("rebuild parse");
+
+        let matrices = parsed
+            .preview_draw_matrices(crate::SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS, None, &[])
+            .expect("rest pose matrices");
+        let stored = model.stored_texcoord_slots();
+        println!("STORED SLOTS: {stored:?}");
+        let slot = stored.iter().position(|used| !used).expect("a free slot") as u8;
+        println!("CHOSEN SLOT: {slot}");
+        match model.store_front_projection_texcoord(slot, &matrices) {
+            Ok(count) => println!("STORE UV: ok, {count} vertices"),
+            Err(error) => println!("STORE UV FAILED: {error}"),
+        }
+
+        let image = crate::RgbaImage::new(8, 8, vec![255u8; 8 * 8 * 4]).expect("image");
+        let texture = crate::GxEncodedTexture::encode_rgba(
+            "goopmask".to_string(),
+            &image,
+            crate::GxTextureEncodeOptions::default(),
+        )
+        .and_then(|encoded| encoded.to_bti())
+        .expect("bti");
+
+        let preview = parsed
+            .geometry_preview_with_loader_flags(crate::SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS)
+            .expect("geometry");
+        println!("MATERIALS: {}", preview.materials.len());
+        for material in &preview.materials {
+            if material.tev_stages.is_empty() {
+                continue;
+            }
+            let request = crate::GoopLayerRequest {
+                material_name: &material.name,
+                texture_name: "goopmask",
+                texture: &texture,
+                coordinate_slot: 1,
+                level: 128,
+            };
+            match model.add_goop_layer(&request) {
+                Ok(_) => println!("  ADD OK   {}", material.name),
+                Err(error) => println!("  ADD FAIL {}: {error}", material.name),
+            }
+        }
     }
 }
