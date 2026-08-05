@@ -2888,12 +2888,46 @@ fn apply_registry_preview_hints(
             continue;
         };
 
+        // A catalog placement carries the exact resource path selected through
+        // its retail ObjChara/SmplChara registration. Keep that stronger path
+        // when its basename agrees with the decomp manager table; old catalog
+        // mistakes such as Gesso's gero_model1 projectile do not agree and are
+        // still replaced below.
+        let authored_file_name = authored_model
+            .replace('\\', "/")
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let catalog_hint_matches = |hint: &AssetRef| {
+            if hint.role != AssetRole::PreviewModel {
+                return false;
+            }
+            let normalized_hint = hint.path.replace('\\', "/");
+            let hint_file_name = normalized_hint.rsplit('/').next().unwrap_or_default();
+            hint_file_name.eq_ignore_ascii_case(&authored_file_name)
+                && assets.iter().any(|asset| {
+                    asset
+                        .path
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                        .eq_ignore_ascii_case(&normalized_hint)
+                })
+        };
+        let preserved_catalog_hint =
+            binding_is_manager_derived && object.asset_hints.iter().any(&catalog_hint_matches);
+
         // Once a schema binding exists, never retain a weaker basename guess,
         // including when the authored model is missing or ambiguous.
         object.asset_hints.retain(|hint| {
             hint.role != AssetRole::InferredPreviewModel
-                && !(binding_is_manager_derived && hint.role == AssetRole::PreviewModel)
+                && !(binding_is_manager_derived
+                    && hint.role == AssetRole::PreviewModel
+                    && !catalog_hint_matches(hint))
         });
+        if preserved_catalog_hint {
+            continue;
+        }
 
         match resolve_authored_model_path(
             &authored_model,
@@ -2945,7 +2979,10 @@ fn apply_registry_preview_hints(
 enum ModelPathResolution {
     Found(String),
     /// Narrowed to a folder related to the actor's name rather than equal to it.
-    Related { path: String, candidates: usize },
+    Related {
+        path: String,
+        candidates: usize,
+    },
     Missing,
     Ambiguous(Vec<String>),
 }
@@ -3001,7 +3038,10 @@ fn actor_folder_key(name: &str) -> String {
 
 fn model_parent_folder_key(path: &str) -> String {
     let normalized = path.replace('\\', "/");
-    let without_file = normalized.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    let without_file = normalized
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .unwrap_or("");
     let folder = without_file
         .rsplit('/')
         .next()
@@ -3016,7 +3056,10 @@ fn model_parent_folder_key(path: &str) -> String {
 /// head or tail of the actor name is accepted (`StayPakkun` -> `pakkun`,
 /// `PoiHanaRed` -> `poihana`), longest match first, but only when a single
 /// candidate qualifies -- a tie stays ambiguous rather than becoming a guess.
-fn narrow_matches_by_owner(matches: &[String], owner_hints: &[&str]) -> Option<ModelPathResolution> {
+fn narrow_matches_by_owner(
+    matches: &[String],
+    owner_hints: &[&str],
+) -> Option<ModelPathResolution> {
     for hint in owner_hints {
         let key = actor_folder_key(hint);
         if key.is_empty() {
@@ -3647,6 +3690,21 @@ fn default_enemy_manager_model<'a>(
     factory_name: &str,
 ) -> Option<&'a EnemyModelDefinition> {
     let actor = registry.find_enemy_actor(factory_name)?;
+    if let Some(model) = actor
+        .manager_factories
+        .iter()
+        .filter(|manager_factory| {
+            manager_factory.strip_suffix("Manager") == Some(actor.factory_name.as_str())
+        })
+        .filter_map(|manager_factory| registry.find_enemy_manager(manager_factory))
+        .find_map(|manager| {
+            actor_manager_model_candidates(actor, manager)
+                .into_iter()
+                .next()
+        })
+    {
+        return Some(model);
+    }
     let mut selected = None;
     for manager_factory in &actor.manager_factories {
         let Some(manager) = registry.find_enemy_manager(manager_factory) else {
@@ -6919,7 +6977,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn bundled_registry_enemies_resolve_their_own_default_bmd() {
         // PoiHana, HamuKuri and MameGesso all declare a bare `default.bmd`, so a
@@ -6970,14 +7027,9 @@ mod tests {
     }
 
     #[test]
-    fn default_bmd_actors_without_a_folder_or_binding_stay_unresolved() {
-        // The two `default.bmd` actors folder narrowing cannot help, recorded so a
-        // change in either is noticed:
-        //   EffectEnemy    - no folder of its own and nothing its name points at,
-        //                    so the ambiguity warning is the honest answer.
-        //   FireHamuKuri   - never reaches the resolver at all; its managers do not
-        //                    agree on a model, so `default_enemy_manager_model`
-        //                    yields nothing. A registry gap, not a matching one.
+    fn default_bmd_actor_without_a_folder_or_binding_stays_unresolved() {
+        // EffectEnemy has no folder of its own and nothing its name points at,
+        // so the ambiguity warning is the honest answer.
         let registry = sms_schema::bundled_object_registry()
             .expect("bundled registry loads")
             .registry;
@@ -6988,11 +7040,59 @@ mod tests {
         assert!(objects[0].asset_hints.is_empty());
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, "object-preview-model-ambiguous");
+    }
+
+    #[test]
+    fn fire_hamukuri_uses_its_exact_manager_model_and_loader_flags() {
+        let registry = sms_schema::bundled_object_registry()
+            .expect("bundled registry loads")
+            .registry;
+        let assets = shared_basename_assets(SHARED_BASENAME_FOLDERS);
+
+        let model = default_enemy_manager_model(&registry, "FireHamuKuri")
+            .expect("FireHamuKuri exact manager model");
+        assert_eq!(model.model_name, "default.bmd");
+        assert_eq!(model.load_flags, 0x1024_0000);
 
         let mut objects = vec![SceneObject::new("obj", "FireHamuKuri")];
         let issues = apply_registry_preview_hints(&mut objects, &assets, &registry);
-        assert!(objects[0].asset_hints.is_empty());
-        assert!(issues.is_empty(), "expected no binding at all, got {issues:?}");
+        assert!(
+            objects[0].asset_hints[0].path.contains("/hamukuri/"),
+            "resolved to {:?}",
+            objects[0].asset_hints
+        );
+        assert!(!issues
+            .iter()
+            .any(|issue| issue.code == "object-preview-model-ambiguous"));
+    }
+
+    #[test]
+    fn exact_catalog_preview_survives_shared_basename_registry_refresh() {
+        let registry = sms_schema::bundled_object_registry()
+            .expect("bundled registry loads")
+            .registry;
+        let assets = shared_basename_assets(SHARED_BASENAME_FOLDERS);
+        let exact_path = "new_stage0.szs!/hamukuri/default.bmd".to_string();
+        let mut object = SceneObject::new("obj", "HamuKuri");
+        object.asset_hints.push(AssetRef {
+            path: exact_path.clone(),
+            role: AssetRole::PreviewModel,
+        });
+
+        let issues =
+            apply_registry_preview_hints(std::slice::from_mut(&mut object), &assets, &registry);
+
+        assert_eq!(
+            object.asset_hints,
+            [AssetRef {
+                path: exact_path,
+                role: AssetRole::PreviewModel,
+            }]
+        );
+        assert!(
+            issues.is_empty(),
+            "exact catalog binding warned: {issues:?}"
+        );
     }
 
     #[test]
@@ -7323,9 +7423,11 @@ mod tests {
                             .primary_model
                             .as_deref()
                             .expect("ShiningStone has a basename primary");
-                        let ModelPathResolution::Found(path) =
-                            resolve_authored_model_path(primary, &model_index, &[resource_name, &object.factory_name])
-                        else {
+                        let ModelPathResolution::Found(path) = resolve_authored_model_path(
+                            primary,
+                            &model_index,
+                            &[resource_name, &object.factory_name],
+                        ) else {
                             panic!(
                                 "{} ShiningStone did not resolve {}",
                                 archive.stage_id, primary
@@ -7352,7 +7454,11 @@ mod tests {
                     .expect("typed resource has a table primary or exact model override");
                 model_identities.insert(resource_name.to_string());
                 model_placement_count += 1;
-                match resolve_authored_model_path(authored_model, &model_index, &[resource_name, &object.factory_name]) {
+                match resolve_authored_model_path(
+                    authored_model,
+                    &model_index,
+                    &[resource_name, &object.factory_name],
+                ) {
                     ModelPathResolution::Found(path) => {
                         resolved_placement_count += 1;
                         let inferred = object

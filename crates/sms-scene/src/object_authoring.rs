@@ -1441,37 +1441,8 @@ fn resolve_resources(
             // archive, so qualifying the reference with the candidate's own
             // character folders reproduces that scoping: hamukuri/default.bmd
             // rather than whichever default.bmd the filename scan met first.
-            let manager_character_names = candidate
-                .dependencies
-                .iter()
-                .filter(|dependency| {
-                    find_object(registry, &dependency.record.type_name)
-                        .is_some_and(|definition| definition.factory_name == *factory_name)
-                })
-                .filter_map(|dependency| record_character_name(&dependency.record))
-                .collect::<BTreeSet<_>>();
-            let character_folders = candidate
-                .character_resource_records
-                .iter()
-                .filter(|registration| {
-                    manager_character_names.is_empty()
-                        || manager_character_names.contains(registration.name.as_str())
-                })
-                .filter_map(
-                    |registration| match semantic_type_name(&registration.type_name) {
-                        "ObjChara" => reference_field(registration, "resource_folder"),
-                        "SmplChara" => reference_field(registration, "archive_path"),
-                        _ => None,
-                    },
-                )
-                .map(|folder| {
-                    // Character folders are runtime-absolute ("/scene/hamukuri")
-                    // while archive paths are root-stripped ("hamukuri/...").
-                    let folder = normalize_text_path(folder);
-                    let folder = folder.trim_matches('/');
-                    folder.strip_prefix("scene/").unwrap_or(folder).to_string()
-                })
-                .collect::<BTreeSet<_>>();
+            let character_folders =
+                candidate_manager_character_folders(candidate, registry, factory_name);
             for model in &manager.models {
                 if bound_names.contains(&normalize_text_path(&model.model_name)) {
                     continue;
@@ -2313,6 +2284,7 @@ fn preview_resource_path(
     resources: &[ObjectAuthoringResource],
     registry: &ObjectRegistry,
 ) -> Option<Vec<u8>> {
+    let exact_enemy_manager = candidate_enemy_manager(candidate, registry);
     let preferred = reference_field(&candidate.record, "resource_name")
         .and_then(|resource_name| {
             registry
@@ -2334,23 +2306,126 @@ fn preview_resource_path(
                 .and_then(|actor| actor.primary_model.as_deref())
         })
         .or_else(|| {
+            exact_enemy_manager.and_then(|(actor, manager)| {
+                super::actor_manager_model_candidates(actor, manager)
+                    .into_iter()
+                    .next()
+                    .map(|model| model.model_name.as_str())
+            })
+        })
+        .or_else(|| {
             super::default_enemy_manager_model(registry, &candidate.factory_name)
                 .map(|model| model.model_name.as_str())
         });
-    preferred
-        .and_then(|preferred| {
-            resources.iter().find(|resource| {
+    let preferred_resource = preferred.and_then(|preferred| {
+        let mut matches = resources
+            .iter()
+            .filter(|resource| {
                 let path = normalized_path(&resource.raw_resource_path);
                 let preferred = normalize_text_path(preferred);
                 path == preferred || path.ends_with(&format!("/{preferred}"))
             })
-        })
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            return matches.pop();
+        }
+        let (actor, manager) = exact_enemy_manager?;
+        let model = super::actor_manager_model_candidates(actor, manager)
+            .into_iter()
+            .find(|model| model.model_name.eq_ignore_ascii_case(preferred))?;
+        let model_name = normalize_text_path(&model.model_name);
+        let folders =
+            candidate_manager_character_folders(candidate, registry, &manager.factory_name);
+        let mut scoped = matches
+            .into_iter()
+            .filter(|resource| {
+                let path = normalized_path(&resource.raw_resource_path);
+                folders.iter().any(|folder| {
+                    path == format!("{folder}/{model_name}")
+                        || path.ends_with(&format!("/{folder}/{model_name}"))
+                })
+            })
+            .collect::<Vec<_>>();
+        (scoped.len() == 1).then(|| scoped.remove(0))
+    });
+    preferred_resource
         .or_else(|| {
+            // A manager model basename that still has several candidates after
+            // exact character-folder scoping is not safe to guess. Returning
+            // no preview is preferable to attaching a different enemy body.
+            let ambiguous_preferred = preferred.is_some_and(|preferred| {
+                let preferred = normalize_text_path(preferred);
+                resources
+                    .iter()
+                    .filter(|resource| {
+                        let path = normalized_path(&resource.raw_resource_path);
+                        path == preferred || path.ends_with(&format!("/{preferred}"))
+                    })
+                    .count()
+                    > 1
+            });
+            if ambiguous_preferred {
+                return None;
+            }
             resources
                 .iter()
                 .find(|resource| normalized_path(&resource.raw_resource_path).ends_with(".bmd"))
         })
         .map(|resource| resource.raw_resource_path.clone())
+}
+
+fn candidate_enemy_manager<'a>(
+    candidate: &Candidate,
+    registry: &'a ObjectRegistry,
+) -> Option<(&'a EnemyActorDefinition, &'a EnemyManagerDefinition)> {
+    let actor = find_enemy_actor(registry, &candidate.factory_name)?;
+    let manager_name = reference_field(&candidate.record, "manager_name")?;
+    let manager = candidate.dependencies.iter().find_map(|dependency| {
+        (dependency.record.name == manager_name)
+            .then(|| find_enemy_manager(registry, &dependency.record.type_name))
+            .flatten()
+    })?;
+    actor
+        .manager_factories
+        .iter()
+        .any(|factory| factory == &manager.factory_name)
+        .then_some((actor, manager))
+}
+
+fn candidate_manager_character_folders(
+    candidate: &Candidate,
+    registry: &ObjectRegistry,
+    manager_factory: &str,
+) -> BTreeSet<String> {
+    let manager_character_names = candidate
+        .dependencies
+        .iter()
+        .filter(|dependency| {
+            find_object(registry, &dependency.record.type_name)
+                .is_some_and(|definition| definition.factory_name == manager_factory)
+        })
+        .filter_map(|dependency| record_character_name(&dependency.record))
+        .collect::<BTreeSet<_>>();
+    candidate
+        .character_resource_records
+        .iter()
+        .filter(|registration| {
+            manager_character_names.is_empty()
+                || manager_character_names.contains(registration.name.as_str())
+        })
+        .filter_map(
+            |registration| match semantic_type_name(&registration.type_name) {
+                "ObjChara" => reference_field(registration, "resource_folder"),
+                "SmplChara" => reference_field(registration, "archive_path"),
+                _ => None,
+            },
+        )
+        .map(|folder| {
+            let folder = normalize_text_path(folder);
+            let folder = folder.trim_matches('/');
+            folder.strip_prefix("scene/").unwrap_or(folder).to_string()
+        })
+        .collect()
 }
 
 fn path_matches_one_of(path: &[u8], names: &BTreeSet<String>) -> bool {
@@ -4031,6 +4106,88 @@ mod tests {
         );
     }
 
+    #[test]
+    fn manager_backed_enemy_preview_scopes_shared_basename_to_registered_character_folder() {
+        let registry = ObjectRegistry {
+            objects: vec![
+                object("FixtureEnemy", "TFixtureEnemy"),
+                object("FixtureManager", "TFixtureManager"),
+            ],
+            enemy_actors: vec![EnemyActorDefinition {
+                factory_name: "FixtureEnemy".into(),
+                class_name: "TFixtureEnemy".into(),
+                model_index: None,
+                fallback_models: Vec::new(),
+                primary_model: None,
+                named_models: Vec::new(),
+                indexed_models: Vec::new(),
+                manager_factories: vec!["FixtureManager".into()],
+                runtime_uniform_scale: None,
+            }],
+            enemy_managers: vec![EnemyManagerDefinition {
+                factory_name: "FixtureManager".into(),
+                class_name: "TFixtureManager".into(),
+                model_index: None,
+                spawned_actor_class: Some("TFixtureEnemy".into()),
+                parameter_path: None,
+                models: vec![EnemyModelDefinition {
+                    model_name: "default.bmd".into(),
+                    load_flags: 0x1022_0000,
+                    source_file: "fixture_enemy.cpp".into(),
+                }],
+            }],
+            ..ObjectRegistry::default()
+        };
+        let manager = fields(
+            "FixtureManager",
+            "fixture manager",
+            vec![field(
+                "character_name",
+                JDramaFieldValue::String("FixtureChara".into()),
+            )],
+        );
+        let mut enemy = actor("FixtureEnemy", "fixture enemy", 1);
+        let JDramaRecordPayload::Actor { fields, .. } = &mut enemy.payload else {
+            unreachable!()
+        };
+        fields.push(field(
+            "manager_name",
+            JDramaFieldValue::String("fixture manager".into()),
+        ));
+        let candidate = Candidate {
+            factory_name: "FixtureEnemy".into(),
+            group_index: 4,
+            record: enemy,
+            dependencies: vec![ObjectAuthoringDependency {
+                group_index: 2,
+                target: AuthoredPlacementDependencyTarget::IndexedGroup { group_index: 2 },
+                record: manager,
+            }],
+            character_records: Vec::new(),
+            character_resource_records: vec![character_registration(
+                "ObjChara",
+                "FixtureChara",
+                "resource_folder",
+                "/scene/hamukuri",
+            )],
+            graph_names: BTreeSet::new(),
+            source_stage: "stage".into(),
+            sort_key: "stage".into(),
+            raw_resource_path: b"map/scene.bin".to_vec(),
+            source_asset_path: PathBuf::from("stage.szs!/map/scene.bin"),
+            record_path: Vec::new(),
+        };
+        let resources = resources(
+            "stage.szs",
+            &["mamegesso/default.bmd", "hamukuri/default.bmd"],
+        );
+
+        assert_eq!(
+            preview_resource_path(&candidate, &resources, &registry).as_deref(),
+            Some(b"hamukuri/default.bmd".as_slice())
+        );
+    }
+
     fn map_obj_animation_registry(extra_name: Option<&str>) -> ObjectRegistry {
         ObjectRegistry {
             objects: vec![object("FixtureMapObj", "TFixtureMapObj")],
@@ -4383,6 +4540,20 @@ mod tests {
                 "missing representative retail-backed template {factory_name}"
             );
         }
+        for (factory_name, expected_path) in [
+            ("HamuKuri", "hamukuri/default.bmd"),
+            ("PoiHana", "poihana/default.bmd"),
+        ] {
+            let template = build
+                .catalog
+                .find(factory_name)
+                .unwrap_or_else(|| panic!("missing {factory_name} retail template"));
+            let actual = template
+                .preview_resource_path
+                .as_deref()
+                .map(normalized_path);
+            assert_eq!(actual.as_deref(), Some(expected_path));
+        }
         assert!(build.catalog.iter().all(|(_, template)| template
             .required_graph_names
             .iter()
@@ -4502,6 +4673,21 @@ mod tests {
             .expect("load bundled object registry")
             .registry;
         let build = ObjectAuthoringCatalog::build_with_base_root(&archives, &registry, &base_root);
+
+        for (factory_name, expected_path) in [
+            ("HamuKuri", "hamukuri/default.bmd"),
+            ("PoiHana", "poihana/default.bmd"),
+            ("MameGesso", "mamegesso/default.bmd"),
+        ] {
+            let template = build.catalog.find(factory_name).unwrap_or_else(|| {
+                panic!("missing {factory_name}; warnings: {:?}", build.warnings)
+            });
+            let actual = template
+                .preview_resource_path
+                .as_deref()
+                .map(normalized_path);
+            assert_eq!(actual.as_deref(), Some(expected_path));
+        }
 
         for factory in ["SamboHead", "HanaSambo"] {
             let template = build

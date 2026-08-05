@@ -1893,7 +1893,7 @@ fn add_catalog_preview_hint(
             source_path.display(),
             String::from_utf8_lossy(raw_path).replace('\\', "/")
         ),
-        role: AssetRole::InferredPreviewModel,
+        role: AssetRole::PreviewModel,
     });
 }
 impl SmsEditorApp {
@@ -5108,6 +5108,41 @@ mod tests {
             actor_previews: BTreeMap::new(),
             loaded_project: None,
         }
+    }
+
+    #[test]
+    fn catalog_preview_hint_is_an_exact_binding() {
+        let document = command_test_document(Vec::new());
+        let mut object = SceneObject::new("fixture", "HamuKuri");
+        let template = sms_scene::ObjectAuthoringTemplate {
+            factory_name: "HamuKuri".to_string(),
+            group_index: 4,
+            record: JDramaRecord::new(
+                "HamuKuri",
+                "hamukuri",
+                JDramaRecordPayload::Fields { fields: Vec::new() },
+            )
+            .unwrap(),
+            dependencies: Vec::new(),
+            character_records: Vec::new(),
+            character_resource_records: Vec::new(),
+            table_dependencies: Vec::new(),
+            runtime_actor_references: Vec::new(),
+            required_graph_names: Vec::new(),
+            resources: Vec::new(),
+            preview_resource_path: Some(b"hamukuri/default.bmd".to_vec()),
+            source_stage: "bianco0".to_string(),
+        };
+
+        add_catalog_preview_hint(&mut object, &document, &template);
+
+        assert_eq!(
+            object.asset_hints,
+            [AssetRef {
+                path: "virtual/fixture0.szs!/hamukuri/default.bmd".to_string(),
+                role: AssetRole::PreviewModel,
+            }]
+        );
     }
 
     #[test]
