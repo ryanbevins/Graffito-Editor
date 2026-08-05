@@ -638,12 +638,107 @@ fn catalog_resource_maintenance(
     document: &StageDocument,
     catalog: &ObjectAuthoringCatalog,
     active_factories: &BTreeSet<String>,
+    excluded_object_id: Option<&str>,
 ) -> CatalogResourceMaintenance {
     let templates = catalog
         .iter()
         .map(|(_, template)| template)
         .collect::<Vec<_>>();
-    catalog_resource_maintenance_from_templates(document, &templates, active_factories)
+    catalog_resource_maintenance_from_templates(
+        document,
+        &templates,
+        active_factories,
+        excluded_object_id,
+    )
+}
+
+fn jdrama_string_field<'a>(
+    record: &'a sms_formats::JDramaRecord,
+    field_name: &str,
+) -> Option<&'a str> {
+    if field_name == "character_name" {
+        if let sms_formats::JDramaRecordPayload::Actor { character_name, .. } = &record.payload {
+            return Some(character_name);
+        }
+    }
+    let fields = match &record.payload {
+        sms_formats::JDramaRecordPayload::Actor { fields, .. }
+        | sms_formats::JDramaRecordPayload::Fields { fields }
+        | sms_formats::JDramaRecordPayload::Group { fields, .. } => fields,
+        sms_formats::JDramaRecordPayload::Empty => return None,
+    };
+    fields.iter().find_map(|field| {
+        (field.name == field_name)
+            .then_some(&field.value)
+            .and_then(|value| match value {
+                sms_formats::JDramaFieldValue::String(value) => Some(value.as_str()),
+                _ => None,
+            })
+    })
+}
+
+fn active_authored_character_resource_folders(
+    document: &StageDocument,
+    excluded_object_id: Option<&str>,
+) -> Result<BTreeSet<String>, String> {
+    let character_names = document
+        .objects
+        .iter()
+        .filter(|object| excluded_object_id != Some(object.id.as_str()))
+        .filter_map(|object| match &object.placement {
+            Some(sms_scene::PlacementBinding::Authored(placement)) => Some(placement),
+            _ => None,
+        })
+        .flat_map(|placement| {
+            std::iter::once(&placement.prototype).chain(
+                placement
+                    .dependencies
+                    .iter()
+                    .map(|dependency| &dependency.record),
+            )
+        })
+        .filter_map(|record| jdrama_string_field(record, "character_name"))
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    if character_names.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    let Some(StageResourceDocument::Placement(tables)) = document
+        .effective_resource_clone(CATALOG_TABLES_PATH)
+        .map_err(|error| format!("could not inspect active character registrations: {error}"))?
+    else {
+        return Ok(BTreeSet::new());
+    };
+    fn visit(
+        record: &sms_formats::JDramaRecord,
+        character_names: &BTreeSet<String>,
+        folders: &mut BTreeSet<String>,
+    ) {
+        if character_names.contains(&record.name) {
+            let field_name = match semantic_record_type(&record.type_name) {
+                "ObjChara" => Some("resource_folder"),
+                "SmplChara" => Some("archive_path"),
+                _ => None,
+            };
+            if let Some(folder) = field_name.and_then(|name| jdrama_string_field(record, name)) {
+                let folder = folder.replace('\\', "/");
+                let folder = folder.trim_matches('/').to_ascii_lowercase();
+                let folder = folder.strip_prefix("scene/").unwrap_or(&folder);
+                if !folder.is_empty() {
+                    folders.insert(folder.to_string());
+                }
+            }
+        }
+        if let sms_formats::JDramaRecordPayload::Group { children, .. } = &record.payload {
+            for child in children {
+                visit(child, character_names, folders);
+            }
+        }
+    }
+    let mut folders = BTreeSet::new();
+    visit(&tables.root, &character_names, &mut folders);
+    Ok(folders)
 }
 
 fn pool_only_manager_name(object: &SceneObject) -> Option<&str> {
@@ -707,6 +802,7 @@ fn catalog_resource_maintenance_from_templates(
     document: &StageDocument,
     templates: &[&sms_scene::ObjectAuthoringTemplate],
     active_factories: &BTreeSet<String>,
+    excluded_object_id: Option<&str>,
 ) -> CatalogResourceMaintenance {
     let mut maintenance = CatalogResourceMaintenance::default();
     let missing_templates = active_factories
@@ -741,6 +837,14 @@ fn catalog_resource_maintenance_from_templates(
                 .map(|resource| resource.raw_resource_path.clone())
         })
         .collect::<BTreeSet<_>>();
+    let active_character_folders =
+        match active_authored_character_resource_folders(document, excluded_object_id) {
+            Ok(folders) => folders,
+            Err(error) => {
+                maintenance.errors.push(error);
+                return maintenance;
+            }
+        };
     let migrate_legacy_inserts = document.objects.iter().any(|object| {
         matches!(
             object.placement,
@@ -802,7 +906,15 @@ fn catalog_resource_maintenance_from_templates(
         }
 
         let before = resource_edit_state(&document.archive_edits, &edit.raw_resource_path);
-        if required_paths.contains(&edit.raw_resource_path) {
+        let normalized_edit_path = String::from_utf8_lossy(&edit.raw_resource_path)
+            .replace('\\', "/")
+            .trim_matches('/')
+            .to_ascii_lowercase();
+        let required_by_active_character = active_character_folders.iter().any(|folder| {
+            normalized_edit_path == *folder
+                || normalized_edit_path.starts_with(&format!("{folder}/"))
+        });
+        if required_paths.contains(&edit.raw_resource_path) || required_by_active_character {
             if !edit.catalog_managed {
                 let mut managed_edit = edit.clone();
                 managed_edit.catalog_managed = true;
@@ -2650,6 +2762,7 @@ impl SmsEditorApp {
                     document,
                     self.object_authoring_catalog.as_ref(),
                     &authored_factories,
+                    None,
                 )
             })
             .unwrap_or_default();
@@ -3524,6 +3637,7 @@ impl SmsEditorApp {
                     document,
                     self.object_authoring_catalog.as_ref(),
                     &remaining_factories,
+                    Some(selected_id.as_str()),
                 )
             })
             .unwrap_or_default();
@@ -4129,6 +4243,7 @@ impl SmsEditorApp {
                     document,
                     self.object_authoring_catalog.as_ref(),
                     &remaining_factories,
+                    None,
                 )
             })
             .unwrap_or_default();
@@ -5741,10 +5856,27 @@ mod tests {
                 .all(|message| !message.starts_with("Could not repair")),
             "{messages:?}"
         );
-        let document = app.document.as_ref().expect("repaired document");
+        let active_factories =
+            authored_catalog_factories(app.document.as_ref().expect("repaired document"), None);
+        let maintenance = catalog_resource_maintenance(
+            app.document.as_ref().expect("repaired document"),
+            app.object_authoring_catalog.as_ref(),
+            &active_factories,
+            None,
+        );
+        assert!(maintenance.errors.is_empty(), "{:?}", maintenance.errors);
+        ObjectUndoRecord {
+            deltas: Vec::new(),
+            resource_deltas: maintenance.resource_deltas,
+            route_delta: None,
+            dialogue_delta: None,
+        }
+        .apply_forward(app.document.as_mut().expect("repaired document"));
+        let document = app.document.as_ref().expect("maintained document");
         for path in [
             b"namekuri2/brain.bmd".as_slice(),
             b"namekuri2/bas/name_jump_start.bas".as_slice(),
+            b"namekuri201/name.bmd".as_slice(),
         ] {
             assert!(
                 document.has_effective_resource(path),
@@ -5761,6 +5893,7 @@ mod tests {
         for path in [
             b"namekuri2/brain.bmd".as_slice(),
             b"namekuri2/bas/name_jump_start.bas".as_slice(),
+            b"namekuri201/name.bmd".as_slice(),
         ] {
             assert!(
                 reopened.resource(path).is_some(),
@@ -7909,8 +8042,12 @@ mod tests {
 
         let templates = [&active_template, &inactive_template];
         let active_factories = authored_catalog_factories(&document, None);
-        let maintenance =
-            catalog_resource_maintenance_from_templates(&document, &templates, &active_factories);
+        let maintenance = catalog_resource_maintenance_from_templates(
+            &document,
+            &templates,
+            &active_factories,
+            None,
+        );
 
         assert!(maintenance.errors.is_empty());
         assert_eq!(maintenance.migrated_resources, 0);
@@ -7937,6 +8074,131 @@ mod tests {
             .resources
             .iter()
             .any(|edit| edit.raw_resource_path == custom_path && !edit.catalog_managed));
+    }
+
+    #[test]
+    fn deleting_unrelated_object_preserves_active_cloned_manager_folder() {
+        let base_path = b"namekuri2/name.bmd".to_vec();
+        let clone_path = b"namekuri201/name.bmd".to_vec();
+        let stale_path = b"namekuri299/name.bmd".to_vec();
+        let active_template = minimal_catalog_template(
+            "NameKuri",
+            vec![sms_scene::ObjectAuthoringResource {
+                raw_resource_path: base_path.clone(),
+                source_asset_path: PathBuf::from("unused-name.bmd"),
+                fixed_runtime_path: false,
+            }],
+        );
+        let removed_template = minimal_catalog_template("Gesso", Vec::new());
+        let mut pool = authored_fixture_object("name-pool", "NameKuri");
+        let Some(sms_scene::PlacementBinding::Authored(placement)) = &mut pool.placement else {
+            panic!("fixture pool uses authored placement");
+        };
+        placement.pool_only = true;
+        placement
+            .dependencies
+            .push(sms_scene::AuthoredPlacementDependency {
+                target: Some(sms_scene::AuthoredPlacementDependencyTarget::IndexedGroup {
+                    group_index: 0,
+                }),
+                target_group_index: 0,
+                record: JDramaRecord::new(
+                    "NameKuriManager",
+                    "name manager_L01",
+                    JDramaRecordPayload::Fields {
+                        fields: vec![JDramaField {
+                            name: "character_name".to_string(),
+                            value: JDramaFieldValue::String("name character_L01".to_string()),
+                        }],
+                    },
+                )
+                .unwrap(),
+            });
+        let removed = authored_fixture_object("gesso", "Gesso");
+        let mut document = command_test_document(vec![pool, removed]);
+        document.archive_edits.resources =
+            [base_path.clone(), clone_path.clone(), stale_path.clone()]
+                .into_iter()
+                .map(|raw_resource_path| StageResourceEdit {
+                    raw_resource_path,
+                    document: empty_parameter_document(),
+                    mode: sms_scene::StageResourceEditMode::Insert,
+                    catalog_managed: true,
+                })
+                .collect();
+        document.archive_edits.upsert_resource(
+            CATALOG_TABLES_PATH.to_vec(),
+            StageResourceDocument::Placement(JDramaDocument {
+                root: JDramaRecord::new(
+                    "NameRefGrp",
+                    "character registrations",
+                    JDramaRecordPayload::Group {
+                        fields: Vec::new(),
+                        children: vec![JDramaRecord::new(
+                            "ObjChara",
+                            "name character_L01",
+                            JDramaRecordPayload::Fields {
+                                fields: vec![JDramaField {
+                                    name: "resource_folder".to_string(),
+                                    value: JDramaFieldValue::String(
+                                        "/scene/namekuri201".to_string(),
+                                    ),
+                                }],
+                            },
+                        )
+                        .unwrap()],
+                    },
+                )
+                .unwrap(),
+            }),
+        );
+
+        let active_factories = authored_catalog_factories(&document, Some("gesso"));
+        let templates = [&active_template, &removed_template];
+        let maintenance = catalog_resource_maintenance_from_templates(
+            &document,
+            &templates,
+            &active_factories,
+            Some("gesso"),
+        );
+
+        assert!(maintenance.errors.is_empty());
+        assert_eq!(maintenance.pruned_resources, 1);
+        ObjectUndoRecord {
+            deltas: Vec::new(),
+            resource_deltas: maintenance.resource_deltas,
+            route_delta: None,
+            dialogue_delta: None,
+        }
+        .apply_forward(&mut document);
+        assert!(document
+            .archive_edits
+            .resources
+            .iter()
+            .any(|edit| edit.raw_resource_path == base_path));
+        assert!(document
+            .archive_edits
+            .resources
+            .iter()
+            .any(|edit| edit.raw_resource_path == clone_path));
+        assert!(!document
+            .archive_edits
+            .resources
+            .iter()
+            .any(|edit| edit.raw_resource_path == stale_path));
+
+        let active_factories = authored_catalog_factories(&document, Some("name-pool"));
+        let maintenance = catalog_resource_maintenance_from_templates(
+            &document,
+            &templates,
+            &active_factories,
+            Some("name-pool"),
+        );
+        assert!(maintenance.errors.is_empty());
+        assert!(maintenance
+            .resource_deltas
+            .iter()
+            .any(|delta| { delta.raw_resource_path == clone_path && delta.after.edit.is_none() }));
     }
 
     #[test]
@@ -8001,8 +8263,12 @@ mod tests {
 
         let templates = [&active_template, &inactive_template];
         let active_factories = authored_catalog_factories(&document, None);
-        let maintenance =
-            catalog_resource_maintenance_from_templates(&document, &templates, &active_factories);
+        let maintenance = catalog_resource_maintenance_from_templates(
+            &document,
+            &templates,
+            &active_factories,
+            None,
+        );
 
         assert!(maintenance.errors.is_empty());
         assert_eq!(maintenance.migrated_resources, 1);
