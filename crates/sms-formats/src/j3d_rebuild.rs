@@ -6480,7 +6480,11 @@ mod bake_repro {
                 level: 128,
             };
             match model.add_goop_layer(&request) {
-                Ok(_) => println!("  ADD OK   {}", material.name),
+                Ok(report) => println!(
+                    "  ADD OK   {} -> konst register K{}, first stage {}, texture index {}",
+                    material.name, report.konst_register, report.first_stage,
+                    report.texture_index
+                ),
                 Err(error) => println!("  ADD FAIL {}: {error}", material.name),
             }
         }
