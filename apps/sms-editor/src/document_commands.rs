@@ -5146,6 +5146,59 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires SMS_BASE_ROOT with extracted retail stages"]
+    fn retail_shared_basename_enemies_build_catalog_drag_preview_geometry() {
+        let base_root = std::env::var_os("SMS_BASE_ROOT")
+            .map(PathBuf::from)
+            .expect("set SMS_BASE_ROOT to the extracted game's root");
+        let mut archives = sms_formats::discover_scene_archives(&base_root)
+            .expect("discover extracted retail stages");
+        archives.retain(|archive| archive.stage_id != "test11");
+        assert_eq!(archives.len(), 107, "stock retail stage census");
+        let registry = sms_schema::bundled_object_registry()
+            .expect("load bundled decomp-derived object registry")
+            .registry;
+        let build = sms_scene::ObjectAuthoringCatalog::build_with_base_root(
+            &archives, &registry, &base_root,
+        );
+        let targets = ["HamuKuri", "PoiHana", "MameGesso"];
+        let document = StageDocument::open(&base_root, "dolpic0")
+            .expect("open retail dolpic0")
+            .with_registry(registry.clone());
+        assert!(document
+            .objects
+            .iter()
+            .all(|object| !targets.contains(&object.factory_name.as_str())));
+        let app = SmsEditorApp {
+            registry: Some(registry),
+            document: Some(document),
+            object_authoring_catalog: Arc::new(build.catalog),
+            ..SmsEditorApp::default()
+        };
+
+        for factory_name in targets {
+            let template = app
+                .object_authoring_catalog
+                .find(factory_name)
+                .unwrap_or_else(|| panic!("retail catalog contains {factory_name}"));
+            assert_eq!(
+                template
+                    .preview_resource_path
+                    .as_deref()
+                    .map(|path| String::from_utf8_lossy(path).to_ascii_lowercase()),
+                Some(format!("{}/default.bmd", factory_name.to_ascii_lowercase()))
+            );
+            let geometry = app
+                .build_object_drag_preview_geometry(factory_name)
+                .unwrap_or_else(|error| panic!("build {factory_name} drag preview: {error}"));
+            assert!(
+                !geometry.triangles.is_empty(),
+                "{factory_name} drag preview geometry"
+            );
+        }
+    }
+
+    #[test]
     fn cloned_character_cleanup_is_exact_not_layer_suffix_wide() {
         let character = |name: &str| {
             JDramaRecord::new(
