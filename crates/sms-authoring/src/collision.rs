@@ -8,7 +8,11 @@ use crate::{
     AuthoringError, AuthoringResult, CollisionDocument, CollisionGroup, Diagnostic, DiagnosticCode,
 };
 
-const MAX_RUNTIME_VERTEX_COUNT: usize = i16::MAX as usize + 1;
+pub const SUNSHINE_COL_MAX_VERTICES: usize = i16::MAX as usize + 1;
+/// Conservative world-COL triangle budget derived from Sunshine's retail
+/// stages. The largest NTSC-U map COL is 12,013 triangles; keeping authored
+/// terrain at 12,000 also leaves room for the blank-stage safety shell.
+pub const SUNSHINE_COL_RUNTIME_TRIANGLE_BUDGET: usize = 12_000;
 const MAX_GROUP_TRIANGLES: usize = i16::MAX as usize;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +36,19 @@ pub struct CollisionImportResult {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct CollisionSimplificationReport {
+    pub input_triangles: usize,
+    pub target_triangles: usize,
+    pub output_triangles: usize,
+    pub collapsed_edges: usize,
+    pub maximum_applied_error: f32,
+    pub stopped_at_error_limit: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct CollisionVertexLimitReport {
+    pub input_vertices: usize,
+    pub target_vertices: usize,
+    pub output_vertices: usize,
     pub input_triangles: usize,
     pub target_triangles: usize,
     pub output_triangles: usize,
@@ -153,9 +170,9 @@ impl CollisionDocument {
 
     pub fn to_col_file(&self) -> AuthoringResult<ColFile> {
         self.validate()?;
-        if self.vertices.len() > MAX_RUNTIME_VERTEX_COUNT {
+        if self.vertices.len() > SUNSHINE_COL_MAX_VERTICES {
             return Err(AuthoringError::Collision(format!(
-                "{} vertices exceed the retail signed-index limit of {MAX_RUNTIME_VERTEX_COUNT}",
+                "{} vertices exceed the retail signed-index limit of {SUNSHINE_COL_MAX_VERTICES}",
                 self.vertices.len()
             )));
         }
@@ -209,8 +226,8 @@ impl CollisionDocument {
     }
 
     /// Reduces triangle count with deterministic quadric-error edge collapses.
-    /// Edges whose vertices participate in different surface groups are never
-    /// collapsed, preserving authored surface boundaries.
+    /// Edges whose vertices participate in different Sunshine surface states
+    /// are never collapsed, preserving authored runtime surface boundaries.
     pub fn simplify(
         &mut self,
         options: &crate::CollisionSimplificationOptions,
@@ -241,8 +258,8 @@ impl CollisionDocument {
         };
         while triangle_count(self) > target_triangles {
             let quadrics = build_vertex_quadrics(self);
-            let incident_groups = vertex_incident_groups(self);
-            let mut candidates = build_edge_candidates(self, &quadrics, &incident_groups);
+            let incident_surfaces = vertex_incident_surfaces(self);
+            let mut candidates = build_edge_candidates(self, &quadrics, &incident_surfaces);
             candidates.sort_by(|left, right| {
                 left.error
                     .total_cmp(&right.error)
@@ -264,6 +281,108 @@ impl CollisionDocument {
         }
         self.cleanup_exact()?;
         report.output_triangles = triangle_count(self);
+        Ok(report)
+    }
+
+    /// Fits collision to Sunshine's signed vertex-index range with
+    /// deterministic, surface-boundary-preserving QEM edge collapses.
+    pub fn fit_vertex_limit(
+        &mut self,
+        target_vertices: usize,
+        max_error: f32,
+    ) -> AuthoringResult<CollisionVertexLimitReport> {
+        let target_triangles = triangle_count(self);
+        self.fit_runtime_limits(target_vertices, target_triangles, max_error)
+    }
+
+    /// Fits collision to both Sunshine's signed vertex-index range and a
+    /// retail-scale triangle budget with deterministic, batched QEM edge
+    /// collapses. Surface boundaries and triangle winding remain protected.
+    pub fn fit_runtime_limits(
+        &mut self,
+        target_vertices: usize,
+        target_triangles: usize,
+        max_error: f32,
+    ) -> AuthoringResult<CollisionVertexLimitReport> {
+        if target_vertices < 3 {
+            return Err(AuthoringError::Collision(
+                "collision vertex target must be at least 3".to_string(),
+            ));
+        }
+        if target_triangles == 0 {
+            return Err(AuthoringError::Collision(
+                "collision triangle target must be at least 1".to_string(),
+            ));
+        }
+        if !max_error.is_finite() || max_error < 0.0 {
+            return Err(AuthoringError::Collision(
+                "collision runtime-fit max_error must be finite and non-negative".to_string(),
+            ));
+        }
+        self.cleanup_exact()?;
+        let mut report = CollisionVertexLimitReport {
+            input_vertices: self.vertices.len(),
+            target_vertices,
+            output_vertices: self.vertices.len(),
+            input_triangles: triangle_count(self),
+            target_triangles,
+            output_triangles: triangle_count(self),
+            ..CollisionVertexLimitReport::default()
+        };
+
+        while self.vertices.len() > target_vertices || triangle_count(self) > target_triangles {
+            let vertex_excess = self.vertices.len().saturating_sub(target_vertices);
+            let triangle_excess = triangle_count(self).saturating_sub(target_triangles);
+            // An interior edge normally removes two triangles while a boundary
+            // edge removes one. Re-evaluate after each disjoint batch so the
+            // deterministic fitter cannot overshoot the requested budget by a
+            // large amount.
+            let collapse_budget = vertex_excess.max(triangle_excess.div_ceil(2)).max(1);
+            let quadrics = build_vertex_quadrics(self);
+            let incident_surfaces = vertex_incident_surfaces(self);
+            let mut candidates = build_edge_candidates(self, &quadrics, &incident_surfaces);
+            candidates.sort_by(|left, right| {
+                left.error
+                    .total_cmp(&right.error)
+                    .then_with(|| left.edge.cmp(&right.edge))
+            });
+            let adjacency = build_vertex_triangle_adjacency(self);
+            let mut touched = vec![false; self.vertices.len()];
+            let mut collapsed_in_batch = 0;
+            for candidate in candidates {
+                if collapsed_in_batch == collapse_budget {
+                    break;
+                }
+                if candidate.error > max_error {
+                    report.stopped_at_error_limit = true;
+                    break;
+                }
+                let [first, second] = candidate.edge.map(|index| index as usize);
+                if touched[first]
+                    || touched[second]
+                    || !collapse_preserves_winding_at_adjacency(self, &candidate, &adjacency)
+                {
+                    continue;
+                }
+                collapse_edge_at_adjacency(self, candidate, &adjacency);
+                touched[first] = true;
+                touched[second] = true;
+                collapsed_in_batch += 1;
+                report.collapsed_edges += 1;
+                report.maximum_applied_error = report.maximum_applied_error.max(candidate.error);
+            }
+            if collapsed_in_batch == 0 {
+                break;
+            }
+            self.cleanup_exact()?;
+        }
+
+        report.output_vertices = self.vertices.len();
+        report.output_triangles = triangle_count(self);
+        if report.output_vertices <= target_vertices && report.output_triangles <= target_triangles
+        {
+            report.stopped_at_error_limit = false;
+        }
         Ok(report)
     }
 }
@@ -381,22 +500,30 @@ fn build_vertex_quadrics(document: &CollisionDocument) -> Vec<Quadric> {
     quadrics
 }
 
-fn vertex_incident_groups(document: &CollisionDocument) -> Vec<BTreeSet<usize>> {
-    let mut groups = vec![BTreeSet::new(); document.vertices.len()];
-    for (group_index, group) in document.groups.iter().enumerate() {
+type CollisionSurfaceKey = (u16, u8, u8, Option<i16>);
+
+fn vertex_incident_surfaces(document: &CollisionDocument) -> Vec<BTreeSet<CollisionSurfaceKey>> {
+    let mut surfaces = vec![BTreeSet::new(); document.vertices.len()];
+    for group in &document.groups {
+        let surface = (
+            group.surface.surface_type,
+            group.surface.attribute_0,
+            group.surface.attribute_1,
+            group.surface.data,
+        );
         for triangle in &group.triangles {
             for &vertex in triangle {
-                groups[vertex as usize].insert(group_index);
+                surfaces[vertex as usize].insert(surface);
             }
         }
     }
-    groups
+    surfaces
 }
 
 fn build_edge_candidates(
     document: &CollisionDocument,
     quadrics: &[Quadric],
-    incident_groups: &[BTreeSet<usize>],
+    incident_surfaces: &[BTreeSet<CollisionSurfaceKey>],
 ) -> Vec<EdgeCandidate> {
     let mut edges = BTreeSet::new();
     for group in &document.groups {
@@ -411,8 +538,8 @@ fn build_edge_candidates(
                 } else {
                     [pair[1], pair[0]]
                 };
-                if incident_groups[edge[0] as usize] == incident_groups[edge[1] as usize]
-                    && incident_groups[edge[0] as usize].len() == 1
+                if incident_surfaces[edge[0] as usize] == incident_surfaces[edge[1] as usize]
+                    && incident_surfaces[edge[0] as usize].len() == 1
                 {
                     edges.insert(edge);
                 }
@@ -464,6 +591,70 @@ fn collapse_preserves_winding(document: &CollisionDocument, candidate: &EdgeCand
         }
     }
     true
+}
+
+fn build_vertex_triangle_adjacency(document: &CollisionDocument) -> Vec<Vec<(usize, usize)>> {
+    let mut adjacency = vec![Vec::new(); document.vertices.len()];
+    for (group_index, group) in document.groups.iter().enumerate() {
+        for (triangle_index, triangle) in group.triangles.iter().enumerate() {
+            for &vertex in triangle {
+                adjacency[vertex as usize].push((group_index, triangle_index));
+            }
+        }
+    }
+    adjacency
+}
+
+fn collapse_preserves_winding_at_adjacency(
+    document: &CollisionDocument,
+    candidate: &EdgeCandidate,
+    adjacency: &[Vec<(usize, usize)>],
+) -> bool {
+    let mut triangles = BTreeSet::new();
+    for vertex in candidate.edge {
+        triangles.extend(adjacency[vertex as usize].iter().copied());
+    }
+    for (group_index, triangle_index) in triangles {
+        let triangle = document.groups[group_index].triangles[triangle_index];
+        if !triangle.contains(&candidate.edge[0]) && !triangle.contains(&candidate.edge[1]) {
+            continue;
+        }
+        if triangle.contains(&candidate.edge[0]) && triangle.contains(&candidate.edge[1]) {
+            continue;
+        }
+        let old = triangle.map(|index| document.vertices[index as usize]);
+        let new = triangle.map(|index| {
+            if candidate.edge.contains(&index) {
+                candidate.position
+            } else {
+                document.vertices[index as usize]
+            }
+        });
+        let old_normal = cross(sub(old[1], old[0]), sub(old[2], old[0]));
+        let new_normal = cross(sub(new[1], new[0]), sub(new[2], new[0]));
+        let dot = old_normal[0] * new_normal[0]
+            + old_normal[1] * new_normal[1]
+            + old_normal[2] * new_normal[2];
+        if dot <= 0.0 || !dot.is_finite() {
+            return false;
+        }
+    }
+    true
+}
+
+fn collapse_edge_at_adjacency(
+    document: &mut CollisionDocument,
+    candidate: EdgeCandidate,
+    adjacency: &[Vec<(usize, usize)>],
+) {
+    document.vertices[candidate.edge[0] as usize] = candidate.position;
+    for &(group_index, triangle_index) in &adjacency[candidate.edge[1] as usize] {
+        for index in &mut document.groups[group_index].triangles[triangle_index] {
+            if *index == candidate.edge[1] {
+                *index = candidate.edge[0];
+            }
+        }
+    }
 }
 
 fn collapse_edge(document: &mut CollisionDocument, candidate: EdgeCandidate) {

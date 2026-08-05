@@ -389,7 +389,7 @@ fn validate_runtime_model_budget(
         return Ok(());
     }
     Err(format!(
-        "{subject} compiles to a {total_size}-byte BMD3 with a {tex1_size}-byte TEX1, exceeding the Graffito-Editor {target} runtime safety budget ({} bytes total / {} bytes TEX1) for Sunshine's 24 MiB MEM1. Prune unused textures or downsize them before building the stage",
+        "{subject} compiles to a {total_size}-byte BMD3 with a {tex1_size}-byte TEX1, exceeding the Graffito-Editor {target} runtime safety budget ({} bytes total / {} bytes TEX1) for Sunshine's 24 MiB MEM1. Select the model asset, open Textures, apply the Sunshine Runtime Preset, save the asset, and retry; downsize textures only if the preset still exceeds the budget",
         RUNTIME_BMD_SAFETY_BUDGET,
         RUNTIME_TEX1_SAFETY_BUDGET,
     ))
@@ -1224,6 +1224,75 @@ impl SmsEditorApp {
             }
         });
         self.sync_texture_json_draft();
+    }
+
+    pub(super) fn apply_sunshine_runtime_texture_preset(&mut self) {
+        let mut report = sms_authoring::SunshineRuntimeTexturePresetReport::default();
+        self.mutate_model_asset("Applied Sunshine runtime texture preset", |document| {
+            report = document.apply_sunshine_runtime_texture_preset();
+        });
+        self.sync_texture_json_draft();
+        if report.changed_texture_count == 0 {
+            self.log
+                .push("Sunshine runtime texture preset was already applied.".to_string());
+        } else {
+            self.log.push(format!(
+                "Applied Sunshine runtime texture preset to {} textures ({} CMPR, {} RGB5A3). Save the model asset before building the stage.",
+                report.changed_texture_count,
+                report.cmpr_texture_count,
+                report.rgb5a3_texture_count,
+            ));
+        }
+    }
+
+    pub(super) fn fit_selected_model_collision_for_sunshine(&mut self) {
+        let Some(mut collision) = self
+            .selected_model_document
+            .as_ref()
+            .and_then(|document| document.collision.clone())
+        else {
+            return;
+        };
+        let max_error = self.model_collision_fit_max_error;
+        let report = match collision.fit_runtime_limits(
+            sms_authoring::SUNSHINE_COL_MAX_VERTICES,
+            sms_authoring::SUNSHINE_COL_RUNTIME_TRIANGLE_BUDGET,
+            max_error,
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                self.model_editor_error = Some(format!("Collision fit failed: {error}"));
+                return;
+            }
+        };
+        if report.output_vertices > sms_authoring::SUNSHINE_COL_MAX_VERTICES
+            || report.output_triangles > sms_authoring::SUNSHINE_COL_RUNTIME_TRIANGLE_BUDGET
+        {
+            self.model_editor_error = Some(format!(
+                "Collision fit stopped at {} vertices / {} triangles with maximum QEM error {max_error}; Sunshine supports at most {} vertices and this editor's retail-scale world-COL budget is {} triangles. Increase the error limit or simplify the collision source.",
+                report.output_vertices,
+                report.output_triangles,
+                sms_authoring::SUNSHINE_COL_MAX_VERTICES,
+                sms_authoring::SUNSHINE_COL_RUNTIME_TRIANGLE_BUDGET,
+            ));
+            return;
+        }
+        self.mutate_model_asset(
+            "Fit collision to Sunshine runtime limits",
+            move |document| {
+                document.collision = Some(collision);
+            },
+        );
+        self.model_editor_error = None;
+        self.log.push(format!(
+            "Fit collision from {} to {} vertices and {} to {} triangles ({} edge collapses; maximum QEM error {:.6}). Save the model asset before building the stage.",
+            report.input_vertices,
+            report.output_vertices,
+            report.input_triangles,
+            report.output_triangles,
+            report.collapsed_edges,
+            report.maximum_applied_error,
+        ));
     }
 
     pub(super) fn apply_gx_json_draft(&mut self) {
@@ -2585,8 +2654,23 @@ impl SmsEditorApp {
                 .as_ref()
                 .map(|collision| collision.to_col_file())
                 .transpose()
-                .map_err(|error| format!("could not compile placed world COL: {error}"))?;
+                .map_err(|error| {
+                    format!(
+                        "could not compile placed world COL: {error}. Select the model asset, open Collision, run Fit Sunshine Runtime COL, save the asset, and retry"
+                    )
+                })?;
             if let Some(collision) = collision {
+                let triangle_count = collision
+                    .groups()
+                    .iter()
+                    .map(|group| group.triangles.len())
+                    .sum::<usize>();
+                if triangle_count > sms_authoring::SUNSHINE_COL_RUNTIME_TRIANGLE_BUDGET {
+                    return Err(format!(
+                        "placed world COL has {triangle_count} triangles, exceeding Graffito's retail-scale Sunshine runtime budget of {}. Select the model asset, open Collision, run Fit Sunshine Runtime COL, save the asset, and retry",
+                        sms_authoring::SUNSHINE_COL_RUNTIME_TRIANGLE_BUDGET,
+                    ));
+                }
                 edits.append_collision(b"map/map.col".to_vec(), collision);
             }
         }
@@ -3260,6 +3344,16 @@ impl SmsEditorApp {
             ui.label("This asset has no textures.");
             return;
         }
+        ui.horizontal(|ui| {
+            if ui.button("Apply Sunshine Runtime Preset").clicked() {
+                self.apply_sunshine_runtime_texture_preset();
+            }
+            ui.label("All textures");
+        });
+        ui.small(
+            "Uses CMPR for opaque or binary-alpha images and RGB5A3 for graduated alpha. Source RGBA8 pixels, dimensions, mipmaps, and sampler settings are preserved; the edit is undoable.",
+        );
+        ui.separator();
         self.selected_model_texture = self
             .selected_model_texture
             .min(textures.len().saturating_sub(1));
@@ -3341,6 +3435,38 @@ impl SmsEditorApp {
                 .map(|group| group.triangles.len())
                 .sum::<usize>()
         ));
+        let triangle_count = collision
+            .groups
+            .iter()
+            .map(|group| group.triangles.len())
+            .sum::<usize>();
+        if collision.vertices.len() > sms_authoring::SUNSHINE_COL_MAX_VERTICES
+            || triangle_count > sms_authoring::SUNSHINE_COL_RUNTIME_TRIANGLE_BUDGET
+        {
+            ui.colored_label(
+                egui::Color32::from_rgb(245, 190, 90),
+                format!(
+                    "Sunshine COL supports at most {} vertices, and retail NTSC-U world collision tops out near {} triangles; this collision must be fitted before stage build.",
+                    sms_authoring::SUNSHINE_COL_MAX_VERTICES,
+                    sms_authoring::SUNSHINE_COL_RUNTIME_TRIANGLE_BUDGET,
+                ),
+            );
+            ui.horizontal(|ui| {
+                ui.label("Maximum QEM error");
+                ui.add(
+                    egui::DragValue::new(&mut self.model_collision_fit_max_error)
+                        .range(0.0..=f32::MAX)
+                        .speed(0.1),
+                );
+                if ui.button("Fit Sunshine Runtime COL").clicked() {
+                    self.fit_selected_model_collision_for_sunshine();
+                }
+            });
+            ui.small(
+                "Deterministically fits both the signed vertex-index limit and a retail-scale triangle budget without crossing surface-group boundaries or flipping triangle winding. Render geometry is unchanged; the collision edit is undoable.",
+            );
+            ui.separator();
+        }
         for (index, group) in collision.groups.iter().enumerate() {
             let mut name = group.name.clone();
             let mut surface = group.surface.clone();
@@ -5440,6 +5566,50 @@ mod tests {
         assert_eq!(edits.models[0].raw_resource_path, b"map/map/map.bmd");
         assert_eq!(edits.collisions.len(), 1);
         assert_eq!(edits.collisions[0].raw_resource_path, b"map/map.col");
+    }
+
+    #[test]
+    fn world_collision_over_retail_runtime_budget_is_rejected_before_launch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let content = temporary.path().join("Content");
+        let catalog = ModelAssetCatalog::open_content_root(&content).unwrap();
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../crates/sms-authoring/tests/fixtures/gltf/valid/minimal-external/model.gltf",
+        );
+        let mut imported =
+            sms_authoring::import_model(source, &sms_authoring::ModelImportOptions::default())
+                .unwrap()
+                .asset;
+        let collision = imported.collision.as_mut().unwrap();
+        let triangle_count = sms_authoring::SUNSHINE_COL_RUNTIME_TRIANGLE_BUDGET + 1;
+        collision.vertices = std::iter::once([0.0, 0.0, 0.0])
+            .chain((0..=triangle_count).map(|index| {
+                let angle = index as f32 / triangle_count as f32 * std::f32::consts::TAU;
+                [angle.cos() * 1_000.0, 0.0, angle.sin() * 1_000.0]
+            }))
+            .collect();
+        collision.groups[0].triangles = (0..triangle_count)
+            .map(|index| [0, index as u32 + 2, index as u32 + 1])
+            .collect();
+        let entry = catalog
+            .create_asset("Geometry/oversized-collision.smsmodel", &imported)
+            .unwrap();
+        let mut placement = ModelInstancePlacement::new(entry.id, "Oversized collision");
+        placement.export_mode = ModelInstanceExportMode::MapTerrain;
+        let instance = EditorModelInstance {
+            stage_id: "test11".to_string(),
+            placement,
+            local_bounds: model_document_bounds(&imported).unwrap(),
+        };
+
+        let error = SmsEditorApp::stage_edits_with_model_instances(
+            &content,
+            &[instance],
+            &sms_scene::StageArchiveEdits::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("12001 triangles"), "{error}");
+        assert!(error.contains("Fit Sunshine Runtime COL"), "{error}");
     }
 
     #[test]

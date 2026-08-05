@@ -104,6 +104,12 @@ enum Commands {
         /// Exact loader flags for `--loader-profile custom` (decimal or 0x-prefixed).
         #[arg(long, value_parser = parse_u32_auto)]
         loader_flags: Option<u32>,
+        /// Apply compact Sunshine-safe GX texture encodings to the compiled output only.
+        #[arg(long)]
+        sunshine_runtime_textures: bool,
+        /// Fit output collision to Sunshine's signed vertex-index limit using this maximum QEM error.
+        #[arg(long)]
+        sunshine_runtime_collision_max_error: Option<f32>,
     },
     /// Validate and optionally emit files for a decomp-verified stock resource slot.
     ValidateStockReplacement {
@@ -421,11 +427,15 @@ fn main() -> Result<()> {
             col_out,
             loader_profile,
             loader_flags,
+            sunshine_runtime_textures,
+            sunshine_runtime_collision_max_error,
         } => compile_model_asset_command(
             asset,
             bmd_out,
             col_out,
             loader_profile.resolve(loader_flags)?,
+            sunshine_runtime_textures,
+            sunshine_runtime_collision_max_error,
         ),
         Commands::ValidateStockReplacement {
             repo_root,
@@ -871,8 +881,38 @@ fn compile_model_asset_command(
     bmd_out: PathBuf,
     col_out: Option<PathBuf>,
     profile: TargetLoaderProfile,
+    sunshine_runtime_textures: bool,
+    sunshine_runtime_collision_max_error: Option<f32>,
 ) -> Result<()> {
-    let asset = load_model_asset(&asset_path)?;
+    let mut asset = load_model_asset(&asset_path)?;
+    let texture_preset =
+        sunshine_runtime_textures.then(|| asset.apply_sunshine_runtime_texture_preset());
+    let collision_fit = sunshine_runtime_collision_max_error
+        .map(|max_error| {
+            let collision = asset
+                .collision
+                .as_mut()
+                .context("model asset has no collision to fit")?;
+            let report = collision.fit_runtime_limits(
+                sms_authoring::SUNSHINE_COL_MAX_VERTICES,
+                sms_authoring::SUNSHINE_COL_RUNTIME_TRIANGLE_BUDGET,
+                max_error,
+            )?;
+            if report.output_vertices > sms_authoring::SUNSHINE_COL_MAX_VERTICES
+                || report.output_triangles
+                    > sms_authoring::SUNSHINE_COL_RUNTIME_TRIANGLE_BUDGET
+            {
+                bail!(
+                    "collision fit stopped at {} vertices / {} triangles with max error {max_error}; Sunshine supports at most {} vertices and the retail-scale runtime budget is {} triangles",
+                    report.output_vertices,
+                    report.output_triangles,
+                    sms_authoring::SUNSHINE_COL_MAX_VERTICES,
+                    sms_authoring::SUNSHINE_COL_RUNTIME_TRIANGLE_BUDGET,
+                );
+            }
+            Ok(report)
+        })
+        .transpose()?;
     let materials = asset
         .materials
         .iter()
@@ -898,6 +938,8 @@ fn compile_model_asset_command(
             "loader_profile": profile,
             "loader_flags": profile.flags(),
             "loader_diagnostics": loader_diagnostics,
+            "sunshine_runtime_texture_preset": texture_preset,
+            "sunshine_runtime_collision_fit": collision_fit,
             "bmd_size_bytes": bmd.len(),
             "col_size_bytes": col.as_ref().map(Vec::len),
             "source_free": true,
@@ -1466,7 +1508,7 @@ fn validate_cli_runtime_model_budget(
         .map_or(0, |section| u64::from(section.declared_size));
     if total_size > RUNTIME_BMD_SAFETY_BUDGET || tex1_size > RUNTIME_TEX1_SAFETY_BUDGET {
         bail!(
-            "{subject} compiles to a {total_size}-byte BMD3 with a {tex1_size}-byte TEX1, exceeding the {target} runtime safety budget ({} bytes total / {} bytes TEX1) for Sunshine's 24 MiB MEM1; prune unused textures or downsize them before building the stage",
+            "{subject} compiles to a {total_size}-byte BMD3 with a {tex1_size}-byte TEX1, exceeding the {target} runtime safety budget ({} bytes total / {} bytes TEX1) for Sunshine's 24 MiB MEM1; compile with --sunshine-runtime-textures or apply the editor's Sunshine Runtime Preset, then downsize textures only if the preset still exceeds the budget",
             RUNTIME_BMD_SAFETY_BUDGET,
             RUNTIME_TEX1_SAFETY_BUDGET,
         );
@@ -2526,6 +2568,8 @@ mod tests {
             second_bmd.clone(),
             Some(second_col.clone()),
             TargetLoaderProfile::SunshineMap,
+            false,
+            None,
         )
         .unwrap();
         assert_eq!(

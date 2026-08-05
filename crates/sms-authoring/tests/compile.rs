@@ -1,7 +1,7 @@
 use sms_authoring::{
-    decode_canonical_bmd3, GxMaterial, GxTextureBinding, ImportedAlphaMode, ModelAssetDocument,
-    ModelMaterial, ModelMesh, ModelNode, ModelPrimitive, ModelTexture, NodePurpose,
-    SourcePbrMetadata, TexCoordSet,
+    decode_canonical_bmd3, GxMaterial, GxTextureBinding, GxTextureEncoding, GxTextureFormat,
+    ImportedAlphaMode, ModelAssetDocument, ModelMaterial, ModelMesh, ModelNode, ModelPrimitive,
+    ModelTexture, NodePurpose, SourcePbrMetadata, TexCoordSet,
 };
 use sms_formats::{J3dMaterialTableKind, J3dRebuildSectionData, J3dScalarArray};
 
@@ -90,6 +90,70 @@ fn four_texture_asset() -> ModelAssetDocument {
     }];
     asset.textures = (0..4).map(texture).collect();
     asset
+}
+
+#[test]
+fn sunshine_runtime_texture_preset_is_alpha_aware_and_preserves_sources() {
+    let mut asset = four_texture_asset();
+    asset.textures[1].rgba8[3] = 0;
+    asset.textures[2].rgba8[3] = 127;
+    let source_pixels = asset
+        .textures
+        .iter()
+        .map(|texture| texture.rgba8.clone())
+        .collect::<Vec<_>>();
+    let source_dimensions = asset
+        .textures
+        .iter()
+        .map(|texture| (texture.width, texture.height))
+        .collect::<Vec<_>>();
+    let source_mip_counts = asset
+        .textures
+        .iter()
+        .map(|texture| texture.encode_options.mip_count)
+        .collect::<Vec<_>>();
+
+    let report = asset.apply_sunshine_runtime_texture_preset();
+
+    assert_eq!(report.changed_texture_count, 4);
+    assert_eq!(report.cmpr_texture_count, 3);
+    assert_eq!(report.rgb5a3_texture_count, 1);
+    assert_eq!(
+        asset.textures[0].encode_options.encoding,
+        GxTextureEncoding::Exact(GxTextureFormat::Cmpr)
+    );
+    assert_eq!(
+        asset.textures[1].encode_options.encoding,
+        GxTextureEncoding::Exact(GxTextureFormat::Cmpr)
+    );
+    assert_eq!(
+        asset.textures[2].encode_options.encoding,
+        GxTextureEncoding::Exact(GxTextureFormat::Rgb5A3)
+    );
+    assert_eq!(
+        asset
+            .textures
+            .iter()
+            .map(|texture| texture.rgba8.clone())
+            .collect::<Vec<_>>(),
+        source_pixels
+    );
+    assert_eq!(
+        asset
+            .textures
+            .iter()
+            .map(|texture| (texture.width, texture.height))
+            .collect::<Vec<_>>(),
+        source_dimensions
+    );
+    assert_eq!(
+        asset
+            .textures
+            .iter()
+            .map(|texture| texture.encode_options.mip_count)
+            .collect::<Vec<_>>(),
+        source_mip_counts
+    );
 }
 
 #[test]

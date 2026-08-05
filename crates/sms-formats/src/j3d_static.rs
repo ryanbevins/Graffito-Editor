@@ -1,5 +1,7 @@
 //! Canonical eight-section BMD3 construction for rigid static meshes.
 
+use std::collections::{hash_map::Entry, HashMap};
+
 use encoding_rs::SHIFT_JIS;
 use serde::{Deserialize, Serialize};
 
@@ -71,21 +73,20 @@ pub fn compile_static_bmd3(model: &StaticModel) -> Result<J3dRebuildDocument> {
         .map(|mesh| model.materials[mesh.material_index as usize].clone())
         .collect::<Vec<_>>();
     let attributes = used_attributes(model);
-    let mut global_vertices = Vec::new();
-    let mut mesh_ranges = Vec::with_capacity(model.meshes.len());
-    for mesh in &model.meshes {
-        let start = global_vertices.len();
-        global_vertices.extend_from_slice(&mesh.vertices);
-        mesh_ranges.push(start);
-    }
-    let bounds = bounds(global_vertices.iter().map(|vertex| vertex.position))?;
+    let indexed_vertices = index_vertices(model, &attributes)?;
+    let bounds = bounds(
+        model
+            .meshes
+            .iter()
+            .flat_map(|mesh| mesh.vertices.iter().map(|vertex| vertex.position)),
+    )?;
 
     let information = information_section(model)?;
-    let vertices = vertex_section(&global_vertices, &attributes);
+    let vertices = vertex_section(&indexed_vertices, &attributes);
     let envelopes = empty_envelope_section();
     let draw_matrices = rigid_draw_matrix_section();
     let joints = joint_section(&model.root_joint_name, bounds)?;
-    let shapes = shape_section(model, &mesh_ranges, &attributes)?;
+    let shapes = shape_section(model, &indexed_vertices.mesh_indices, &attributes)?;
     let materials = compile_material_section(&runtime_materials)?;
     let textures = compile_texture_section(&model.textures)?;
 
@@ -161,6 +162,40 @@ struct UsedAttributes {
     tex_coords: [bool; 8],
 }
 
+#[derive(Debug, Clone, Copy)]
+struct StaticVertexIndices {
+    position: u16,
+    normal: u16,
+    normal_binormal_tangent: Option<u16>,
+    colors: [Option<u16>; 2],
+    tex_coords: [Option<u16>; 8],
+}
+
+#[derive(Debug)]
+struct IndexedVertices {
+    positions: Vec<[u32; 3]>,
+    normals: Vec<[u32; 3]>,
+    normal_binormal_tangents: Vec<[u32; 9]>,
+    colors: [Vec<[u8; 4]>; 2],
+    tex_coords: [Vec<[u32; 2]>; 8],
+    mesh_indices: Vec<Vec<StaticVertexIndices>>,
+}
+
+const COLOR_LIMIT_NAMES: [&str; 2] = [
+    "unique color 0 values addressable by GX index16",
+    "unique color 1 values addressable by GX index16",
+];
+const TEX_COORD_LIMIT_NAMES: [&str; 8] = [
+    "unique texture coordinate 0 values addressable by GX index16",
+    "unique texture coordinate 1 values addressable by GX index16",
+    "unique texture coordinate 2 values addressable by GX index16",
+    "unique texture coordinate 3 values addressable by GX index16",
+    "unique texture coordinate 4 values addressable by GX index16",
+    "unique texture coordinate 5 values addressable by GX index16",
+    "unique texture coordinate 6 values addressable by GX index16",
+    "unique texture coordinate 7 values addressable by GX index16",
+];
+
 fn used_attributes(model: &StaticModel) -> UsedAttributes {
     let mut used = UsedAttributes {
         normal_binormal_tangent: false,
@@ -179,6 +214,126 @@ fn used_attributes(model: &StaticModel) -> UsedAttributes {
     used
 }
 
+fn index_vertices(model: &StaticModel, attributes: &UsedAttributes) -> Result<IndexedVertices> {
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut normal_binormal_tangents = Vec::new();
+    let mut colors: [Vec<[u8; 4]>; 2] = std::array::from_fn(|_| Vec::new());
+    let mut tex_coords: [Vec<[u32; 2]>; 8] = std::array::from_fn(|_| Vec::new());
+    let mut position_map = HashMap::new();
+    let mut normal_map = HashMap::new();
+    let mut normal_binormal_tangent_map = HashMap::new();
+    let mut color_maps: [HashMap<[u8; 4], u16>; 2] = std::array::from_fn(|_| HashMap::new());
+    let mut tex_coord_maps: [HashMap<[u32; 2], u16>; 8] = std::array::from_fn(|_| HashMap::new());
+    let mut mesh_indices = Vec::with_capacity(model.meshes.len());
+
+    for mesh in &model.meshes {
+        let mut indices = Vec::with_capacity(mesh.vertices.len());
+        for vertex in &mesh.vertices {
+            let position = intern_attribute(
+                &mut position_map,
+                &mut positions,
+                vertex.position.map(f32::to_bits),
+                "unique positions addressable by GX index16",
+                u16::MAX as usize,
+            )?;
+            let normal = intern_attribute(
+                &mut normal_map,
+                &mut normals,
+                vertex.normal.map(f32::to_bits),
+                "unique normals addressable by GX index16",
+                u16::MAX as usize + 1,
+            )?;
+            let normal_binormal_tangent = attributes
+                .normal_binormal_tangent
+                .then(|| {
+                    let values = vertex
+                        .normal_binormal_tangent
+                        .unwrap_or_else(|| fallback_nbt(vertex.normal));
+                    let mut bits = [0; 9];
+                    for (output, value) in bits.iter_mut().zip(values.into_iter().flatten()) {
+                        *output = value.to_bits();
+                    }
+                    intern_attribute(
+                        &mut normal_binormal_tangent_map,
+                        &mut normal_binormal_tangents,
+                        bits,
+                        "unique NBT values addressable by GX index16",
+                        u16::MAX as usize + 1,
+                    )
+                })
+                .transpose()?;
+            let mut color_indices = [None; 2];
+            for slot in 0..2 {
+                if attributes.colors[slot] {
+                    color_indices[slot] = Some(intern_attribute(
+                        &mut color_maps[slot],
+                        &mut colors[slot],
+                        vertex.colors[slot].unwrap_or([255; 4]),
+                        COLOR_LIMIT_NAMES[slot],
+                        u16::MAX as usize + 1,
+                    )?);
+                }
+            }
+            let mut tex_coord_indices = [None; 8];
+            for slot in 0..8 {
+                if attributes.tex_coords[slot] {
+                    tex_coord_indices[slot] = Some(intern_attribute(
+                        &mut tex_coord_maps[slot],
+                        &mut tex_coords[slot],
+                        vertex.tex_coords[slot]
+                            .unwrap_or([0.0; 2])
+                            .map(f32::to_bits),
+                        TEX_COORD_LIMIT_NAMES[slot],
+                        u16::MAX as usize + 1,
+                    )?);
+                }
+            }
+            indices.push(StaticVertexIndices {
+                position,
+                normal,
+                normal_binormal_tangent,
+                colors: color_indices,
+                tex_coords: tex_coord_indices,
+            });
+        }
+        mesh_indices.push(indices);
+    }
+
+    Ok(IndexedVertices {
+        positions,
+        normals,
+        normal_binormal_tangents,
+        colors,
+        tex_coords,
+        mesh_indices,
+    })
+}
+
+fn intern_attribute<T>(
+    indices: &mut HashMap<T, u16>,
+    values: &mut Vec<T>,
+    value: T,
+    resource: &'static str,
+    capacity: usize,
+) -> Result<u16>
+where
+    T: Copy + Eq + std::hash::Hash,
+{
+    match indices.entry(value) {
+        Entry::Occupied(entry) => Ok(*entry.get()),
+        Entry::Vacant(entry) => {
+            if values.len() == capacity {
+                return Err(limit(resource, capacity + 1, capacity));
+            }
+            let index = values.len() as u16;
+            values.push(value);
+            entry.insert(index);
+            Ok(index)
+        }
+    }
+}
+
 fn validate_static_model(model: &StaticModel) -> Result<()> {
     validate_name("root joint", &model.root_joint_name)?;
     if model.meshes.is_empty() {
@@ -189,18 +344,6 @@ fn validate_static_model(model: &StaticModel) -> Result<()> {
     }
     if model.materials.is_empty() {
         return Err(unsupported("static BMD3 needs at least one material"));
-    }
-    let total_vertices = model
-        .meshes
-        .iter()
-        .try_fold(0usize, |count, mesh| count.checked_add(mesh.vertices.len()))
-        .ok_or_else(|| limit("vertices", usize::MAX, u16::MAX as usize + 1))?;
-    if total_vertices > u16::MAX as usize + 1 {
-        return Err(limit(
-            "vertices addressable by GX index16",
-            total_vertices,
-            u16::MAX as usize + 1,
-        ));
     }
     for (mesh_index, mesh) in model.meshes.iter().enumerate() {
         validate_name("shape", &mesh.name)?;
@@ -339,30 +482,21 @@ fn information_section(model: &StaticModel) -> Result<J3dRebuildSection> {
     })
 }
 
-fn vertex_section(
-    vertices: &[StaticModelVertex],
-    attributes: &UsedAttributes,
-) -> J3dRebuildSection {
+fn vertex_section(vertices: &IndexedVertices, attributes: &UsedAttributes) -> J3dRebuildSection {
     let mut formats = vec![vertex_format(9, 1, 4), vertex_format(10, 0, 4)];
     let mut arrays = vec![
         J3dVertexArray {
             attribute: J3dVertexArrayAttribute::Position,
             offset: 0,
             values: J3dScalarArray::Float32Bits(
-                vertices
-                    .iter()
-                    .flat_map(|vertex| vertex.position.map(f32::to_bits))
-                    .collect(),
+                vertices.positions.iter().flatten().copied().collect(),
             ),
         },
         J3dVertexArray {
             attribute: J3dVertexArrayAttribute::Normal,
             offset: 0,
             values: J3dScalarArray::Float32Bits(
-                vertices
-                    .iter()
-                    .flat_map(|vertex| vertex.normal.map(f32::to_bits))
-                    .collect(),
+                vertices.normals.iter().flatten().copied().collect(),
             ),
         },
     ];
@@ -373,15 +507,10 @@ fn vertex_section(
             offset: 0,
             values: J3dScalarArray::Float32Bits(
                 vertices
+                    .normal_binormal_tangents
                     .iter()
-                    .flat_map(|vertex| {
-                        vertex
-                            .normal_binormal_tangent
-                            .unwrap_or_else(|| fallback_nbt(vertex.normal))
-                            .into_iter()
-                            .flatten()
-                            .map(f32::to_bits)
-                    })
+                    .flatten()
+                    .copied()
                     .collect(),
             ),
         });
@@ -397,10 +526,7 @@ fn vertex_section(
                 },
                 offset: 0,
                 values: J3dScalarArray::PackedColor(
-                    vertices
-                        .iter()
-                        .flat_map(|vertex| vertex.colors[slot].unwrap_or([255; 4]))
-                        .collect(),
+                    vertices.colors[slot].iter().flatten().copied().collect(),
                 ),
             });
         }
@@ -412,13 +538,10 @@ fn vertex_section(
                 attribute: J3dVertexArrayAttribute::TexCoord(slot as u8),
                 offset: 0,
                 values: J3dScalarArray::Float32Bits(
-                    vertices
+                    vertices.tex_coords[slot]
                         .iter()
-                        .flat_map(|vertex| {
-                            vertex.tex_coords[slot]
-                                .unwrap_or([0.0; 2])
-                                .map(f32::to_bits)
-                        })
+                        .flatten()
+                        .copied()
                         .collect(),
                 ),
             });
@@ -522,7 +645,7 @@ fn joint_section(name: &str, bounds: ([f32; 3], [f32; 3], f32)) -> Result<J3dReb
 
 fn shape_section(
     model: &StaticModel,
-    mesh_ranges: &[usize],
+    mesh_indices: &[Vec<StaticVertexIndices>],
     attributes: &UsedAttributes,
 ) -> Result<J3dRebuildSection> {
     let descriptors = descriptors(attributes);
@@ -561,19 +684,31 @@ fn shape_section(
             // final SHP1 operand order written for the runtime.
             .flat_map(|triangle| [triangle[0], triangle[2], triangle[1]])
             .map(|local_index| {
-                let global_index = mesh_ranges[index] + local_index as usize;
-                let mut operands = vec![J3dGxVertexOperand::Index16(global_index as u16); 2];
+                let indices = mesh_indices[index][local_index as usize];
+                let mut operands = vec![
+                    J3dGxVertexOperand::Index16(indices.position),
+                    J3dGxVertexOperand::Index16(indices.normal),
+                ];
                 if attributes.normal_binormal_tangent {
-                    operands.push(J3dGxVertexOperand::Index16(global_index as u16));
+                    operands.push(J3dGxVertexOperand::Index16(
+                        indices
+                            .normal_binormal_tangent
+                            .expect("used NBT attributes were indexed"),
+                    ));
                 }
-                for used in attributes.colors {
+                for (slot, used) in attributes.colors.into_iter().enumerate() {
                     if used {
-                        operands.push(J3dGxVertexOperand::Index16(global_index as u16));
+                        operands.push(J3dGxVertexOperand::Index16(
+                            indices.colors[slot].expect("used color attributes were indexed"),
+                        ));
                     }
                 }
-                for used in attributes.tex_coords {
+                for (slot, used) in attributes.tex_coords.into_iter().enumerate() {
                     if used {
-                        operands.push(J3dGxVertexOperand::Index16(global_index as u16));
+                        operands.push(J3dGxVertexOperand::Index16(
+                            indices.tex_coords[slot]
+                                .expect("used texture-coordinate attributes were indexed"),
+                        ));
                     }
                 }
                 operands
@@ -949,6 +1084,74 @@ mod tests {
         ];
         let emitted_face_normal = cross(emitted_edges[0], emitted_edges[1]);
         assert!(emitted_face_normal[1] < 0.0);
+    }
+
+    #[test]
+    fn gx_vertex_attributes_are_interned_independently() {
+        let mut model = triangle_model();
+        let mut seam_vertex = model.meshes[0].vertices[0];
+        seam_vertex.normal = [1.0, 0.0, 0.0];
+        seam_vertex.tex_coords[0] = Some([0.25, 0.75]);
+        model.meshes[0].vertices.push(seam_vertex);
+        model.meshes[0].triangles.push([3, 2, 1]);
+
+        let document = compile_static_bmd3(&model).unwrap();
+        let vertex_section = document
+            .sections
+            .iter()
+            .find_map(|section| match &section.data {
+                J3dRebuildSectionData::Vertices(vertices) => Some(vertices),
+                _ => None,
+            })
+            .expect("compiled BMD3 has VTX1");
+        let scalar_count = |attribute| match &vertex_section
+            .arrays
+            .iter()
+            .find(|array| array.attribute == attribute)
+            .expect("used attribute has a VTX1 array")
+            .values
+        {
+            J3dScalarArray::Float32Bits(values) => values.len(),
+            _ => panic!("tested geometric attribute uses float32 values"),
+        };
+        assert_eq!(scalar_count(J3dVertexArrayAttribute::Position), 3 * 3);
+        assert_eq!(scalar_count(J3dVertexArrayAttribute::Normal), 2 * 3);
+        assert_eq!(scalar_count(J3dVertexArrayAttribute::TexCoord(0)), 4 * 2);
+
+        let shapes = document
+            .sections
+            .iter()
+            .find_map(|section| match &section.data {
+                J3dRebuildSectionData::Shapes(shapes) => Some(shapes),
+                _ => None,
+            })
+            .expect("compiled BMD3 has SHP1");
+        let J3dGxCommand::Primitive { vertices, .. } = &shapes.draws[0].commands[0] else {
+            panic!("static BMD3 shape starts with a GX primitive");
+        };
+        assert_eq!(vertices[0][0], vertices[3][0]);
+        assert_ne!(vertices[0][1], vertices[3][1]);
+        assert_ne!(vertices[0][4], vertices[3][4]);
+    }
+
+    #[test]
+    fn more_than_index16_unified_vertices_compile_when_attribute_pools_fit() {
+        let mut model = triangle_model();
+        let source_vertices = model.meshes[0].vertices.clone();
+        model.meshes[0].vertices = (0..u16::MAX as usize + 2)
+            .map(|index| source_vertices[index % source_vertices.len()])
+            .collect();
+
+        let document = compile_static_bmd3(&model).unwrap();
+        let preview = J3dFile::parse(document.to_bytes().unwrap())
+            .unwrap()
+            .geometry_preview()
+            .unwrap();
+        assert_eq!(preview.triangles.len(), 1);
+        assert_eq!(
+            preview.triangles[0].vertices[0],
+            source_vertices[0].position
+        );
     }
 
     #[test]
