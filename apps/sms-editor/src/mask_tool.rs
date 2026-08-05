@@ -2358,7 +2358,8 @@ impl SmsEditorApp {
                 level,
                 posed.as_ref().map(|(animation, frame)| (animation, *frame)),
             ) {
-                Ok(count) => {
+                Ok((count, konst)) => {
+                    self.remember_wash_konst(konst);
                     let Some(document) = self.document.as_mut() else {
                         return;
                     };
@@ -2436,7 +2437,7 @@ impl SmsEditorApp {
         load_flags: u32,
         level: u8,
         posed: Option<(&sms_formats::J3dJointAnimation, f32)>,
-    ) -> Result<usize, String> {
+    ) -> Result<(usize, u8), String> {
         let preview = self
             .mask_preview
             .as_ref()
@@ -2523,6 +2524,7 @@ impl SmsEditorApp {
             .map_err(|error| format!("Could not store the goop coordinate: {error}"))?;
 
         let mut authored = 0usize;
+        let mut claimed_konst: Option<u8> = None;
         let mut failures = Vec::new();
         for material in &preview.geometry.materials {
             if material.tev_stages.is_empty() {
@@ -2536,7 +2538,12 @@ impl SmsEditorApp {
                 level,
             };
             match model.add_goop_layer(&request) {
-                Ok(_) => authored += 1,
+                Ok(report) => {
+                    // The wash has to write the register the layer reads, and
+                    // the bake takes whichever the material had spare.
+                    claimed_konst = Some(report.konst_register as u8);
+                    authored += 1;
+                }
                 Err(error) => failures.push(format!("{}: {error}", material.name)),
             }
         }
@@ -2549,7 +2556,7 @@ impl SmsEditorApp {
         model
             .to_bytes()
             .map_err(|error| format!("The authored model would not rebuild: {error}"))?;
-        Ok(authored)
+        Ok((authored, claimed_konst.unwrap_or(0)))
     }
 
     /// Replaces the actor's wash mask with a painted image, as a stage
@@ -2864,6 +2871,23 @@ impl SmsEditorApp {
         self.mask_bake_washable = project.descriptor.mask_bake_washable;
         self.mask_wash_resistance = project.descriptor.mask_wash_resistance.max(1);
         self.mask_wash_settings_project = Some(id);
+    }
+
+    /// Records which konst register a bake claimed.
+    ///
+    /// The wash has to write the register the layer reads. The bake takes
+    /// whichever the material had spare, so the answer moves between actors and
+    /// between bakes of the same actor, and guessing it wrong looks exactly
+    /// like a wash that never runs.
+    fn remember_wash_konst(&mut self, register: u8) {
+        let Some(project) = self.current_project.as_mut() else {
+            return;
+        };
+        if project.descriptor.mask_wash_konst == register {
+            return;
+        }
+        project.descriptor.mask_wash_konst = register;
+        self.persist_project_settings(false);
     }
 
     /// Keeps the project's copy in step once a control moves.

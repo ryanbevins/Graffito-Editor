@@ -270,6 +270,11 @@ pub(super) struct SmsProjectFile {
     pub(super) mask_bake_washable: bool,
     #[serde(default = "resistance_default")]
     pub(super) mask_wash_resistance: u32,
+    /// The konst register the last bake claimed. The wash has to write the
+    /// register the layer reads, and the bake takes whichever the material had
+    /// spare, so it is recorded rather than assumed.
+    #[serde(default)]
+    pub(super) mask_wash_konst: u8,
 }
 
 #[derive(Deserialize)]
@@ -351,6 +356,7 @@ impl LegacySmsProjectFileV1 {
             mask_wash_invert: false,
             mask_bake_washable: true,
             mask_wash_resistance: 4,
+            mask_wash_konst: 0,
         }
     }
 }
@@ -382,6 +388,7 @@ impl SmsProjectFile {
             mask_wash_invert: false,
             mask_bake_washable: true,
             mask_wash_resistance: 4,
+            mask_wash_konst: 0,
         }
     }
 

@@ -19,9 +19,12 @@ use sms_schema::ObjectRegistry;
 
 use crate::direct_boot::{
     patch_sms_dialogue_dol, patch_sms_direct_boot_dol, patch_sms_goop_enemy_managers_dol,
-    patch_sms_goop_layer_spawn_dol, patch_sms_sound_assignments_dol, patch_sms_stage_music_dol,
+    dol_supports_goop_wash, install_goop_wash, patch_sms_goop_layer_spawn_dol,
+    patch_sms_sound_assignments_dol,
+    patch_sms_stage_music_dol,
     RuntimeBalloonOverride, RuntimeDialogueOverride, RuntimeGoopLayerBinding,
-    RuntimeGoopManagerPatch, RuntimeMusicRoleOverride, RuntimeSoundAssignment,
+    GoopWashSettings, RuntimeGoopManagerPatch, RuntimeMusicRoleOverride,
+    RuntimeSoundAssignment,
     RuntimeSoundAssignmentKind, RuntimeStageMusicOverride, RuntimeStageMusicTransition,
     RuntimeStageTarget,
 };
@@ -1475,6 +1478,24 @@ fn install_managed_runtime_patches(
                 run.run_main_dol.display()
             )
         })?;
+    // Washing an authored goop layer off. The level and how stubborn it is come
+    // from the Mask Tool; the register comes from whichever one the bake claimed,
+    // since writing the wrong one leaves the coating sitting there looking like
+    // the wash never ran.
+    let goop_wash = project.descriptor.mask_bake_washable.then(|| GoopWashSettings {
+        konst_register: project.descriptor.mask_wash_konst.min(3),
+        start_level: (project.descriptor.mask_wash_coverage.clamp(0.0, 1.0) * 255.0).round() as u8,
+        resistance: project.descriptor.mask_wash_resistance.max(1),
+        step: 1,
+    });
+    if let Some(wash) = goop_wash.filter(|_| dol_supports_goop_wash(&patched_bytes)) {
+        patched_bytes = install_goop_wash(&patched_bytes, wash).map_err(|error| {
+            format!(
+                "Could not install the goop wash into '{}': {error}",
+                run.run_main_dol.display()
+            )
+        })?;
+    }
     if !overrides.is_empty() {
         patched_bytes = patch_sms_stage_music_dol(&patched_bytes, &overrides)
             .map_err(|error| {
