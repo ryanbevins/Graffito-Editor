@@ -126,6 +126,7 @@ reviews the project design and each published change.
 - Use **Launch in Editor** to embed Dolphin on Windows.
 - Use **Launch in Dolphin** to start Dolphin separately.
 - Direct-boot the open stage without changing the base extraction.
+- Restart the same area and scenario after losing a life in a direct-boot session.
 
 ## Command-line tools
 
