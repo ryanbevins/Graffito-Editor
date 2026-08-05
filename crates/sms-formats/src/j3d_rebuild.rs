@@ -524,6 +524,18 @@ pub struct GoopLayerRequest<'a> {
     /// The wash level to ship at. The coating shows where the mask does not
     /// exceed this, so 255 ships fully coated.
     pub level: u8,
+    /// How much level a single water hit removes, for whatever drives the wash
+    /// at runtime.
+    ///
+    /// This rides in the konst's red channel. The comparison selects the
+    /// konst's *alpha* into the colour channel (`GX_TEV_KCSEL_K<n>_A`), so the
+    /// colour bytes are never sampled, and the register is one this layer
+    /// claimed exclusively. Carrying the settings here makes the model
+    /// self-describing: whatever washes it reads the same bytes the bake wrote,
+    /// per actor, with nothing to keep in step separately.
+    pub step: u8,
+    /// How many water hits pass between steps, in the konst's green channel.
+    pub resistance: u8,
 }
 
 /// What authoring a goop layer placed.
@@ -1448,7 +1460,12 @@ impl J3dRebuildDocument {
             let konst_index = append_material_bytes(
                 materials,
                 J3dMaterialTableKind::TevKonstColor,
-                &[0xff, 0xff, 0xff, request.level],
+                &[
+                    request.step.max(1),
+                    request.resistance.max(1),
+                    0xff,
+                    request.level,
+                ],
                 4,
             )?;
             let gen_count_index = append_material_count(
@@ -5949,6 +5966,8 @@ mod goop_layout_tests {
                 texture: &texture,
                 coordinate_slot: 1,
                 level: 200,
+                step: 1,
+                resistance: 1,
             })
             .expect("author");
         let written = model.to_bytes().expect("rebuild");
@@ -6478,6 +6497,8 @@ mod bake_repro {
                 texture: &texture,
                 coordinate_slot: 1,
                 level: 128,
+                step: 1,
+                resistance: 1,
             };
             match model.add_goop_layer(&request) {
                 Ok(report) => println!(

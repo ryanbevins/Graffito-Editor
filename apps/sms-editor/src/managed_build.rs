@@ -1486,7 +1486,8 @@ fn install_managed_runtime_patches(
         konst_register: project.descriptor.mask_wash_konst.min(3),
         start_level: (project.descriptor.mask_wash_coverage.clamp(0.0, 1.0) * 255.0).round() as u8,
         resistance: project.descriptor.mask_wash_resistance.max(1),
-        step: 1,
+        step: project.descriptor.mask_wash_step.clamp(1, 255) as u8,
+        uniform_rate: project.descriptor.mask_wash_uniform_rate,
     });
     if let Some(wash) = goop_wash.filter(|_| dol_supports_goop_wash(&patched_bytes)) {
         patched_bytes = install_goop_wash(&patched_bytes, wash).map_err(|error| {

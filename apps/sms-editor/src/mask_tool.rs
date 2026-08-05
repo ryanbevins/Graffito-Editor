@@ -2536,6 +2536,11 @@ impl SmsEditorApp {
                 texture: &texture,
                 coordinate_slot: slot,
                 level,
+                // Recorded against this actor rather than the project, so a
+                // stubborn class can be tuned without dragging every other
+                // actor's wash along with it.
+                step: self.mask_wash_step.clamp(1, 255) as u8,
+                resistance: self.mask_wash_resistance.clamp(1, 255) as u8,
             };
             match model.add_goop_layer(&request) {
                 Ok(report) => {
@@ -2870,6 +2875,8 @@ impl SmsEditorApp {
         self.mask_wash_invert = project.descriptor.mask_wash_invert;
         self.mask_bake_washable = project.descriptor.mask_bake_washable;
         self.mask_wash_resistance = project.descriptor.mask_wash_resistance.max(1);
+        self.mask_wash_step = project.descriptor.mask_wash_step.clamp(1, 255);
+        self.mask_wash_uniform_rate = project.descriptor.mask_wash_uniform_rate;
         self.mask_wash_settings_project = Some(id);
     }
 
@@ -2892,11 +2899,13 @@ impl SmsEditorApp {
 
     /// Keeps the project's copy in step once a control moves.
     fn remember_mask_wash_settings(&mut self) {
-        let (coverage, invert, washable, resistance) = (
+        let (coverage, invert, washable, resistance, step, uniform) = (
             self.mask_wash_phase,
             self.mask_wash_invert,
             self.mask_bake_washable,
             self.mask_wash_resistance,
+            self.mask_wash_step,
+            self.mask_wash_uniform_rate,
         );
         match self.current_project.as_mut() {
             Some(project) => {
@@ -2904,6 +2913,8 @@ impl SmsEditorApp {
                     && project.descriptor.mask_wash_invert == invert
                     && project.descriptor.mask_bake_washable == washable
                     && project.descriptor.mask_wash_resistance == resistance
+                    && project.descriptor.mask_wash_step == step
+                    && project.descriptor.mask_wash_uniform_rate == uniform
                 {
                     return;
                 }
@@ -2911,6 +2922,8 @@ impl SmsEditorApp {
                 project.descriptor.mask_wash_invert = invert;
                 project.descriptor.mask_bake_washable = washable;
                 project.descriptor.mask_wash_resistance = resistance;
+                project.descriptor.mask_wash_step = step;
+                project.descriptor.mask_wash_uniform_rate = uniform;
             }
             None => return,
         }
@@ -3313,6 +3326,34 @@ impl SmsEditorApp {
             }
             ui.label("Resistance");
         });
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.mask_wash_step)
+                        .range(1..=255)
+                        .speed(1.0),
+                )
+                .on_hover_text(
+                    "Wash level removed per step. Raise it for a class the game feeds                      few water hits, so it cleans in step with the rest",
+                )
+                .changed()
+            {
+                self.remember_mask_wash_settings();
+            }
+            ui.label("Step");
+        });
+        if ui
+            .checkbox(
+                &mut self.mask_wash_uniform_rate,
+                "Same wash rate for every actor",
+            )
+            .on_hover_text(
+                "Count every spray. Off, an actor only washes when its own class lets                  water through -- Gesso clears its spray cooldown each hit and PoiHana                  does not, so the same coating takes far longer on one than the other",
+            )
+            .changed()
+        {
+            self.remember_mask_wash_settings();
+        }
 
         if ui
             .add(
@@ -3404,9 +3445,10 @@ impl SmsEditorApp {
                 let level = (self.mask_wash_phase.clamp(0.0, 1.0) * 255.0).round() as u8;
                 if self.mask_bake_washable {
                     format!(
-                        "bakes at {:.0}% (K{}_A {level}), washes down every {} water hits",
+                        "bakes at {:.0}% (K{}_A {level}), -{} every {} water hits",
                         self.mask_wash_phase * 100.0,
                         self.authored_wash_konst().map_or_else(|| "?".to_string(), |r| r.to_string()),
+                        self.mask_wash_step,
                         self.mask_wash_resistance
                     )
                 } else {

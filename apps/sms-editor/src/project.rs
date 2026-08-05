@@ -270,6 +270,10 @@ pub(super) struct SmsProjectFile {
     pub(super) mask_bake_washable: bool,
     #[serde(default = "resistance_default")]
     pub(super) mask_wash_resistance: u32,
+    #[serde(default = "wash_step_default")]
+    pub(super) mask_wash_step: u32,
+    #[serde(default = "uniform_rate_default")]
+    pub(super) mask_wash_uniform_rate: bool,
     /// The konst register the last bake claimed. The wash has to write the
     /// register the layer reads, and the bake takes whichever the material had
     /// spare, so it is recorded rather than assumed.
@@ -356,6 +360,8 @@ impl LegacySmsProjectFileV1 {
             mask_wash_invert: false,
             mask_bake_washable: true,
             mask_wash_resistance: 4,
+            mask_wash_step: 1,
+            mask_wash_uniform_rate: true,
             mask_wash_konst: 0,
         }
     }
@@ -388,6 +394,8 @@ impl SmsProjectFile {
             mask_wash_invert: false,
             mask_bake_washable: true,
             mask_wash_resistance: 4,
+            mask_wash_step: 1,
+            mask_wash_uniform_rate: true,
             mask_wash_konst: 0,
         }
     }
@@ -1352,4 +1360,15 @@ fn washable_default() -> bool {
 /// Four water hits per step: slow enough to watch, fast enough to finish.
 fn resistance_default() -> u32 {
     4
+}
+
+/// One level per hit unless the author asks for more.
+fn wash_step_default() -> u32 {
+    1
+}
+
+/// Count every spray, rather than only the ones an actor's class lets past
+/// its cooldown.
+fn uniform_rate_default() -> bool {
+    true
 }

@@ -6348,6 +6348,19 @@ const GOOP_WASH_SIGNATURE: [u32; 5] = [
 /// Where the signature sits inside the function.
 const GOOP_WASH_SIGNATURE_OFFSET: u32 = 0x20;
 
+/// `TSmallEnemy::receiveMessage`, which is where the spray arrives before the
+/// cooldown decides whether to act on it.
+const GOOP_WASH_MESSAGE_SIGNATURE: [u32; 5] = [
+    0x3BE4_0000, // addi r31, r4, 0   -- sender
+    0x93C1_0050, // stw r30, 0x50(r1)
+    0x7C7E_1B78, // mr r30, r3        -- this
+    0x93A1_004C, // stw r29, 0x4C(r1)
+    0x3BA5_0000, // addi r29, r5, 0   -- message
+];
+const GOOP_WASH_MESSAGE_SIGNATURE_OFFSET: u32 = 0x10;
+/// `HIT_MESSAGE_SPRAYED_BY_WATER` (HitActor.hpp:31).
+const GOOP_WASH_WATER_MESSAGE: u32 = 0xF;
+
 /// What the runtime wash needs to know about an authored layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct GoopWashSettings {
@@ -6361,6 +6374,16 @@ pub(super) struct GoopWashSettings {
     pub(super) resistance: u32,
     /// Alpha removed per step.
     pub(super) step: u8,
+    /// Whether to count every spray rather than only the ones the actor's class
+    /// lets through.
+    ///
+    /// `TSmallEnemy::receiveMessage` acts on water only while
+    /// `mSprayedByWaterCooldown` is clear. Gesso clears it on every hit and
+    /// PoiHana leaves it running, so the same coating washes off several times
+    /// faster on one than the other for reasons that have nothing to do with
+    /// the coating. Hooking the message instead of the damage step gives every
+    /// actor the same rate.
+    pub(super) uniform_rate: bool,
 }
 
 impl Default for GoopWashSettings {
@@ -6370,6 +6393,7 @@ impl Default for GoopWashSettings {
             start_level: 255,
             resistance: 4,
             step: 1,
+            uniform_rate: true,
         }
     }
 }
@@ -6470,6 +6494,16 @@ fn build_goop_wash_stub(
     words.push(goop_stw(0, 0x34, 1));
     words.push(goop_stw(3, 0x20, 1));
     words.push(goop_stw(4, 0x24, 1));
+    // Hooking the message rather than the damage step means every message
+    // arrives here, so anything that is not a spray leaves immediately.
+    let to_done_other_message = if settings.uniform_rate {
+        words.push(goop_cmplwi(5, GOOP_WASH_WATER_MESSAGE));
+        let slot = words.len();
+        words.push(0); // bne done
+        Some(slot)
+    } else {
+        None
+    };
 
     // Find this actor's entry, or the first free slot.
     words.push(goop_lis(11, table_address >> 16));
@@ -6567,6 +6601,9 @@ fn build_goop_wash_stub(
     let resume_word = words.len();
     words.push(0);
 
+    if let Some(slot) = to_done_other_message {
+        words[slot] = goop_bne(done as i32 - slot as i32);
+    }
     words[to_have_entry] = goop_beq(have_entry as i32 - to_have_entry as i32);
     words[to_claim] = goop_beq(claim as i32 - to_claim as i32);
     words[to_done_full] = goop_b(done as i32 - to_done_full as i32);
@@ -6582,6 +6619,24 @@ fn build_goop_wash_stub(
 /// Where `TSmallEnemy::decHpByWater` begins, found by its own instructions
 /// rather than a symbol table, and rejected unless it occurs exactly once.
 fn find_goop_wash_hook(source: &[u8], image: &DolImage) -> Result<u32, String> {
+    find_goop_wash_signature(
+        source,
+        image,
+        &GOOP_WASH_SIGNATURE,
+        GOOP_WASH_SIGNATURE_OFFSET,
+        "TSmallEnemy::decHpByWater",
+    )
+}
+
+/// A function located by a run of its own instructions, refused unless the run
+/// occurs exactly once.
+fn find_goop_wash_signature(
+    source: &[u8],
+    image: &DolImage,
+    signature: &[u32],
+    signature_offset: u32,
+    what: &str,
+) -> Result<u32, String> {
     let mut found: Option<u32> = None;
     for section in image.sections.iter().copied().filter(|section| section.text) {
         let start = usize::try_from(section.file_offset)
@@ -6595,11 +6650,11 @@ fn find_goop_wash_hook(source: &[u8], image: &DolImage) -> Result<u32, String> {
             .chunks_exact(4)
             .map(|chunk| u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect();
-        if words.len() < GOOP_WASH_SIGNATURE.len() {
+        if words.len() < signature.len() {
             continue;
         }
-        for index in 0..=words.len() - GOOP_WASH_SIGNATURE.len() {
-            if words[index..index + GOOP_WASH_SIGNATURE.len()] != GOOP_WASH_SIGNATURE {
+        for index in 0..=words.len() - signature.len() {
+            if words[index..index + signature.len()] != *signature {
                 continue;
             }
             let address = section
@@ -6607,19 +6662,15 @@ fn find_goop_wash_hook(source: &[u8], image: &DolImage) -> Result<u32, String> {
                 .checked_add(u32::try_from(index * 4).map_err(|_| "index overflow".to_string())?)
                 .ok_or_else(|| "signature address overflows".to_string())?;
             let hook = address
-                .checked_sub(GOOP_WASH_SIGNATURE_OFFSET)
+                .checked_sub(signature_offset)
                 .ok_or_else(|| "signature sits too early in the section".to_string())?;
             if found.is_some_and(|earlier| earlier != hook) {
-                return Err(
-                    "Expected one TSmallEnemy::decHpByWater, found several candidates".to_string(),
-                );
+                return Err(format!("Expected one {what}, found several candidates"));
             }
             found = Some(hook);
         }
     }
-    found.ok_or_else(|| {
-        "Could not find TSmallEnemy::decHpByWater in this DOL; the goop wash needs it".to_string()
-    })
+    found.ok_or_else(|| format!("Could not find {what} in this DOL; the goop wash needs it"))
 }
 
 /// Installs the runtime wash, returning the patched image.
@@ -6643,7 +6694,17 @@ pub(super) fn patch_goop_wash_dol(
     }
 
     let image = parse_dol(source)?;
-    let hook = find_goop_wash_hook(source, &image)?;
+    let hook = if settings.uniform_rate {
+        find_goop_wash_signature(
+            source,
+            &image,
+            &GOOP_WASH_MESSAGE_SIGNATURE,
+            GOOP_WASH_MESSAGE_SIGNATURE_OFFSET,
+            "TSmallEnemy::receiveMessage",
+        )?
+    } else {
+        find_goop_wash_hook(source, &image)?
+    };
     let hook_offset = usize::try_from(dol_file_offset(&image, hook)?)
         .map_err(|_| "goop wash hook offset does not fit usize".to_string())?;
     let displaced = source
@@ -6891,11 +6952,49 @@ mod goop_wash_tests {
         let hook = find_goop_wash_hook(&source, &image).expect("find decHpByWater");
         println!("HOOK: {hook:#010x}");
 
+        // Both hooks, since they find different functions and the message form
+        // carries an extra guard that the damage-step form does not.
+        for uniform_rate in [false, true] {
+            let settings = GoopWashSettings {
+                konst_register: 1,
+                start_level: 143,
+                resistance: 5,
+                step: 1,
+                uniform_rate,
+            };
+            let patched = install_goop_wash(&source, settings)
+                .unwrap_or_else(|error| panic!("install (uniform={uniform_rate}): {error}"));
+            assert!(patched.len() > source.len());
+            let after = parse_dol(&patched).expect("reparse");
+            let hook = if uniform_rate {
+                find_goop_wash_signature(
+                    &source,
+                    &image,
+                    &GOOP_WASH_MESSAGE_SIGNATURE,
+                    GOOP_WASH_MESSAGE_SIGNATURE_OFFSET,
+                    "receiveMessage",
+                )
+                .expect("find receiveMessage")
+            } else {
+                find_goop_wash_hook(&source, &image).expect("find decHpByWater")
+            };
+            let offset = dol_file_offset(&after, hook).expect("hook offset") as usize;
+            let word = u32::from_be_bytes([
+                patched[offset],
+                patched[offset + 1],
+                patched[offset + 2],
+                patched[offset + 3],
+            ]);
+            assert_eq!(word >> 26, 18, "uniform={uniform_rate}: hook is not a branch");
+            println!("uniform={uniform_rate}: hook {hook:#010x}, {} bytes", patched.len());
+        }
+
         let settings = GoopWashSettings {
             konst_register: 1,
             start_level: 143,
             resistance: 5,
             step: 1,
+            uniform_rate: false,
         };
         let (get_model, init_kcolor) =
             find_goop_wash_callees(&source, &image).expect("find the callees");

@@ -1299,6 +1299,14 @@ struct SmsEditorApp {
     /// of the level the layer is baked at, so a lightly coated actor can still
     /// be stubborn to clean.
     mask_wash_resistance: u32,
+    /// How much wash level one water hit removes. Raising it is how a class the
+    /// game feeds few water hits -- PoiHana keeps its spray cooldown running
+    /// where Gesso clears it every hit -- is brought into line without touching
+    /// what any other actor does.
+    mask_wash_step: u32,
+    /// Whether every spray counts, or only the ones an actor's class lets past
+    /// its own cooldown.
+    mask_wash_uniform_rate: bool,
     mask_bake_tpose: bool,
     /// Where the idle animation is held while the layer is authored, in
     /// seconds. The preview holds this frame rather than running on the wall
@@ -1678,6 +1686,8 @@ impl Default for SmsEditorApp {
             mask_author_status: String::new(),
             mask_bake_washable: true,
             mask_wash_resistance: 4,
+            mask_wash_step: 1,
+            mask_wash_uniform_rate: true,
             mask_bake_tpose: true,
             mask_idle_frame: 0.0,
             mask_wash_settings_project: None,
