@@ -1064,6 +1064,27 @@ fn new_project_id() -> String {
     format!("{nanos:032x}-{:08x}-{sequence:08x}", std::process::id())
 }
 
+/// A layer is authored to be washed off unless the author says otherwise.
+fn washable_default() -> bool {
+    true
+}
+
+/// Four water hits per step: slow enough to watch, fast enough to finish.
+fn resistance_default() -> u32 {
+    4
+}
+
+/// One level per hit unless the author asks for more.
+fn wash_step_default() -> u32 {
+    1
+}
+
+/// Count every spray, rather than only the ones an actor's class lets past
+/// its cooldown.
+fn uniform_rate_default() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1350,25 +1371,4 @@ secondary_wave_scene_id = 516
         assert_eq!(reopened.entries(), recents.entries());
         fs::remove_dir_all(root).unwrap();
     }
-}
-
-/// A layer is authored to be washed off unless the author says otherwise.
-fn washable_default() -> bool {
-    true
-}
-
-/// Four water hits per step: slow enough to watch, fast enough to finish.
-fn resistance_default() -> u32 {
-    4
-}
-
-/// One level per hit unless the author asks for more.
-fn wash_step_default() -> u32 {
-    1
-}
-
-/// Count every spray, rather than only the ones an actor's class lets past
-/// its cooldown.
-fn uniform_rate_default() -> bool {
-    true
 }
