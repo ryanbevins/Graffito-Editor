@@ -737,6 +737,103 @@ fn face_normal(vertices: [[f32; 3]; 3]) -> [f32; 3] {
     }
 }
 
+/// A glTF's JSON and the bytes its first buffer resolves to.
+///
+/// Blender writes `.glb` by default and `.gltf` beside a `.bin` when asked for
+/// separate files, so both are read. An embedded base64 buffer is refused by
+/// name rather than silently producing nothing.
+fn read_gltf_document(path: &std::path::Path) -> Result<(serde_json::Value, Vec<u8>), String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("Could not read the file: {error}"))?;
+    if bytes.starts_with(b"glTF") {
+        // A GLB is a header and then length-tagged chunks: JSON first, binary
+        // second where it is present at all.
+        let mut json = None;
+        let mut binary = Vec::new();
+        let mut offset = 12usize;
+        while offset + 8 <= bytes.len() {
+            let length = u32::from_le_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]) as usize;
+            let kind = &bytes[offset + 4..offset + 8];
+            let start = offset + 8;
+            let end = start
+                .checked_add(length)
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(|| "A chunk runs past the end of the file.".to_string())?;
+            if kind == b"JSON" {
+                json = Some(
+                    serde_json::from_slice(&bytes[start..end])
+                        .map_err(|error| format!("The glTF's JSON is malformed: {error}"))?,
+                );
+            } else if kind == b"BIN\0" {
+                binary = bytes[start..end].to_vec();
+            }
+            offset = end + (4 - end % 4) % 4;
+        }
+        let json = json.ok_or_else(|| "That GLB carries no JSON chunk.".to_string())?;
+        return Ok((json, binary));
+    }
+    let json: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("The glTF's JSON is malformed: {error}"))?;
+    let uri = json["buffers"][0]["uri"]
+        .as_str()
+        .ok_or_else(|| "That glTF names no buffer.".to_string())?;
+    if uri.starts_with("data:") {
+        return Err(
+            "That glTF embeds its buffer as base64. Export it as glTF Separate or Binary."
+                .to_string(),
+        );
+    }
+    let directory = path.parent().unwrap_or(std::path::Path::new("."));
+    let buffer = std::fs::read(directory.join(uri))
+        .map_err(|error| format!("Could not read '{uri}': {error}"))?;
+    Ok((json, buffer))
+}
+
+/// Reads a float accessor, honouring the byte stride its view may carry.
+///
+/// Values are widened to three so one reader serves `VEC2` and `VEC3`.
+fn read_gltf_floats(
+    json: &serde_json::Value,
+    buffer: &[u8],
+    accessor: usize,
+    components: usize,
+) -> Result<Vec<[f32; 3]>, String> {
+    let accessor = &json["accessors"][accessor];
+    if accessor["componentType"].as_u64() != Some(5126) {
+        return Err("That mesh stores a coordinate in something other than floats.".to_string());
+    }
+    let count = accessor["count"]
+        .as_u64()
+        .ok_or_else(|| "An accessor carries no count.".to_string())? as usize;
+    let view = &json["bufferViews"][accessor["bufferView"].as_u64().unwrap_or(0) as usize];
+    let base = view["byteOffset"].as_u64().unwrap_or(0) as usize
+        + accessor["byteOffset"].as_u64().unwrap_or(0) as usize;
+    let stride = view["byteStride"].as_u64().unwrap_or(0) as usize;
+    let stride = if stride == 0 { components * 4 } else { stride };
+    let mut values = Vec::with_capacity(count);
+    for index in 0..count {
+        let mut value = [0.0f32; 3];
+        for (component, axis) in value.iter_mut().enumerate().take(components) {
+            let at = base + index * stride + component * 4;
+            let bytes = buffer
+                .get(at..at + 4)
+                .ok_or_else(|| "An accessor runs past its buffer.".to_string())?;
+            *axis = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        }
+        values.push(value);
+    }
+    Ok(values)
+}
+
+/// A position rounded to a hundredth, which is what a coordinate is matched on.
+fn gltf_position_key(position: [f32; 3]) -> [i32; 3] {
+    std::array::from_fn(|axis| (position[axis] * 100.0).round() as i32)
+}
+
 const CANVAS: usize = 384;
 
 /// The texture an authored goop layer carries its coating and mask in.
@@ -2881,10 +2978,197 @@ print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
     /// can be matched back onto the model's vertices by position. Re-unwrap
     /// without remodelling and the match is exact.
     fn reimport_mask_uv(&mut self) {
-        self.log.push(
-            "Reimport UV is not wired yet: it will read the goop set from an edited glTF."
-                .to_string(),
+        let Some(choice) = self.selected_mask_choice() else {
+            self.log.push("Select an actor first.".to_string());
+            return;
+        };
+        let Some(slot) = self.authored_goop_coord() else {
+            self.log.push(
+                "This actor has no goop layer to re-unwrap. Bake one first, then export it."
+                    .to_string(),
+            );
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Reimport Goop UV")
+            .add_filter("glTF", &["gltf", "glb"])
+            .pick_file()
+        else {
+            return;
+        };
+        let (json, buffer) = match read_gltf_document(&path) {
+            Ok(document) => document,
+            Err(error) => {
+                self.log.push(error);
+                return;
+            }
+        };
+        let attributes = &json["meshes"][0]["primitives"][0]["attributes"];
+        let (Some(position_accessor), Some(goop_accessor)) = (
+            attributes["POSITION"].as_u64(),
+            attributes["TEXCOORD_1"].as_u64(),
+        ) else {
+            self.log.push(
+                "That mesh carries no TEXCOORD_1. The goop unwrap is the second UV set -- keep \
+                 it when exporting from Blender."
+                    .to_string(),
+            );
+            return;
+        };
+        let positions = match read_gltf_floats(&json, &buffer, position_accessor as usize, 3) {
+            Ok(values) => values,
+            Err(error) => {
+                self.log.push(error);
+                return;
+            }
+        };
+        let coordinates = match read_gltf_floats(&json, &buffer, goop_accessor as usize, 2) {
+            Ok(values) => values,
+            Err(error) => {
+                self.log.push(error);
+                return;
+            }
+        };
+        if positions.len() != coordinates.len() {
+            self.log.push(
+                "That mesh has more positions than coordinates, which it should not.".to_string(),
+            );
+            return;
+        }
+
+        // Matched on position rather than on order: Blender renumbers vertices
+        // freely, and welding drops some outright, but where a vertex sits is
+        // what it was exported as.
+        let mut unwrapped: std::collections::HashMap<[i32; 3], [f32; 2]> =
+            std::collections::HashMap::with_capacity(positions.len());
+        for (position, coordinate) in positions.iter().zip(&coordinates) {
+            unwrapped.insert(gltf_position_key(*position), [coordinate[0], coordinate[1]]);
+        }
+
+        let (raw_path, bytes) = {
+            let Some(document) = self.document.as_ref() else {
+                return;
+            };
+            let Some(raw_path) = document.archive_resource_path_for_asset(&choice.model_path)
+            else {
+                self.log.push(
+                    "This actor's model lives outside the stage archive, so it cannot be \
+                     re-unwrapped here yet."
+                        .to_string(),
+                );
+                return;
+            };
+            match document.read_asset_bytes(&choice.model_path) {
+                Ok(bytes) => (raw_path, bytes),
+                Err(error) => {
+                    self.log.push(format!("Could not read the model: {error}"));
+                    return;
+                }
+            }
+        };
+        let mut model = match sms_formats::J3dRebuildDocument::parse(&bytes) {
+            Ok(model) => model,
+            Err(error) => {
+                self.log.push(format!("Could not parse the model: {error}"));
+                return;
+            }
+        };
+        let parsed = match sms_formats::J3dFile::parse(&bytes) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.log.push(format!("Could not read the model: {error}"));
+                return;
+            }
+        };
+        let posed = self.mask_pose_animation(&choice);
+        let matrices = match parsed.preview_draw_matrices(
+            choice.load_flags,
+            posed.as_ref().map(|(animation, frame)| (animation, *frame)),
+            &[],
+        ) {
+            Ok(matrices) => matrices,
+            Err(error) => {
+                self.log.push(format!("Could not pose the model: {error}"));
+                return;
+            }
+        };
+        let walk = match model.posed_display_list_vertices(&matrices) {
+            Ok(walk) => walk,
+            Err(error) => {
+                self.log.push(format!("Could not walk the model: {error}"));
+                return;
+            }
+        };
+
+        // The export put the coordinate into image space, where glTF and PNG
+        // both keep V. It goes back the way it came.
+        let projected = match self.authored_mask() {
+            Some((_, name)) => name.as_deref() == Some(GOOP_LAYER_TEXTURE),
+            None => true,
+        };
+        let mut missed = 0usize;
+        let mut matched = Vec::with_capacity(walk.len());
+        for position in &walk {
+            let key = gltf_position_key(*position);
+            // A hundredth apart in the round trip is still the same vertex, so
+            // the neighbouring cells are tried before giving up on one.
+            let found = unwrapped.get(&key).copied().or_else(|| {
+                (-1..=1).find_map(|x| {
+                    (-1..=1).find_map(|y| {
+                        (-1..=1).find_map(|z| {
+                            unwrapped
+                                .get(&[key[0] + x, key[1] + y, key[2] + z])
+                                .copied()
+                        })
+                    })
+                })
+            });
+            match found {
+                Some(coordinate) => matched.push(if projected {
+                    [coordinate[0], 1.0 - coordinate[1]]
+                } else {
+                    coordinate
+                }),
+                None => {
+                    missed += 1;
+                    matched.push([0.0, 0.0]);
+                }
+            }
+        }
+        if missed > 0 {
+            self.log.push(format!(
+                "{missed} of {} vertices had no match in that mesh, so it is not the model that \
+                 was exported -- or it was moved rather than re-unwrapped.",
+                walk.len()
+            ));
+            return;
+        }
+
+        if let Err(error) = model.replace_texcoord_values(slot as u8, &matched) {
+            self.log
+                .push(format!("Could not store the unwrap: {error}"));
+            return;
+        }
+        // Rebuilding proves the edit before it is kept.
+        if let Err(error) = model.to_bytes() {
+            self.log
+                .push(format!("The re-unwrapped model would not rebuild: {error}"));
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let before = document.archive_edits.clone();
+        document.archive_edits.replace_model(raw_path, model);
+        self.finish_mask_author_edit(
+            before,
+            format!(
+                "Re-unwrapped this actor's goop coordinate from {} across {} vertices.",
+                path.display(),
+                walk.len()
+            ),
         );
+        self.build_mask_preview(&choice);
     }
 
     /// Writes the coverage on the slider into the model's own wash, so the
@@ -3223,6 +3507,17 @@ print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
                 return;
             }
         };
+        // The export put the map into image space, where PNG keeps V, so a map
+        // painted against that layout comes back the other way up. The model
+        // stores its own the way GX reads it -- first row written is v zero,
+        // which the stored coordinate puts at the model's foot -- so reading a
+        // painted map straight in lands the mask upside down and moves the
+        // coating without anything having been repainted.
+        let painted = if mask_name == GOOP_LAYER_TEXTURE {
+            image::imageops::flip_vertical(&painted)
+        } else {
+            painted
+        };
         let (width, height) = painted.dimensions();
         if width == 0
             || height == 0
@@ -3236,15 +3531,39 @@ print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
             ));
             return;
         }
-        // The wash reads one channel; spread it so the encoder lands on an
-        // intensity format the way the retail masks do.
-        let pixels: Vec<u8> = painted
-            .pixels()
-            .flat_map(|pixel| {
-                let value = pixel.0[0];
-                [value, value, value, value]
-            })
-            .collect();
+        // A retail mask is one channel, so spreading it lands the encoder on
+        // I8 the way those ship. A layer this tool bakes is not: it carries
+        // its coating in the colour channels and only its mask in alpha, so
+        // spreading there would repaint the coat in grey and throw the colour
+        // away. Keep the coat and take only the alpha from what was painted.
+        let pixels: Vec<u8> = if mask_name == GOOP_LAYER_TEXTURE {
+            let coat = self.mask_preview.as_ref().and_then(|preview| {
+                preview
+                    .geometry
+                    .textures
+                    .iter()
+                    .find(|texture| texture.name == mask_name)
+            });
+            painted
+                .enumerate_pixels()
+                .flat_map(|(x, y, pixel)| {
+                    let u = (x as f32 + 0.5) / width as f32;
+                    let v = (y as f32 + 0.5) / height as f32;
+                    let texel = coat
+                        .and_then(|coat| sample_texture(coat, u, v))
+                        .unwrap_or([255, 255, 255, 255]);
+                    [texel[0], texel[1], texel[2], pixel.0[0]]
+                })
+                .collect()
+        } else {
+            painted
+                .pixels()
+                .flat_map(|pixel| {
+                    let value = pixel.0[0];
+                    [value, value, value, value]
+                })
+                .collect()
+        };
         let rgba = match sms_formats::RgbaImage::new(width as u16, height as u16, pixels) {
             Ok(rgba) => rgba,
             Err(error) => {
@@ -4153,20 +4472,37 @@ print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
             .small()
             .weak(),
         );
+        // Both of these refuse actors they cannot act on, and refusing after
+        // the click looked like the button doing nothing at all. Say so on the
+        // button instead, so the reason is on screen before it is pressed.
+        let can_reimport_mask = matches!(self.authored_mask(), Some((_, Some(_))));
+        let can_reimport_uv =
+            self.selected_mask_choice().is_some() && self.authored_goop_coord().is_some();
         ui.horizontal(|ui| {
             if ui
-                .button("Reimport goop mask\u{2026}")
+                .add_enabled(
+                    can_reimport_mask,
+                    egui::Button::new("Reimport goop mask\u{2026}"),
+                )
                 .on_hover_text(
                     "Replace this actor's wash mask with a painted PNG; it previews here \
                      and ships with the stage",
+                )
+                .on_disabled_hover_text(
+                    "This actor carries no named wash mask to replace. Bake a goop layer \
+                     first.",
                 )
                 .clicked()
             {
                 self.reimport_mask_goop_map();
             }
             if ui
-                .button("Reimport UV\u{2026}")
+                .add_enabled(can_reimport_uv, egui::Button::new("Reimport UV\u{2026}"))
                 .on_hover_text("Read a re-unwrapped goop UV back out of an edited glTF")
+                .on_disabled_hover_text(
+                    "This actor has no goop coordinate to re-unwrap. Bake a goop layer \
+                     first, then export it.",
+                )
                 .clicked()
             {
                 self.reimport_mask_uv();
