@@ -5956,7 +5956,11 @@ fn probe_wash_bake_roundtrip() {
             continue;
         };
         let Some(asset) = assets.iter().find(|a| {
-            let text = a.path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+            let text = a
+                .path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase();
             text.contains(needle) && (text.ends_with(".bmd") || text.ends_with(".bdl"))
         }) else {
             println!("{needle}: not found");
@@ -5965,11 +5969,9 @@ fn probe_wash_bake_roundtrip() {
         let Ok(bytes) = sms_formats::read_stage_asset_bytes(&asset.path) else {
             continue;
         };
-        let Ok(geometry) = sms_formats::J3dFile::parse(&bytes)
-            .and_then(|model| {
-                model.geometry_preview_with_loader_flags(sms_formats::SMS_MAP_MODEL_LOAD_FLAGS)
-            })
-        else {
+        let Ok(geometry) = sms_formats::J3dFile::parse(&bytes).and_then(|model| {
+            model.geometry_preview_with_loader_flags(sms_formats::SMS_MAP_MODEL_LOAD_FLAGS)
+        }) else {
             continue;
         };
         let wash: Vec<String> = geometry
@@ -6017,9 +6019,8 @@ fn probe_wash_bake_roundtrip() {
                     .ok()
                     .and_then(|geometry| {
                         geometry.materials.iter().find_map(|material| {
-                            wash.contains(&material.name).then(|| {
-                                material.tev_k_colors.map(|konst| konst[3])
-                            })
+                            wash.contains(&material.name)
+                                .then(|| material.tev_k_colors.map(|konst| konst[3]))
                         })
                     });
                 println!(

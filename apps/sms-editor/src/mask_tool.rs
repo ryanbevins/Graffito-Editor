@@ -179,7 +179,11 @@ fn sample_preview_texel(texture: &PreviewTexture, u: f32, v: f32) -> egui::Color
             0 => value.clamp(0.0, 1.0),
             2 => {
                 let folded = value.rem_euclid(2.0);
-                if folded > 1.0 { 2.0 - folded } else { folded }
+                if folded > 1.0 {
+                    2.0 - folded
+                } else {
+                    folded
+                }
             }
             _ => value.rem_euclid(1.0),
         };
@@ -194,7 +198,6 @@ fn sample_preview_texel(texture: &PreviewTexture, u: f32, v: f32) -> egui::Color
 fn sample_preview_alpha(texture: &PreviewTexture, u: f32, v: f32) -> u8 {
     sample_preview_texel(texture, u, v).a()
 }
-
 
 /// What the coating pass resolves at one canvas pixel: the coat UV, the
 /// sweep UV, and the actor's own mask value where it authored one.
@@ -630,7 +633,11 @@ fn build_mask_model_preview(geometry: &sms_formats::J3dGeometryPreview) -> Model
     }
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
-    for vertex in preview.triangles.iter().flat_map(|triangle| triangle.vertices) {
+    for vertex in preview
+        .triangles
+        .iter()
+        .flat_map(|triangle| triangle.vertices)
+    {
         for axis in 0..3 {
             min[axis] = min[axis].min(vertex[axis]);
             max[axis] = max[axis].max(vertex[axis]);
@@ -1040,7 +1047,10 @@ impl SmsEditorApp {
             return Some((AuthoredMaskTexture::Stage(texture), name));
         }
         if let Some(texture) = self.model_mask_texture() {
-            return Some((AuthoredMaskTexture::Model(texture), Some(texture.name.clone())));
+            return Some((
+                AuthoredMaskTexture::Model(texture),
+                Some(texture.name.clone()),
+            ));
         }
         // The wash itself names its mask: `mask(goop UV) > K0_A` is a TEV
         // comparison stage, and the stage's order says which texture it
@@ -1053,7 +1063,10 @@ impl SmsEditorApp {
             .geometry
             .textures
             .get(texture_index)?;
-        Some((AuthoredMaskTexture::Model(texture), Some(texture.name.clone())))
+        Some((
+            AuthoredMaskTexture::Model(texture),
+            Some(texture.name.clone()),
+        ))
     }
 
     /// The wash-mask texture the actor's own model carries.
@@ -1473,7 +1486,11 @@ impl SmsEditorApp {
                                     .zip(
                                         coord
                                             .and_then(|index| {
-                                                triangle.tex_coord_sets.get(index).copied().flatten()
+                                                triangle
+                                                    .tex_coord_sets
+                                                    .get(index)
+                                                    .copied()
+                                                    .flatten()
                                             })
                                             .or(tex_coords),
                                     )
@@ -1654,12 +1671,10 @@ impl SmsEditorApp {
                     .ok()
             })
             .is_some_and(|geometry| {
-                geometry.materials.iter().any(|material| {
-                    material
-                        .tev_stages
-                        .iter()
-                        .any(stage_is_wash_comparison)
-                })
+                geometry
+                    .materials
+                    .iter()
+                    .any(|material| material.tev_stages.iter().any(stage_is_wash_comparison))
             });
         self.mask_edit_state = format!(
             "edit stored: {}   model reads back washable: {}",
@@ -1765,83 +1780,83 @@ impl SmsEditorApp {
                 .count()
                 == geometry.triangles.len()
         });
-        let mut isolated = if let Some(model_index) =
-            model_index.filter(|_| stage_carries_pose)
-        {
+        let mut isolated = if let Some(model_index) = model_index.filter(|_| stage_carries_pose) {
             let mut isolated = preview.clone();
-        // The stage instance carries the stage's pose baked into its vertices,
-        // so the tool drew whatever the idle happened to be doing while the
-        // bake projected a pose of its own. Take the positions from the
-        // geometry this tool posed, keeping the stage's materials and textures
-        // so the shading stays what it was. Same model, same walk, so the
-        // triangles line up one for one; if they ever do not, leave the stage's
-        // alone rather than pair them up wrongly.
-        // This is the tool's own clone: the stage viewport and the runtime are
-        // untouched and get whatever the bake writes. Only this viewport
-        // follows the pose, which is what the projection is judged against.
-        // Counts already agree, so the walks pair one for one: take the tool's
-        // posed positions and keep the stage's materials, so only the pose
-        // changes and the shading stays as the stage renders it.
-        {
-            let mut posed = geometry.triangles.iter();
-            for triangle in isolated
-                .triangles
-                .iter_mut()
-                .filter(|triangle| triangle.model_index == model_index)
+            // The stage instance carries the stage's pose baked into its vertices,
+            // so the tool drew whatever the idle happened to be doing while the
+            // bake projected a pose of its own. Take the positions from the
+            // geometry this tool posed, keeping the stage's materials and textures
+            // so the shading stays what it was. Same model, same walk, so the
+            // triangles line up one for one; if they ever do not, leave the stage's
+            // alone rather than pair them up wrongly.
+            // This is the tool's own clone: the stage viewport and the runtime are
+            // untouched and get whatever the bake writes. Only this viewport
+            // follows the pose, which is what the projection is judged against.
+            // Counts already agree, so the walks pair one for one: take the tool's
+            // posed positions and keep the stage's materials, so only the pose
+            // changes and the shading stays as the stage renders it.
             {
-                if let Some(source) = posed.next() {
-                    triangle.vertices = source.vertices;
+                let mut posed = geometry.triangles.iter();
+                for triangle in isolated
+                    .triangles
+                    .iter_mut()
+                    .filter(|triangle| triangle.model_index == model_index)
+                {
+                    if let Some(source) = posed.next() {
+                        triangle.vertices = source.vertices;
+                    }
                 }
             }
-        }
-        isolated
-            .triangles
-            .retain(|triangle| triangle.model_index == model_index);
-        // The model index covers more than the body: effect meshes ride along
-        // -- PoiHana's sleep Zs, billboarded sprites, particle quads. They
-        // float away from the actor, so left in they inflate the bounds the
-        // camera frames and the span the mask projects across, and the goop
-        // paints past the body. Keep the drawn body alone.
-        isolated.triangles.retain(|triangle| {
-            triangle.billboard.is_none()
-                && triangle.particle_type.is_none()
-                && triangle.render_layer == PreviewRenderLayer::Main
-        });
-        if isolated.triangles.is_empty() {
-            return;
-        }
-        // Effect geometry that slips the filters still sits away from the
-        // dense cluster of body triangles; trim by distance from it.
-        let centroids: Vec<[f32; 3]> = isolated
-            .triangles
-            .iter()
-            .map(|triangle| {
-                std::array::from_fn(|axis| {
-                    (triangle.vertices[0][axis]
-                        + triangle.vertices[1][axis]
-                        + triangle.vertices[2][axis])
-                        / 3.0
+            isolated
+                .triangles
+                .retain(|triangle| triangle.model_index == model_index);
+            // The model index covers more than the body: effect meshes ride along
+            // -- PoiHana's sleep Zs, billboarded sprites, particle quads. They
+            // float away from the actor, so left in they inflate the bounds the
+            // camera frames and the span the mask projects across, and the goop
+            // paints past the body. Keep the drawn body alone.
+            isolated.triangles.retain(|triangle| {
+                triangle.billboard.is_none()
+                    && triangle.particle_type.is_none()
+                    && triangle.render_layer == PreviewRenderLayer::Main
+            });
+            if isolated.triangles.is_empty() {
+                return;
+            }
+            // Effect geometry that slips the filters still sits away from the
+            // dense cluster of body triangles; trim by distance from it.
+            let centroids: Vec<[f32; 3]> = isolated
+                .triangles
+                .iter()
+                .map(|triangle| {
+                    std::array::from_fn(|axis| {
+                        (triangle.vertices[0][axis]
+                            + triangle.vertices[1][axis]
+                            + triangle.vertices[2][axis])
+                            / 3.0
+                    })
                 })
-            })
-            .collect();
-        let mean: [f32; 3] = std::array::from_fn(|axis| {
-            centroids.iter().map(|centroid| centroid[axis]).sum::<f32>()
-                / centroids.len() as f32
-        });
-        let distances: Vec<f32> = centroids
-            .iter()
-            .map(|centroid| {
-                (0..3)
-                    .map(|axis| (centroid[axis] - mean[axis]).powi(2))
-                    .sum::<f32>()
-                    .sqrt()
-            })
-            .collect();
-        let mut sorted = distances.clone();
-        sorted.sort_by(f32::total_cmp);
-        let median = sorted[sorted.len() / 2].max(f32::EPSILON);
-        let mut keep = distances.into_iter().map(|distance| distance <= median * 4.0);
-        isolated.triangles.retain(|_| keep.next().unwrap_or(true));
+                .collect();
+            let mean: [f32; 3] = std::array::from_fn(|axis| {
+                centroids.iter().map(|centroid| centroid[axis]).sum::<f32>()
+                    / centroids.len() as f32
+            });
+            let distances: Vec<f32> = centroids
+                .iter()
+                .map(|centroid| {
+                    (0..3)
+                        .map(|axis| (centroid[axis] - mean[axis]).powi(2))
+                        .sum::<f32>()
+                        .sqrt()
+                })
+                .collect();
+            let mut sorted = distances.clone();
+            sorted.sort_by(f32::total_cmp);
+            let median = sorted[sorted.len() / 2].max(f32::EPSILON);
+            let mut keep = distances
+                .into_iter()
+                .map(|distance| distance <= median * 4.0);
+            isolated.triangles.retain(|_| keep.next().unwrap_or(true));
             isolated
         } else {
             // Nothing of this actor stands in the stage preview. Render the
@@ -2088,8 +2103,7 @@ impl SmsEditorApp {
             right[0] * forward[1] - right[1] * forward[0],
         ];
         let distance = radius * 8.0;
-        let camera: [f32; 3] =
-            std::array::from_fn(|axis| center[axis] - forward[axis] * distance);
+        let camera: [f32; 3] = std::array::from_fn(|axis| center[axis] - forward[axis] * distance);
         // The focal length the frame uses, carried into canvas pixels. The
         // viewport's own width cancels, so the two framings agree at any size.
         let scale = distance * 0.45 * CANVAS as f32 / radius;
@@ -2135,7 +2149,9 @@ impl SmsEditorApp {
                 let relative: [f32; 3] = std::array::from_fn(|axis| point[axis] - camera[axis]);
                 let x = (0..3).map(|axis| relative[axis] * right[axis]).sum::<f32>();
                 let y = (0..3).map(|axis| relative[axis] * up[axis]).sum::<f32>();
-                let z = (0..3).map(|axis| relative[axis] * forward[axis]).sum::<f32>();
+                let z = (0..3)
+                    .map(|axis| relative[axis] * forward[axis])
+                    .sum::<f32>();
                 if z <= 1.0 {
                     behind = true;
                     break;
@@ -2148,8 +2164,7 @@ impl SmsEditorApp {
             let front: [[f32; 2]; 3] = std::array::from_fn(|corner| {
                 std::array::from_fn(|axis| {
                     if span[axis] > f32::EPSILON {
-                        ((triangle.vertices[corner][axis] - min[axis]) / span[axis])
-                            .clamp(0.0, 1.0)
+                        ((triangle.vertices[corner][axis] - min[axis]) / span[axis]).clamp(0.0, 1.0)
                     } else {
                         0.5
                     }
@@ -2382,11 +2397,8 @@ impl SmsEditorApp {
             .objects
             .iter()
             .find(|object| object.id == choice.object_id)?;
-        let (animation, rate) = crate::preview_assets::starting_joint_animation(
-            document,
-            object,
-            &choice.model_path,
-        )?;
+        let (animation, rate) =
+            crate::preview_assets::starting_joint_animation(document, object, &choice.model_path)?;
         let frame = animation.playback_frame(self.mask_idle_frame * rate);
         Some((animation, frame))
     }
@@ -2464,12 +2476,7 @@ impl SmsEditorApp {
                     .geometry
                     .materials
                     .iter()
-                    .filter(|material| {
-                        material
-                            .tev_stages
-                            .iter()
-                            .any(stage_is_wash_comparison)
-                    })
+                    .filter(|material| material.tev_stages.iter().any(stage_is_wash_comparison))
                     .map(|material| material.name.clone())
                     .collect()
             })
@@ -2540,9 +2547,7 @@ impl SmsEditorApp {
                     );
                     self.build_mask_preview(&choice);
                 }
-                Err(error) => {
-                    self.log.push(error)
-                }
+                Err(error) => self.log.push(error),
             }
             return;
         }
@@ -2555,7 +2560,8 @@ impl SmsEditorApp {
             match model.set_material_konst_alpha(name, register, level) {
                 Ok(count) => written += count,
                 Err(error) => {
-                    self.log.push(format!("Could not bake into '{name}': {error}"));
+                    self.log
+                        .push(format!("Could not bake into '{name}': {error}"));
                     return;
                 }
             }
@@ -2664,15 +2670,16 @@ impl SmsEditorApp {
         // BTK while no stage samples it. Authoring over such a slot is refused
         // by the writer, so take the union of what is sampled and what is
         // actually stored.
-        let mut used = preview.geometry.triangles.iter().fold(
-            [false; 8],
-            |mut used, triangle| {
+        let mut used = preview
+            .geometry
+            .triangles
+            .iter()
+            .fold([false; 8], |mut used, triangle| {
                 for (slot, set) in triangle.tex_coord_sets.iter().enumerate() {
                     used[slot] |= set.is_some();
                 }
                 used
-            },
-        );
+            });
         for (slot, stored) in model.stored_texcoord_slots().iter().enumerate() {
             used[slot] |= *stored;
         }
@@ -2737,9 +2744,8 @@ impl SmsEditorApp {
             return;
         };
         let Some((_, Some(mask_name))) = self.authored_mask() else {
-            self.log.push(
-                "This actor has no authored goop mask slot to replace.".to_string(),
-            );
+            self.log
+                .push("This actor has no authored goop mask slot to replace.".to_string());
             return;
         };
         let wraps = self
@@ -2801,15 +2807,16 @@ impl SmsEditorApp {
         let mut options = sms_formats::GxTextureEncodeOptions::default();
         options.sampler.wrap_s = wraps.0;
         options.sampler.wrap_t = wraps.1;
-        let bti = match sms_formats::GxEncodedTexture::encode_rgba(mask_name.clone(), &rgba, options)
-            .and_then(|encoded| encoded.to_bti())
-        {
-            Ok(bti) => bti,
-            Err(error) => {
-                self.log.push(format!("Could not encode the mask: {error}"));
-                return;
-            }
-        };
+        let bti =
+            match sms_formats::GxEncodedTexture::encode_rgba(mask_name.clone(), &rgba, options)
+                .and_then(|encoded| encoded.to_bti())
+            {
+                Ok(bti) => bti,
+                Err(error) => {
+                    self.log.push(format!("Could not encode the mask: {error}"));
+                    return;
+                }
+            };
 
         let (raw_path, bytes) = {
             let Some(document) = self.document.as_ref() else {
@@ -2842,7 +2849,8 @@ impl SmsEditorApp {
         let replaced = match model.replace_named_texture_from_bti(&mask_name, &bti) {
             Ok(count) => count,
             Err(error) => {
-                self.log.push(format!("Could not replace '{mask_name}': {error}"));
+                self.log
+                    .push(format!("Could not replace '{mask_name}': {error}"));
                 return;
             }
         };
@@ -2859,9 +2867,7 @@ impl SmsEditorApp {
         document.archive_edits.replace_model(raw_path, model);
         self.finish_mask_author_edit(
             before,
-            format!(
-                "Reimported '{mask_name}' at {width}x{height}; Ctrl+Z reverses it."
-            ),
+            format!("Reimported '{mask_name}' at {width}x{height}; Ctrl+Z reverses it."),
         );
         self.build_mask_preview(&choice);
     }
@@ -3456,7 +3462,8 @@ impl SmsEditorApp {
         }
 
         self.push_mask_wash();
-        if let (Some(scene), Some(frame)) = (self.mask_gpu_scene.as_ref(), self.mask_gpu_frame(rect))
+        if let (Some(scene), Some(frame)) =
+            (self.mask_gpu_scene.as_ref(), self.mask_gpu_frame(rect))
         {
             scene.set_frame(frame);
             ui.painter().add(scene.paint_callback(rect));
@@ -3594,7 +3601,8 @@ impl SmsEditorApp {
         ui.label(
             egui::RichText::new(format!(
                 "wash level K{}_A \u{2248} {}  (mask \u{2264} this stays coated)",
-                self.authored_wash_konst().map_or_else(|| "?".to_string(), |r| r.to_string()),
+                self.authored_wash_konst()
+                    .map_or_else(|| "?".to_string(), |r| r.to_string()),
                 (self.mask_wash_phase * 255.0).round() as u16
             ))
             .small()
@@ -3680,7 +3688,8 @@ impl SmsEditorApp {
                     format!(
                         "bakes at {:.0}% (K{}_A {level}), -{} every {} water hits",
                         self.mask_wash_phase * 100.0,
-                        self.authored_wash_konst().map_or_else(|| "?".to_string(), |r| r.to_string()),
+                        self.authored_wash_konst()
+                            .map_or_else(|| "?".to_string(), |r| r.to_string()),
                         self.mask_wash_step,
                         self.mask_wash_resistance
                     )
@@ -3688,7 +3697,8 @@ impl SmsEditorApp {
                     format!(
                         "bakes at {:.0}% (K{}_A {level}) and stays put",
                         self.mask_wash_phase * 100.0,
-                        self.authored_wash_konst().map_or_else(|| "?".to_string(), |r| r.to_string())
+                        self.authored_wash_konst()
+                            .map_or_else(|| "?".to_string(), |r| r.to_string())
                     )
                 }
             })

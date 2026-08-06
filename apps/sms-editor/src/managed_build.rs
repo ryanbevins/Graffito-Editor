@@ -18,13 +18,11 @@ use sms_scene::{
 use sms_schema::ObjectRegistry;
 
 use crate::direct_boot::{
-    patch_sms_dialogue_dol, patch_sms_direct_boot_dol, patch_sms_goop_enemy_managers_dol,
-    dol_supports_goop_wash, install_goop_wash, patch_sms_goop_layer_spawn_dol,
-    patch_sms_sound_assignments_dol,
-    patch_sms_stage_music_dol,
+    dol_supports_goop_wash, install_goop_wash, patch_sms_dialogue_dol, patch_sms_direct_boot_dol,
+    patch_sms_goop_enemy_managers_dol, patch_sms_goop_layer_spawn_dol,
+    patch_sms_sound_assignments_dol, patch_sms_stage_music_dol, GoopWashSettings,
     RuntimeBalloonOverride, RuntimeDialogueOverride, RuntimeGoopLayerBinding,
-    GoopWashSettings, RuntimeGoopManagerPatch, RuntimeMusicRoleOverride,
-    RuntimeSoundAssignment,
+    RuntimeGoopManagerPatch, RuntimeMusicRoleOverride, RuntimeSoundAssignment,
     RuntimeSoundAssignmentKind, RuntimeStageMusicOverride, RuntimeStageMusicTransition,
     RuntimeStageTarget,
 };
@@ -1482,13 +1480,17 @@ fn install_managed_runtime_patches(
     // from the Mask Tool; the register comes from whichever one the bake claimed,
     // since writing the wrong one leaves the coating sitting there looking like
     // the wash never ran.
-    let goop_wash = project.descriptor.mask_bake_washable.then(|| GoopWashSettings {
-        konst_register: project.descriptor.mask_wash_konst.min(3),
-        start_level: (project.descriptor.mask_wash_coverage.clamp(0.0, 1.0) * 255.0).round() as u8,
-        resistance: project.descriptor.mask_wash_resistance.max(1),
-        step: project.descriptor.mask_wash_step.clamp(1, 255) as u8,
-        uniform_rate: project.descriptor.mask_wash_uniform_rate,
-    });
+    let goop_wash = project
+        .descriptor
+        .mask_bake_washable
+        .then(|| GoopWashSettings {
+            konst_register: project.descriptor.mask_wash_konst.min(3),
+            start_level: (project.descriptor.mask_wash_coverage.clamp(0.0, 1.0) * 255.0).round()
+                as u8,
+            resistance: project.descriptor.mask_wash_resistance.max(1),
+            step: project.descriptor.mask_wash_step.clamp(1, 255) as u8,
+            uniform_rate: project.descriptor.mask_wash_uniform_rate,
+        });
     if let Some(wash) = goop_wash.filter(|_| dol_supports_goop_wash(&patched_bytes)) {
         patched_bytes = install_goop_wash(&patched_bytes, wash).map_err(|error| {
             format!(

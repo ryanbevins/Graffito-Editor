@@ -6877,7 +6877,12 @@ fn find_goop_wash_signature(
     what: &str,
 ) -> Result<u32, String> {
     let mut found: Option<u32> = None;
-    for section in image.sections.iter().copied().filter(|section| section.text) {
+    for section in image
+        .sections
+        .iter()
+        .copied()
+        .filter(|section| section.text)
+    {
         let start = usize::try_from(section.file_offset)
             .map_err(|_| "DOL text section offset does not fit usize".to_string())?;
         let end = usize::try_from(section.file_end()?)
@@ -7075,7 +7080,12 @@ fn goop_signature_matches(
     signature: &[u32],
 ) -> Result<Vec<u32>, String> {
     let mut matches = Vec::new();
-    for section in image.sections.iter().copied().filter(|section| section.text) {
+    for section in image
+        .sections
+        .iter()
+        .copied()
+        .filter(|section| section.text)
+    {
         let words = section_words(source, section)?;
         if words.len() < signature.len() {
             continue;
@@ -7127,19 +7137,14 @@ fn find_goop_wash_callees(source: &[u8], image: &DolImage) -> Result<(u32, u32),
         let start = address
             .checked_sub(GOOP_INIT_KCOLOR_SIGNATURE_OFFSET)
             .ok_or_else(|| "packet signature sits too early in the section".to_string())?;
-        if goop_word_at(source, image, start + GOOP_INIT_KCOLOR_TAG_OFFSET)?
-            == GOOP_INIT_KCOLOR_TAG
+        if goop_word_at(source, image, start + GOOP_INIT_KCOLOR_TAG_OFFSET)? == GOOP_INIT_KCOLOR_TAG
         {
             packets.push(start);
         }
     }
     let init_kcolor = match packets.as_slice() {
         [only] => *only,
-        [] => {
-            return Err(
-                "Could not find SMS_InitPacket_OneTevKColor in this DOL".to_string(),
-            )
-        }
+        [] => return Err("Could not find SMS_InitPacket_OneTevKColor in this DOL".to_string()),
         several => {
             return Err(format!(
                 "Expected one SMS_InitPacket_OneTevKColor, found {}",
@@ -7184,7 +7189,9 @@ mod goop_wash_tests {
     #[ignore = "requires SMS_BASE_ROOT pointing at the extracted retail game"]
     fn the_wash_installs_against_the_retail_dol() {
         let base = std::env::var("SMS_BASE_ROOT").expect("set SMS_BASE_ROOT");
-        let path = std::path::Path::new(&base).join("sys").join("main.dol.orig");
+        let path = std::path::Path::new(&base)
+            .join("sys")
+            .join("main.dol.orig");
         let source = std::fs::read(&path).expect("read the original DOL");
 
         let image = parse_dol(&source).expect("parse");
@@ -7224,8 +7231,15 @@ mod goop_wash_tests {
                 patched[offset + 2],
                 patched[offset + 3],
             ]);
-            assert_eq!(word >> 26, 18, "uniform={uniform_rate}: hook is not a branch");
-            println!("uniform={uniform_rate}: hook {hook:#010x}, {} bytes", patched.len());
+            assert_eq!(
+                word >> 26,
+                18,
+                "uniform={uniform_rate}: hook is not a branch"
+            );
+            println!(
+                "uniform={uniform_rate}: hook {hook:#010x}, {} bytes",
+                patched.len()
+            );
         }
 
         let settings = GoopWashSettings {

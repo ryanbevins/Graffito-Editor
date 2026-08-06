@@ -565,10 +565,7 @@ fn append_material_bytes(
         J3dScalarArray::Unsigned8(values) | J3dScalarArray::PackedColor(values) => values,
         _ => return Err(unsupported(format!("{kind:?} is not a byte table"))),
     };
-    if let Some(existing) = values
-        .chunks_exact(stride)
-        .position(|chunk| chunk == bytes)
-    {
+    if let Some(existing) = values.chunks_exact(stride).position(|chunk| chunk == bytes) {
         return Ok(existing);
     }
     let index = values.len() / stride;
@@ -605,10 +602,7 @@ fn append_material_count(
 }
 
 /// How many coordinates a material generates.
-fn material_tex_gen_count(
-    materials: &J3dMaterialSection,
-    record: &J3dMaterialInitRecord,
-) -> usize {
+fn material_tex_gen_count(materials: &J3dMaterialSection, record: &J3dMaterialInitRecord) -> usize {
     materials
         .tables
         .iter()
@@ -634,10 +628,7 @@ fn record_alignment_padding(spans: &mut Vec<J3dPaddingSpan>, cursor: usize, alig
     if aligned <= cursor {
         return;
     }
-    let (Ok(offset), Ok(length)) = (
-        u32::try_from(cursor),
-        u32::try_from(aligned - cursor),
-    ) else {
+    let (Ok(offset), Ok(length)) = (u32::try_from(cursor), u32::try_from(aligned - cursor)) else {
         return;
     };
     spans.push(J3dPaddingSpan {
@@ -665,9 +656,8 @@ fn relayout_name_table(table: &mut J3dNameTable) -> Result<usize> {
                 entry.name
             )));
         }
-        entry.string_offset = u16::try_from(cursor).map_err(|_| {
-            unsupported(format!("name table is too large for {:?}", entry.name))
-        })?;
+        entry.string_offset = u16::try_from(cursor)
+            .map_err(|_| unsupported(format!("name table is too large for {:?}", entry.name)))?;
         cursor += encoded.len() + 1;
     }
     Ok(cursor)
@@ -1071,7 +1061,9 @@ impl J3dRebuildDocument {
                     };
                     for vertex in vertices {
                         let index = u16::try_from(written).map_err(|_| {
-                            unsupported("more vertices than a coordinate array can index".to_string())
+                            unsupported(
+                                "more vertices than a coordinate array can index".to_string(),
+                            )
                         })?;
                         vertex.push(J3dGxVertexOperand::Index16(index));
                         written += 1;
@@ -1091,7 +1083,9 @@ impl J3dRebuildDocument {
             let J3dRebuildSectionData::Vertices(vertices) = &mut section.data else {
                 continue;
             };
-            vertices.formats.retain(|format| format.attribute != GX_VA_NULL);
+            vertices
+                .formats
+                .retain(|format| format.attribute != GX_VA_NULL);
             vertices.formats.push(J3dVertexAttributeFormat {
                 attribute,
                 component_count: 1,
@@ -1247,8 +1241,9 @@ impl J3dRebuildDocument {
                             *slot_matrix = draw_matrices.get(entry as usize).copied().flatten();
                         }
                     }
-                    let matrix_for =
-                        |slot: usize| -> Option<[[f32; 4]; 3]> { in_force.get(slot).copied().flatten() };
+                    let matrix_for = |slot: usize| -> Option<[[f32; 4]; 3]> {
+                        in_force.get(slot).copied().flatten()
+                    };
                     for command in &draw.commands {
                         let J3dGxCommand::Primitive { vertices, .. } = command else {
                             continue;
@@ -1373,9 +1368,8 @@ impl J3dRebuildDocument {
             let texture_number_index = append_material_u16(
                 materials,
                 J3dMaterialTableKind::TextureNumber,
-                u16::try_from(texture_index).map_err(|_| {
-                    unsupported("model carries too many textures".to_string())
-                })?,
+                u16::try_from(texture_index)
+                    .map_err(|_| unsupported("model carries too many textures".to_string()))?,
             )?;
 
             // A stage names the slots a material binds, not the table entries
@@ -1445,15 +1439,12 @@ impl J3dRebuildDocument {
                     }
                 }
             }
-            let konst_register = claimed
-                .iter()
-                .position(|used| !used)
-                .ok_or_else(|| {
-                    unsupported(format!(
-                        "material {:?} reads all four konst registers",
-                        request.material_name
-                    ))
-                })?;
+            let konst_register = claimed.iter().position(|used| !used).ok_or_else(|| {
+                unsupported(format!(
+                    "material {:?} reads all four konst registers",
+                    request.material_name
+                ))
+            })?;
             // Alpha selectors for the four registers run from twenty eight.
             let konst_selector = 0x1c + konst_register as u8;
 
@@ -1471,8 +1462,7 @@ impl J3dRebuildDocument {
             let gen_count_index = append_material_count(
                 materials,
                 J3dMaterialTableKind::TexGenCount,
-                u8::try_from(gen_count + 1)
-                    .map_err(|_| unsupported("texgen count".to_string()))?,
+                u8::try_from(gen_count + 1).map_err(|_| unsupported("texgen count".to_string()))?,
             )?;
             let stage_count_index = append_material_count(
                 materials,
@@ -1601,7 +1591,10 @@ impl J3dRebuildDocument {
                     cursor += relayout_name_table(names)?;
                     continue;
                 }
-                let Some(table) = materials.tables.iter_mut().find(|table| table.kind == *kind)
+                let Some(table) = materials
+                    .tables
+                    .iter_mut()
+                    .find(|table| table.kind == *kind)
                 else {
                     continue;
                 };
@@ -1623,8 +1616,8 @@ impl J3dRebuildDocument {
             materials.offsets = offsets;
             let size = align_up(cursor, 0x20);
             record_alignment_padding(&mut padding, cursor, size);
-            section.declared_size = u32::try_from(size)
-                .map_err(|_| unsupported("MAT3 is too large".to_string()))?;
+            section.declared_size =
+                u32::try_from(size).map_err(|_| unsupported("MAT3 is too large".to_string()))?;
             section.padding = padding;
         }
         Ok(())
@@ -1739,8 +1732,8 @@ impl J3dRebuildDocument {
 
             let size = align_up(cursor, 0x20);
             record_alignment_padding(&mut padding, cursor, size);
-            section.declared_size = u32::try_from(size)
-                .map_err(|_| unsupported("TEX1 is too large".to_string()))?;
+            section.declared_size =
+                u32::try_from(size).map_err(|_| unsupported("TEX1 is too large".to_string()))?;
             section.padding = padding;
         }
         Ok(())
@@ -5999,7 +5992,10 @@ mod goop_layout_tests {
             .iter()
             .find(|stage| stage.color_op >= 8 || stage.alpha_op >= 8)
             .expect("comparison stage");
-        let map = comparison.order.tex_map.expect("the comparison names a map");
+        let map = comparison
+            .order
+            .tex_map
+            .expect("the comparison names a map");
         let sampled = washed
             .texture_indices
             .get(map as usize)
@@ -6017,7 +6013,10 @@ mod goop_layout_tests {
             sampled.height
         );
         assert_eq!(washed.name, material_name, "the wash landed elsewhere");
-        assert_eq!(sampled.name, "graffito_goop", "the wash reads another texture");
+        assert_eq!(
+            sampled.name, "graffito_goop",
+            "the wash reads another texture"
+        );
         assert_eq!(
             washed.tev_k_colors[report.konst_register][3], 200,
             "the wash level did not survive in the register the layer claimed"
@@ -6125,7 +6124,11 @@ mod goop_layout_tests {
             "after: {carried} of {} triangles carry slot {slot}, range {min:?}..{max:?}",
             after.triangles.len()
         );
-        assert_eq!(carried, after.triangles.len(), "not every triangle stored one");
+        assert_eq!(
+            carried,
+            after.triangles.len(),
+            "not every triangle stored one"
+        );
         for axis in 0..2 {
             assert!(min[axis] >= -0.001, "axis {axis} runs below zero: {min:?}");
             assert!(max[axis] <= 1.001, "axis {axis} runs past one: {max:?}");
@@ -6156,7 +6159,10 @@ mod goop_layout_tests {
                 );
             }
         }
-        println!("   geometry unchanged across {} vertices", posed_after.len());
+        println!(
+            "   geometry unchanged across {} vertices",
+            posed_after.len()
+        );
     }
 
     /// The posing behind a stored goop coordinate must agree with the pose the
@@ -6238,9 +6244,7 @@ mod goop_layout_tests {
 
         let mut unmatched = 0usize;
         for point in &actual {
-            let found = expected
-                .binary_search_by_key(&key(point), key)
-                .is_ok();
+            let found = expected.binary_search_by_key(&key(point), key).is_ok();
             if !found {
                 if unmatched < 4 {
                     println!("   unmatched {point:?}");
@@ -6280,7 +6284,11 @@ mod goop_layout_tests {
         let mut checked = 0usize;
         let mut skipped = 0usize;
         for asset in &assets {
-            let text = asset.path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+            let text = asset
+                .path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase();
             if !text.ends_with(".bmd") && !text.ends_with(".bdl") {
                 continue;
             }
@@ -6525,8 +6533,7 @@ mod bake_repro {
             match model.add_goop_layer(&request) {
                 Ok(report) => println!(
                     "  ADD OK   {} -> konst register K{}, first stage {}, texture index {}",
-                    material.name, report.konst_register, report.first_stage,
-                    report.texture_index
+                    material.name, report.konst_register, report.first_stage, report.texture_index
                 ),
                 Err(error) => println!("  ADD FAIL {}: {error}", material.name),
             }
