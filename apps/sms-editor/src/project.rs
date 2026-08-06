@@ -18,6 +18,12 @@ const MAX_PROJECT_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_RECENT_PROJECTS: usize = 12;
 static PROJECT_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+pub(super) const EXTENDED_DOLPHIN_MEM1_BYTES: u32 = 48 * 1024 * 1024;
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct ProjectLaunchConfiguration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -26,6 +32,12 @@ pub(super) struct ProjectLaunchConfiguration {
     pub(super) game_image: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) dolphin_user_directory: Option<PathBuf>,
+    /// Gives Dolphin-only managed launches a 48 MiB MEM1 arena.
+    ///
+    /// This cannot make a package compatible with retail 24 MiB hardware, so
+    /// users can opt out when validating a hardware-safe stage.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(super) extended_dolphin_memory: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1097,6 +1109,25 @@ mod tests {
         assert_eq!(reopened.descriptor, project);
         assert_eq!(reopened.data_root(), root.join("Isle Delfino.smsdata"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn extended_dolphin_memory_defaults_off_and_persists_an_explicit_opt_in() {
+        let default_launch: ProjectLaunchConfiguration = toml::from_str("").unwrap();
+        assert!(!default_launch.extended_dolphin_memory);
+        assert!(!ProjectLaunchConfiguration::default().extended_dolphin_memory);
+
+        let enabled = ProjectLaunchConfiguration {
+            extended_dolphin_memory: true,
+            ..ProjectLaunchConfiguration::default()
+        };
+        let serialized = toml::to_string(&enabled).unwrap();
+        assert!(serialized.contains("extended_dolphin_memory = true"));
+        assert!(
+            toml::from_str::<ProjectLaunchConfiguration>(&serialized)
+                .unwrap()
+                .extended_dolphin_memory
+        );
     }
 
     #[test]

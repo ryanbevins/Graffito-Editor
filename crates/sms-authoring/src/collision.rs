@@ -9,6 +9,11 @@ use crate::{
 };
 
 pub const SUNSHINE_COL_MAX_VERTICES: usize = i16::MAX as usize + 1;
+/// Graffito's managed runtime changes Sunshine's three COL index loads from
+/// signed to unsigned halfwords. The on-disc field is already two bytes wide,
+/// so authored collision can address the complete `u16` range without a new
+/// file format when it is paired with the managed DOL patch.
+pub const SUNSHINE_COL_EXTENDED_MAX_VERTICES: usize = u16::MAX as usize + 1;
 /// Conservative world-COL triangle budget derived from Sunshine's retail
 /// stages. The largest NTSC-U map COL is 12,013 triangles; keeping authored
 /// terrain at 12,000 also leaves room for the blank-stage safety shell.
@@ -170,10 +175,10 @@ impl CollisionDocument {
 
     pub fn to_col_file(&self) -> AuthoringResult<ColFile> {
         self.validate()?;
-        if self.vertices.len() > SUNSHINE_COL_MAX_VERTICES {
+        if self.vertices.len() > SUNSHINE_COL_EXTENDED_MAX_VERTICES {
             return Err(AuthoringError::Collision(format!(
-                "{} vertices exceed the retail signed-index limit of {SUNSHINE_COL_MAX_VERTICES}",
-                self.vertices.len()
+                "{} vertices exceed Graffito's extended Sunshine COL u16-index limit of {SUNSHINE_COL_EXTENDED_MAX_VERTICES}",
+                self.vertices.len(),
             )));
         }
         let vertices = self
@@ -199,7 +204,7 @@ impl CollisionDocument {
                     .map(|triangle| {
                         let vertex_indices = triangle.map(|index| {
                             u16::try_from(index)
-                                .expect("runtime signed-index validation also guarantees u16")
+                                .expect("extended runtime index validation guarantees u16")
                         });
                         ColTriangle {
                             vertex_indices,

@@ -2654,23 +2654,8 @@ impl SmsEditorApp {
                 .as_ref()
                 .map(|collision| collision.to_col_file())
                 .transpose()
-                .map_err(|error| {
-                    format!(
-                        "could not compile placed world COL: {error}. Select the model asset, open Collision, run Fit Sunshine Runtime COL, save the asset, and retry"
-                    )
-                })?;
+                .map_err(|error| format!("could not compile placed world COL: {error}"))?;
             if let Some(collision) = collision {
-                let triangle_count = collision
-                    .groups()
-                    .iter()
-                    .map(|group| group.triangles.len())
-                    .sum::<usize>();
-                if triangle_count > sms_authoring::SUNSHINE_COL_RUNTIME_TRIANGLE_BUDGET {
-                    return Err(format!(
-                        "placed world COL has {triangle_count} triangles, exceeding Graffito's retail-scale Sunshine runtime budget of {}. Select the model asset, open Collision, run Fit Sunshine Runtime COL, save the asset, and retry",
-                        sms_authoring::SUNSHINE_COL_RUNTIME_TRIANGLE_BUDGET,
-                    ));
-                }
                 edits.append_collision(b"map/map.col".to_vec(), collision);
             }
         }
@@ -3446,7 +3431,7 @@ impl SmsEditorApp {
             ui.colored_label(
                 egui::Color32::from_rgb(245, 190, 90),
                 format!(
-                    "Sunshine COL supports at most {} vertices, and retail NTSC-U world collision tops out near {} triangles; this collision must be fitted before stage build.",
+                    "This exceeds stock Sunshine's {}-vertex / approximately {}-triangle range. Graffito's managed game build will install extended unsigned COL indexing and tighter runtime pools automatically; fitting remains available for an unpatched retail DOL.",
                     sms_authoring::SUNSHINE_COL_MAX_VERTICES,
                     sms_authoring::SUNSHINE_COL_RUNTIME_TRIANGLE_BUDGET,
                 ),
@@ -3463,7 +3448,7 @@ impl SmsEditorApp {
                 }
             });
             ui.small(
-                "Deterministically fits both the signed vertex-index limit and a retail-scale triangle budget without crossing surface-group boundaries or flipping triangle winding. Render geometry is unchanged; the collision edit is undoable.",
+                "Optional retail-compatibility conversion. It deterministically fits the signed vertex-index limit and retail-scale triangle budget without crossing runtime surface boundaries or flipping triangle winding. Render geometry is unchanged; the collision edit is undoable.",
             );
             ui.separator();
         }
@@ -5569,7 +5554,7 @@ mod tests {
     }
 
     #[test]
-    fn world_collision_over_retail_runtime_budget_is_rejected_before_launch() {
+    fn world_collision_over_retail_runtime_budget_uses_extended_managed_runtime() {
         let temporary = tempfile::tempdir().unwrap();
         let content = temporary.path().join("Content");
         let catalog = ModelAssetCatalog::open_content_root(&content).unwrap();
@@ -5602,14 +5587,22 @@ mod tests {
             local_bounds: model_document_bounds(&imported).unwrap(),
         };
 
-        let error = SmsEditorApp::stage_edits_with_model_instances(
+        let edits = SmsEditorApp::stage_edits_with_model_instances(
             &content,
             &[instance],
             &sms_scene::StageArchiveEdits::default(),
         )
-        .unwrap_err();
-        assert!(error.contains("12001 triangles"), "{error}");
-        assert!(error.contains("Fit Sunshine Runtime COL"), "{error}");
+        .unwrap();
+        assert_eq!(edits.collisions.len(), 1);
+        assert_eq!(
+            edits.collisions[0]
+                .document
+                .groups()
+                .iter()
+                .map(|group| group.triangles.len())
+                .sum::<usize>(),
+            triangle_count
+        );
     }
 
     #[test]

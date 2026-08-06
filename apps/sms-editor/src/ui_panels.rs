@@ -844,12 +844,30 @@ impl SmsEditorApp {
 
         ui.separator();
         ui.heading("Dolphin");
+        if ui
+            .add_enabled(
+                self.current_project.is_some(),
+                egui::Checkbox::new(
+                    &mut self.dolphin_extended_memory,
+                    "Extended Dolphin memory (48 MiB MEM1)",
+                ),
+            )
+            .on_hover_text(
+                "Patches only the project-owned managed run-root and applies matching per-launch Dolphin overrides. Disable this to test against the retail 24 MiB MEM1 limit.",
+            )
+            .changed()
+        {
+            self.persist_project_settings(false);
+        }
+        ui.small(
+            "Enabled by default for authored stages. This is Dolphin-only and does not make an oversized stage compatible with a retail GameCube.",
+        );
         let choose_dolphin =
             path_display_row(ui, "Executable", &self.dolphin_path, "Browse...", true);
         let choose_user_dir =
             path_display_row(ui, "User Dir", &self.dolphin_user_dir, "Browse...", true);
         ui.small(
-            "Both launch buttons refresh the managed runnable mirror, skip the Nintendo logo sequence, boot the open scene directly, and reload that scene after losing a life. They enable Dolphin's targeted Native Resolution Goop graphics mod. Launch in Editor embeds Dolphin into the viewport; Launch in Dolphin keeps an external window. Leave User Dir blank to use your normal Dolphin profile and controller configuration.",
+            "Both launch buttons refresh the managed runnable mirror, apply the selected memory profile, skip the Nintendo logo sequence, boot the open scene directly, and reload that scene after losing a life. They enable Dolphin's targeted Native Resolution Goop graphics mod. Launch in Editor embeds Dolphin into the viewport; Launch in Dolphin keeps an external window. Leave User Dir blank to use your normal Dolphin profile and controller configuration.",
         );
         ui.label("Legacy external game launch (optional)");
         let choose_game = path_display_row(ui, "Game", &self.game_path, "Browse...", true);

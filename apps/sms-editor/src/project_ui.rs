@@ -409,6 +409,7 @@ impl SmsEditorApp {
             dolphin_executable: optional_path(&self.dolphin_path),
             game_image: optional_path(&self.game_path),
             dolphin_user_directory: optional_path(&self.dolphin_user_dir),
+            extended_dolphin_memory: self.dolphin_extended_memory,
         };
         match project.save() {
             Ok(()) => {
@@ -585,6 +586,7 @@ impl SmsEditorApp {
         self.game_path = display_optional_path(&project.descriptor.launch.game_image);
         self.dolphin_user_dir =
             display_optional_path(&project.descriptor.launch.dolphin_user_directory);
+        self.dolphin_extended_memory = project.descriptor.launch.extended_dolphin_memory;
         self.project_name_draft = project.descriptor.name.clone();
         self.current_project = Some(project);
         if let Some(project) = &self.current_project {

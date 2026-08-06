@@ -26,8 +26,17 @@ const COLLISION_TRIANGLE_CAPACITY_FIELD: &str = "collision_triangle_capacity";
 const COLLISION_LIST_CAPACITY_FIELD: &str = "collision_list_capacity";
 const COLLISION_WARP_CAPACITY_FIELD: &str = "collision_warp_capacity";
 const COLLISION_GRID_CELL_SIZE: f32 = 1024.0;
-const COLLISION_GRID_CELL_RECIPROCAL: f32 = 1.0 / COLLISION_GRID_CELL_SIZE;
+const EXTENDED_COLLISION_GRID_CELL_SIZE: f32 = 65_536.0;
+const EXTENDED_COLLISION_GRID_WIDTH_MARKER: u32 = 0x8000_0000;
 const COLLISION_WALL_PADDING: f32 = 80.0;
+const RETAIL_COLLISION_VERTEX_LIMIT: usize = i16::MAX as usize + 1;
+const RETAIL_WORLD_COLLISION_TRIANGLE_BUDGET: i32 = 12_000;
+/// Extended terrain keeps small moving-collision reserves instead of the blank
+/// stage's retail-scale pools. Wuhu's unmodified static COL alone consumes over
+/// 5 MiB in `TMapCollisionData`; retaining the default reserves exhausts the
+/// stage solid heap before its list pool can be constructed.
+const EXTENDED_COLLISION_TRIANGLE_RESERVE: i32 = 256;
+const EXTENDED_COLLISION_WARP_RESERVE: i32 = 256;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StageArchiveEdits {
@@ -768,20 +777,19 @@ fn apply_resource_edits(
     for edit in &edits.collisions {
         match archive.resource(&edit.raw_resource_path) {
             Some(StageResourceDocument::Collision(document)) => {
+                let existing = document.clone();
                 let replacement = match edit.mode {
                     StageCollisionEditMode::Replace | StageCollisionEditMode::Upsert => {
                         edit.document.clone()
                     }
                     StageCollisionEditMode::Append => append_collision_document(
-                        document,
+                        &existing,
                         &edit.document,
                         &edit.raw_resource_path,
                     )?,
                 };
-                if edit.mode == StageCollisionEditMode::Append
-                    && edit.raw_resource_path == WORLD_COLLISION_PATH
-                {
-                    preserve_world_collision_runtime_headroom(archive, &edit.document)?;
+                if edit.raw_resource_path == WORLD_COLLISION_PATH {
+                    preserve_world_collision_runtime_headroom(archive, &existing, &replacement)?;
                 }
                 archive.replace_resource(
                     &edit.raw_resource_path,
@@ -837,11 +845,11 @@ pub(crate) fn append_collision_document(
                             display_raw_path(raw_resource_path)
                         ))
                     })?;
-                if remapped > i16::MAX as usize {
+                if remapped > u16::MAX as usize {
                     return Err(stage_export_error(format!(
-                        "collision append for {} cannot remap group {group_index} triangle {triangle_index} vertex {vertex_index}: index {remapped} exceeds the retail COL signed-index limit {}",
+                        "collision append for {} cannot remap group {group_index} triangle {triangle_index} vertex {vertex_index}: index {remapped} exceeds Graffito's extended Sunshine COL u16-index limit {}",
                         display_raw_path(raw_resource_path),
-                        i16::MAX
+                        u16::MAX
                     )));
                 }
                 *vertex_index = remapped as u16;
@@ -867,8 +875,10 @@ pub(crate) fn append_collision_document(
 struct MapCollisionRuntimeConfig {
     grid_width: i32,
     grid_height: i32,
+    grid_cell_size: f32,
     triangle_capacity: i32,
     list_capacity: i32,
+    warp_capacity: i32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -879,7 +889,8 @@ struct CollisionTrianglePoints {
 
 fn preserve_world_collision_runtime_headroom(
     archive: &mut SourceFreeStageArchive,
-    authored: &ColFile,
+    existing: &ColFile,
+    replacement: &ColFile,
 ) -> Result<()> {
     let placement = match archive.resource_mut(WORLD_SCENE_PATH) {
         Some(StageResourceDocument::Placement(document)) => document,
@@ -905,25 +916,124 @@ fn preserve_world_collision_runtime_headroom(
         )));
     };
     let config = read_map_collision_runtime_config(fields)?;
-    let triangle_delta = authored_collision_triangle_count(authored)?;
-    let list_delta = authored_collision_grid_link_count(authored, config)?;
-    let triangle_capacity = config
+    let existing_triangles = authored_collision_triangle_count(existing)?;
+    let replacement_triangles = authored_collision_triangle_count(replacement)?;
+    let existing_links = authored_collision_grid_link_count(existing, config)?;
+    let extended_runtime = replacement.vertices().len() > RETAIL_COLLISION_VERTEX_LIMIT
+        || replacement_triangles > RETAIL_WORLD_COLLISION_TRIANGLE_BUDGET;
+    let (grid_width, grid_height) = if extended_runtime {
+        (
+            extended_collision_grid_dimension(replacement, 0, config.grid_width)?,
+            extended_collision_grid_dimension(replacement, 2, config.grid_height)?,
+        )
+    } else {
+        (config.grid_width, config.grid_height)
+    };
+    let replacement_config = MapCollisionRuntimeConfig {
+        grid_width,
+        grid_height,
+        grid_cell_size: if extended_runtime {
+            EXTENDED_COLLISION_GRID_CELL_SIZE
+        } else {
+            COLLISION_GRID_CELL_SIZE
+        },
+        ..config
+    };
+    let replacement_links = authored_collision_grid_link_count(replacement, replacement_config)?;
+
+    let triangle_reserve = config
         .triangle_capacity
-        .checked_add(triangle_delta)
+        .checked_sub(existing_triangles)
         .ok_or_else(|| {
             stage_export_error(format!(
-                "Map field '{COLLISION_TRIANGLE_CAPACITY_FIELD}' overflows i32 while preserving {triangle_delta} authored collision triangles"
+                "Map field '{COLLISION_TRIANGLE_CAPACITY_FIELD}' ({}) is smaller than the existing world collision ({existing_triangles})",
+                config.triangle_capacity
             ))
         })?;
-    let list_capacity = config.list_capacity.checked_add(list_delta).ok_or_else(|| {
+    let list_reserve = config
+        .list_capacity
+        .checked_sub(existing_links)
+        .ok_or_else(|| {
+            stage_export_error(format!(
+                "Map field '{COLLISION_LIST_CAPACITY_FIELD}' ({}) is smaller than the existing world collision grid ({existing_links})",
+                config.list_capacity
+            ))
+        })?;
+    let triangle_reserve = if extended_runtime {
+        triangle_reserve.min(EXTENDED_COLLISION_TRIANGLE_RESERVE)
+    } else {
+        triangle_reserve
+    };
+    // `TMapCollisionData::unk2C` is shared by the forward-growing static list
+    // cursor and the reverse-growing moving-collision cursor. The authored
+    // world-COL census accounts only for the static half; the shell's original
+    // unused list capacity is runtime headroom for object collision and must
+    // remain intact. Capping it lets either unchecked cursor leave the
+    // constructed `TBGCheckList` array and corrupt a later virtual call.
+    let triangle_capacity = replacement_triangles
+        .checked_add(triangle_reserve)
+        .ok_or_else(|| {
+            stage_export_error(format!(
+                "Map field '{COLLISION_TRIANGLE_CAPACITY_FIELD}' overflows i32 while preserving {triangle_reserve} runtime-reserve triangles"
+            ))
+        })?;
+    let list_capacity = replacement_links.checked_add(list_reserve).ok_or_else(|| {
         stage_export_error(format!(
-            "Map field '{COLLISION_LIST_CAPACITY_FIELD}' overflows i32 while preserving {list_delta} authored collision grid links"
+            "Map field '{COLLISION_LIST_CAPACITY_FIELD}' overflows i32 while preserving {list_reserve} runtime-reserve grid links"
         ))
     })?;
+    let warp_capacity = if extended_runtime {
+        config.warp_capacity.min(EXTENDED_COLLISION_WARP_RESERVE)
+    } else {
+        config.warp_capacity
+    };
 
     set_unique_i32_field(fields, COLLISION_TRIANGLE_CAPACITY_FIELD, triangle_capacity)?;
     set_unique_i32_field(fields, COLLISION_LIST_CAPACITY_FIELD, list_capacity)?;
+    set_unique_i32_field(fields, COLLISION_WARP_CAPACITY_FIELD, warp_capacity)?;
+    let encoded_grid_width = if extended_runtime {
+        (u32::try_from(grid_width)
+            .map_err(|_| stage_export_error("Map collision grid width does not fit u32"))?
+            | EXTENDED_COLLISION_GRID_WIDTH_MARKER) as i32
+    } else {
+        config.grid_width
+    };
+    set_unique_i32_field(fields, COLLISION_GRID_WIDTH_FIELD, encoded_grid_width)?;
+    set_unique_i32_field(fields, COLLISION_GRID_HEIGHT_FIELD, grid_height)?;
     Ok(())
+}
+
+fn extended_collision_grid_dimension(
+    collision: &ColFile,
+    axis: usize,
+    maximum_dimension: i32,
+) -> Result<i32> {
+    let maximum_absolute = collision
+        .vertices()
+        .iter()
+        .try_fold(0.0_f32, |maximum, vertex| {
+            let coordinate = vertex.position[axis];
+            if !coordinate.is_finite() {
+                return Err(stage_export_error(format!(
+                    "world collision vertex has non-finite axis {axis} coordinate"
+                )));
+            }
+            Ok(maximum.max(coordinate.abs()))
+        })?;
+    let required_half_cells = ((maximum_absolute + COLLISION_WALL_PADDING)
+        / EXTENDED_COLLISION_GRID_CELL_SIZE)
+        .ceil() as i32
+        + 1;
+    let dimension = required_half_cells
+        .checked_mul(2)
+        .ok_or_else(|| stage_export_error("extended collision grid dimension overflowed i32"))?
+        .max(2);
+    if dimension > maximum_dimension {
+        return Err(stage_export_error(format!(
+            "world collision axis {axis} requires an extended grid dimension of {dimension}, exceeding this stage's maximum {maximum_dimension}"
+        )));
+    }
+    Ok(dimension)
 }
 
 fn unique_map_record_mut(document: &mut JDramaDocument) -> Result<&mut JDramaRecord> {
@@ -992,7 +1102,11 @@ fn semantic_record_type_name(type_name: &str) -> &str {
 }
 
 fn read_map_collision_runtime_config(fields: &[JDramaField]) -> Result<MapCollisionRuntimeConfig> {
-    let grid_width = unique_i32_field(fields, COLLISION_GRID_WIDTH_FIELD)?;
+    let raw_grid_width = unique_i32_field(fields, COLLISION_GRID_WIDTH_FIELD)?;
+    let raw_grid_width_bits = raw_grid_width as u32;
+    let extended_grid = raw_grid_width_bits & EXTENDED_COLLISION_GRID_WIDTH_MARKER != 0;
+    let grid_width = i32::try_from(raw_grid_width_bits & !EXTENDED_COLLISION_GRID_WIDTH_MARKER)
+        .map_err(|_| stage_export_error("Map collision grid width does not fit i32"))?;
     let grid_height = unique_i32_field(fields, COLLISION_GRID_HEIGHT_FIELD)?;
     let triangle_capacity = unique_i32_field(fields, COLLISION_TRIANGLE_CAPACITY_FIELD)?;
     let list_capacity = unique_i32_field(fields, COLLISION_LIST_CAPACITY_FIELD)?;
@@ -1023,8 +1137,14 @@ fn read_map_collision_runtime_config(fields: &[JDramaField]) -> Result<MapCollis
     Ok(MapCollisionRuntimeConfig {
         grid_width,
         grid_height,
+        grid_cell_size: if extended_grid {
+            EXTENDED_COLLISION_GRID_CELL_SIZE
+        } else {
+            COLLISION_GRID_CELL_SIZE
+        },
         triangle_capacity,
         list_capacity,
+        warp_capacity,
     })
 }
 
@@ -1088,8 +1208,8 @@ fn authored_collision_grid_link_count(
     authored: &ColFile,
     config: MapCollisionRuntimeConfig,
 ) -> Result<i32> {
-    let extent_x = (config.grid_width / 2) as f32 * COLLISION_GRID_CELL_SIZE;
-    let extent_z = (config.grid_height / 2) as f32 * COLLISION_GRID_CELL_SIZE;
+    let extent_x = (config.grid_width / 2) as f32 * config.grid_cell_size;
+    let extent_z = (config.grid_height / 2) as f32 * config.grid_cell_size;
     if !extent_x.is_finite() || !extent_z.is_finite() {
         return Err(stage_export_error(
             "Map collision grid extents are not finite",
@@ -1113,6 +1233,7 @@ fn authored_collision_grid_link_count(
                 extent_z,
                 config.grid_width,
                 config.grid_height,
+                config.grid_cell_size.recip(),
                 group_index,
                 triangle_index,
             )?
@@ -1122,10 +1243,10 @@ fn authored_collision_grid_link_count(
 
             for z_index in min_z..=max_z {
                 for x_index in min_x..=max_x {
-                    let cell_min_x = x_index as f32 * COLLISION_GRID_CELL_SIZE - extent_x;
-                    let cell_min_z = z_index as f32 * COLLISION_GRID_CELL_SIZE - extent_z;
-                    let cell_max_x = (x_index + 1) as f32 * COLLISION_GRID_CELL_SIZE - extent_x;
-                    let cell_max_z = (z_index + 1) as f32 * COLLISION_GRID_CELL_SIZE - extent_z;
+                    let cell_min_x = x_index as f32 * config.grid_cell_size - extent_x;
+                    let cell_min_z = z_index as f32 * config.grid_cell_size - extent_z;
+                    let cell_max_x = (x_index + 1) as f32 * config.grid_cell_size - extent_x;
+                    let cell_max_z = (z_index + 1) as f32 * config.grid_cell_size - extent_z;
                     let (cell_min_x, cell_min_z, cell_max_x, cell_max_z) =
                         if plane_type == CollisionPlaneType::Wall {
                             (
@@ -1234,6 +1355,7 @@ fn collision_grid_bounds(
     extent_z: f32,
     grid_width: i32,
     grid_height: i32,
+    grid_cell_reciprocal: f32,
     group_index: usize,
     triangle_index: usize,
 ) -> Result<Option<[i32; 4]>> {
@@ -1260,25 +1382,25 @@ fn collision_grid_bounds(
     }
 
     let min_x = checked_trunc_grid_index(
-        (min_x + extent_x) * COLLISION_GRID_CELL_RECIPROCAL,
+        (min_x + extent_x) * grid_cell_reciprocal,
         group_index,
         triangle_index,
     )?
     .max(0);
     let min_z = checked_trunc_grid_index(
-        (min_z + extent_z) * COLLISION_GRID_CELL_RECIPROCAL,
+        (min_z + extent_z) * grid_cell_reciprocal,
         group_index,
         triangle_index,
     )?
     .max(0);
     let max_x = checked_trunc_grid_index(
-        (max_x + extent_x) * COLLISION_GRID_CELL_RECIPROCAL,
+        (max_x + extent_x) * grid_cell_reciprocal,
         group_index,
         triangle_index,
     )?
     .min(grid_width - 1);
     let max_z = checked_trunc_grid_index(
-        (max_z + extent_z) * COLLISION_GRID_CELL_RECIPROCAL,
+        (max_z + extent_z) * grid_cell_reciprocal,
         group_index,
         triangle_index,
     )?
@@ -3964,8 +4086,10 @@ mod tests {
         let config = MapCollisionRuntimeConfig {
             grid_width: 60,
             grid_height: 60,
+            grid_cell_size: COLLISION_GRID_CELL_SIZE,
             triangle_capacity: 12_000,
             list_capacity: 30_000,
+            warp_capacity: 3_000,
         };
         assert_eq!(authored_collision_triangle_count(&authored).unwrap(), 4_212);
         assert_eq!(
@@ -3998,6 +4122,48 @@ mod tests {
     }
 
     #[test]
+    fn extended_world_collision_trades_unused_retail_headroom_for_static_terrain() {
+        let fixture = StageFixture::new("extended-world-collision-capacities");
+        let mut document = fixture.document();
+        install_world_collision_resources(&mut document);
+        let mut authored = authored_collision(0, 100.0, 0);
+        let triangle = authored.groups()[0].triangles[0].clone();
+        authored.groups_mut()[0].triangles = vec![triangle; 12_001];
+
+        let mut edits = StageArchiveEdits::default();
+        edits.append_collision(WORLD_COLLISION_PATH.to_vec(), authored);
+        let rebuilt = document.build_stage_archive_with_edits(&edits).unwrap();
+        let reopened = SourceFreeStageArchive::parse(&rebuilt).unwrap();
+        // One existing triangle plus 12,001 authored triangles, with a
+        // bounds-fitted grid, compact triangle/warp reserves, and the shell's
+        // complete non-world collision-list headroom.
+        assert_eq!(
+            world_map_collision_fields(&reopened),
+            [
+                (EXTENDED_COLLISION_GRID_WIDTH_MARKER | 4) as i32,
+                4,
+                12_258,
+                42_001,
+                256,
+            ]
+        );
+        let placement = match reopened.resource(WORLD_SCENE_PATH).unwrap() {
+            StageResourceDocument::Placement(document) => document,
+            _ => panic!("world scene has wrong kind"),
+        };
+        let JDramaRecordPayload::Group { children, .. } = &placement.root.payload else {
+            panic!("world scene root is not a group");
+        };
+        let JDramaRecordPayload::Fields { fields } = &children[0].payload else {
+            panic!("Map record does not have fields");
+        };
+        let config = read_map_collision_runtime_config(fields).unwrap();
+        assert_eq!(config.grid_width, 4);
+        assert_eq!(config.grid_height, 4);
+        assert_eq!(config.grid_cell_size, EXTENDED_COLLISION_GRID_CELL_SIZE);
+    }
+
+    #[test]
     fn collision_grid_links_apply_wall_padding_to_bounds_and_cells() {
         let authored = collision_with_triangle(
             0,
@@ -4010,8 +4176,10 @@ mod tests {
         let config = MapCollisionRuntimeConfig {
             grid_width: 4,
             grid_height: 4,
+            grid_cell_size: COLLISION_GRID_CELL_SIZE,
             triangle_capacity: 0,
             list_capacity: 0,
+            warp_capacity: 0,
         };
         let points = collision_triangle_points(&authored, [0, 1, 2], 0, 0).unwrap();
 
@@ -4027,6 +4195,7 @@ mod tests {
                 2_048.0,
                 4,
                 4,
+                COLLISION_GRID_CELL_SIZE.recip(),
                 0,
                 0,
             )
@@ -4060,8 +4229,10 @@ mod tests {
         let config = MapCollisionRuntimeConfig {
             grid_width: 4,
             grid_height: 4,
+            grid_cell_size: COLLISION_GRID_CELL_SIZE,
             triangle_capacity: 0,
             list_capacity: 0,
+            warp_capacity: 0,
         };
         let points = collision_triangle_points(&authored, [0, 1, 2], 0, 0).unwrap();
 
@@ -4078,6 +4249,7 @@ mod tests {
                 2_048.0,
                 4,
                 4,
+                COLLISION_GRID_CELL_SIZE.recip(),
                 0,
                 0,
             )
@@ -4103,8 +4275,10 @@ mod tests {
         let config = MapCollisionRuntimeConfig {
             grid_width: 4,
             grid_height: 4,
+            grid_cell_size: COLLISION_GRID_CELL_SIZE,
             triangle_capacity: 0,
             list_capacity: 0,
+            warp_capacity: 0,
         };
         let triangle = collision_triangle_points(&forced_ground, [0, 1, 2], 0, 0).unwrap();
 
@@ -4144,8 +4318,10 @@ mod tests {
         let config = MapCollisionRuntimeConfig {
             grid_width: 4,
             grid_height: 4,
+            grid_cell_size: COLLISION_GRID_CELL_SIZE,
             triangle_capacity: 0,
             list_capacity: 0,
+            warp_capacity: 0,
         };
         let partial_points = collision_triangle_points(&partial, [0, 1, 2], 0, 0).unwrap();
         let outside_points = collision_triangle_points(&outside, [0, 1, 2], 0, 0).unwrap();
@@ -4158,6 +4334,7 @@ mod tests {
                 2_048.0,
                 4,
                 4,
+                COLLISION_GRID_CELL_SIZE.recip(),
                 0,
                 0,
             )
@@ -4172,6 +4349,7 @@ mod tests {
                 2_048.0,
                 4,
                 4,
+                COLLISION_GRID_CELL_SIZE.recip(),
                 0,
                 0,
             )
@@ -4209,8 +4387,10 @@ mod tests {
         let config = MapCollisionRuntimeConfig {
             grid_width: 5,
             grid_height: 3,
+            grid_cell_size: COLLISION_GRID_CELL_SIZE,
             triangle_capacity: 0,
             list_capacity: 0,
+            warp_capacity: 0,
         };
         let boundary_points = collision_triangle_points(&boundary, [0, 1, 2], 0, 0).unwrap();
 
@@ -4222,6 +4402,7 @@ mod tests {
                 1_024.0,
                 5,
                 3,
+                COLLISION_GRID_CELL_SIZE.recip(),
                 0,
                 0,
             )
@@ -4272,11 +4453,12 @@ mod tests {
     #[test]
     fn world_collision_capacity_target_rejects_missing_ambiguous_and_wrong_fields() {
         let authored = authored_collision(0, 100.0, 0);
+        let existing = ColFile::new(Vec::new(), Vec::new());
 
         let mut missing = world_collision_archive("missing-map-field");
         world_map_fields_mut(&mut missing)
             .retain(|field| field.name != COLLISION_LIST_CAPACITY_FIELD);
-        let error = preserve_world_collision_runtime_headroom(&mut missing, &authored)
+        let error = preserve_world_collision_runtime_headroom(&mut missing, &existing, &authored)
             .unwrap_err()
             .to_string();
         assert!(
@@ -4293,7 +4475,7 @@ mod tests {
             panic!("world scene root is not a group");
         };
         children.push(children[0].clone());
-        let error = preserve_world_collision_runtime_headroom(&mut ambiguous, &authored)
+        let error = preserve_world_collision_runtime_headroom(&mut ambiguous, &existing, &authored)
             .unwrap_err()
             .to_string();
         assert!(error.contains("capacity target is ambiguous"), "{error}");
@@ -4305,9 +4487,10 @@ mod tests {
             .find(|field| field.name == COLLISION_TRIANGLE_CAPACITY_FIELD)
             .unwrap();
         field.value = JDramaFieldValue::U32(12_000);
-        let error = preserve_world_collision_runtime_headroom(&mut wrong_type, &authored)
-            .unwrap_err()
-            .to_string();
+        let error =
+            preserve_world_collision_runtime_headroom(&mut wrong_type, &existing, &authored)
+                .unwrap_err()
+                .to_string();
         assert!(
             error.contains("collision_triangle_capacity") && error.contains("not typed i32"),
             "{error}"
@@ -4340,6 +4523,7 @@ mod tests {
     #[test]
     fn world_collision_capacity_overflow_is_rejected_atomically() {
         let authored = authored_collision(0, 100.0, 0);
+        let existing = ColFile::new(Vec::new(), Vec::new());
 
         let mut triangle_overflow = world_collision_archive("triangle-capacity-overflow");
         set_unique_i32_field(
@@ -4349,9 +4533,10 @@ mod tests {
         )
         .unwrap();
         let before = world_map_collision_fields(&triangle_overflow);
-        let error = preserve_world_collision_runtime_headroom(&mut triangle_overflow, &authored)
-            .unwrap_err()
-            .to_string();
+        let error =
+            preserve_world_collision_runtime_headroom(&mut triangle_overflow, &existing, &authored)
+                .unwrap_err()
+                .to_string();
         assert!(error.contains("collision_triangle_capacity"), "{error}");
         assert_eq!(world_map_collision_fields(&triangle_overflow), before);
 
@@ -4363,15 +4548,16 @@ mod tests {
         )
         .unwrap();
         let before = world_map_collision_fields(&list_overflow);
-        let error = preserve_world_collision_runtime_headroom(&mut list_overflow, &authored)
-            .unwrap_err()
-            .to_string();
+        let error =
+            preserve_world_collision_runtime_headroom(&mut list_overflow, &existing, &authored)
+                .unwrap_err()
+                .to_string();
         assert!(error.contains("collision_list_capacity"), "{error}");
         assert_eq!(world_map_collision_fields(&list_overflow), before);
     }
 
     #[test]
-    fn collision_append_rejects_retail_signed_index_overflow() {
+    fn collision_append_crosses_retail_signed_index_boundary() {
         let existing = ColFile::new(
             vec![ColVertex::new(0.0, 0.0, 0.0); i16::MAX as usize],
             Vec::new(),
@@ -4389,19 +4575,17 @@ mod tests {
                 }],
             }],
         );
-        let error = append_collision_document(&existing, &authored, b"map.col")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("index 32768 exceeds the retail COL signed-index limit 32767"),
-            "{error}"
+        let merged = append_collision_document(&existing, &authored, b"map.col").unwrap();
+        assert_eq!(
+            merged.groups()[0].triangles[0].vertex_indices,
+            [i16::MAX as u16, i16::MAX as u16 + 1, i16::MAX as u16 + 1]
         );
     }
 
     #[test]
-    fn collision_append_accepts_retail_signed_index_maximum() {
+    fn collision_append_accepts_extended_unsigned_index_maximum() {
         let existing = ColFile::new(
-            vec![ColVertex::new(0.0, 0.0, 0.0); i16::MAX as usize],
+            vec![ColVertex::new(0.0, 0.0, 0.0); u16::MAX as usize],
             Vec::new(),
         );
         let authored = ColFile::new(
@@ -4421,7 +4605,35 @@ mod tests {
         let merged = append_collision_document(&existing, &authored, b"map.col").unwrap();
         assert_eq!(
             merged.groups()[0].triangles[0].vertex_indices,
-            [i16::MAX as u16; 3]
+            [u16::MAX; 3]
+        );
+    }
+
+    #[test]
+    fn collision_append_rejects_extended_unsigned_index_overflow() {
+        let existing = ColFile::new(
+            vec![ColVertex::new(0.0, 0.0, 0.0); u16::MAX as usize],
+            Vec::new(),
+        );
+        let authored = ColFile::new(
+            vec![ColVertex::new(1.0, 0.0, 0.0), ColVertex::new(2.0, 0.0, 0.0)],
+            vec![ColGroup {
+                surface_type: 0,
+                has_per_triangle_data: false,
+                triangles: vec![ColTriangle {
+                    vertex_indices: [0, 1, 1],
+                    attribute_0: 0,
+                    attribute_1: 0,
+                    data: None,
+                }],
+            }],
+        );
+        let error = append_collision_document(&existing, &authored, b"map.col")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("index 65536") && error.contains("u16-index limit 65535"),
+            "{error}"
         );
     }
 

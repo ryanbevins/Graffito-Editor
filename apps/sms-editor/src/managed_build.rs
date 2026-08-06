@@ -18,18 +18,19 @@ use sms_scene::{
 use sms_schema::ObjectRegistry;
 
 use crate::direct_boot::{
-    patch_sms_dialogue_dol, patch_sms_direct_boot_dol, patch_sms_goop_enemy_managers_dol,
-    patch_sms_goop_layer_spawn_dol, patch_sms_sound_assignments_dol, patch_sms_stage_music_dol,
-    RuntimeBalloonOverride, RuntimeDialogueOverride, RuntimeGoopLayerBinding,
-    RuntimeGoopManagerPatch, RuntimeMusicRoleOverride, RuntimeSoundAssignment,
-    RuntimeSoundAssignmentKind, RuntimeStageMusicOverride, RuntimeStageMusicTransition,
-    RuntimeStageTarget,
+    patch_sms_dialogue_dol, patch_sms_direct_boot_dol, patch_sms_extended_collision_dol,
+    patch_sms_goop_enemy_managers_dol, patch_sms_goop_layer_spawn_dol,
+    patch_sms_sound_assignments_dol, patch_sms_stage_music_dol, RuntimeBalloonOverride,
+    RuntimeDialogueOverride, RuntimeGoopLayerBinding, RuntimeGoopManagerPatch,
+    RuntimeMusicRoleOverride, RuntimeSoundAssignment, RuntimeSoundAssignmentKind,
+    RuntimeStageMusicOverride, RuntimeStageMusicTransition, RuntimeStageTarget,
 };
 #[cfg(test)]
 use crate::project::ProjectSoundAssignment;
 use crate::project::{
     normalized_absolute_with_missing_tail, path_is_same_or_child, OpenProject,
     ProjectMusicRoleOverride, ProjectSoundAssignmentKind, ProjectStageMusicTransition,
+    EXTENDED_DOLPHIN_MEM1_BYTES,
 };
 
 const MANAGED_BUILD_MARKER_NAME: &str = ".smsbuild-owner.toml";
@@ -41,6 +42,13 @@ const RUN_ROOT_NAME: &str = "run-root";
 const MAX_MARKER_BYTES: u64 = 64 * 1024;
 const MAX_RUNTIME_STAGE_TABLE_BYTES: u64 = 16 * 1024 * 1024;
 const PROJECT_RUNTIME_STAGE_TABLE_PATH: &[&str] = &["files", "data", "stageArc.bin"];
+const MANAGED_BI2_PATH: &[&str] = &["sys", "bi2.bin"];
+const BI2_SIMULATED_MEMORY_SIZE_OFFSET: usize = 4;
+const BI2_MINIMUM_SIZE: usize = BI2_SIMULATED_MEMORY_SIZE_OFFSET + 4;
+const MAX_BI2_BYTES: u64 = 64 * 1024;
+const MANAGED_WORLD_COLLISION_PATH: &[u8] = b"map/map.col";
+const RETAIL_WORLD_COLLISION_VERTEX_LIMIT: usize = i16::MAX as usize + 1;
+const RETAIL_WORLD_COLLISION_TRIANGLE_BUDGET: usize = 12_000;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) const MANAGED_BUILD_CANCELLED: &str = "Managed game build cancelled";
@@ -111,6 +119,7 @@ pub(super) struct ManagedDirectBootOutcome {
 pub(super) struct ManagedGameLaunchOutcome {
     pub(super) run: ManagedRunMirrorOutcome,
     pub(super) direct_boot: ManagedDirectBootOutcome,
+    pub(super) extended_dolphin_memory: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,6 +338,32 @@ pub(super) fn merge_compiled_dialogue_stage_edits(
     Ok(merged)
 }
 
+fn stage_requires_extended_collision_runtime(archive_bytes: &[u8]) -> Result<bool, String> {
+    let archive = SourceFreeStageArchive::parse(archive_bytes).map_err(|error| {
+        format!(
+            "Could not inspect the finalized stage for extended collision requirements: {error}"
+        )
+    })?;
+    let Some(resource) = archive.resource(MANAGED_WORLD_COLLISION_PATH) else {
+        return Ok(false);
+    };
+    let StageResourceDocument::Collision(collision) = resource else {
+        return Err(format!(
+            "Finalized stage resource '{}' is not collision",
+            String::from_utf8_lossy(MANAGED_WORLD_COLLISION_PATH)
+        ));
+    };
+    let triangles = collision.groups().iter().try_fold(0usize, |count, group| {
+        count
+            .checked_add(group.triangles.len())
+            .ok_or_else(|| "Finalized world collision triangle count overflowed usize".to_string())
+    })?;
+    Ok(
+        collision.vertices().len() > RETAIL_WORLD_COLLISION_VERTEX_LIMIT
+            || triangles > RETAIL_WORLD_COLLISION_TRIANGLE_BUDGET,
+    )
+}
+
 /// Installs compiled stage/common dialogue and resolves manager-local actor
 /// indexes only after the finalized stage archive has been rebuilt.
 ///
@@ -374,6 +409,7 @@ pub(super) fn build_managed_game_for_launch_with_compiled_dialogue(
     Ok(ManagedGameLaunchOutcome {
         run: build.run,
         direct_boot: direct_boot.expect("launch build requests a direct-boot image"),
+        extended_dolphin_memory: project.descriptor.launch.extended_dolphin_memory,
     })
 }
 
@@ -386,6 +422,7 @@ fn build_managed_game_with_compiled_dialogue_inner(
     cancelled: &AtomicBool,
 ) -> Result<(ManagedGameBuildOutcome, Option<ManagedDirectBootOutcome>), String> {
     check_cancelled(cancelled)?;
+    let extended_collision_required = stage_requires_extended_collision_runtime(archive_bytes)?;
     let final_archive = if compiled.stage_edits == StageArchiveEdits::default()
         && compiled.runtime_override_requests.is_empty()
     {
@@ -419,6 +456,7 @@ fn build_managed_game_with_compiled_dialogue_inner(
         PathBuf::from("files/data/common.szs"),
         PathBuf::from("files/data/stageArc.bin"),
         PathBuf::from("sys/main.dol"),
+        PathBuf::from("sys/bi2.bin"),
     ];
     let snapshots = transaction_paths
         .into_iter()
@@ -468,6 +506,7 @@ fn build_managed_game_with_compiled_dialogue_inner(
                 goop_layer_bindings: &goop_layer_bindings,
                 dialogue_overrides: &runtime.talk,
                 balloon_overrides: &runtime.balloon,
+                extended_collision_required,
                 direct_boot,
             },
             cancelled,
@@ -1346,6 +1385,7 @@ struct ManagedRuntimePatchInputs<'a> {
     goop_layer_bindings: &'a BTreeMap<usize, RuntimeGoopLayerBinding>,
     dialogue_overrides: &'a [RuntimeDialogueOverride],
     balloon_overrides: &'a [RuntimeBalloonOverride],
+    extended_collision_required: bool,
     direct_boot: Option<(RuntimeStageTarget, usize)>,
 }
 
@@ -1361,6 +1401,7 @@ fn install_managed_runtime_patches(
         goop_layer_bindings,
         dialogue_overrides,
         balloon_overrides,
+        extended_collision_required,
         direct_boot,
     } = inputs;
     check_cancelled(cancelled)?;
@@ -1451,8 +1492,17 @@ fn install_managed_runtime_patches(
             sound_id: assignment.sound_id,
         })
         .collect::<Vec<_>>();
-    let mut patched_bytes = patch_sms_sound_assignments_dol(&source_dol, &sound_assignments)
-        .map_err(|error| {
+    let mut patched_bytes =
+        patch_sms_extended_collision_dol(&source_dol, extended_collision_required).map_err(
+            |error| {
+                format!(
+                    "Could not install packaged extended collision support into '{}': {error}",
+                    run.run_main_dol.display()
+                )
+            },
+        )?;
+    patched_bytes =
+        patch_sms_sound_assignments_dol(&patched_bytes, &sound_assignments).map_err(|error| {
             format!(
                 "Could not install packaged sound helper assignments into '{}': {error}",
                 run.run_main_dol.display()
@@ -1596,6 +1646,7 @@ fn install_managed_stage_music(
             goop_layer_bindings: &BTreeMap::new(),
             dialogue_overrides: &[],
             balloon_overrides: &[],
+            extended_collision_required: false,
             direct_boot: None,
         },
         cancelled,
@@ -1901,6 +1952,15 @@ fn prepare_managed_run_mirror_from_source_with_cancel(
             base_root.join(&main_relative).display()
         ));
     }
+    let bi2_relative = PathBuf::from("sys").join("bi2.bin");
+    if project.descriptor.launch.extended_dolphin_memory
+        && !inventory.file_paths.contains(&bi2_relative)
+    {
+        return Err(format!(
+            "Extended Dolphin memory requires a regular non-link sys/bi2.bin in the extracted base game: {}",
+            base_root.join(&bi2_relative).display()
+        ));
+    }
     let build_root = ensure_owned_build_root(project)?;
     let run_root = ensure_child_directory(&build_root, Path::new(RUN_ROOT_NAME))?;
     let mut stats = MirrorStats::default();
@@ -1911,10 +1971,12 @@ fn prepare_managed_run_mirror_from_source_with_cancel(
     }
     for file in &inventory.files {
         check_cancelled(cancelled)?;
-        if file.relative == main_relative {
-            // Runtime patches are always composed from the pristine base DOL
-            // in memory and installed once at the end of the transaction.
-            // Preserve the previous runnable executable until that succeeds.
+        if file.relative == main_relative
+            || (project.descriptor.launch.extended_dolphin_memory && file.relative == bi2_relative)
+        {
+            // Runtime DOL and BI2 patches are always composed from pristine
+            // base files and installed once during the transaction. Preserve
+            // their previous runnable entries until composition succeeds.
             continue;
         }
         let destination = run_root.join(&file.relative);
@@ -1924,6 +1986,11 @@ fn prepare_managed_run_mirror_from_source_with_cancel(
         }
     }
     check_cancelled(cancelled)?;
+
+    if project.descriptor.launch.extended_dolphin_memory {
+        install_managed_extended_mem1_bi2(&base_root, &run_root, cancelled)?;
+        check_cancelled(cancelled)?;
+    }
 
     install_project_runtime_stage_table(project, &run_root, &mut stats, cancelled)?;
     check_cancelled(cancelled)?;
@@ -1979,6 +2046,66 @@ fn prepare_managed_run_mirror_from_source_with_cancel(
         reused_files: stats.reused_files,
         removed_entries: stats.removed_entries,
     })
+}
+
+fn install_managed_extended_mem1_bi2(
+    base_root: &Path,
+    run_root: &Path,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    check_cancelled(cancelled)?;
+    let source_path = find_case_insensitive_path(
+        base_root,
+        MANAGED_BI2_PATH,
+        "pristine extracted game BI2 boot metadata",
+    )?;
+    let metadata = fs::symlink_metadata(&source_path).map_err(|error| {
+        format!(
+            "Could not inspect pristine BI2 boot metadata '{}': {error}",
+            source_path.display()
+        )
+    })?;
+    reject_link_or_reparse(&metadata, &source_path, "pristine BI2 boot metadata")?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "Pristine BI2 boot metadata is not a regular file: {}",
+            source_path.display()
+        ));
+    }
+    if metadata.len() > MAX_BI2_BYTES {
+        return Err(format!(
+            "Pristine BI2 boot metadata '{}' is unexpectedly large ({} bytes; maximum {MAX_BI2_BYTES})",
+            source_path.display(),
+            metadata.len()
+        ));
+    }
+    let mut bytes = fs::read(&source_path).map_err(|error| {
+        format!(
+            "Could not read pristine BI2 boot metadata '{}': {error}",
+            source_path.display()
+        )
+    })?;
+    if bytes.len() < BI2_MINIMUM_SIZE {
+        return Err(format!(
+            "Pristine BI2 boot metadata '{}' is truncated: {} bytes, expected at least {BI2_MINIMUM_SIZE}",
+            source_path.display(),
+            bytes.len()
+        ));
+    }
+    bytes[BI2_SIMULATED_MEMORY_SIZE_OFFSET..BI2_MINIMUM_SIZE]
+        .copy_from_slice(&EXTENDED_DOLPHIN_MEM1_BYTES.to_be_bytes());
+    let output_path = run_root.join("sys").join("bi2.bin");
+    atomic_write_if_changed_with_cancel(&output_path, &bytes, cancelled).map_err(|error| {
+        if is_cancelled_error(&error.to_string()) {
+            error.to_string()
+        } else {
+            format!(
+                "Could not install extended Dolphin BI2 boot metadata '{}': {error}",
+                output_path.display()
+            )
+        }
+    })?;
+    Ok(())
 }
 
 fn install_project_runtime_stage_table(
@@ -3079,6 +3206,59 @@ mod tests {
     };
     use std::hash::{DefaultHasher, Hash, Hasher};
 
+    #[test]
+    fn finalized_stage_detects_extended_world_collision_requirements() {
+        let mut archive = SourceFreeStageArchive::new().unwrap();
+        archive
+            .insert_resource(
+                MANAGED_WORLD_COLLISION_PATH.to_vec(),
+                StageResourceDocument::Collision(sms_formats::ColFile::new(
+                    vec![sms_formats::ColVertex::new(0.0, 0.0, 0.0); 32_769],
+                    vec![sms_formats::ColGroup {
+                        surface_type: 0,
+                        has_per_triangle_data: false,
+                        triangles: vec![sms_formats::ColTriangle {
+                            vertex_indices: [32_768, 0, 1],
+                            attribute_0: 0,
+                            attribute_1: 0,
+                            data: None,
+                        }],
+                    }],
+                )),
+            )
+            .unwrap();
+        assert!(stage_requires_extended_collision_runtime(&archive.encode().unwrap()).unwrap());
+
+        let mut triangle_heavy = SourceFreeStageArchive::new().unwrap();
+        triangle_heavy
+            .insert_resource(
+                MANAGED_WORLD_COLLISION_PATH.to_vec(),
+                StageResourceDocument::Collision(sms_formats::ColFile::new(
+                    vec![sms_formats::ColVertex::new(0.0, 0.0, 0.0); 3],
+                    vec![sms_formats::ColGroup {
+                        surface_type: 0,
+                        has_per_triangle_data: false,
+                        triangles: vec![
+                            sms_formats::ColTriangle {
+                                vertex_indices: [0, 1, 2],
+                                attribute_0: 0,
+                                attribute_1: 0,
+                                data: None,
+                            };
+                            RETAIL_WORLD_COLLISION_TRIANGLE_BUDGET + 1
+                        ],
+                    }],
+                )),
+            )
+            .unwrap();
+        assert!(
+            stage_requires_extended_collision_runtime(&triangle_heavy.encode().unwrap()).unwrap()
+        );
+
+        let empty = SourceFreeStageArchive::new().unwrap().encode().unwrap();
+        assert!(!stage_requires_extended_collision_runtime(&empty).unwrap());
+    }
+
     struct Fixture {
         _root: tempfile::TempDir,
         project: OpenProject,
@@ -3100,6 +3280,10 @@ mod tests {
         fs::create_dir_all(base_root.join("sys")).unwrap();
         fs::create_dir_all(&data_root).unwrap();
         fs::write(base_root.join("sys/main.dol"), b"retail-main-dol").unwrap();
+        let mut bi2 = vec![0_u8; 0x2000];
+        bi2[BI2_SIMULATED_MEMORY_SIZE_OFFSET..BI2_MINIMUM_SIZE]
+            .copy_from_slice(&(24_u32 * 1024 * 1024).to_be_bytes());
+        fs::write(base_root.join("sys/bi2.bin"), bi2).unwrap();
         fs::write(base_root.join("files/shared.bin"), b"shared-retail-data").unwrap();
         fs::write(&source_path, b"retail-source-must-not-change").unwrap();
         let descriptor_path = root.path().join("Authoring.sms");
@@ -3642,6 +3826,7 @@ mod tests {
                 goop_layer_bindings: &BTreeMap::new(),
                 dialogue_overrides: &[override_],
                 balloon_overrides: &[],
+                extended_collision_required: false,
                 direct_boot: None,
             },
             &AtomicBool::new(false),
@@ -3713,6 +3898,7 @@ mod tests {
                 goop_layer_bindings: &BTreeMap::new(),
                 dialogue_overrides: &[],
                 balloon_overrides: &[],
+                extended_collision_required: false,
                 direct_boot: None,
             },
             &AtomicBool::new(false),
@@ -4274,7 +4460,8 @@ mod tests {
 
     #[test]
     fn runnable_mirror_preserves_base_and_uses_independent_file_copies() {
-        let fixture = fixture();
+        let mut fixture = fixture();
+        fixture.project.descriptor.launch.extended_dolphin_memory = true;
         let base_stage_before = fs::read(&fixture.source_path).unwrap();
         let base_stage_hash_before = file_hash(&fixture.source_path);
 
@@ -4301,6 +4488,7 @@ mod tests {
                 goop_layer_bindings: &BTreeMap::new(),
                 dialogue_overrides: &[],
                 balloon_overrides: &[],
+                extended_collision_required: false,
                 direct_boot: None,
             },
             &AtomicBool::new(false),
@@ -4334,11 +4522,55 @@ mod tests {
             &run_metadata,
         ));
         assert_eq!(outcome.copied_files + outcome.reused_files, 2);
+        let base_bi2 = fs::read(fixture.base_root.join("sys/bi2.bin")).unwrap();
+        let run_bi2 = fs::read(outcome.run_root.join("sys/bi2.bin")).unwrap();
+        assert_eq!(
+            &base_bi2[BI2_SIMULATED_MEMORY_SIZE_OFFSET..BI2_MINIMUM_SIZE],
+            &(24_u32 * 1024 * 1024).to_be_bytes()
+        );
+        assert_eq!(
+            &run_bi2[BI2_SIMULATED_MEMORY_SIZE_OFFSET..BI2_MINIMUM_SIZE],
+            &EXTENDED_DOLPHIN_MEM1_BYTES.to_be_bytes()
+        );
+        assert_ne!(run_bi2, base_bi2);
+    }
+
+    #[test]
+    fn disabling_extended_memory_restores_retail_bi2_in_the_managed_run_root() {
+        let mut fixture = fixture();
+        fixture.project.descriptor.launch.extended_dolphin_memory = true;
+        let first = prepare_managed_run_mirror_from_source(
+            &fixture.project,
+            &fixture.base_root,
+            &fixture.source_path,
+            b"extended-stage",
+        )
+        .unwrap();
+        assert_eq!(
+            &fs::read(first.run_root.join("sys/bi2.bin")).unwrap()
+                [BI2_SIMULATED_MEMORY_SIZE_OFFSET..BI2_MINIMUM_SIZE],
+            &EXTENDED_DOLPHIN_MEM1_BYTES.to_be_bytes()
+        );
+
+        fixture.project.descriptor.launch.extended_dolphin_memory = false;
+        let second = prepare_managed_run_mirror_from_source(
+            &fixture.project,
+            &fixture.base_root,
+            &fixture.source_path,
+            b"retail-stage",
+        )
+        .unwrap();
+        assert_eq!(
+            &fs::read(second.run_root.join("sys/bi2.bin")).unwrap()
+                [BI2_SIMULATED_MEMORY_SIZE_OFFSET..BI2_MINIMUM_SIZE],
+            &(24_u32 * 1024 * 1024).to_be_bytes()
+        );
     }
 
     #[test]
     fn runnable_mirror_refreshes_owned_entries_without_recursive_root_replacement() {
-        let fixture = fixture();
+        let mut fixture = fixture();
+        fixture.project.descriptor.launch.extended_dolphin_memory = true;
         let first = prepare_managed_run_mirror_from_source(
             &fixture.project,
             &fixture.base_root,
@@ -4383,6 +4615,7 @@ mod tests {
                 goop_layer_bindings: &BTreeMap::new(),
                 dialogue_overrides: &[],
                 balloon_overrides: &[],
+                extended_collision_required: false,
                 direct_boot: None,
             },
             &AtomicBool::new(false),
