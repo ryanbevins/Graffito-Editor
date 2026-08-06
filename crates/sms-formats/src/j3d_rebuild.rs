@@ -974,7 +974,6 @@ impl J3dRebuildDocument {
         slot: u8,
         draw_matrices: &[Option<[[f32; 4]; 3]>],
     ) -> Result<usize> {
-        let attribute = u32::from(GX_VA_TEX0 + slot);
         let positions = self.decoded_positions()?;
 
         // Pose every vertex the display lists name, in the order they name
@@ -1007,6 +1006,41 @@ impl J3dRebuildDocument {
             })
             .collect();
 
+        self.store_texcoord_values_in_place(slot, &coordinates)
+    }
+
+    /// Stores coordinates the caller already has, rather than ones this
+    /// computes.
+    ///
+    /// The order is the display-list walk, the same order
+    /// [`Self::posed_display_list_vertices`] reports, so a coordinate taken
+    /// from an edited mesh can be matched onto a vertex and handed back here.
+    pub fn store_texcoord_values(&mut self, slot: u8, coordinates: &[[f32; 2]]) -> Result<usize> {
+        let mut stored = self.clone();
+        let count = stored.store_texcoord_values_in_place(slot, coordinates)?;
+        *self = stored;
+        Ok(count)
+    }
+
+    /// Every vertex the display lists name, posed, in the order they name
+    /// them.
+    ///
+    /// This is the order a stored coordinate array is indexed in, so it is
+    /// what a caller matches against to bring an edited unwrap back.
+    pub fn posed_display_list_vertices(
+        &self,
+        draw_matrices: &[Option<[[f32; 4]; 3]>],
+    ) -> Result<Vec<[f32; 3]>> {
+        let positions = self.decoded_positions()?;
+        self.posed_display_list_positions(&positions, draw_matrices)
+    }
+
+    fn store_texcoord_values_in_place(
+        &mut self,
+        slot: u8,
+        coordinates: &[[f32; 2]],
+    ) -> Result<usize> {
+        let attribute = u32::from(GX_VA_TEX0 + slot);
         // Write the coordinate index into every vertex, in that same walk.
         let mut written = 0usize;
         for section in &mut self.sections {
@@ -1101,7 +1135,7 @@ impl J3dRebuildDocument {
                 reserved: [0; 3],
             });
             let mut values = Vec::with_capacity(coordinates.len() * 2);
-            for coordinate in &coordinates {
+            for coordinate in coordinates {
                 values.push(coordinate[0].to_bits());
                 values.push(coordinate[1].to_bits());
             }
@@ -1114,6 +1148,50 @@ impl J3dRebuildDocument {
 
         self.canonicalize_geometry_layout_in_place()?;
         Ok(written)
+    }
+
+    /// Overwrites a coordinate array the model already stores.
+    ///
+    /// A model that has been baked already carries the slot, and its display
+    /// lists already index it, so bringing an edited unwrap back is a matter of
+    /// replacing the values rather than declaring the attribute again. The
+    /// count has to agree: a different one means the mesh was remodelled, not
+    /// re-unwrapped, and the indices no longer mean what they meant.
+    pub fn replace_texcoord_values(&mut self, slot: u8, coordinates: &[[f32; 2]]) -> Result<usize> {
+        for section in &mut self.sections {
+            let J3dRebuildSectionData::Vertices(vertices) = &mut section.data else {
+                continue;
+            };
+            for array in &mut vertices.arrays {
+                if array.attribute != J3dVertexArrayAttribute::TexCoord(slot) {
+                    continue;
+                }
+                let stored = match &array.values {
+                    J3dScalarArray::Float32Bits(values) => values.len() / 2,
+                    _ => {
+                        return Err(unsupported(format!(
+                            "texture coordinate {slot} is not stored as floats"
+                        )))
+                    }
+                };
+                if stored != coordinates.len() {
+                    return Err(unsupported(format!(
+                        "the model stores {stored} coordinates in slot {slot} but {} arrived",
+                        coordinates.len()
+                    )));
+                }
+                let mut values = Vec::with_capacity(coordinates.len() * 2);
+                for coordinate in coordinates {
+                    values.push(coordinate[0].to_bits());
+                    values.push(coordinate[1].to_bits());
+                }
+                array.values = J3dScalarArray::Float32Bits(values);
+                return Ok(coordinates.len());
+            }
+        }
+        Err(unsupported(format!(
+            "the model stores no texture coordinate {slot} to replace"
+        )))
     }
 
     /// Every position the vertex arrays carry, in model units.
