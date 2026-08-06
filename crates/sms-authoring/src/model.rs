@@ -10,6 +10,13 @@ pub const MODEL_ASSET_FORMAT_VERSION: u32 = 1;
 /// height-minus-one fields by `GXInitTexObj`.
 pub const GX_MAX_TEXTURE_DIMENSION: u32 = 1024;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct SunshineRuntimeTexturePresetReport {
+    pub changed_texture_count: usize,
+    pub cmpr_texture_count: usize,
+    pub rgb5a3_texture_count: usize,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelCoordinateSpace {
@@ -58,6 +65,32 @@ impl ModelAssetDocument {
             diagnostics: Vec::new(),
             acknowledged_diagnostics: BTreeSet::new(),
         }
+    }
+
+    /// Selects compact native GX encodings suitable for Sunshine's constrained
+    /// runtime heap without changing source pixels, dimensions, mip counts, or
+    /// sampler state. CMPR preserves opaque/binary-alpha textures at 4 bpp;
+    /// RGB5A3 retains graduated alpha at 16 bpp.
+    pub fn apply_sunshine_runtime_texture_preset(&mut self) -> SunshineRuntimeTexturePresetReport {
+        let mut report = SunshineRuntimeTexturePresetReport::default();
+        for texture in &mut self.textures {
+            let has_graduated_alpha = texture
+                .rgba8
+                .chunks_exact(4)
+                .any(|pixel| pixel[3] != 0 && pixel[3] != u8::MAX);
+            let encoding = if has_graduated_alpha {
+                report.rgb5a3_texture_count += 1;
+                sms_formats::GxTextureEncoding::Exact(sms_formats::GxTextureFormat::Rgb5A3)
+            } else {
+                report.cmpr_texture_count += 1;
+                sms_formats::GxTextureEncoding::Exact(sms_formats::GxTextureFormat::Cmpr)
+            };
+            if texture.encode_options.encoding != encoding {
+                texture.encode_options.encoding = encoding;
+                report.changed_texture_count += 1;
+            }
+        }
+        report
     }
 
     /// Downscales textures that cannot be represented by GX's 10-bit texture

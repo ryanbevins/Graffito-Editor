@@ -28,6 +28,7 @@ const INIT_REGISTER_SEARCH_WORDS: usize = 0x40;
 const TRANSITION_CAVE_WORDS: usize = 7;
 const MOVIE_PRIMARY_CAVE_WORDS: usize = 7;
 const MOVIE_SECONDARY_CAVE_WORDS: usize = 3;
+const DEATH_RESTART_CAVE_WORDS: usize = 7;
 const TRANSITION_WORD_COUNT: u32 = 8;
 const MOVIE_WRAPPER_WORD_COUNT: u32 = 9;
 const DIRECT_BOOT_MARKER: &[u8] = b"SMS_EDITOR_DIRECT_BOOT_V1\0";
@@ -219,6 +220,8 @@ pub(super) struct DirectBootDol {
     pub(super) logo_bypass_address: u32,
     pub(super) hook_address: u32,
     pub(super) movie_hook_address: u32,
+    pub(super) death_hook_address: u32,
+    pub(super) death_stub_address: u32,
     pub(super) stub_address: u32,
 }
 
@@ -329,6 +332,13 @@ struct DirectBootCaves {
     transition: CodeCave,
     movie_primary: CodeCave,
     movie_secondary: CodeCave,
+    death_restart: CodeCave,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeathRestartHook {
+    call_anchor: WordAnchor,
+    current_area_register: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2262,6 +2272,7 @@ pub(super) fn patch_sms_direct_boot_dol(
     let setup_bypass = find_nlogo_setup_bypass(source, &image, hook.this_register)?;
     let setter = find_next_area_setter(source, &image)?;
     let movie = find_movie_hook(source, &image, setter)?;
+    let death = find_death_restart_hook(source, &image, setter.next_area_offset)?;
     if hook.this_register == hook.next_state_register {
         return Err(
             "Post-NLogo state register aliases the TApplication register; refusing unsafe patch"
@@ -2278,18 +2289,21 @@ pub(super) fn patch_sms_direct_boot_dol(
         .checked_add(4)
         .ok_or_else(|| "Post-NLogo transition hook address overflows u32".to_string())?;
     let movie_hook_address = movie.call_anchor.address()?;
+    let death_hook_address = death.call_anchor.address()?;
     let original_transition_target =
         decode_branch_target(section_word(source, hook.anchor, 4)?, hook_address)?;
     let caves = choose_direct_boot_caves(
         find_zero_alignment_code_caves(source, &image)?,
         hook_address,
         movie_hook_address,
+        death_hook_address,
         original_transition_target,
         movie.original_target,
     )?;
     let transition_address = caves.transition.anchor.address()?;
     let movie_primary_address = caves.movie_primary.anchor.address()?;
     let movie_secondary_address = caves.movie_secondary.anchor.address()?;
+    let death_restart_address = caves.death_restart.anchor.address()?;
 
     let transition_words = build_transition_cave(
         transition_address,
@@ -2305,6 +2319,7 @@ pub(super) fn patch_sms_direct_boot_dol(
         movie.original_target,
         setter.next_area_offset,
     )?;
+    let death_restart_words = build_death_restart_cave(death.current_area_register, target);
 
     let mut bytes = source.to_vec();
     let director_branch_address = director_bypass.branch_anchor.address()?;
@@ -2344,6 +2359,11 @@ pub(super) fn patch_sms_direct_boot_dol(
         movie.call_anchor.file_offset()?,
         encode_branch(movie_hook_address, movie_primary_address, true)?,
     )?;
+    write_be_u32(
+        &mut bytes,
+        death.call_anchor.file_offset()?,
+        encode_branch(death_hook_address, death_restart_address, true)?,
+    )?;
     write_words(&mut bytes, caves.transition.anchor, &transition_words)?;
     write_words(&mut bytes, caves.movie_primary.anchor, &movie_primary_words)?;
     write_words(
@@ -2351,6 +2371,7 @@ pub(super) fn patch_sms_direct_boot_dol(
         caves.movie_secondary.anchor,
         &movie_secondary_words,
     )?;
+    write_words(&mut bytes, caves.death_restart.anchor, &death_restart_words)?;
     parse_dol(&bytes)?;
 
     Ok(DirectBootDol {
@@ -2358,6 +2379,8 @@ pub(super) fn patch_sms_direct_boot_dol(
         logo_bypass_address: setup_case_address,
         hook_address,
         movie_hook_address,
+        death_hook_address,
+        death_stub_address: death_restart_address,
         stub_address: transition_address,
     })
 }
@@ -3274,6 +3297,131 @@ fn find_movie_hook(
     require_unique_value(candidates, "checkAdditionalMovie call")
 }
 
+fn find_death_restart_hook(
+    source: &[u8],
+    image: &DolImage,
+    next_area_offset: i16,
+) -> Result<DeathRestartHook, String> {
+    let mut candidates = Vec::new();
+    for section in image
+        .sections
+        .iter()
+        .copied()
+        .filter(|section| section.text)
+    {
+        let words = section_words(source, section)?;
+        for word_index in 0..words.len().saturating_sub(7) {
+            if !is_relative_bl(words[word_index]) {
+                continue;
+            }
+            let Some((loaded_flags, director_register, flags_offset)) =
+                decode_d_form(words[word_index + 1], 40)
+            else {
+                continue;
+            };
+            let director_forwarded = decode_d_form(words[word_index + 2], 14)
+                == Some((3, director_register, 0))
+                || is_mr(words[word_index + 2], 3, director_register);
+            if loaded_flags != 0
+                || flags_offset != 0x4c
+                || !director_forwarded
+                || decode_d_form(words[word_index + 4], 44) != Some((0, director_register, 0x4c))
+                || !is_relative_bl(words[word_index + 5])
+                || !is_li(words[word_index + 6], 15)
+            {
+                continue;
+            }
+
+            let call_anchor = WordAnchor {
+                section,
+                word_index,
+            };
+            let resume_address = call_anchor
+                .address()?
+                .checked_add(4)
+                .ok_or_else(|| "Death-restart resume address overflows u32".to_string())?;
+            let search_start = word_index.saturating_sub(0x60);
+            let mut current_registers = Vec::new();
+            for branch_word in search_start..word_index {
+                if !is_unconditional_branch(words[branch_word]) {
+                    continue;
+                }
+                let branch_anchor = WordAnchor {
+                    section,
+                    word_index: branch_word,
+                };
+                if decode_branch_target(words[branch_word], branch_anchor.address()?)?
+                    != resume_address
+                {
+                    continue;
+                }
+                if let Some(register) = find_special_miss_restart_current_register(
+                    &words[search_start..branch_word],
+                    next_area_offset,
+                ) {
+                    current_registers.push(register);
+                }
+            }
+            current_registers.sort_unstable();
+            current_registers.dedup();
+            if let [current_area_register] = current_registers.as_slice() {
+                candidates.push(DeathRestartHook {
+                    call_anchor,
+                    current_area_register: *current_area_register,
+                });
+            }
+        }
+    }
+    require_unique_value(candidates, "ordinary-stage miss redirect")
+}
+
+fn find_special_miss_restart_current_register(words: &[u32], next_area_offset: i16) -> Option<u8> {
+    for first_store in (0..words.len()).rev() {
+        let store_opcode = opcode(words[first_store]);
+        if store_opcode != 38 && store_opcode != 39 {
+            continue;
+        }
+        let Some((stored_stage, application_register, stage_offset)) =
+            decode_d_form(words[first_store], store_opcode)
+        else {
+            continue;
+        };
+        if stored_stage != 0 || application_register == 0 || stage_offset != next_area_offset {
+            continue;
+        }
+        let updated_base = store_opcode == 39;
+        let scenario_offset = if updated_base {
+            1
+        } else {
+            next_area_offset.checked_add(1)?
+        };
+        let flag_offset = if updated_base {
+            2
+        } else {
+            next_area_offset.checked_add(2)?
+        };
+        let tail = &words[first_store + 1..];
+        let has_scenario_store = tail.iter().any(|word| {
+            decode_d_form(*word, 38) == Some((0, application_register, scenario_offset))
+        });
+        let has_flag_store = tail
+            .iter()
+            .any(|word| decode_d_form(*word, 44) == Some((0, application_register, flag_offset)));
+        if !has_scenario_store || !has_flag_store {
+            continue;
+        }
+        let current_search_start = first_store.saturating_sub(8);
+        for word in words[current_search_start..first_store].iter().rev() {
+            if let Some((loaded_stage, current_area_register, 0)) = decode_lbz(*word) {
+                if loaded_stage == 0 && current_area_register != 0 {
+                    return Some(current_area_register);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn find_stack_top(source: &[u8], image: &DolImage) -> Result<u32, String> {
     let entry_section = image
         .sections
@@ -3531,6 +3679,20 @@ fn build_movie_caves(
     Ok((primary, secondary))
 }
 
+fn build_death_restart_cave(current_area_register: u8, target: &RuntimeStageTarget) -> Vec<u32> {
+    let words = vec![
+        encode_li(0, i16::from(target.area_index)),
+        encode_d_form(38, 0, current_area_register, 4),
+        encode_li(0, i16::from(target.scenario_index)),
+        encode_d_form(38, 0, current_area_register, 5),
+        encode_li(0, 0),
+        encode_d_form(44, 0, current_area_register, 6),
+        PPC_BLR,
+    ];
+    debug_assert_eq!(words.len(), DEATH_RESTART_CAVE_WORDS);
+    words
+}
+
 fn find_zero_alignment_code_caves(
     source: &[u8],
     image: &DolImage,
@@ -3609,6 +3771,7 @@ fn choose_direct_boot_caves(
     caves: Vec<CodeCave>,
     hook_address: u32,
     movie_hook_address: u32,
+    death_hook_address: u32,
     original_transition_target: u32,
     original_movie_target: u32,
 ) -> Result<DirectBootCaves, String> {
@@ -3647,21 +3810,39 @@ fn choose_direct_boot_caves(
                 }
                 let secondary_address = movie_secondary.anchor.address()?;
                 let secondary_tail_address = secondary_address + 8;
-                if encode_bne(primary_address + 8, secondary_tail_address).is_ok()
-                    && encode_branch(primary_address + 24, secondary_address, false).is_ok()
-                    && encode_branch(secondary_tail_address, original_movie_target, false).is_ok()
+                if encode_bne(primary_address + 8, secondary_tail_address).is_err()
+                    || encode_branch(primary_address + 24, secondary_address, false).is_err()
+                    || encode_branch(secondary_tail_address, original_movie_target, false).is_err()
                 {
-                    return Ok(DirectBootCaves {
-                        transition,
-                        movie_primary,
-                        movie_secondary,
-                    });
+                    continue;
+                }
+                for death_restart in caves
+                    .iter()
+                    .copied()
+                    .filter(|cave| cave.word_count >= DEATH_RESTART_CAVE_WORDS)
+                {
+                    if death_restart.anchor == transition.anchor
+                        || death_restart.anchor == movie_primary.anchor
+                        || death_restart.anchor == movie_secondary.anchor
+                    {
+                        continue;
+                    }
+                    if encode_branch(death_hook_address, death_restart.anchor.address()?, true)
+                        .is_ok()
+                    {
+                        return Ok(DirectBootCaves {
+                            transition,
+                            movie_primary,
+                            movie_secondary,
+                            death_restart,
+                        });
+                    }
                 }
             }
         }
     }
     Err(format!(
-        "Could not find three safe executable alignment caves for direct boot (need {TRANSITION_CAVE_WORDS}, {MOVIE_PRIMARY_CAVE_WORDS}, and {MOVIE_SECONDARY_CAVE_WORDS} words)"
+        "Could not find four safe executable alignment caves for direct boot (need {TRANSITION_CAVE_WORDS}, {MOVIE_PRIMARY_CAVE_WORDS}, {MOVIE_SECONDARY_CAVE_WORDS}, and {DEATH_RESTART_CAVE_WORDS} words)"
     ))
 }
 
@@ -4673,11 +4854,12 @@ mod tests {
         let mut words = vec![PPC_NOP; SYNTHETIC_TEXT_WORDS];
         let address = |word: usize| layout.text_address + u32::try_from(word * 4).unwrap();
 
-        // Three zero-filled linker alignment gaps, each immediately after a
+        // Four zero-filled linker alignment gaps, each immediately after a
         // return and ending on the next 0x20-byte function boundary.
         install_alignment_cave(&mut words, 0x188, TRANSITION_CAVE_WORDS);
         install_alignment_cave(&mut words, 0x198, MOVIE_PRIMARY_CAVE_WORDS);
         install_alignment_cave(&mut words, 0x1a8, MOVIE_SECONDARY_CAVE_WORDS);
+        install_alignment_cave(&mut words, 0x1b8, DEATH_RESTART_CAVE_WORDS);
         // The NLogo proc case constructs and sets up TGCLogoDir. Direct boot
         // bypasses the case body so the display remains black while the
         // required asynchronous game-data setup continues.
@@ -4761,6 +4943,31 @@ mod tests {
         words[layout.setter_word + 2] = encode_d_form(38, 4, 31, 0x12);
         words[layout.setter_word + 3] = encode_d_form(38, 0, 31, 0x13);
         words[layout.setter_word + 4] = encode_d_form(44, 0, 31, 0x14);
+
+        // Ordinary-stage miss handling has a special-stage branch that copies
+        // the current area directly. The other branch normally calls
+        // decideNextStage and returns to Delfino Plaza. The direct-boot patch
+        // replaces only that ordinary-stage call and preserves the surrounding
+        // life/fade state machine.
+        let death_word = layout.movie_word - 0x20;
+        let special_word = death_word - 8;
+        words[special_word] = encode_d_form(34, 0, 27, 0);
+        words[special_word + 1] = encode_d_form(38, 0, 3, 0x12);
+        words[special_word + 2] = encode_li(0, 0);
+        words[special_word + 3] = encode_d_form(38, 0, 3, 0x13);
+        words[special_word + 4] = encode_d_form(44, 0, 3, 0x14);
+        words[special_word + 5] =
+            encode_branch(address(special_word + 5), address(death_word + 1), false).unwrap();
+        words[death_word] = encode_branch(address(death_word), address(0x1c8), true).unwrap();
+        words[death_word + 1] = encode_d_form(40, 0, 28, 0x4c);
+        words[death_word + 2] = encode_d_form(14, 3, 28, 0);
+        words[death_word + 3] = 0x5400_04e0;
+        words[death_word + 4] = encode_d_form(44, 0, 28, 0x4c);
+        words[death_word + 5] =
+            encode_branch(address(death_word + 5), address(0x1c9), true).unwrap();
+        words[death_word + 6] = encode_li(0, 15);
+        words[0x1c8] = PPC_BLR;
+        words[0x1c9] = PPC_BLR;
 
         let text_size = u32::try_from(words.len() * 4).unwrap();
         let mut bytes = vec![0_u8; SYNTHETIC_TEXT_OFFSET + text_size as usize];
@@ -5117,6 +5324,11 @@ mod tests {
             patched.movie_hook_address,
             layout.text_address + u32::try_from((layout.movie_word + 1) * 4).unwrap()
         );
+        let death_word = layout.movie_word - 0x20;
+        assert_eq!(
+            patched.death_hook_address,
+            layout.text_address + u32::try_from(death_word * 4).unwrap()
+        );
         assert_eq!(
             decode_branch_target(
                 read_be_u32(
@@ -5191,6 +5403,30 @@ mod tests {
         assert_eq!(
             transition_target,
             layout.text_address + u32::try_from((layout.hook_word + 5) * 4).unwrap()
+        );
+        assert_eq!(
+            decode_branch_target(
+                read_be_u32(&patched.bytes, SYNTHETIC_TEXT_OFFSET + death_word * 4,).unwrap(),
+                patched.death_hook_address,
+            )
+            .unwrap(),
+            patched.death_stub_address
+        );
+        let death_stub = address_to_word_anchor(&patched_image, patched.death_stub_address)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            &section_words(&patched.bytes, death_stub.section).unwrap()
+                [death_stub.word_index..death_stub.word_index + DEATH_RESTART_CAVE_WORDS],
+            &[
+                encode_li(0, 7),
+                encode_d_form(38, 0, 27, 4),
+                encode_li(0, 4),
+                encode_d_form(38, 0, 27, 5),
+                encode_li(0, 0),
+                encode_d_form(44, 0, 27, 6),
+                PPC_BLR,
+            ]
         );
         assert_eq!(patched.bytes.len(), source.len());
     }
@@ -6289,16 +6525,19 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         eprintln!(
-            "{}: hook=0x{:08X}, movie=0x{:08X}, stub=0x{:08X}, bytes={}",
+            "{}: hook=0x{:08X}, movie=0x{:08X}, death=0x{:08X}->0x{:08X}, stub=0x{:08X}, bytes={}",
             path.display(),
             patched.hook_address,
             patched.movie_hook_address,
+            patched.death_hook_address,
+            patched.death_stub_address,
             patched.stub_address,
             patched.bytes.len()
         );
         assert_eq!(patched.bytes.len(), dialogue.len());
         let image = parse_dol(&patched.bytes).unwrap();
         assert!(address_is_in_text(&image.sections, patched.stub_address, 4).unwrap());
+        assert!(address_is_in_text(&image.sections, patched.death_stub_address, 4).unwrap());
     }
 }
 

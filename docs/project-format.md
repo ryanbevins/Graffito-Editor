@@ -205,7 +205,10 @@ archive through the resulting staged `stageArc.bin`, and atomically patch the
 managed `sys/main.dol` copy. Its behavior-based PowerPC
 patch suppresses the Nintendo-logo director, waits for the normal asynchronous
 startup data load to finish, and then boots the resolved area and scenario
-directly while preserving the executable's regional or modded code. Keeping
+directly while preserving the executable's regional or modded code. During that
+target-specific direct-boot session, Sunshine's ordinary miss redirect is also
+rerouted to the same area and scenario instead of its normal Delfino Plaza
+fallback. Keeping
 the launch executable at that exact path lets Dolphin mount the surrounding
 extracted game directory. Dolphin uses its normal user profile by default,
 preserving the user's controller configuration. If

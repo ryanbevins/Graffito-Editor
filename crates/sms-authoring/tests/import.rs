@@ -5,7 +5,7 @@ use base64::Engine;
 use sms_authoring::{
     import_model, AuthoringError, CollisionDocument, CollisionGroup,
     CollisionSimplificationOptions, CollisionSource, CollisionSurface, CoordinateConversion,
-    DiagnosticCode, ModelAssetDocument, ModelImportOptions,
+    DiagnosticCode, ModelAssetDocument, ModelImportOptions, SUNSHINE_COL_MAX_VERTICES,
 };
 
 fn triangle_buffer() -> Vec<u8> {
@@ -48,6 +48,141 @@ fn optional_qem_simplification_is_deterministic_and_respects_target() {
     assert_eq!(first_report.target_triangles, 1);
     assert_eq!(first_report.output_triangles, 1);
     assert_eq!(first_report.maximum_applied_error, 0.0);
+}
+
+#[test]
+fn vertex_limit_fit_is_deterministic_and_preserves_triangle_winding() {
+    let original = CollisionDocument {
+        vertices: vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0],
+        ],
+        groups: vec![CollisionGroup {
+            name: "flat".to_string(),
+            surface: CollisionSurface::default(),
+            triangles: vec![[0, 2, 1], [0, 3, 2]],
+        }],
+    };
+    let mut first = original.clone();
+    let mut second = original;
+    let first_report = first.fit_vertex_limit(3, 0.0).unwrap();
+    let second_report = second.fit_vertex_limit(3, 0.0).unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(first_report, second_report);
+    assert_eq!(first_report.input_vertices, 4);
+    assert_eq!(first_report.target_vertices, 3);
+    assert_eq!(first_report.output_vertices, 3);
+    assert_eq!(first_report.output_triangles, 1);
+    assert_eq!(first_report.maximum_applied_error, 0.0);
+    assert!(first.groups[0].triangles.iter().all(|triangle| {
+        let [a, b, c] = triangle.map(|index| first.vertices[index as usize]);
+        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        ab[0] * ac[2] - ab[2] * ac[0] < 0.0
+    }));
+}
+
+#[test]
+fn vertex_limit_fit_makes_an_oversized_collision_runtime_encodable() {
+    let triangle_count = SUNSHINE_COL_MAX_VERTICES / 3 + 1;
+    let mut collision = CollisionDocument {
+        vertices: Vec::with_capacity(triangle_count * 3),
+        groups: vec![CollisionGroup {
+            name: "oversized".to_string(),
+            surface: CollisionSurface::default(),
+            triangles: Vec::with_capacity(triangle_count),
+        }],
+    };
+    for triangle in 0..triangle_count {
+        let base_vertex = collision.vertices.len() as u32;
+        let x = triangle as f32 * 2.0;
+        collision
+            .vertices
+            .extend([[x, 0.0, 0.0], [x + 1.0, 0.0, 0.0], [x, 0.0, 1.0]]);
+        collision.groups[0]
+            .triangles
+            .push([base_vertex, base_vertex + 2, base_vertex + 1]);
+    }
+    assert!(collision.to_col_file().is_err());
+
+    let report = collision
+        .fit_vertex_limit(SUNSHINE_COL_MAX_VERTICES, 0.0)
+        .unwrap();
+
+    assert!(report.input_vertices > SUNSHINE_COL_MAX_VERTICES);
+    assert!(report.output_vertices <= SUNSHINE_COL_MAX_VERTICES);
+    collision.to_col_file().unwrap();
+}
+
+#[test]
+fn runtime_fit_is_deterministic_and_reaches_triangle_budget() {
+    let mut original = CollisionDocument {
+        vertices: Vec::new(),
+        groups: vec![CollisionGroup {
+            name: "runtime-budget".to_string(),
+            surface: CollisionSurface::default(),
+            triangles: Vec::new(),
+        }],
+    };
+    for triangle in 0..20 {
+        let base = original.vertices.len() as u32;
+        let x = triangle as f32 * 2.0;
+        original
+            .vertices
+            .extend([[x, 0.0, 0.0], [x + 1.0, 0.0, 0.0], [x, 0.0, 1.0]]);
+        original.groups[0]
+            .triangles
+            .push([base, base + 2, base + 1]);
+    }
+
+    let mut first = original.clone();
+    let mut second = original;
+    let first_report = first.fit_runtime_limits(usize::MAX, 5, 0.0).unwrap();
+    let second_report = second.fit_runtime_limits(usize::MAX, 5, 0.0).unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(first_report, second_report);
+    assert_eq!(first_report.target_triangles, 5);
+    assert!(first_report.output_triangles <= 5);
+    assert_eq!(first_report.maximum_applied_error, 0.0);
+}
+
+#[test]
+fn runtime_fit_crosses_group_seams_only_for_identical_surface_state() {
+    let surface = CollisionSurface::default();
+    let original = CollisionDocument {
+        vertices: vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0],
+        ],
+        groups: vec![
+            CollisionGroup {
+                name: "first".to_string(),
+                surface: surface.clone(),
+                triangles: vec![[0, 2, 1]],
+            },
+            CollisionGroup {
+                name: "second".to_string(),
+                surface,
+                triangles: vec![[0, 3, 2]],
+            },
+        ],
+    };
+
+    let mut identical = original.clone();
+    let identical_report = identical.fit_runtime_limits(usize::MAX, 1, 0.0).unwrap();
+    assert!(identical_report.output_triangles <= 1);
+
+    let mut distinct = original;
+    distinct.groups[1].surface.surface_type = 1;
+    let distinct_report = distinct.fit_runtime_limits(usize::MAX, 1, 0.0).unwrap();
+    assert_eq!(distinct_report.output_triangles, 2);
+    assert_eq!(distinct_report.collapsed_edges, 0);
 }
 
 fn triangle_json(buffer_uri: &str, node_name: &str, mode: u32) -> String {

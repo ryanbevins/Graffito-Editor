@@ -2227,6 +2227,14 @@ impl ValidationIssue {
             message: message.into(),
         }
     }
+
+    pub fn info(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            severity: ValidationSeverity::Info,
+            code: code.into(),
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2800,11 +2808,33 @@ fn apply_registry_preview_hints(
             let Some((primary_model, source)) = authored else {
                 continue;
             };
-            match resolve_authored_model_path(primary_model, &model_index) {
+            match resolve_authored_model_path(
+                primary_model,
+                &model_index,
+                &[&resource.resource_name, &object.factory_name],
+            ) {
                 ModelPathResolution::Found(path) => object.asset_hints.push(AssetRef {
                     path,
                     role: AssetRole::InferredPreviewModel,
                 }),
+                ModelPathResolution::Related { path, candidates } => {
+                    issues.push(ValidationIssue::info(
+                        "object-preview-model-narrowed",
+                        format!(
+                            "Decomp-authored model '{}' for {} resource {} matched {} assets; \
+                             using {} because its folder matches the actor name",
+                            primary_model,
+                            object.factory_name,
+                            resource.resource_name,
+                            candidates,
+                            path
+                        ),
+                    ));
+                    object.asset_hints.push(AssetRef {
+                        path,
+                        role: AssetRole::InferredPreviewModel,
+                    });
+                }
                 ModelPathResolution::Missing => issues.push(ValidationIssue::warning(
                     "object-preview-model-unresolved",
                     format!(
@@ -2881,15 +2911,67 @@ fn apply_registry_preview_hints(
             continue;
         };
 
+        // A catalog placement carries the exact resource path selected through
+        // its retail ObjChara/SmplChara registration. Keep that stronger path
+        // when its basename agrees with the decomp manager table; old catalog
+        // mistakes such as Gesso's gero_model1 projectile do not agree and are
+        // still replaced below.
+        let authored_file_name = authored_model
+            .replace('\\', "/")
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let catalog_hint_matches = |hint: &AssetRef| {
+            if hint.role != AssetRole::PreviewModel {
+                return false;
+            }
+            let normalized_hint = hint.path.replace('\\', "/");
+            let hint_file_name = normalized_hint.rsplit('/').next().unwrap_or_default();
+            hint_file_name.eq_ignore_ascii_case(&authored_file_name)
+                && assets.iter().any(|asset| {
+                    asset
+                        .path
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                        .eq_ignore_ascii_case(&normalized_hint)
+                })
+        };
+        let preserved_catalog_hint =
+            binding_is_manager_derived && object.asset_hints.iter().any(&catalog_hint_matches);
+
         // Once a schema binding exists, never retain a weaker basename guess,
         // including when the authored model is missing or ambiguous.
         object.asset_hints.retain(|hint| {
             hint.role != AssetRole::InferredPreviewModel
-                && !(binding_is_manager_derived && hint.role == AssetRole::PreviewModel)
+                && !(binding_is_manager_derived
+                    && hint.role == AssetRole::PreviewModel
+                    && !catalog_hint_matches(hint))
         });
+        if preserved_catalog_hint {
+            continue;
+        }
 
-        match resolve_authored_model_path(&authored_model, &model_index) {
+        match resolve_authored_model_path(
+            &authored_model,
+            &model_index,
+            &[&object.factory_name, resource_name.as_deref().unwrap_or("")],
+        ) {
             ModelPathResolution::Found(path) => {
+                object.asset_hints.push(AssetRef {
+                    path,
+                    role: AssetRole::InferredPreviewModel,
+                });
+            }
+            ModelPathResolution::Related { path, candidates } => {
+                issues.push(ValidationIssue::info(
+                    "object-preview-model-narrowed",
+                    format!(
+                        "Decomp-authored model '{}' for {} matched {} assets; using {} because \
+                         its folder matches the actor name",
+                        authored_model, object.factory_name, candidates, path
+                    ),
+                ));
                 object.asset_hints.push(AssetRef {
                     path,
                     role: AssetRole::InferredPreviewModel,
@@ -2919,6 +3001,11 @@ fn apply_registry_preview_hints(
 
 enum ModelPathResolution {
     Found(String),
+    /// Narrowed to a folder related to the actor's name rather than equal to it.
+    Related {
+        path: String,
+        candidates: usize,
+    },
     Missing,
     Ambiguous(Vec<String>),
 }
@@ -2926,6 +3013,7 @@ enum ModelPathResolution {
 fn resolve_authored_model_path(
     authored_model: &str,
     model_index: &[(String, String)],
+    owner_hints: &[&str],
 ) -> ModelPathResolution {
     let normalized = authored_model.replace('\\', "/").to_ascii_lowercase();
     let suffix = normalized
@@ -2949,11 +3037,95 @@ fn resolve_authored_model_path(
         .collect();
     matches.sort();
     matches.dedup();
+    if matches.len() > 1 {
+        // A bare `default.bmd` names every actor folder in the stage at once.
+        // The actor's own name picks its folder out of the crowd.
+        if let Some(narrowed) = narrow_matches_by_owner(&matches, owner_hints) {
+            return narrowed;
+        }
+    }
     match matches.len() {
         0 => ModelPathResolution::Missing,
         1 => ModelPathResolution::Found(matches.pop().expect("one model match")),
         _ => ModelPathResolution::Ambiguous(matches),
     }
+}
+
+/// Lowercased alphanumerics only, so `PoiHana`, `poi_hana` and `poihana` agree.
+fn actor_folder_key(name: &str) -> String {
+    name.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn model_parent_folder_key(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let without_file = normalized
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .unwrap_or("");
+    let folder = without_file
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('!');
+    actor_folder_key(folder)
+}
+
+/// Pick the one candidate that lives in the actor's own folder.
+///
+/// Exact folder matches win outright. Failing that a folder whose name is the
+/// head or tail of the actor name is accepted (`StayPakkun` -> `pakkun`,
+/// `PoiHanaRed` -> `poihana`), longest match first, but only when a single
+/// candidate qualifies -- a tie stays ambiguous rather than becoming a guess.
+fn narrow_matches_by_owner(
+    matches: &[String],
+    owner_hints: &[&str],
+) -> Option<ModelPathResolution> {
+    for hint in owner_hints {
+        let key = actor_folder_key(hint);
+        if key.is_empty() {
+            continue;
+        }
+
+        let exact: Vec<&String> = matches
+            .iter()
+            .filter(|path| model_parent_folder_key(path) == key)
+            .collect();
+        if exact.len() == 1 {
+            return Some(ModelPathResolution::Found(exact[0].clone()));
+        }
+        if exact.len() > 1 {
+            continue;
+        }
+
+        let mut best: Option<&String> = None;
+        let mut best_len = 0usize;
+        let mut tied = false;
+        for path in matches {
+            let folder = model_parent_folder_key(path);
+            if folder.is_empty() || !(key.starts_with(&folder) || key.ends_with(&folder)) {
+                continue;
+            }
+            if folder.len() > best_len {
+                best_len = folder.len();
+                best = Some(path);
+                tied = false;
+            } else if folder.len() == best_len {
+                tied = true;
+            }
+        }
+        if !tied {
+            if let Some(path) = best {
+                return Some(ModelPathResolution::Related {
+                    path: path.clone(),
+                    candidates: matches.len(),
+                });
+            }
+        }
+    }
+    None
 }
 
 #[derive(Clone)]
@@ -3541,6 +3713,21 @@ fn default_enemy_manager_model<'a>(
     factory_name: &str,
 ) -> Option<&'a EnemyModelDefinition> {
     let actor = registry.find_enemy_actor(factory_name)?;
+    if let Some(model) = actor
+        .manager_factories
+        .iter()
+        .filter(|manager_factory| {
+            manager_factory.strip_suffix("Manager") == Some(actor.factory_name.as_str())
+        })
+        .filter_map(|manager_factory| registry.find_enemy_manager(manager_factory))
+        .find_map(|manager| {
+            actor_manager_model_candidates(actor, manager)
+                .into_iter()
+                .next()
+        })
+    {
+        return Some(model);
+    }
     let mut selected = None;
     for manager_factory in &actor.manager_factories {
         let Some(manager) = registry.find_enemy_manager(manager_factory) else {
@@ -6761,6 +6948,233 @@ mod tests {
         assert_eq!(issues[0].code, "object-preview-model-ambiguous");
     }
 
+    fn shared_basename_registry(factory: &str) -> ObjectRegistry {
+        let mut registry = ObjectRegistry::default();
+        registry
+            .object_resources
+            .push(sms_schema::ObjectResourceBinding {
+                factory_name: factory.to_string(),
+                model_index: 0,
+                role: sms_schema::ObjectResourceRole::Primary,
+                model_name: "default.bmd".to_string(),
+                resource_base: None,
+                load_flags: 0,
+                source_file: "actor.cpp".to_string(),
+            });
+        registry
+    }
+
+    fn shared_basename_assets(folders: &[&str]) -> Vec<StageAsset> {
+        folders
+            .iter()
+            .map(|folder| StageAsset {
+                path: PathBuf::from(format!("new_stage0.szs!/{folder}/default.bmd")),
+                kind: StageAssetKind::Model,
+            })
+            .collect()
+    }
+
+    const SHARED_BASENAME_FOLDERS: &[&str] = &[
+        "hamukuri",
+        "hamukuri00",
+        "hamukuri01",
+        "hamukuri02",
+        "hamukuri_l00",
+        "hamukuri_l01",
+        "hamukuri_l02",
+        "mamegesso",
+        "poihana",
+        "pakkun",
+    ];
+
+    #[test]
+    fn shared_basename_resolves_to_the_actors_own_folder() {
+        for (factory, expected) in [
+            ("PoiHana", "poihana"),
+            ("HamuKuri", "hamukuri"),
+            ("MameGesso", "mamegesso"),
+        ] {
+            let registry = shared_basename_registry(factory);
+            let assets = shared_basename_assets(SHARED_BASENAME_FOLDERS);
+            let mut objects = vec![SceneObject::new("obj", factory)];
+
+            let issues = apply_registry_preview_hints(&mut objects, &assets, &registry);
+
+            assert_eq!(objects[0].asset_hints.len(), 1, "{factory} lost its model");
+            assert!(
+                objects[0].asset_hints[0]
+                    .path
+                    .contains(&format!("/{expected}/")),
+                "{factory} resolved to {:?}, wanted {expected}",
+                objects[0].asset_hints[0].path
+            );
+            assert!(
+                issues.is_empty(),
+                "{factory} should resolve without complaint, got {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_basename_falls_back_to_a_related_folder() {
+        // Neither actor has a folder of its own; `pakkun` and `poihana` sit
+        // inside their names, so each still gets a model plus an Info note.
+        for (factory, expected) in [("StayPakkun", "pakkun"), ("PoiHanaRed", "poihana")] {
+            let registry = shared_basename_registry(factory);
+            let assets = shared_basename_assets(SHARED_BASENAME_FOLDERS);
+            let mut objects = vec![SceneObject::new("obj", factory)];
+
+            let issues = apply_registry_preview_hints(&mut objects, &assets, &registry);
+
+            assert_eq!(objects[0].asset_hints.len(), 1, "{factory} lost its model");
+            assert!(
+                objects[0].asset_hints[0]
+                    .path
+                    .contains(&format!("/{expected}/")),
+                "{factory} resolved to {:?}, wanted {expected}",
+                objects[0].asset_hints[0].path
+            );
+            assert_eq!(issues.len(), 1);
+            assert_eq!(issues[0].code, "object-preview-model-narrowed");
+            assert_eq!(issues[0].severity, ValidationSeverity::Info);
+        }
+    }
+
+    #[test]
+    fn bundled_registry_enemies_resolve_their_own_default_bmd() {
+        // PoiHana, HamuKuri and MameGesso all declare a bare `default.bmd`, so a
+        // stage holding several of them used to leave every one of them unresolved
+        // and invisible. Drives the real shipped registry through the enemy-manager
+        // binding, which is how these actors get a model in practice.
+        let registry = sms_schema::bundled_object_registry()
+            .expect("bundled registry loads")
+            .registry;
+        let assets = shared_basename_assets(SHARED_BASENAME_FOLDERS);
+
+        for (factory, expected) in [
+            // Folders of their own.
+            ("PoiHana", "poihana"),
+            ("HamuKuri", "hamukuri"),
+            ("MameGesso", "mamegesso"),
+            // No folder of their own; each falls back to the actor it derives from.
+            ("PoiHanaRed", "poihana"),
+            ("SleepPoiHana", "poihana"),
+            ("BossDangoHamuKuri", "hamukuri"),
+        ] {
+            let mut objects = vec![SceneObject::new("obj", factory)];
+            let issues = apply_registry_preview_hints(&mut objects, &assets, &registry);
+
+            let inferred: Vec<_> = objects[0]
+                .asset_hints
+                .iter()
+                .filter(|hint| hint.role == AssetRole::InferredPreviewModel)
+                .collect();
+            assert_eq!(
+                inferred.len(),
+                1,
+                "{factory} hints: {:?} issues: {issues:?}",
+                objects[0].asset_hints
+            );
+            assert!(
+                inferred[0].path.contains(&format!("/{expected}/")),
+                "{factory} resolved to {}, wanted {expected}",
+                inferred[0].path
+            );
+            assert!(
+                !issues
+                    .iter()
+                    .any(|issue| issue.code == "object-preview-model-ambiguous"),
+                "{factory} still ambiguous: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_bmd_actor_without_a_folder_or_binding_stays_unresolved() {
+        // EffectEnemy has no folder of its own and nothing its name points at,
+        // so the ambiguity warning is the honest answer.
+        let registry = sms_schema::bundled_object_registry()
+            .expect("bundled registry loads")
+            .registry;
+        let assets = shared_basename_assets(SHARED_BASENAME_FOLDERS);
+
+        let mut objects = vec![SceneObject::new("obj", "EffectEnemy")];
+        let issues = apply_registry_preview_hints(&mut objects, &assets, &registry);
+        assert!(objects[0].asset_hints.is_empty());
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, "object-preview-model-ambiguous");
+    }
+
+    #[test]
+    fn fire_hamukuri_uses_its_exact_manager_model_and_loader_flags() {
+        let registry = sms_schema::bundled_object_registry()
+            .expect("bundled registry loads")
+            .registry;
+        let assets = shared_basename_assets(SHARED_BASENAME_FOLDERS);
+
+        let model = default_enemy_manager_model(&registry, "FireHamuKuri")
+            .expect("FireHamuKuri exact manager model");
+        assert_eq!(model.model_name, "default.bmd");
+        assert_eq!(model.load_flags, 0x1024_0000);
+
+        let mut objects = vec![SceneObject::new("obj", "FireHamuKuri")];
+        let issues = apply_registry_preview_hints(&mut objects, &assets, &registry);
+        assert!(
+            objects[0].asset_hints[0].path.contains("/hamukuri/"),
+            "resolved to {:?}",
+            objects[0].asset_hints
+        );
+        assert!(!issues
+            .iter()
+            .any(|issue| issue.code == "object-preview-model-ambiguous"));
+    }
+
+    #[test]
+    fn exact_catalog_preview_survives_shared_basename_registry_refresh() {
+        let registry = sms_schema::bundled_object_registry()
+            .expect("bundled registry loads")
+            .registry;
+        let assets = shared_basename_assets(SHARED_BASENAME_FOLDERS);
+        let exact_path = "new_stage0.szs!/hamukuri/default.bmd".to_string();
+        let mut object = SceneObject::new("obj", "HamuKuri");
+        object.asset_hints.push(AssetRef {
+            path: exact_path.clone(),
+            role: AssetRole::PreviewModel,
+        });
+
+        let issues =
+            apply_registry_preview_hints(std::slice::from_mut(&mut object), &assets, &registry);
+
+        assert_eq!(
+            object.asset_hints,
+            [AssetRef {
+                path: exact_path,
+                role: AssetRole::PreviewModel,
+            }]
+        );
+        assert!(
+            issues.is_empty(),
+            "exact catalog binding warned: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn shared_basename_keeps_an_exact_folder_over_a_longer_related_one() {
+        // `bosspakkun` contains `pakkun`; the exact match must still win.
+        let registry = shared_basename_registry("BossPakkun");
+        let assets = shared_basename_assets(&["pakkun", "bosspakkun"]);
+        let mut objects = vec![SceneObject::new("obj", "BossPakkun")];
+
+        let issues = apply_registry_preview_hints(&mut objects, &assets, &registry);
+
+        assert!(
+            objects[0].asset_hints[0].path.contains("/bosspakkun/"),
+            "resolved to {:?}",
+            objects[0].asset_hints[0].path
+        );
+        assert!(issues.is_empty(), "got {issues:?}");
+    }
+
     #[test]
     fn registry_refresh_replaces_stale_unknown_class_metadata() {
         let mut registry = ObjectRegistry::default();
@@ -6960,6 +7374,7 @@ mod tests {
         let mut resolved_placement_count = 0usize;
         let mut missing = Vec::new();
         let mut ambiguous = Vec::new();
+        let mut narrowed: Vec<String> = Vec::new();
         let mut renderable_models = BTreeMap::<String, (String, u32)>::new();
         let mut override_placements = BTreeMap::<String, usize>::new();
         let mut override_stage_placements = BTreeMap::<(String, String), usize>::new();
@@ -7071,9 +7486,11 @@ mod tests {
                             .primary_model
                             .as_deref()
                             .expect("ShiningStone has a basename primary");
-                        let ModelPathResolution::Found(path) =
-                            resolve_authored_model_path(primary, &model_index)
-                        else {
+                        let ModelPathResolution::Found(path) = resolve_authored_model_path(
+                            primary,
+                            &model_index,
+                            &[resource_name, &object.factory_name],
+                        ) else {
                             panic!(
                                 "{} ShiningStone did not resolve {}",
                                 archive.stage_id, primary
@@ -7100,7 +7517,11 @@ mod tests {
                     .expect("typed resource has a table primary or exact model override");
                 model_identities.insert(resource_name.to_string());
                 model_placement_count += 1;
-                match resolve_authored_model_path(authored_model, &model_index) {
+                match resolve_authored_model_path(
+                    authored_model,
+                    &model_index,
+                    &[resource_name, &object.factory_name],
+                ) {
                     ModelPathResolution::Found(path) => {
                         resolved_placement_count += 1;
                         let inferred = object
@@ -7125,6 +7546,10 @@ mod tests {
                             .entry(path)
                             .or_insert_with(|| (resource_name.to_string(), load_flags));
                     }
+                    ModelPathResolution::Related { path, candidates } => narrowed.push(format!(
+                        "{}:{} -> {} ({} of {} candidates)",
+                        archive.stage_id, resource_name, authored_model, path, candidates
+                    )),
                     ModelPathResolution::Missing => missing.push(format!(
                         "{}:{} -> {}",
                         archive.stage_id, resource_name, authored_model
@@ -7154,6 +7579,12 @@ mod tests {
         assert!(
             ambiguous.is_empty(),
             "ambiguous declared primary BMDs: {ambiguous:?}"
+        );
+        // Retail names every primary unambiguously; folder narrowing exists for
+        // decomp-authored actors placed into custom stages, not for this corpus.
+        assert!(
+            narrowed.is_empty(),
+            "declared primary BMDs needed folder narrowing: {narrowed:?}"
         );
         assert_eq!(no_primary_placements.len(), 21);
         assert_eq!(no_primary_placement_count, 3_652);
