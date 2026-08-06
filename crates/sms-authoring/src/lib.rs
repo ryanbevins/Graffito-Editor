@@ -19,7 +19,8 @@ pub use bootstrap::built_in_blank_stage_proxy;
 pub use catalog::*;
 pub use collision::{
     CollisionCleanupReport, CollisionImportResult, CollisionSimplificationReport,
-    CollisionVertexLimitReport, SUNSHINE_COL_MAX_VERTICES, SUNSHINE_COL_RUNTIME_TRIANGLE_BUDGET,
+    CollisionVertexLimitReport, SUNSHINE_COL_EXTENDED_MAX_VERTICES, SUNSHINE_COL_MAX_VERTICES,
+    SUNSHINE_COL_RUNTIME_TRIANGLE_BUDGET,
 };
 pub use compile::{
     decode_bmd3, decode_canonical_bmd3, BmdCompileReport, BmdSectionSize, CompiledBmd,

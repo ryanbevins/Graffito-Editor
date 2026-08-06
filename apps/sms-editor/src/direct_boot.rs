@@ -35,9 +35,22 @@ const DIRECT_BOOT_MARKER: &[u8] = b"SMS_EDITOR_DIRECT_BOOT_V1\0";
 const STAGE_MUSIC_MARKER: &[u8] = b"SMS_EDITOR_STAGE_MUSIC_V1\0";
 const DIALOGUE_MARKER: &[u8] = b"GRAFFITO_DIALOGUE_OVERRIDE_V1\0";
 const BALLOON_DIALOGUE_MARKER: &[u8] = b"GRAFFITO_BALLOON_OVERRIDE_V1\0";
+const EXTENDED_COLLISION_MARKER: &[u8] = b"GRAFFITO_EXTENDED_COLLISION_V1\0";
+const RETAIL_COLLISION_GRID_SIZE_BITS: u32 = 1024.0_f32.to_bits();
+const RETAIL_COLLISION_GRID_RECIPROCAL_BITS: u32 = (1.0_f32 / 1024.0).to_bits();
+const EXTENDED_COLLISION_GRID_SIZE_BITS: u32 = 65_536.0_f32.to_bits();
+const EXTENDED_COLLISION_GRID_RECIPROCAL_BITS: u32 = (1.0_f32 / 65_536.0).to_bits();
 const MAX_STAGE_MUSIC_OVERRIDES: usize = 128;
 const MAX_DIALOGUE_OVERRIDES: usize = 4096;
 const DIALOGUE_TABLE_ENTRY_SIZE: usize = 36;
+// `TMapCollisionBase::setCheckData` loads the three on-disc COL vertex
+// indices as signed halfwords in retail. `initAllCheckData` also inlines those
+// loads twice for the large-mesh path. The file field and all subsequent
+// address arithmetic are already 16-bit clean; replacing only these loads
+// preserves stock data while extending the addressable range to 0..=65535.
+const SIGNED_COLLISION_INDEX_LOADS: [u32; 4] = [0xa805_0000, 0xa8c5_0002, 0x1c60_000c, 0xa805_0004];
+const UNSIGNED_COLLISION_INDEX_LOADS: [u32; 4] =
+    [0xa005_0000, 0xa0c5_0002, 0x1c60_000c, 0xa005_0004];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RuntimeStageTarget {
@@ -364,6 +377,391 @@ struct BalloonDialogueHook {
     entry_anchor: WordAnchor,
     replay_instruction: u32,
     director_sda_offset: i16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CollisionGridConstants {
+    reciprocal_a: u32,
+    size_a: u32,
+    size_b: u32,
+    size_c: u32,
+    reciprocal_b: u32,
+}
+
+/// Extends Sunshine's existing two-byte COL vertex-index field from the retail
+/// signed range to the complete unsigned range. Retail collision remains byte
+/// compatible. If the current stage requires the extension, an unknown DOL is
+/// rejected instead of silently packaging collision that it cannot load.
+pub(super) fn patch_sms_extended_collision_dol(
+    source: &[u8],
+    required: bool,
+) -> Result<Vec<u8>, String> {
+    let has_marker = source
+        .windows(EXTENDED_COLLISION_MARKER.len())
+        .any(|window| window == EXTENDED_COLLISION_MARKER);
+    if !required {
+        return Ok(source.to_vec());
+    }
+    let image = match parse_dol(source) {
+        Ok(image) => image,
+        Err(error) => {
+            return Err(format!(
+                "extended collision requires a valid Sunshine DOL: {error}"
+            ));
+        }
+    };
+    let signed = find_collision_index_loads(source, &image, SIGNED_COLLISION_INDEX_LOADS)?;
+    let unsigned = find_collision_index_loads(source, &image, UNSIGNED_COLLISION_INDEX_LOADS)?;
+    let (loader, standalone_is_signed) = match (signed.as_slice(), unsigned.as_slice()) {
+        ([anchor], []) => (*anchor, true),
+        ([], [anchor]) => (*anchor, false),
+        ([], []) => {
+            return Err(
+            "extended collision is required, but the Sunshine COL signed-index loader was not found"
+                .to_string(),
+            );
+        }
+        _ => {
+            return Err(format!(
+                "Sunshine COL index loader is ambiguous: found {} signed and {} already-extended candidates",
+                signed.len(),
+                unsigned.len()
+            ));
+        }
+    };
+    let inline_signed = find_collision_inline_index_loads(source, &image, 42)?;
+    let inline_unsigned = find_collision_inline_index_loads(source, &image, 40)?;
+    let (inline_loaders, inline_is_signed) = match (
+        inline_signed.as_slice(),
+        inline_unsigned.as_slice(),
+    ) {
+        ([first, second], []) => ([*first, *second], true),
+        ([], [first, second]) => ([*first, *second], false),
+        ([], []) => {
+            return Err(
+                    "extended collision is required, but the two inlined Sunshine COL large-mesh index loaders were not found"
+                        .to_string(),
+                );
+        }
+        _ => {
+            return Err(format!(
+                    "Sunshine inline COL index loaders are ambiguous: found {} signed and {} already-extended candidates",
+                    inline_signed.len(),
+                    inline_unsigned.len()
+                ));
+        }
+    };
+
+    // V1 builds already contain the adaptive-grid hook and marker, but older
+    // revisions patched only the standalone loader. Upgrade those DOLs in
+    // place so a managed run-root does not need to be recreated from scratch.
+    if has_marker {
+        if standalone_is_signed {
+            return Err(
+                "The extended-collision marker is present, but the standalone COL loader is still signed"
+                    .to_string(),
+            );
+        }
+        if !inline_is_signed {
+            return Ok(source.to_vec());
+        }
+        let mut bytes = source.to_vec();
+        patch_collision_inline_index_loads(&mut bytes, &inline_loaders)?;
+        parse_dol(&bytes)?;
+        return Ok(bytes);
+    }
+
+    let init_hook = find_collision_init_hook(source, &image)?;
+    let constants = find_collision_grid_constants(source, &image)?;
+    let text_slot = (0..DOL_TEXT_SECTION_COUNT)
+        .find(|slot| {
+            !image
+                .sections
+                .iter()
+                .any(|section| section.text && section.slot == *slot)
+        })
+        .ok_or_else(|| "The DOL has no unused text section for extended collision".to_string())?;
+    let file_offset = align_up_usize(source.len(), FILE_ALIGNMENT as usize)?;
+    let loaded_end = image
+        .sections
+        .iter()
+        .map(|section| section.address_end())
+        .chain(image.bss.map(|(_, end)| Ok(end)))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .ok_or_else(|| "The DOL has no loaded sections".to_string())?;
+    let stub_address = align_up_u32(loaded_end, FILE_ALIGNMENT)?;
+    let stub = build_extended_collision_stub(stub_address, constants)?;
+    let mut payload = Vec::with_capacity(stub.len() * 4 + EXTENDED_COLLISION_MARKER.len());
+    for word in stub {
+        payload.extend_from_slice(&word.to_be_bytes());
+    }
+    payload.extend_from_slice(EXTENDED_COLLISION_MARKER);
+    let payload_size = align_up_usize(payload.len(), FILE_ALIGNMENT as usize)?;
+    payload.resize(payload_size, 0);
+    let stub_end = stub_address
+        .checked_add(u32::try_from(payload_size).map_err(|_| {
+            "Extended collision payload size does not fit the DOL address space".to_string()
+        })?)
+        .ok_or_else(|| "Extended collision payload range overflows u32".to_string())?;
+    let stack_top = find_stack_top(source, &image)?;
+    if stub_end
+        .checked_add(MIN_STAGE_MUSIC_STACK_GAP)
+        .is_none_or(|safe_end| safe_end > stack_top)
+    {
+        return Err(format!(
+            "Extended collision stub 0x{stub_address:08X}..0x{stub_end:08X} is too close to the original stack top 0x{stack_top:08X}"
+        ));
+    }
+    reject_injected_range_overlap(&image, stub_address, stub_end)?;
+
+    let mut bytes = source.to_vec();
+    if standalone_is_signed {
+        for (relative_word, replacement) in [(0, 0xa005_0000), (1, 0xa0c5_0002), (3, 0xa005_0004)] {
+            let offset = loader
+                .file_offset()?
+                .checked_add(relative_word * 4)
+                .ok_or_else(|| "extended collision patch offset overflowed".to_string())?;
+            write_be_u32(&mut bytes, offset, replacement)?;
+        }
+    }
+    if inline_is_signed {
+        patch_collision_inline_index_loads(&mut bytes, &inline_loaders)?;
+    }
+    bytes.resize(file_offset, 0);
+    bytes.extend_from_slice(&payload);
+    write_be_u32(
+        &mut bytes,
+        DOL_TEXT_FILE_OFFSETS + text_slot * 4,
+        u32::try_from(file_offset)
+            .map_err(|_| "Extended collision file offset does not fit u32".to_string())?,
+    )?;
+    write_be_u32(&mut bytes, DOL_TEXT_ADDRESSES + text_slot * 4, stub_address)?;
+    write_be_u32(
+        &mut bytes,
+        DOL_TEXT_SIZES + text_slot * 4,
+        u32::try_from(payload_size)
+            .map_err(|_| "Extended collision payload size does not fit u32".to_string())?,
+    )?;
+    write_be_u32(
+        &mut bytes,
+        init_hook.file_offset()?,
+        encode_branch(init_hook.address()?, stub_address, true)?,
+    )?;
+    parse_dol(&bytes)?;
+    Ok(bytes)
+}
+
+fn find_collision_init_hook(source: &[u8], image: &DolImage) -> Result<WordAnchor, String> {
+    let mut candidates = Vec::new();
+    for section in image
+        .sections
+        .iter()
+        .copied()
+        .filter(|section| section.text)
+    {
+        let words = section_words(source, section)?;
+        for word_index in 0..words.len().saturating_sub(5) {
+            let sequence = &words[word_index..word_index + 6];
+            if sequence[0] == 0x801f_0008
+                && opcode(sequence[1]) == 50
+                && register_a(sequence[1]) == 2
+                && sequence[2] == 0x7c00_0e70
+                && opcode(sequence[3]) == 48
+                && register_a(sequence[3]) == 2
+                && sequence[4] == 0x7c00_0194
+                && sequence[5] == 0x6c00_8000
+            {
+                candidates.push(WordAnchor {
+                    section,
+                    word_index,
+                });
+            }
+        }
+    }
+    require_unique_anchor(candidates, "TMapCollisionData::init grid-width load")
+}
+
+fn find_collision_grid_constants(
+    source: &[u8],
+    image: &DolImage,
+) -> Result<CollisionGridConstants, String> {
+    const CLUSTER_SIZE: usize = 0xcc;
+    let mut candidates = Vec::new();
+    for section in image
+        .sections
+        .iter()
+        .copied()
+        .filter(|section| !section.text)
+    {
+        let start = usize::try_from(section.file_offset)
+            .map_err(|_| format!("DOL {} file offset does not fit usize", section.label()))?;
+        let size = usize::try_from(section.size)
+            .map_err(|_| format!("DOL {} size does not fit usize", section.label()))?;
+        for relative in (0..=size.saturating_sub(CLUSTER_SIZE)).step_by(4) {
+            let offset = start
+                .checked_add(relative)
+                .ok_or_else(|| "Collision constant file offset overflowed".to_string())?;
+            if read_be_u32(source, offset)? == RETAIL_COLLISION_GRID_RECIPROCAL_BITS
+                && read_be_u32(source, offset + 4)? == RETAIL_COLLISION_GRID_SIZE_BITS
+                && read_be_u32(source, offset + 0x44)? == RETAIL_COLLISION_GRID_SIZE_BITS
+                && read_be_u32(source, offset + 0xb8)? == RETAIL_COLLISION_GRID_SIZE_BITS
+                && read_be_u32(source, offset + 0xbc)? == 80.0_f32.to_bits()
+                && read_be_u32(source, offset + 0xc8)? == RETAIL_COLLISION_GRID_RECIPROCAL_BITS
+            {
+                let base = section
+                    .address
+                    .checked_add(u32::try_from(relative).map_err(|_| {
+                        "Collision constant relative address does not fit u32".to_string()
+                    })?)
+                    .ok_or_else(|| "Collision constant address overflowed".to_string())?;
+                candidates.push(CollisionGridConstants {
+                    reciprocal_a: base,
+                    size_a: base + 4,
+                    size_b: base + 0x44,
+                    size_c: base + 0xb8,
+                    reciprocal_b: base + 0xc8,
+                });
+            }
+        }
+    }
+    require_unique_value(candidates, "Sunshine collision-grid constant cluster")
+}
+
+fn build_extended_collision_stub(
+    stub_address: u32,
+    constants: CollisionGridConstants,
+) -> Result<Vec<u32>, String> {
+    let mut words = vec![
+        encode_d_form(32, 0, 31, 8),
+        encode_cmpwi(0, 0),
+        0,
+        ppc_rlwinm(0, 0, 0, 1, 31, 0),
+        encode_d_form(36, 0, 31, 8),
+    ];
+    words.extend(encode_u32(10, EXTENDED_COLLISION_GRID_SIZE_BITS));
+    words.extend(encode_u32(12, EXTENDED_COLLISION_GRID_RECIPROCAL_BITS));
+    let extended_to_write = words.len();
+    words.push(0);
+    let retail_word = words.len();
+    words.extend(encode_u32(10, RETAIL_COLLISION_GRID_SIZE_BITS));
+    words.extend(encode_u32(12, RETAIL_COLLISION_GRID_RECIPROCAL_BITS));
+    let write_word = words.len();
+    for (address, register) in [
+        (constants.reciprocal_a, 12),
+        (constants.size_a, 10),
+        (constants.size_b, 10),
+        (constants.size_c, 10),
+        (constants.reciprocal_b, 12),
+    ] {
+        words.extend(encode_u32(11, address));
+        words.push(encode_d_form(36, register, 11, 0));
+    }
+    words.push(encode_d_form(32, 0, 31, 8));
+    words.push(PPC_BLR);
+    let address = |word: usize| -> Result<u32, String> {
+        stub_address
+            .checked_add(
+                u32::try_from(word)
+                    .map_err(|_| "Extended collision stub index does not fit u32".to_string())?
+                    .checked_mul(4)
+                    .ok_or_else(|| "Extended collision stub offset overflowed".to_string())?,
+            )
+            .ok_or_else(|| "Extended collision stub address overflowed".to_string())
+    };
+    words[2] = encode_bge(address(2)?, address(retail_word)?)?;
+    words[extended_to_write] =
+        encode_branch(address(extended_to_write)?, address(write_word)?, false)?;
+    Ok(words)
+}
+
+fn find_collision_index_loads(
+    source: &[u8],
+    image: &DolImage,
+    sequence: [u32; 4],
+) -> Result<Vec<WordAnchor>, String> {
+    let mut matches = Vec::new();
+    for section in image
+        .sections
+        .iter()
+        .copied()
+        .filter(|section| section.text)
+    {
+        let words = section_words(source, section)?;
+        matches.extend(words.windows(sequence.len()).enumerate().filter_map(
+            |(word_index, window)| {
+                (window == sequence).then_some(WordAnchor {
+                    section,
+                    word_index,
+                })
+            },
+        ));
+    }
+    Ok(matches)
+}
+
+fn find_collision_inline_index_loads(
+    source: &[u8],
+    image: &DolImage,
+    load_opcode: u8,
+) -> Result<Vec<WordAnchor>, String> {
+    let mut matches = Vec::new();
+    for section in image
+        .sections
+        .iter()
+        .copied()
+        .filter(|section| section.text)
+    {
+        let words = section_words(source, section)?;
+        for (word_index, sequence) in words.windows(6).enumerate() {
+            let base_register = register_a(sequence[0]);
+            let first_index_register = register_t(sequence[0]);
+            if opcode(sequence[0]) == load_opcode
+                && immediate_u16(sequence[0]) == 0
+                && opcode(sequence[1]) == 31
+                && opcode(sequence[2]) == load_opcode
+                && register_a(sequence[2]) == base_register
+                && immediate_u16(sequence[2]) == 2
+                && opcode(sequence[3]) == 14
+                && opcode(sequence[4]) == 7
+                && register_a(sequence[4]) == first_index_register
+                && immediate_u16(sequence[4]) == 12
+                && opcode(sequence[5]) == load_opcode
+                && register_t(sequence[5]) == first_index_register
+                && register_a(sequence[5]) == base_register
+                && immediate_u16(sequence[5]) == 4
+            {
+                matches.push(WordAnchor {
+                    section,
+                    word_index,
+                });
+            }
+        }
+    }
+    Ok(matches)
+}
+
+fn patch_collision_inline_index_loads(
+    bytes: &mut [u8],
+    loaders: &[WordAnchor],
+) -> Result<(), String> {
+    for loader in loaders {
+        for relative_word in [0, 2, 5] {
+            let offset = loader
+                .file_offset()?
+                .checked_add(relative_word * 4)
+                .ok_or_else(|| "inline extended collision patch offset overflowed".to_string())?;
+            let word = read_be_u32(bytes, offset)?;
+            if opcode(word) != 42 {
+                return Err(format!(
+                    "inline extended collision load at file offset 0x{offset:X} is not signed"
+                ));
+            }
+            write_be_u32(bytes, offset, (word & 0x03ff_ffff) | (40_u32 << 26))?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn patch_sms_sound_assignments_dol(
@@ -4108,6 +4506,16 @@ fn encode_beq(from: u32, to: u32) -> Result<u32, String> {
     Ok(0x4182_0000 | ((displacement as i32 as u32) & 0x0000_fffc))
 }
 
+fn encode_bge(from: u32, to: u32) -> Result<u32, String> {
+    let displacement = i64::from(to) - i64::from(from);
+    if from & 3 != 0 || to & 3 != 0 || !(-0x8000..=0x7ffc).contains(&displacement) {
+        return Err(format!(
+            "PowerPC conditional branch 0x{from:08X} -> 0x{to:08X} is out of range or unaligned"
+        ));
+    }
+    Ok(0x4080_0000 | ((displacement as i32 as u32) & 0x0000_fffc))
+}
+
 fn encode_bdnz(from: u32, to: u32) -> Result<u32, String> {
     let displacement = i64::from(to) - i64::from(from);
     if from & 3 != 0 || to & 3 != 0 || !(-0x8000..=0x7ffc).contains(&displacement) {
@@ -5013,6 +5421,212 @@ mod tests {
 
     fn encode_clrlwi_dot_r0_r3_24() -> u32 {
         (21_u32 << 26) | (3_u32 << 21) | (24_u32 << 6) | (31_u32 << 1) | 1
+    }
+
+    fn install_extended_collision_fixture(
+        source: &mut Vec<u8>,
+        loader_word: usize,
+        inline_words: [usize; 2],
+        init_word: usize,
+    ) {
+        write_be_u32(source, DOL_TEXT_SIZES, 0x20).unwrap();
+        write_be_u32(
+            source,
+            SYNTHETIC_ENTRY_OFFSET,
+            encode_branch(0x8000_3100, 0x8000_3108, true).unwrap(),
+        )
+        .unwrap();
+        write_be_u32(
+            source,
+            SYNTHETIC_ENTRY_OFFSET + 8,
+            encode_d_form(15, 1, 0, 0x8040_u16 as i16),
+        )
+        .unwrap();
+        write_be_u32(
+            source,
+            SYNTHETIC_ENTRY_OFFSET + 12,
+            encode_d_form(14, 1, 1, 0),
+        )
+        .unwrap();
+        write_be_u32(source, SYNTHETIC_ENTRY_OFFSET + 16, PPC_BLR).unwrap();
+        for (index, word) in SIGNED_COLLISION_INDEX_LOADS.into_iter().enumerate() {
+            write_be_u32(
+                source,
+                SYNTHETIC_TEXT_OFFSET + (loader_word + index) * 4,
+                word,
+            )
+            .unwrap();
+        }
+        for (inline_word, stack_offset) in inline_words.into_iter().zip([0x64, 0x40]) {
+            for (index, word) in [
+                0xa81a_0000,
+                encode_mr(3, 24),
+                0xa8ba_0002,
+                encode_d_form(14, 4, 1, stack_offset),
+                0x1cc0_000c,
+                0xa81a_0004,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                write_be_u32(
+                    source,
+                    SYNTHETIC_TEXT_OFFSET + (inline_word + index) * 4,
+                    word,
+                )
+                .unwrap();
+            }
+        }
+        for (index, word) in [
+            0x801f_0008,
+            0xc822_0000,
+            0x7c00_0e70,
+            0xc042_0000,
+            0x7c00_0194,
+            0x6c00_8000,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            write_be_u32(
+                source,
+                SYNTHETIC_TEXT_OFFSET + (init_word + index) * 4,
+                word,
+            )
+            .unwrap();
+        }
+
+        let data_offset = align_up_usize(source.len(), FILE_ALIGNMENT as usize).unwrap();
+        source.resize(data_offset + 0xcc, 0);
+        write_be_u32(source, DOL_DATA_FILE_OFFSETS, data_offset as u32).unwrap();
+        write_be_u32(source, DOL_DATA_ADDRESSES, 0x802f_0000).unwrap();
+        write_be_u32(source, DOL_DATA_SIZES, 0xcc).unwrap();
+        for (relative, value) in [
+            (0, RETAIL_COLLISION_GRID_RECIPROCAL_BITS),
+            (4, RETAIL_COLLISION_GRID_SIZE_BITS),
+            (0x44, RETAIL_COLLISION_GRID_SIZE_BITS),
+            (0xb8, RETAIL_COLLISION_GRID_SIZE_BITS),
+            (0xbc, 80.0_f32.to_bits()),
+            (0xc8, RETAIL_COLLISION_GRID_RECIPROCAL_BITS),
+        ] {
+            write_be_u32(source, data_offset + relative, value).unwrap();
+        }
+    }
+
+    #[test]
+    fn extended_collision_patches_indices_and_installs_adaptive_grid_hook() {
+        let layout = SyntheticLayout {
+            text_address: 0x8000_4000,
+            hook_word: 0x80,
+            movie_word: 0xc0,
+            setter_word: 0xe0,
+        };
+        let mut source = synthetic_dol(layout);
+        let loader_word = 0x140;
+        let inline_words = [0x148, 0x150];
+        let init_word = 0x160;
+        install_extended_collision_fixture(&mut source, loader_word, inline_words, init_word);
+
+        let patched = patch_sms_extended_collision_dol(&source, true).unwrap();
+        let image = parse_dol(&patched).unwrap();
+        let text = image
+            .sections
+            .iter()
+            .copied()
+            .find(|section| section.file_offset as usize == SYNTHETIC_TEXT_OFFSET)
+            .unwrap();
+        let words = section_words(&patched, text).unwrap();
+        assert_eq!(
+            &words[loader_word..loader_word + UNSIGNED_COLLISION_INDEX_LOADS.len()],
+            &UNSIGNED_COLLISION_INDEX_LOADS
+        );
+        for inline_word in inline_words {
+            assert_eq!(words[inline_word], 0xa01a_0000);
+            assert_eq!(words[inline_word + 2], 0xa0ba_0002);
+            assert_eq!(words[inline_word + 5], 0xa01a_0004);
+        }
+        let init_hook = words[init_word];
+        assert!(is_relative_bl(init_hook));
+        let stub_address =
+            decode_branch_target(init_hook, text.address + init_word as u32 * 4).unwrap();
+        let stub_section = image
+            .sections
+            .iter()
+            .copied()
+            .find(|section| section.text && section.address == stub_address)
+            .unwrap();
+        let stub_words = section_words(&patched, stub_section).unwrap();
+        assert_eq!(stub_words[0], encode_d_form(32, 0, 31, 8));
+        assert_eq!(stub_words[3], ppc_rlwinm(0, 0, 0, 1, 31, 0));
+        assert!(patched
+            .windows(EXTENDED_COLLISION_MARKER.len())
+            .any(|window| window == EXTENDED_COLLISION_MARKER));
+        assert_eq!(
+            patch_sms_extended_collision_dol(&patched, true).unwrap(),
+            patched,
+            "the managed DOL patch must be idempotent"
+        );
+    }
+
+    #[test]
+    fn extended_collision_upgrades_a_v1_managed_dol_in_place() {
+        let layout = SyntheticLayout {
+            text_address: 0x8000_4000,
+            hook_word: 0x80,
+            movie_word: 0xc0,
+            setter_word: 0xe0,
+        };
+        let mut source = synthetic_dol(layout);
+        let loader_word = 0x140;
+        let inline_words = [0x148, 0x150];
+        install_extended_collision_fixture(&mut source, loader_word, inline_words, 0x160);
+        for (relative_word, replacement) in [(0, 0xa005_0000), (1, 0xa0c5_0002), (3, 0xa005_0004)] {
+            write_be_u32(
+                &mut source,
+                SYNTHETIC_TEXT_OFFSET + (loader_word + relative_word) * 4,
+                replacement,
+            )
+            .unwrap();
+        }
+        source.extend_from_slice(EXTENDED_COLLISION_MARKER);
+        let original_len = source.len();
+
+        let patched = patch_sms_extended_collision_dol(&source, true).unwrap();
+        assert_eq!(patched.len(), original_len);
+        let image = parse_dol(&patched).unwrap();
+        assert_eq!(
+            find_collision_inline_index_loads(&patched, &image, 40)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(find_collision_inline_index_loads(&patched, &image, 42)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            patch_sms_extended_collision_dol(&patched, true).unwrap(),
+            patched
+        );
+    }
+
+    #[test]
+    fn extended_collision_rejects_an_unknown_required_dol() {
+        let layout = SyntheticLayout {
+            text_address: 0x8000_4000,
+            hook_word: 0x80,
+            movie_word: 0xc0,
+            setter_word: 0xe0,
+        };
+        let source = synthetic_dol(layout);
+        assert_eq!(
+            patch_sms_extended_collision_dol(&source, false).unwrap(),
+            source
+        );
+        let error = patch_sms_extended_collision_dol(&source, true).unwrap_err();
+        assert!(
+            error.contains("signed-index loader was not found"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -6258,6 +6872,38 @@ mod tests {
 
     #[test]
     #[ignore = "requires SMS_US_RETAIL_DOL"]
+    fn extended_collision_patches_the_local_retail_dol() {
+        let path = PathBuf::from(std::env::var_os("SMS_US_RETAIL_DOL").expect("SMS_US_RETAIL_DOL"));
+        let source = fs::read(&path).unwrap();
+        let patched = patch_sms_extended_collision_dol(&source, true)
+            .unwrap_or_else(|error| panic!("extended retail collision patch: {error}"));
+        let image = parse_dol(&patched).unwrap();
+        assert_eq!(
+            find_collision_index_loads(&patched, &image, UNSIGNED_COLLISION_INDEX_LOADS)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            find_collision_inline_index_loads(&patched, &image, 40)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(find_collision_inline_index_loads(&patched, &image, 42)
+            .unwrap()
+            .is_empty());
+        assert!(patched
+            .windows(EXTENDED_COLLISION_MARKER.len())
+            .any(|window| window == EXTENDED_COLLISION_MARKER));
+        assert_eq!(
+            patch_sms_extended_collision_dol(&patched, true).unwrap(),
+            patched
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SMS_US_RETAIL_DOL"]
     fn maximum_stage_music_profile_payload_fits_retail_stack_guard() {
         let path = PathBuf::from(std::env::var_os("SMS_US_RETAIL_DOL").expect("SMS_US_RETAIL_DOL"));
         let source = fs::read(&path).unwrap();
@@ -6308,8 +6954,10 @@ mod tests {
     fn packaged_sound_music_dialogue_balloon_and_direct_boot_compose_on_retail_dol() {
         let path = PathBuf::from(std::env::var_os("SMS_US_RETAIL_DOL").expect("SMS_US_RETAIL_DOL"));
         let source = fs::read(&path).unwrap();
+        let collision = patch_sms_extended_collision_dol(&source, true)
+            .unwrap_or_else(|error| panic!("composed extended collision: {error}"));
         let sound = patch_sms_sound_assignments_dol(
-            &source,
+            &collision,
             &[
                 RuntimeSoundAssignment {
                     kind: RuntimeSoundAssignmentKind::MapStatic,

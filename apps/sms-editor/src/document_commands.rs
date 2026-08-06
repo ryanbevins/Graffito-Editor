@@ -2501,6 +2501,7 @@ impl SmsEditorApp {
         let mut command = Command::new(&self.dolphin_path);
         let configured_user_dir =
             Self::configure_dolphin_user_directory(&mut command, &self.dolphin_user_dir);
+        Self::configure_dolphin_memory(&mut command, outcome.extended_dolphin_memory);
         let native_goop_mod_ready = match dolphin_graphics::prepare_native_resolution_goop_profile(
             Path::new(&self.dolphin_path),
             configured_user_dir.as_deref(),
@@ -2536,9 +2537,14 @@ impl SmsEditorApp {
             .as_ref()
             .map(|path| format!("configured Dolphin user directory '{}'", path.display()))
             .unwrap_or_else(|| "Dolphin's normal user profile".to_string());
+        let memory_profile = if outcome.extended_dolphin_memory {
+            "48 MiB extended MEM1"
+        } else {
+            "retail 24 MiB MEM1"
+        };
         match (mode, command.spawn()) {
             (DolphinLaunchMode::External, Ok(_)) => self.log.push(format!(
-                "Launched Dolphin directly into '{}' (runtime area {}, scenario {}) with managed game '{}' using {}.",
+                "Launched Dolphin directly into '{}' (runtime area {}, scenario {}) with managed game '{}' using {memory_profile} and {}.",
                 outcome.direct_boot.target.archive_name,
                 outcome.direct_boot.target.area_index,
                 outcome.direct_boot.target.scenario_index,
@@ -2551,7 +2557,7 @@ impl SmsEditorApp {
                     editor_host.expect("editor host was validated before spawning Dolphin"),
                 ));
                 self.log.push(format!(
-                    "Started Play in Editor for '{}' (runtime area {}, scenario {}) using {}; waiting for Dolphin's render window.",
+                    "Started Play in Editor for '{}' (runtime area {}, scenario {}) using {memory_profile} and {}; waiting for Dolphin's render window.",
                     outcome.direct_boot.target.archive_name,
                     outcome.direct_boot.target.area_index,
                     outcome.direct_boot.target.scenario_index,
@@ -2678,6 +2684,19 @@ impl SmsEditorApp {
             // reordering or duplicating the game's audio initialization.
             .arg("-C")
             .arg("Dolphin.Core.FastDiscSpeed=True");
+    }
+
+    pub(super) fn configure_dolphin_memory(command: &mut Command, extended: bool) {
+        if extended {
+            command
+                .arg("-C")
+                .arg("Dolphin.Core.RAMOverrideEnable=True")
+                .arg("-C")
+                .arg(format!(
+                    "Dolphin.Core.MEM1Size={}",
+                    EXTENDED_DOLPHIN_MEM1_BYTES
+                ));
+        }
     }
 
     pub(super) fn configure_sms_graphics(command: &mut Command, native_goop_mod_ready: bool) {

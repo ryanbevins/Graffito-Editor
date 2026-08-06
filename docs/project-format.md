@@ -48,6 +48,7 @@ sound_id = 0x5000
 dolphin_executable = "C:\\Tools\\Dolphin\\Dolphin.exe"
 game_image = "D:\\Games\\Super Mario Sunshine.rvz"
 dolphin_user_directory = "C:\\DolphinProfiles\\SMS-Modding"
+extended_dolphin_memory = true
 ```
 
 Required fields are:
@@ -220,6 +221,12 @@ command-line overrides; it does not rewrite the saved Dolphin profile.
 **Launch in Dolphin** leaves it as a normal external window. The extracted base is never
 opened for modification; the next managed build refreshes the copy from its
 configured base executable before preparing another launch.
+
+`launch.extended_dolphin_memory` defaults to `false`. Enable it to make managed
+builds patch only the run-root `sys/bi2.bin` simulated-memory field to 48 MiB;
+both launch actions then pass matching temporary Dolphin MEM1 overrides. The
+default keeps a retail 24 MiB run-root for hardware-budget validation. The extracted base
+`bi2.bin` and the user's global Dolphin configuration are never modified.
 
 Both managed launch actions require `launch.dolphin_executable`. The optional
 `launch.dolphin_user_directory` applies to both managed and legacy launches.

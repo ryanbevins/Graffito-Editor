@@ -4000,6 +4000,7 @@ fn completed_managed_launch_reports_the_resolved_direct_boot_target() {
                     movie_hook_address: 0x800F_A000,
                     stub_address: 0x8042_0000,
                 },
+                extended_dolphin_memory: true,
             }),
         })
         .unwrap();
@@ -4091,6 +4092,27 @@ fn play_in_editor_keeps_input_active_and_accelerates_original_disc_loads() {
             std::ffi::OsStr::new("Dolphin.Core.FastDiscSpeed=True"),
         ]
     );
+}
+
+#[test]
+fn managed_dolphin_launch_enables_the_matching_extended_mem1_profile() {
+    let mut command = Command::new("Dolphin");
+
+    SmsEditorApp::configure_dolphin_memory(&mut command, true);
+
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        [
+            std::ffi::OsStr::new("-C"),
+            std::ffi::OsStr::new("Dolphin.Core.RAMOverrideEnable=True"),
+            std::ffi::OsStr::new("-C"),
+            std::ffi::OsStr::new("Dolphin.Core.MEM1Size=50331648"),
+        ]
+    );
+
+    let mut retail = Command::new("Dolphin");
+    SmsEditorApp::configure_dolphin_memory(&mut retail, false);
+    assert!(retail.get_args().next().is_none());
 }
 
 #[test]

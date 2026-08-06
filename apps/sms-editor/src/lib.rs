@@ -1199,6 +1199,7 @@ struct SmsEditorApp {
     dolphin_path: String,
     game_path: String,
     dolphin_user_dir: String,
+    dolphin_extended_memory: bool,
     registry: Option<ObjectRegistry>,
     object_authoring_catalog_cache_key: Option<ObjectAuthoringCatalogCacheKey>,
     object_authoring_catalog: Arc<ObjectAuthoringCatalog>,
@@ -1610,6 +1611,7 @@ impl Default for SmsEditorApp {
                 .dolphin_user_directory
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_default(),
+            dolphin_extended_memory: launch.extended_dolphin_memory,
             registry: None,
             object_authoring_catalog_cache_key: None,
             object_authoring_catalog: Arc::new(ObjectAuthoringCatalog::default()),

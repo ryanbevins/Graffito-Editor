@@ -5,7 +5,8 @@ use base64::Engine;
 use sms_authoring::{
     import_model, AuthoringError, CollisionDocument, CollisionGroup,
     CollisionSimplificationOptions, CollisionSource, CollisionSurface, CoordinateConversion,
-    DiagnosticCode, ModelAssetDocument, ModelImportOptions, SUNSHINE_COL_MAX_VERTICES,
+    DiagnosticCode, ModelAssetDocument, ModelImportOptions, SUNSHINE_COL_EXTENDED_MAX_VERTICES,
+    SUNSHINE_COL_MAX_VERTICES,
 };
 
 fn triangle_buffer() -> Vec<u8> {
@@ -87,7 +88,7 @@ fn vertex_limit_fit_is_deterministic_and_preserves_triangle_winding() {
 
 #[test]
 fn vertex_limit_fit_makes_an_oversized_collision_runtime_encodable() {
-    let triangle_count = SUNSHINE_COL_MAX_VERTICES / 3 + 1;
+    let triangle_count = SUNSHINE_COL_EXTENDED_MAX_VERTICES / 3 + 1;
     let mut collision = CollisionDocument {
         vertices: Vec::with_capacity(triangle_count * 3),
         groups: vec![CollisionGroup {
