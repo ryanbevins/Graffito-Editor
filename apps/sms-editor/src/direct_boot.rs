@@ -7456,13 +7456,28 @@ fn goop_mr(ra: u32, rs: u32) -> u32 {
 }
 
 /// `J3DModel::mModelData`, then `J3DModelData::mMaterialNum`.
+/// `TLiveActor`'s `mMActor`, which `getModel` reads before the model itself.
+const GOOP_ACTOR_MODEL_OFFSET: i32 = 0x74;
 const GOOP_MODEL_DATA_OFFSET: i32 = 0x04;
 const GOOP_MATERIAL_NUM_OFFSET: i32 = 0x24;
 
 const GOOP_MFLR_R0: u32 = 0x7C08_02A6;
+/// `mfcr r0` and `mtcrf 0xFF, r0`. The stub compares, so it writes the
+/// condition register, and a hook that lands mid-function has to give it back.
+/// How much of the wash stub to emit, for narrowing a fault down to the piece
+/// that causes it. Zero saves and restores and does nothing else, which tests
+/// the hook itself; each step adds the next piece back.
+///
+/// 0 nothing  1 find the entry  2 read the model  3 everything
+const GOOP_WASH_BISECT: u8 = 3;
+const GOOP_MFCR_R0: u32 = 0x7C00_0026;
+const GOOP_MTCR_R0: u32 = 0x7C0F_F120;
 const GOOP_MTLR_R0: u32 = 0x7C08_03A6;
 
 /// The detour body.
+// Every one of these is a distinct scalar the emitted code needs, and bundling
+// them into a struct would only move the list somewhere else.
+#[allow(clippy::too_many_arguments)]
 fn build_goop_wash_stub(
     table_address: u32,
     displaced: u32,
@@ -7471,18 +7486,45 @@ fn build_goop_wash_stub(
     get_model: u32,
     init_kcolor: u32,
     settings: GoopWashSettings,
+    allowed: &[u32],
 ) -> Result<Vec<u32>, String> {
     let mut words: Vec<u32> = Vec::new();
     let start_word = 0xFF00 | u32::from(settings.start_level);
     let kcolor = i32::from(settings.konst_register);
     let step = i32::from(settings.step);
 
-    // r3 is the actor and r4 the water on entry; both must outlive the calls.
+    // Everything this stub touches has to be handed back exactly as it was.
+    //
+    // The enemy hooks land on a function's first instruction, where almost
+    // nothing is live and saving r3, r4 and the link register was enough.
+    // Reaching everything hooks the middle of a function instead -- one
+    // instruction before a virtual call, with the message in r5, the sender in
+    // r4, and whatever else the water manager is holding still live. Clobbering
+    // any of that corrupts the call that follows, which is what broke the game
+    // rather than any part of the wash itself.
     words.push(GOOP_MFLR_R0);
-    words.push(goop_stwu(1, -0x30, 1));
-    words.push(goop_stw(0, 0x34, 1));
+    words.push(goop_stwu(1, -0x50, 1));
+    words.push(goop_stw(0, 0x54, 1));
+    words.push(GOOP_MFCR_R0);
+    words.push(goop_stw(0, 0x4C, 1));
     words.push(goop_stw(3, 0x20, 1));
     words.push(goop_stw(4, 0x24, 1));
+    words.push(goop_stw(5, 0x30, 1));
+    words.push(goop_stw(6, 0x08, 1));
+    words.push(goop_stw(7, 0x34, 1));
+    words.push(goop_stw(8, 0x38, 1));
+    words.push(goop_stw(9, 0x3C, 1));
+    words.push(goop_stw(10, 0x40, 1));
+    words.push(goop_stw(11, 0x44, 1));
+    words.push(goop_stw(12, 0x48, 1));
+    let bisect_out = if GOOP_WASH_BISECT == 0 {
+        let slot = words.len();
+        words.push(0); // b done
+        Some(slot)
+    } else {
+        None
+    };
+
     // Hooking the message rather than the damage step means every message
     // arrives here, so anything that is not a spray leaves immediately.
     let to_done_other_message = if settings.uniform_rate {
@@ -7514,9 +7556,59 @@ fn build_goop_wash_stub(
     let to_done_full = words.len();
     words.push(0);
 
+    // Reaching everything means being handed whatever the spray touched --
+    // including actors this tool never authored. Binding a konst packet into
+    // one of those writes into a display list built for something else, which
+    // ends with the game executing data rather than crashing cleanly. An actor
+    // carries its class at offset zero, so the classes that were authored are
+    // baked in and anything else is let go untouched.
+    // `claim` has to name the first guard, not the first store: the scan
+    // reaches this path by branching to the label, so anything emitted above it
+    // is never executed. Both guards sat there and neither ever ran, which is
+    // why an actor with no layer was still walked and an absent model was still
+    // dereferenced.
+    let claim = words.len();
+    let mut skip_stranger = Vec::new();
+    if !allowed.is_empty() {
+        words.push(goop_lwz(9, 0, 3));
+        let mut to_known = Vec::new();
+        for vtable in allowed {
+            words.push(goop_lis(10, vtable >> 16));
+            words.push(goop_ori(10, 10, vtable & 0xFFFF));
+            words.push(goop_cmpw(9, 10));
+            to_known.push(words.len());
+            words.push(0);
+        }
+        skip_stranger.push(words.len());
+        words.push(0);
+        let known = words.len();
+        for at in to_known {
+            words[at] = goop_beq(known as i32 - at as i32);
+        }
+    }
+
+    // Not all of what arrives is a `TLiveActor`: the send is to a `THitActor`, whose
+    // model pointer may be absent or may not be a model pointer at all.
+    // `getModel` walks 0x74 then 0x04 without checking either, so it reads
+    // address four and the game dies. Walk it here first and leave quietly if
+    // anything on the way is null, before a slot is spent on an actor that has
+    // nothing to wash.
+    let mut skip_null = Vec::new();
+    words.push(goop_lwz(9, GOOP_ACTOR_MODEL_OFFSET, 3));
+    words.push(goop_cmplwi(9, 0));
+    skip_null.push(words.len());
+    words.push(0);
+    words.push(goop_lwz(9, GOOP_MODEL_DATA_OFFSET, 9));
+    words.push(goop_cmplwi(9, 0));
+    skip_null.push(words.len());
+    words.push(0);
+    words.push(goop_lwz(9, GOOP_MODEL_DATA_OFFSET, 9));
+    words.push(goop_cmplwi(9, 0));
+    skip_null.push(words.len());
+    words.push(0);
+
     // First sight: seed the level and bind the material to this entry's colour,
     // once. Binding per hit would allocate a packet every time.
-    let claim = words.len();
     words.push(goop_stw(3, 0, 11));
     words.push(goop_lis(9, 0xFFFF));
     words.push(goop_ori(9, 9, start_word));
@@ -7524,6 +7616,13 @@ fn build_goop_wash_stub(
     words.push(goop_li(9, 0));
     words.push(goop_stw(9, 8, 11));
     words.push(goop_stw(11, 0x28, 1));
+    let bisect_before_model = if GOOP_WASH_BISECT < 2 {
+        let slot = words.len();
+        words.push(0); // b done
+        Some(slot)
+    } else {
+        None
+    };
     words.push(goop_lwz(3, 0x20, 1));
     let get_model_call = words.len();
     words.push(0);
@@ -7537,6 +7636,13 @@ fn build_goop_wash_stub(
     words.push(goop_stw(10, 0x1C, 1));
     words.push(goop_li(9, 0));
     words.push(goop_stw(9, 0x18, 1));
+    let bisect_before_bind = if GOOP_WASH_BISECT < 3 {
+        let slot = words.len();
+        words.push(0); // b done
+        Some(slot)
+    } else {
+        None
+    };
     let bind_loop = words.len();
     words.push(goop_lwz(9, 0x18, 1));
     words.push(goop_lwz(10, 0x1C, 1));
@@ -7581,10 +7687,35 @@ fn build_goop_wash_stub(
     words.push(goop_stw(5, 4, 11));
 
     let done = words.len();
+    if let Some(at) = bisect_before_bind {
+        words[at] = goop_b(done as i32 - at as i32);
+    }
+    if let Some(at) = bisect_before_model {
+        words[at] = goop_b(done as i32 - at as i32);
+    }
+    if let Some(at) = bisect_out {
+        words[at] = goop_b(done as i32 - at as i32);
+    }
+    for at in skip_null {
+        words[at] = goop_beq(done as i32 - at as i32);
+    }
+    for at in skip_stranger {
+        words[at] = goop_b(done as i32 - at as i32);
+    }
+    words.push(goop_lwz(0, 0x4C, 1));
+    words.push(GOOP_MTCR_R0);
     words.push(goop_lwz(3, 0x20, 1));
     words.push(goop_lwz(4, 0x24, 1));
-    words.push(goop_lwz(0, 0x34, 1));
-    words.push(goop_addi(1, 1, 0x30));
+    words.push(goop_lwz(5, 0x30, 1));
+    words.push(goop_lwz(6, 0x08, 1));
+    words.push(goop_lwz(7, 0x34, 1));
+    words.push(goop_lwz(8, 0x38, 1));
+    words.push(goop_lwz(9, 0x3C, 1));
+    words.push(goop_lwz(10, 0x40, 1));
+    words.push(goop_lwz(11, 0x44, 1));
+    words.push(goop_lwz(12, 0x48, 1));
+    words.push(goop_lwz(0, 0x54, 1));
+    words.push(goop_addi(1, 1, 0x50));
     words.push(GOOP_MTLR_R0);
     words.push(displaced);
     let resume_word = words.len();
@@ -7671,6 +7802,7 @@ fn find_goop_wash_signature(
 pub(super) fn patch_goop_wash_dol(
     source: &[u8],
     settings: GoopWashSettings,
+    allowed: &[u32],
     get_model: u32,
     init_kcolor: u32,
 ) -> Result<Vec<u8>, String> {
@@ -7765,6 +7897,7 @@ pub(super) fn patch_goop_wash_dol(
         get_model,
         init_kcolor,
         settings,
+        allowed,
     )?;
     let stride = probe.len();
     let table_address = stub_address
@@ -7788,6 +7921,7 @@ pub(super) fn patch_goop_wash_dol(
             get_model,
             init_kcolor,
             settings,
+            allowed,
         )?;
         if stub.len() != stride {
             return Err("goop wash stub changed size between passes".to_string());
@@ -7956,10 +8090,11 @@ fn find_goop_wash_callees(source: &[u8], image: &DolImage) -> Result<(u32, u32),
 pub(super) fn install_goop_wash(
     source: &[u8],
     settings: GoopWashSettings,
+    allowed: &[u32],
 ) -> Result<Vec<u8>, String> {
     let image = parse_dol(source)?;
     let (get_model, init_kcolor) = find_goop_wash_callees(source, &image)?;
-    patch_goop_wash_dol(source, settings, get_model, init_kcolor)
+    patch_goop_wash_dol(source, settings, allowed, get_model, init_kcolor)
 }
 
 /// Whether this DOL carries the code the wash needs.
@@ -8010,7 +8145,7 @@ mod goop_wash_tests {
             uniform_rate: true,
             reach: GoopWashReach::Props,
         };
-        let patched = install_goop_wash(&source, settings).expect("install for props");
+        let patched = install_goop_wash(&source, settings, &[]).expect("install for props");
         assert!(patched.len() > source.len());
 
         let after = parse_dol(&patched).expect("reparse");
@@ -8026,6 +8161,59 @@ mod goop_wash_tests {
             word >> 26,
             18,
             "the props hook is not a branch: {word:#010x}"
+        );
+
+        // The stub itself, so an address inside it can be read as an
+        // instruction rather than guessed at.
+        {
+            let image = parse_dol(&patched).expect("reparse for dump");
+            if let Some(section) = image.sections.iter().find(|s| s.text && s.slot == 2) {
+                let words = section_words(&patched, *section).expect("stub words");
+                for (index, word) in words.iter().enumerate().take(80) {
+                    println!("  STUB +{:#05x} (w{index:>3}) {:#010x}", index * 4, word);
+                }
+            }
+        }
+
+        // Where the stub actually lands, so a crash address can be read
+        // against it rather than against the unpatched image.
+        {
+            let image = parse_dol(&patched).expect("reparse for layout");
+            for section in image.sections.iter().filter(|section| section.text) {
+                println!(
+                    "  TEXT slot {} {:#010x}..{:#010x}",
+                    section.slot,
+                    section.address,
+                    section.address_end().unwrap()
+                );
+            }
+        }
+
+        // With an allowlist the stub must let a stranger past: a class it was
+        // not told about arrives at the same hook and must leave untouched,
+        // because binding a konst packet into a display list built for
+        // something else ends with the game executing data.
+        let filtered = install_goop_wash(
+            &source,
+            GoopWashSettings {
+                reach: GoopWashReach::Everything,
+                ..settings
+            },
+            &[0x803B_45D4, 0x803B_7378],
+        )
+        .expect("install with an allowlist");
+        let unfiltered = install_goop_wash(
+            &source,
+            GoopWashSettings {
+                reach: GoopWashReach::Everything,
+                ..settings
+            },
+            &[],
+        )
+        .expect("install without one");
+        assert!(
+            filtered.len() > unfiltered.len(),
+            "the allowlist emitted no comparison"
         );
 
         // Everything hooks the send itself, at every site the water manager
@@ -8044,7 +8232,7 @@ mod goop_wash_tests {
             reach: GoopWashReach::Everything,
             ..settings
         };
-        let patched_all = install_goop_wash(&source, universal).expect("install everywhere");
+        let patched_all = install_goop_wash(&source, universal, &[]).expect("install everywhere");
         let after_all = parse_dol(&patched_all).expect("reparse");
         for site in &sites {
             let offset = usize::try_from(dol_file_offset(&after_all, *site).expect("site offset"))
@@ -8068,8 +8256,8 @@ mod goop_wash_tests {
             reach: GoopWashReach::Enemies,
             ..settings
         };
-        let both = install_goop_wash(&source, enemies).expect("install for enemies");
-        let both = install_goop_wash(&both, settings).expect("install for props too");
+        let both = install_goop_wash(&source, enemies, &[]).expect("install for enemies");
+        let both = install_goop_wash(&both, settings, &[]).expect("install for props too");
         assert!(
             both.len() > patched.len(),
             "the second install added nothing"
@@ -8104,7 +8292,7 @@ mod goop_wash_tests {
                 uniform_rate,
                 reach: GoopWashReach::Enemies,
             };
-            let patched = install_goop_wash(&source, settings)
+            let patched = install_goop_wash(&source, settings, &[])
                 .unwrap_or_else(|error| panic!("install (uniform={uniform_rate}): {error}"));
             assert!(patched.len() > source.len());
             let after = parse_dol(&patched).expect("reparse");
@@ -8149,7 +8337,7 @@ mod goop_wash_tests {
         let (get_model, init_kcolor) =
             find_goop_wash_callees(&source, &image).expect("find the callees");
         println!("GET_MODEL: {get_model:#010x}  INIT_KCOLOR: {init_kcolor:#010x}");
-        let patched = install_goop_wash(&source, settings).expect("install the wash");
+        let patched = install_goop_wash(&source, settings, &[]).expect("install the wash");
         assert!(patched.len() > source.len());
         if let Some(out) = std::env::var_os("SMS_WASH_OUT") {
             std::fs::write(out, &patched).expect("write the patched DOL");

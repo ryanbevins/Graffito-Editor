@@ -288,6 +288,11 @@ pub(super) struct SmsProjectFile {
     pub(super) mask_wash_uniform_rate: bool,
     #[serde(default = "wash_reach_default")]
     pub(super) mask_wash_reach: String,
+    /// Classes this project has authored goop layers on, as the vtables their
+    /// instances carry. A wash that reaches every actor uses them to tell the
+    /// ones it authored from the ones it was handed.
+    #[serde(default)]
+    pub(super) mask_wash_vtables: Vec<u32>,
     /// The konst register the last bake claimed. The wash has to write the
     /// register the layer reads, and the bake takes whichever the material had
     /// spare, so it is recorded rather than assumed.
@@ -377,6 +382,7 @@ impl LegacySmsProjectFileV1 {
             mask_wash_step: 1,
             mask_wash_uniform_rate: true,
             mask_wash_reach: wash_reach_default(),
+            mask_wash_vtables: Vec::new(),
             mask_wash_konst: 0,
         }
     }
@@ -412,6 +418,7 @@ impl SmsProjectFile {
             mask_wash_step: 1,
             mask_wash_uniform_rate: true,
             mask_wash_reach: wash_reach_default(),
+            mask_wash_vtables: Vec::new(),
             mask_wash_konst: 0,
         }
     }

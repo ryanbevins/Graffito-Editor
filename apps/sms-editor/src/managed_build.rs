@@ -1546,13 +1546,35 @@ fn install_managed_runtime_patches(
                 _ => GoopWashReach::Props,
             },
         });
-    if let Some(wash) = goop_wash.filter(|_| dol_supports_goop_wash(&patched_bytes)) {
-        patched_bytes = install_goop_wash(&patched_bytes, wash).map_err(|error| {
-            format!(
-                "Could not install the goop wash into '{}': {error}",
-                run.run_main_dol.display()
-            )
-        })?;
+    // Only what this project authored, at every reach.
+    //
+    // The narrow hooks were treated as self-filtering because they are confined
+    // to classes that can carry a layer -- but that is a filter on the class,
+    // not on whether this actor was ever given a coating. Every enemy that got
+    // sprayed was entering the stub and having konst packets bound into
+    // materials that never asked for one, which is why baking Petey corrupted
+    // PoiHana.
+    let wash_allowlist: Vec<u32> = project.descriptor.mask_wash_vtables.clone();
+    // An empty allowlist means no filtering, which is right for the narrow
+    // reaches and catastrophic for the widest one: it would hand the stub every
+    // actor the spray touches and bind konst packets into models that never
+    // asked for one. Refuse rather than install something that crashes the game
+    // as soon as an unrelated actor is sprayed.
+    // An empty list means the wash cannot tell an authored actor from any
+    // other, so it would act on all of them. Nothing is installed rather than
+    // something that corrupts whatever gets sprayed.
+    let wash_knows_its_actors = !wash_allowlist.is_empty();
+    if let Some(wash) = goop_wash
+        .filter(|_| wash_knows_its_actors)
+        .filter(|_| dol_supports_goop_wash(&patched_bytes))
+    {
+        patched_bytes =
+            install_goop_wash(&patched_bytes, wash, &wash_allowlist).map_err(|error| {
+                format!(
+                    "Could not install the goop wash into '{}': {error}",
+                    run.run_main_dol.display()
+                )
+            })?;
     }
     if !overrides.is_empty() {
         patched_bytes = patch_sms_stage_music_dol(&patched_bytes, &overrides)

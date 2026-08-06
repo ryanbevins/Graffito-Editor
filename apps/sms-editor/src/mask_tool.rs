@@ -3264,6 +3264,7 @@ print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
             ) {
                 Ok((count, konst)) => {
                     self.remember_wash_konst(konst);
+                    self.remember_wash_vtable(&choice);
                     let Some(document) = self.document.as_mut() else {
                         return;
                     };
@@ -3727,6 +3728,54 @@ print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
         None
     }
 
+    /// Puts every actor in the stage back on its retail model.
+    ///
+    /// Runs the single-actor reset over each in turn rather than reaching into
+    /// the archive directly: on a custom stage the resource list is the stage's
+    /// own content, so the only safe way to shed a coating is the one that
+    /// restores the model from retail behind it.
+    fn restore_every_mask_goop_default(&mut self) {
+        let restored_from = self.mask_selected_actor.clone();
+        let actors: Vec<String> = self
+            .mask_actor_choices()
+            .into_iter()
+            .map(|choice| choice.object_id)
+            .collect();
+        let total = actors.len();
+        let mut reset = 0usize;
+        for object_id in actors {
+            self.mask_selected_actor = Some(object_id);
+            let said = self.log.len();
+            self.restore_mask_goop_default();
+            // The single-actor reset says so when there was nothing to shed,
+            // which is the difference between an actor restored and one that
+            // was already wearing its own model.
+            if !self.log[said..]
+                .iter()
+                .any(|line| line.contains("already wears"))
+            {
+                reset += 1;
+            }
+        }
+        self.mask_selected_actor = restored_from;
+        // Every layer is gone, so the classes recorded for the wash go with
+        // them -- otherwise a build would still be telling the patch to watch
+        // for actors that no longer carry anything.
+        self.mask_wash_vtables.clear();
+        if let Some(project) = self.current_project.as_mut() {
+            if !project.descriptor.mask_wash_vtables.is_empty() {
+                project.descriptor.mask_wash_vtables.clear();
+                self.persist_project_settings(false);
+            }
+        }
+        self.log.push(format!(
+            "Put {reset} of {total} actor(s) back on their retail models."
+        ));
+        if let Some(choice) = self.selected_mask_choice() {
+            self.build_mask_preview(&choice);
+        }
+    }
+
     fn restore_mask_goop_default(&mut self) {
         let Some(choice) = self.selected_mask_choice() else {
             return;
@@ -3892,6 +3941,46 @@ print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
         }
         project.descriptor.mask_wash_konst = register;
         self.persist_project_settings(false);
+    }
+
+    /// Remembers the class this actor is, so a wash that reaches everything can
+    /// tell the actors this project authored from the ones it is handed.
+    ///
+    /// The vtable is what an actor carries at offset zero, which is the only
+    /// identity a stub can check in a load and a compare.
+    fn remember_wash_vtable(&mut self, choice: &MaskActorChoice) {
+        let vtable =
+            self.document
+                .as_ref()
+                .zip(self.registry.as_ref())
+                .and_then(|(document, registry)| {
+                    let object = document
+                        .objects
+                        .iter()
+                        .find(|object| object.id == choice.object_id)?;
+                    let class = &registry.find_object(&object.factory_name)?.class_name;
+                    crate::class_vtables::class_vtable(class)
+                });
+        let Some(vtable) = vtable else {
+            return;
+        };
+        if !self.mask_wash_vtables.contains(&vtable) {
+            self.mask_wash_vtables.push(vtable);
+        }
+        let changed = match self.current_project.as_mut() {
+            Some(project) => {
+                if project.descriptor.mask_wash_vtables.contains(&vtable) {
+                    false
+                } else {
+                    project.descriptor.mask_wash_vtables.push(vtable);
+                    true
+                }
+            }
+            None => false,
+        };
+        if changed {
+            self.persist_project_settings(false);
+        }
     }
 
     /// Keeps the project's copy in step once a control moves.
@@ -4642,6 +4731,19 @@ print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
             {
                 let said = self.log.len();
                 self.restore_mask_goop_default();
+                self.mask_author_status = self.log[said..].join(" ");
+            }
+            if ui
+                .button("Reset every actor")
+                .on_hover_text(
+                    "Put every actor in this stage back on its retail model. Baked \
+                     coatings and reimported masks are all discarded, across the whole \
+                     stage, and the wash forgets which classes carried a layer",
+                )
+                .clicked()
+            {
+                let said = self.log.len();
+                self.restore_every_mask_goop_default();
                 self.mask_author_status = self.log[said..].join(" ");
             }
         });

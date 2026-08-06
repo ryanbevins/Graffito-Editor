@@ -42,6 +42,7 @@ mod audio_preview;
 mod boolean_cut;
 mod browser_settings;
 mod camera;
+mod class_vtables;
 mod content_browser;
 mod content_thumbnails;
 mod dialogue;
@@ -1314,6 +1315,9 @@ struct SmsEditorApp {
     mask_wash_uniform_rate: bool,
     /// How far the wash reaches: `enemies`, `props`, or `everything`.
     mask_wash_reach: String,
+    /// The vtables of the classes this project has authored layers on, so a
+    /// wash that reaches everything can let strangers past untouched.
+    mask_wash_vtables: Vec<u32>,
     mask_bake_tpose: bool,
     /// Where the idle animation is held while the layer is authored, in
     /// seconds. The preview holds this frame rather than running on the wall
@@ -1699,6 +1703,7 @@ impl Default for SmsEditorApp {
             mask_layer_pool_label: String::new(),
             mask_wash_uniform_rate: true,
             mask_wash_reach: "props".to_string(),
+            mask_wash_vtables: Vec::new(),
             mask_bake_tpose: true,
             mask_idle_frame: 0.0,
             mask_wash_settings_project: None,
