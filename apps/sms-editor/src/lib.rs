@@ -1305,6 +1305,9 @@ struct SmsEditorApp {
     /// where Gesso clears it every hit -- is brought into line without touching
     /// what any other actor does.
     mask_wash_step: u32,
+    /// Which per-layer pool folder this instance resolved to, and the
+    /// manager that chose it.
+    mask_layer_pool_label: String,
     /// Whether every spray counts, or only the ones an actor's class lets past
     /// its own cooldown.
     mask_wash_uniform_rate: bool,
@@ -1689,6 +1692,7 @@ impl Default for SmsEditorApp {
             mask_bake_washable: true,
             mask_wash_resistance: 4,
             mask_wash_step: 1,
+            mask_layer_pool_label: String::new(),
             mask_wash_uniform_rate: true,
             mask_bake_tpose: true,
             mask_idle_frame: 0.0,

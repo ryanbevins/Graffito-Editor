@@ -6422,6 +6422,28 @@ mod bake_repro {
     }
 
     #[test]
+    #[ignore = "needs SMS_REPRO_BMD pointing at an extracted model"]
+    fn probe_wash_stages() {
+        let path = std::env::var("SMS_REPRO_BMD").expect("set SMS_REPRO_BMD");
+        let bytes = std::fs::read(&path).expect("read the model");
+        let parsed = crate::J3dFile::parse(&bytes).expect("parse");
+        let preview = parsed
+            .geometry_preview_with_loader_flags(crate::SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS)
+            .expect("geometry");
+        for (index, material) in preview.materials.iter().enumerate() {
+            for (slot, stage) in material.tev_stages.iter().enumerate() {
+                if stage.color_op >= 8 || stage.alpha_op >= 8 {
+                    println!(
+                        "  mat{index} stage{slot}: color_op={:#04x} alpha_op={:#04x} konst_color={:#04x} konst_alpha={:#04x} map={:?}",
+                        stage.color_op, stage.alpha_op, stage.konst_color,
+                        stage.konst_alpha, stage.order.tex_map
+                    );
+                }
+            }
+        }
+        println!("MATERIALS: {}", preview.materials.len());
+    }
+    #[test]
     #[ignore = "needs SMS_BASE_ROOT pointing at the extracted retail game"]
     fn a_pristine_actor_model_can_be_recovered_from_retail() {
         let base_root = std::env::var("SMS_BASE_ROOT").expect("set SMS_BASE_ROOT");

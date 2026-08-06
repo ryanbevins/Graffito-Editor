@@ -84,7 +84,13 @@ pub(super) enum MaskTextureSource {
 /// comparison that takes its level from a konst register's alpha, which is the
 /// register the coverage slider drives.
 fn stage_is_wash_comparison(stage: &sms_formats::J3dTevStage) -> bool {
-    (stage.color_op >= 8 || stage.alpha_op >= 8) && (0x1c..=0x1f).contains(&stage.konst_alpha)
+    // A compare op is the whole test, as it always was. Requiring the stage to
+    // read a konst-alpha register as well looked tighter and was wrong: retail
+    // washes do not all select their level that way, so HamuKuri's own layer
+    // stopped being recognised and the tool fell back to a borrowed mask over a
+    // front projection while the stage renderer carried on drawing the real
+    // coating perfectly well.
+    stage.color_op >= 8 || stage.alpha_op >= 8
 }
 
 /// One placed enemy the Mask Tool can target.
@@ -189,11 +195,6 @@ fn sample_preview_alpha(texture: &PreviewTexture, u: f32, v: f32) -> u8 {
     sample_preview_texel(texture, u, v).a()
 }
 
-/// The wash value of a stage texture at a UV. Intensity formats carry the
-/// value in the colour channels.
-fn sample_preview_channel(texture: &PreviewTexture, u: f32, v: f32) -> u8 {
-    sample_preview_texel(texture, u, v).r()
-}
 
 /// What the coating pass resolves at one canvas pixel: the coat UV, the
 /// sweep UV, and the actor's own mask value where it authored one.
@@ -211,11 +212,23 @@ enum AuthoredMaskTexture<'a> {
 
 impl AuthoredMaskTexture<'_> {
     /// The wash value at a UV, in the mask's own image space.
+    ///
+    /// A layer this tool bakes packs its coating into the colour channels and
+    /// its mask into the alpha, so that one is read from alpha. Everything else
+    /// -- retail masks especially -- carries the value in the image itself, and
+    /// reading those from alpha returns a constant, which is a mask that cannot
+    /// recede however the coverage moves.
     fn value(&self, u: f32, v: f32) -> u8 {
         match self {
-            Self::Stage(texture) => sample_preview_channel(texture, u, v),
+            Self::Stage(texture) => sample_preview_texel(texture, u, v).r(),
             Self::Model(texture) => sample_texture(texture, u, v)
-                .map(|texel| texel[0])
+                .map(|texel| {
+                    if texture.name == GOOP_LAYER_TEXTURE {
+                        texel[3]
+                    } else {
+                        texel[0]
+                    }
+                })
                 .unwrap_or(0),
         }
     }
@@ -550,11 +563,18 @@ fn sample_texture(texture: &sms_formats::J3dTexturePreview, u: f32, v: f32) -> O
 /// only the catalog missed actors placed from the content browser, which carry
 /// their model as a hint.
 /// Which konst register a wash comparison sweeps.
-fn wash_konst_index(stage: &sms_formats::J3dTevStage) -> usize {
+/// Which konst register a wash comparison reads, where it reads one at all.
+///
+/// Answering zero for a comparison that selects no konst says the actor's
+/// coating can be driven when it cannot: HamuKuri's goop is permanent in
+/// retail, so nothing in its material responds, and the tool would sit writing
+/// a register the comparison never looks at while suppressing its own overlay
+/// in favour of a wash that never happens.
+fn wash_konst_index(stage: &sms_formats::J3dTevStage) -> Option<usize> {
     match stage.konst_color {
-        12..=15 => (stage.konst_color - 12) as usize,
-        16..=31 => ((stage.konst_color - 16) & 3) as usize,
-        _ => 0,
+        12..=15 => Some((stage.konst_color - 12) as usize),
+        16..=31 => Some(((stage.konst_color - 16) & 3) as usize),
+        _ => None,
     }
 }
 
@@ -635,13 +655,62 @@ fn mask_model_path(
             .find(|asset| asset.role == role)
             .map(|asset| asset.path.clone())
     };
-    hint(sms_scene::AssetRole::PreviewModel)
+    let resolved = hint(sms_scene::AssetRole::PreviewModel)
         .or_else(|| {
             document
                 .actor_preview(object)
                 .map(|preview| preview.model_path.clone())
         })
-        .or_else(|| hint(sms_scene::AssetRole::InferredPreviewModel))
+        .or_else(|| hint(sms_scene::AssetRole::InferredPreviewModel))?;
+    Some(layer_pool_model_path(document, object).unwrap_or(resolved))
+}
+
+/// The model an actor spawned from a goop layer's own pool actually wears.
+///
+/// The goop tool styles a layer, binds managers to it, and gives each layer its
+/// own copy of the actor's folder suffixed with the layer number -- `hamukuri`
+/// becomes `hamukuri00` -- so the layer's own map rides with it. Every copy
+/// holds a file called `default.bmd`, so a hint that names one says nothing
+/// about which, and reading the wrong copy shows a coating the actor does not
+/// wear.
+fn layer_pool_model_path(
+    document: &sms_scene::StageDocument,
+    object: &sms_scene::SceneObject,
+) -> Option<String> {
+    let base = {
+        let hint = |role: sms_scene::AssetRole| {
+            object
+                .asset_hints
+                .iter()
+                .find(|asset| asset.role == role)
+                .map(|asset| asset.path.clone())
+        };
+        hint(sms_scene::AssetRole::PreviewModel)
+            .or_else(|| {
+                document
+                    .actor_preview(object)
+                    .map(|preview| preview.model_path.clone())
+            })
+            .or_else(|| hint(sms_scene::AssetRole::InferredPreviewModel))?
+    };
+    let normalized = base.replace(char::from(92), "/");
+    let (directory, file) = normalized.rsplit_once('/')?;
+    let (parent, folder) = directory.rsplit_once('/')?;
+    // The layer is named in the actor's manager -- `...マネージャー_L02` is
+    // layer two -- and that is what picks the copy. Taking the first numbered
+    // folder that exists instead gave every instance `00`, so four actors on
+    // four layers all read one layer's map.
+    let manager = object.raw_param("manager_name")?;
+    let (_, digits) = manager.rsplit_once("_L")?;
+    if digits.len() != 2 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let candidate = format!("{parent}/{folder}{digits}/{file}");
+    document
+        .assets
+        .iter()
+        .any(|asset| asset.path.to_string_lossy().replace(char::from(92), "/") == candidate)
+        .then_some(candidate)
 }
 
 const CANVAS: usize = 384;
@@ -1009,8 +1078,13 @@ impl SmsEditorApp {
         let preview = self.mask_preview.as_ref()?;
         for material in &preview.geometry.materials {
             for stage in &material.tev_stages {
+                // Only a K0..K3 alpha selector names a register; anything else
+                // is a comparison that takes its level elsewhere, and
+                // subtracting from it reported nonsense like "K232".
                 if stage_is_wash_comparison(stage) {
-                    return Some(stage.konst_alpha - 0x1c);
+                    return (0x1c..=0x1f)
+                        .contains(&stage.konst_alpha)
+                        .then(|| stage.konst_alpha - 0x1c);
                 }
             }
         }
@@ -1170,8 +1244,11 @@ impl SmsEditorApp {
                 else {
                     return material.clone();
                 };
+                let Some(konst) = wash_konst_index(stage) else {
+                    return material.clone();
+                };
                 let mut washed = material.clone();
-                washed.tev_k_colors[wash_konst_index(stage)] = [wash_threshold; 4];
+                washed.tev_k_colors[konst] = [wash_threshold; 4];
                 washed
             })
             .collect();
@@ -1816,20 +1893,76 @@ impl SmsEditorApp {
             .iter()
             .filter_map(|triangle| triangle.material_index)
             .collect();
+        // A comparison can take its level from a constant rather than a
+        // register -- HamuKuri's reads GX's fixed one-half, which is why its
+        // goop is permanent in retail and why writing any register leaves it
+        // untouched. Point it at a spare register in this clone so the renderer
+        // can wash it like any other. Only the preview is affected; what ships
+        // still carries the constant unless the layer is rebaked washable.
+        for index in used_materials.iter().copied() {
+            let Some(material) = isolated.materials.get_mut(index) else {
+                continue;
+            };
+            let claimed: Vec<usize> = material
+                .tev_stages
+                .iter()
+                .filter_map(wash_konst_index)
+                .collect();
+            let Some(spare) = (0..4).find(|register| !claimed.contains(register)) else {
+                continue;
+            };
+            for stage in material.tev_stages.iter_mut() {
+                if stage.color_op < 8 && stage.alpha_op < 8 {
+                    continue;
+                }
+                if wash_konst_index(stage).is_some() {
+                    continue;
+                }
+                // K<n>'s alpha, broadcast into the colour channel, which is how
+                // a wash comparison reads its level.
+                stage.konst_color = 0x1c + spare as u8;
+                stage.konst_alpha = 0x1c + spare as u8;
+            }
+        }
         self.mask_wash_materials = isolated
             .materials
             .iter()
             .enumerate()
             .filter(|(index, _)| used_materials.contains(index))
             .filter_map(|(index, material)| {
+                // Only materials whose comparison actually reads a konst can be
+                // washed by moving one. A material without one keeps its
+                // coating whatever the slider does, so leaving it out is what
+                // lets the tool draw its own preview over the top instead.
                 material.tev_stages.iter().find_map(|stage| {
                     if !stage_is_wash_comparison(stage) {
                         return None;
                     }
-                    Some((index, wash_konst_index(stage)))
+                    wash_konst_index(stage).map(|konst| (index, konst))
                 })
             })
             .collect();
+        // An actor whose coating cannot be driven -- HamuKuri's goop is
+        // permanent in retail, its comparison reads no konst -- keeps drawing
+        // that coating whatever the tool previews, so the preview lands on top
+        // of it and both show at once. Take the model's own coating out of the
+        // preview scene, leaving the tool's the only one drawn.
+        if self.mask_wash_materials.is_empty() {
+            if let Some(index) = isolated
+                .triangles
+                .iter()
+                .find_map(|triangle| triangle.mask_texture_index)
+            {
+                if let Some(texture) = isolated.textures.get_mut(index) {
+                    // The coating shows where the mask does not exceed the
+                    // comparison's level, so a mask at the top of its range
+                    // shows none of it.
+                    for pixel in texture.image.pixels.iter_mut() {
+                        *pixel = egui::Color32::WHITE;
+                    }
+                }
+            }
+        }
         self.mask_gpu_scene = Some(gpu_viewport::GpuViewportScene::from_preview(
             &isolated,
             target_format,
@@ -2197,6 +2330,38 @@ impl SmsEditorApp {
     }
 
     /// The actor currently selected in the Mask Tool.
+    /// The goop style the actor's own layer was given, as an index into the
+    /// retail template catalog.
+    ///
+    /// The goop tool styles a layer -- chocolate, oil -- binds managers to it,
+    /// and gives each layer its own copy of the actor's folder suffixed with the
+    /// layer number. So the actor already names its layer: the copy it draws
+    /// from is `hamukuri00`, and 00 is the layer whose style it wears. Defaulting
+    /// the colour to a generated rainbow instead offers a coating the actor can
+    /// never have.
+    fn actor_layer_style(&self, choice: &MaskActorChoice) -> Option<usize> {
+        let path = choice.model_path.replace(char::from(92), "/");
+        let (directory, _) = path.rsplit_once('/')?;
+        let folder = directory.rsplit('/').next()?;
+        let digits = folder.get(folder.len().checked_sub(2)?..)?;
+        if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let layer: usize = digits.parse().ok()?;
+        let style = self
+            .document
+            .as_ref()?
+            .goop_authoring
+            .as_ref()?
+            .layers
+            .get(layer)?
+            .style_source
+            .as_ref()?;
+        self.retail_goop_templates.iter().position(|template| {
+            template.stage_id == style.stage_id && template.layer_index == style.layer_index
+        })
+    }
+
     /// The pose a goop layer is authored in: the model's rest pose, or its idle
     /// animation held at the frame the slider names.
     ///
@@ -2973,6 +3138,14 @@ impl SmsEditorApp {
         if let Some(id) = picked {
             self.mask_selected_actor = Some(id.clone());
             if let Some(choice) = choices.iter().find(|choice| choice.object_id == id) {
+                // Seed the colour from the style this actor's layer was given,
+                // so a chocolate pool opens on chocolate rather than a rainbow
+                // it can never wear. Only on selection: doing it whenever the
+                // preview rebuilds would throw away a colour just chosen.
+                if let Some(style) = self.actor_layer_style(choice) {
+                    self.mask_colour_source = MaskTextureSource::GoopStyle(style);
+                    self.load_goop_style(style);
+                }
                 self.build_mask_preview(choice);
             }
         }
@@ -3029,6 +3202,22 @@ impl SmsEditorApp {
                 .map(|(_, name)| name.clone())
                 .unwrap_or_else(|| "Goop style".to_string()),
         };
+        // On an actor that already carries a layer the coating on screen is the
+        // model's own texture, drawn by the stage renderer -- these pick what a
+        // bake would write next, not what is being shown. HamuKuri's layer
+        // samples an I4 image, so it draws grey however this is set, and
+        // BossGesso's is coloured so the difference never shows there. Saying so
+        // is the difference between a control that is scoped and one that looks
+        // broken.
+        if self.authored_mask().is_some() {
+            ui.label(
+                egui::RichText::new(
+                    "this actor wears its own layer -- these choose what the next bake                      writes, not what is drawn",
+                )
+                .small()
+                .weak(),
+            );
+        }
         let mut picked_style = None;
         egui::ComboBox::from_label("Colour")
             .selected_text(colour_label)
@@ -3087,6 +3276,41 @@ impl SmsEditorApp {
                     "Authored / StayPakkun default",
                 );
             });
+        // Which pool folder an instance reads is not something the tool should
+        // leave implicit: the goop tool emits one per layer and they differ, so
+        // the resolved model and the manager that chose it are shown.
+        if self.authored_mask().is_some() {
+            let manager = self
+                .document
+                .as_ref()
+                .zip(self.mask_selected_actor.as_ref())
+                .and_then(|(document, id)| {
+                    document
+                        .objects
+                        .iter()
+                        .find(|object| &object.id == id)
+                        .and_then(|object| object.raw_param("manager_name"))
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "<no manager_name>".to_string());
+            let model = self
+                .selected_mask_choice()
+                .map(|choice| {
+                    let path = choice.model_path.replace(char::from(92), "/");
+                    path.rsplit('/')
+                        .take(2)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
+                .unwrap_or_default();
+            self.mask_layer_pool_label =
+                format!("Layer pool: {model}  \u{2014}  manager {manager}");
+        } else {
+            self.mask_layer_pool_label = String::new();
+        }
         let renderer = if self.mask_gpu_scene.is_some() {
             "stage renderer"
         } else {
@@ -3238,9 +3462,11 @@ impl SmsEditorApp {
             ui.painter().add(scene.paint_callback(rect));
         }
 
-        if self.mask_uv_layer != MaskUvLayer::Goop {
-            return;
-        }
+        // The coating is not a property of which UV tab is open. An actor the
+        // renderer washes shows it on either, so an actor the tool coats should
+        // too -- otherwise the slider works on one tab and not the other purely
+        // because of which actor is selected.
+        //
         // An authored actor washes inside the renderer itself; the overlay
         // exists only for actors coated with the borrowed mask.
         if !self.mask_wash_materials.is_empty() {
@@ -3374,6 +3600,13 @@ impl SmsEditorApp {
             .small()
             .color(egui::Color32::GRAY),
         );
+        if !self.mask_layer_pool_label.is_empty() {
+            ui.label(
+                egui::RichText::new(self.mask_layer_pool_label.clone())
+                    .small()
+                    .weak(),
+            );
+        }
 
         ui.separator();
         ui.heading("Pose");
