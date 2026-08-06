@@ -1699,39 +1699,6 @@ impl SmsEditorApp {
                 }
             }
 
-            if let Some(sms_scene::PlacementBinding::Authored(placement)) = &object.placement {
-                if self.object_uses_stu_stain_model(&object) {
-                    let mut stained = self.stu_stain_baked();
-                    if ui
-                        .checkbox(&mut stained, "Goop stain on cap")
-                        .on_hover_text(
-                            "Bakes the stage's stain texture into the Stu model and pins its \
-                             blend, so it shows regardless of what the runtime decides. Applies \
-                             to the base pool; per-layer pools keep their own layer's stain.",
-                        )
-                        .changed()
-                    {
-                        match stained {
-                            true => self.bake_stu_stain(),
-                            false => self.unbake_stu_stain(),
-                        }
-                    }
-                }
-                if self.object_uses_enemy_pool(&object) {
-                    ui.separator();
-                    let mut pool_only = placement.pool_only;
-                    if ui
-                        .checkbox(&mut pool_only, "Pool only (no placed instance)")
-                        .on_hover_text(
-                            "Export the manager and its resources without this actor record.                              The conductor fills the manager's pool at load, so goop spawning                              still works and nothing stands in the world.",
-                        )
-                        .changed()
-                    {
-                        self.set_selected_object_pool_only(pool_only);
-                    }
-                }
-            }
-
             ui.separator();
             ui.heading("Params");
             let editable_parameters = self
