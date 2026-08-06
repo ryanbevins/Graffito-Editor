@@ -1312,6 +1312,8 @@ struct SmsEditorApp {
     /// Whether every spray counts, or only the ones an actor's class lets past
     /// its own cooldown.
     mask_wash_uniform_rate: bool,
+    /// How far the wash reaches: `enemies`, `props`, or `everything`.
+    mask_wash_reach: String,
     mask_bake_tpose: bool,
     /// Where the idle animation is held while the layer is authored, in
     /// seconds. The preview holds this frame rather than running on the wall
@@ -1696,6 +1698,7 @@ impl Default for SmsEditorApp {
             mask_wash_step: 1,
             mask_layer_pool_label: String::new(),
             mask_wash_uniform_rate: true,
+            mask_wash_reach: "props".to_string(),
             mask_bake_tpose: true,
             mask_idle_frame: 0.0,
             mask_wash_settings_project: None,

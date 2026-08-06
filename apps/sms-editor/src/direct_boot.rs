@@ -7245,8 +7245,106 @@ const GOOP_WASH_MESSAGE_SIGNATURE: [u32; 5] = [
     0x3BA5_0000, // addi r29, r5, 0   -- message
 ];
 const GOOP_WASH_MESSAGE_SIGNATURE_OFFSET: u32 = 0x10;
+
+/// `TMapObjBase::receiveMessage`, at the point it has already matched the water
+/// message and is about to dispatch to the subclass's `touchWater` through the
+/// vtable -- so the prop is still in `r3` and the message needs no re-testing.
+///
+/// Props reach the wash by a different road to enemies. A map object is a
+/// `TLiveActor` like any other, so the stub reads its model the same way; only
+/// the hook differs. It covers every class that does not override
+/// `receiveMessage`, plus `TMapObjGeneral` and `TMapObjTurn`, which call up to
+/// this one. The few that reimplement it -- switches, balls, planes, nails,
+/// messengers and the Delfino bell -- do not pass through here and are not
+/// washed by it.
+const GOOP_WASH_PROP_SIGNATURE: [u32; 5] = [
+    0x8183_0000, // lwz r12, 0(r3)      -- the vtable
+    0x818C_014C, // lwz r12, 0x14C(r12) -- touchWater
+    0x7D88_03A6, // mtlr r12
+    0x4E80_0021, // blrl                -- CodeWarrior dispatches through LR
+    0x4800_0008, // b
+];
+const GOOP_WASH_PROP_SIGNATURE_OFFSET: u32 = 0;
+
+/// The water manager dispatching `receiveMessage` on whatever the spray hit.
+///
+/// This is upstream of every class: the send happens before any actor's own
+/// handler runs, so hooking here reaches actors that reimplement or ignore the
+/// message -- the Delfino bell, switches, balls, planes, nails -- which neither
+/// of the other roads can.
+const GOOP_WASH_DISPATCH: [u32; 4] = [
+    0x8183_0000, // lwz r12, 0(r3)      -- the target's vtable
+    0x818C_00A0, // lwz r12, 0xA0(r12)  -- receiveMessage
+    0x7D88_03A6, // mtlr r12
+    0x4E80_0021, // blrl
+];
+/// `li r5, HIT_MESSAGE_SPRAYED_BY_WATER`, staged before the dispatch. The
+/// same dispatch shape carries every other message too, so the message is what
+/// tells a water send apart from the rest.
+const GOOP_WASH_WATER_ARGUMENT: u32 = 0x38A0_000F;
+/// How far back the message may have been staged.
+const GOOP_WASH_ARGUMENT_WINDOW: usize = 12;
+/// What retail has. A DOL with a different count is not one this understands.
+const GOOP_WASH_DISPATCH_SITES: usize = 4;
+
+/// Every site where the water manager tells something it has been sprayed.
+///
+/// Found by the dispatch's own instructions with the message staged ahead of
+/// it, and refused unless the count is exactly what retail carries -- the same
+/// bargain the single-site signatures make, so a DOL this does not recognise is
+/// rejected rather than patched at whatever happened to match.
+fn find_goop_wash_dispatch_sites(source: &[u8], image: &DolImage) -> Result<Vec<u32>, String> {
+    let mut sites = Vec::new();
+    for section in image
+        .sections
+        .iter()
+        .copied()
+        .filter(|section| section.text)
+    {
+        let words = section_words(source, section)?;
+        if words.len() < GOOP_WASH_DISPATCH.len() {
+            continue;
+        }
+        for index in 0..=words.len() - GOOP_WASH_DISPATCH.len() {
+            if words[index..index + GOOP_WASH_DISPATCH.len()] != GOOP_WASH_DISPATCH {
+                continue;
+            }
+            let from = index.saturating_sub(GOOP_WASH_ARGUMENT_WINDOW);
+            if !words[from..index].contains(&GOOP_WASH_WATER_ARGUMENT) {
+                continue;
+            }
+            let address = section
+                .address
+                .checked_add(u32::try_from(index * 4).map_err(|_| "index overflow".to_string())?)
+                .ok_or_else(|| "dispatch address overflows".to_string())?;
+            sites.push(address);
+        }
+    }
+    if sites.len() != GOOP_WASH_DISPATCH_SITES {
+        return Err(format!(
+            "Expected {GOOP_WASH_DISPATCH_SITES} water dispatch sites, found {}",
+            sites.len()
+        ));
+    }
+    Ok(sites)
+}
 /// `HIT_MESSAGE_SPRAYED_BY_WATER` (HitActor.hpp:31).
 const GOOP_WASH_WATER_MESSAGE: u32 = 0xF;
+
+/// How far a wash reaches.
+///
+/// Kept as levels rather than independent switches: everything already covers
+/// what props covers, so the two together would spend a second text section on
+/// a hook that never fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GoopWashReach {
+    /// `TSmallEnemy`, by whichever of its two roads `uniform_rate` picks.
+    Enemies,
+    /// `TMapObjBase::receiveMessage`, which most scenery inherits.
+    Props,
+    /// The send itself, upstream of every class.
+    Everything,
+}
 
 /// What the runtime wash needs to know about an authored layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7271,6 +7369,9 @@ pub(super) struct GoopWashSettings {
     /// the coating. Hooking the message instead of the damage step gives every
     /// actor the same rate.
     pub(super) uniform_rate: bool,
+    /// How far the wash reaches. Enemies and props arrive by their own roads;
+    /// everything is hooked upstream of both, where the spray is sent.
+    pub(super) reach: GoopWashReach,
 }
 
 impl Default for GoopWashSettings {
@@ -7281,6 +7382,7 @@ impl Default for GoopWashSettings {
             resistance: 4,
             step: 1,
             uniform_rate: true,
+            reach: GoopWashReach::Enemies,
         }
     }
 }
@@ -7586,23 +7688,49 @@ pub(super) fn patch_goop_wash_dol(
     }
 
     let image = parse_dol(source)?;
-    let hook = if settings.uniform_rate {
-        find_goop_wash_signature(
-            source,
-            &image,
-            &GOOP_WASH_MESSAGE_SIGNATURE,
-            GOOP_WASH_MESSAGE_SIGNATURE_OFFSET,
-            "TSmallEnemy::receiveMessage",
-        )?
-    } else {
-        find_goop_wash_hook(source, &image)?
+    // The levels stack: props keeps the enemy road and adds its own, so raising
+    // the reach never takes an actor away from the wash. Everything replaces
+    // both, being upstream of each.
+    let enemy_hook = |image: &DolImage| -> Result<u32, String> {
+        if settings.uniform_rate {
+            find_goop_wash_signature(
+                source,
+                image,
+                &GOOP_WASH_MESSAGE_SIGNATURE,
+                GOOP_WASH_MESSAGE_SIGNATURE_OFFSET,
+                "TSmallEnemy::receiveMessage",
+            )
+        } else {
+            find_goop_wash_hook(source, image)
+        }
     };
-    let hook_offset = usize::try_from(dol_file_offset(&image, hook)?)
-        .map_err(|_| "goop wash hook offset does not fit usize".to_string())?;
-    let displaced = source
-        .get(hook_offset..hook_offset + 4)
-        .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-        .ok_or_else(|| "goop wash hook runs past the image".to_string())?;
+    let hooks: Vec<u32> = match settings.reach {
+        GoopWashReach::Enemies => vec![enemy_hook(&image)?],
+        GoopWashReach::Props => vec![
+            enemy_hook(&image)?,
+            find_goop_wash_signature(
+                source,
+                &image,
+                &GOOP_WASH_PROP_SIGNATURE,
+                GOOP_WASH_PROP_SIGNATURE_OFFSET,
+                "TMapObjBase::receiveMessage",
+            )?,
+        ],
+        GoopWashReach::Everything => find_goop_wash_dispatch_sites(source, &image)?,
+    };
+    let mut hook_offsets = Vec::with_capacity(hooks.len());
+    let mut displaced = Vec::with_capacity(hooks.len());
+    for hook in &hooks {
+        let offset = usize::try_from(dol_file_offset(&image, *hook)?)
+            .map_err(|_| "goop wash hook offset does not fit usize".to_string())?;
+        displaced.push(
+            source
+                .get(offset..offset + 4)
+                .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                .ok_or_else(|| "goop wash hook runs past the image".to_string())?,
+        );
+        hook_offsets.push(offset);
+    }
 
     let text_slot = (0..DOL_TEXT_SECTION_COUNT)
         .find(|slot| {
@@ -7625,34 +7753,50 @@ pub(super) fn patch_goop_wash_dol(
     let stub_address = align_up_u32(loaded_end, GOOP_WASH_ALIGNMENT as u32)?;
 
     // Two passes: the table follows the code, whose length depends on where the
-    // table is.
+    // table is. Reaching everything means several hooks, and each needs its own
+    // copy -- the displaced instruction and the address to resume at differ per
+    // site -- but they share one table, so an actor is recorded once however
+    // many roads lead to it.
     let probe = build_goop_wash_stub(
         0,
-        displaced,
-        hook + 4,
+        displaced[0],
+        hooks[0] + 4,
         stub_address,
         get_model,
         init_kcolor,
         settings,
     )?;
+    let stride = probe.len();
     let table_address = stub_address
-        .checked_add(u32::try_from(probe.len() * 4).map_err(|_| "stub too large".to_string())?)
+        .checked_add(
+            u32::try_from(stride * hooks.len() * 4).map_err(|_| "stub too large".to_string())?,
+        )
         .ok_or_else(|| "goop wash stub overflows the address space".to_string())?;
-    let stub = build_goop_wash_stub(
-        table_address,
-        displaced,
-        hook + 4,
-        stub_address,
-        get_model,
-        init_kcolor,
-        settings,
-    )?;
-    if stub.len() != probe.len() {
-        return Err("goop wash stub changed size between passes".to_string());
+
+    let mut stubs = Vec::with_capacity(hooks.len());
+    for (index, hook) in hooks.iter().enumerate() {
+        let at = stub_address
+            .checked_add(
+                u32::try_from(index * stride * 4).map_err(|_| "stub too large".to_string())?,
+            )
+            .ok_or_else(|| "goop wash stub overflows the address space".to_string())?;
+        let stub = build_goop_wash_stub(
+            table_address,
+            displaced[index],
+            hook + 4,
+            at,
+            get_model,
+            init_kcolor,
+            settings,
+        )?;
+        if stub.len() != stride {
+            return Err("goop wash stub changed size between passes".to_string());
+        }
+        stubs.push((at, stub));
     }
 
     let payload_size = align_up_usize(
-        stub.len() * 4 + (GOOP_WASH_ENTRIES * GOOP_WASH_ENTRY_SIZE) as usize,
+        stride * hooks.len() * 4 + (GOOP_WASH_ENTRIES * GOOP_WASH_ENTRY_SIZE) as usize,
         GOOP_WASH_ALIGNMENT,
     )?;
     let stub_end = stub_address
@@ -7670,8 +7814,10 @@ pub(super) fn patch_goop_wash_dol(
     let mut bytes = source.to_vec();
     let file_offset = align_up_usize(bytes.len(), GOOP_WASH_ALIGNMENT)?;
     bytes.resize(file_offset, 0);
-    for word in &stub {
-        bytes.extend_from_slice(&word.to_be_bytes());
+    for (_, stub) in &stubs {
+        for word in stub {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
     }
     // The table stays zeroed: an owner of zero is what marks a slot free.
     bytes.resize(file_offset + payload_size, 0);
@@ -7689,11 +7835,14 @@ pub(super) fn patch_goop_wash_dol(
         u32::try_from(payload_size)
             .map_err(|_| "goop wash payload size does not fit u32".to_string())?,
     )?;
-    write_be_u32(
-        &mut bytes,
-        hook_offset,
-        encode_branch(hook, stub_address, false)?,
-    )?;
+    for (index, hook) in hooks.iter().enumerate() {
+        let (at, _) = stubs[index];
+        write_be_u32(
+            &mut bytes,
+            hook_offsets[index],
+            encode_branch(*hook, at, false)?,
+        )?;
+    }
     Ok(bytes)
 }
 
@@ -7829,6 +7978,104 @@ pub(super) fn dol_supports_goop_wash(source: &[u8]) -> bool {
 mod goop_wash_tests {
     use super::*;
 
+    /// Props arrive at the wash through `TMapObjBase::receiveMessage` rather
+    /// than through the enemy classes, so the hook is a different one and worth
+    /// checking against the retail image on its own. The signature is anchored
+    /// past the message test, where the prop is still in `r3`.
+    #[test]
+    #[ignore = "requires SMS_BASE_ROOT pointing at the extracted retail game"]
+    fn the_wash_installs_on_the_props_road() {
+        let base = std::env::var("SMS_BASE_ROOT").expect("set SMS_BASE_ROOT");
+        let path = std::path::Path::new(&base)
+            .join("sys")
+            .join("main.dol.orig");
+        let source = std::fs::read(&path).expect("read the original DOL");
+        let image = parse_dol(&source).expect("parse");
+
+        let hook = find_goop_wash_signature(
+            &source,
+            &image,
+            &GOOP_WASH_PROP_SIGNATURE,
+            GOOP_WASH_PROP_SIGNATURE_OFFSET,
+            "TMapObjBase::receiveMessage",
+        )
+        .expect("find the props hook");
+        println!("PROP HOOK: {hook:#010x}");
+
+        let settings = GoopWashSettings {
+            konst_register: 1,
+            start_level: 143,
+            resistance: 5,
+            step: 1,
+            uniform_rate: true,
+            reach: GoopWashReach::Props,
+        };
+        let patched = install_goop_wash(&source, settings).expect("install for props");
+        assert!(patched.len() > source.len());
+
+        let after = parse_dol(&patched).expect("reparse");
+        let offset = usize::try_from(dol_file_offset(&after, hook).expect("hook offset"))
+            .expect("offset fits");
+        let word = u32::from_be_bytes([
+            patched[offset],
+            patched[offset + 1],
+            patched[offset + 2],
+            patched[offset + 3],
+        ]);
+        assert_eq!(
+            word >> 26,
+            18,
+            "the props hook is not a branch: {word:#010x}"
+        );
+
+        // Everything hooks the send itself, at every site the water manager
+        // uses. All of them have to become branches: a missed one is an actor
+        // that silently never washes.
+        let sites = find_goop_wash_dispatch_sites(&source, &image).expect("find the dispatch");
+        println!(
+            "DISPATCH SITES: {}",
+            sites
+                .iter()
+                .map(|site| format!("{site:#010x}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let universal = GoopWashSettings {
+            reach: GoopWashReach::Everything,
+            ..settings
+        };
+        let patched_all = install_goop_wash(&source, universal).expect("install everywhere");
+        let after_all = parse_dol(&patched_all).expect("reparse");
+        for site in &sites {
+            let offset = usize::try_from(dol_file_offset(&after_all, *site).expect("site offset"))
+                .expect("offset fits");
+            let word = u32::from_be_bytes([
+                patched_all[offset],
+                patched_all[offset + 1],
+                patched_all[offset + 2],
+                patched_all[offset + 3],
+            ]);
+            assert_eq!(
+                word >> 26,
+                18,
+                "site {site:#010x} is not a branch: {word:#010x}"
+            );
+        }
+
+        // Installing both roads has to leave two stubs standing, not one
+        // overwriting the other.
+        let enemies = GoopWashSettings {
+            reach: GoopWashReach::Enemies,
+            ..settings
+        };
+        let both = install_goop_wash(&source, enemies).expect("install for enemies");
+        let both = install_goop_wash(&both, settings).expect("install for props too");
+        assert!(
+            both.len() > patched.len(),
+            "the second install added nothing"
+        );
+    }
+
     /// The hook is found by its own instructions, and the stub reaches the game
     /// through the DOL's section table. Both are checked against the retail
     /// image rather than a fixture, since a signature that matches something
@@ -7855,6 +8102,7 @@ mod goop_wash_tests {
                 resistance: 5,
                 step: 1,
                 uniform_rate,
+                reach: GoopWashReach::Enemies,
             };
             let patched = install_goop_wash(&source, settings)
                 .unwrap_or_else(|error| panic!("install (uniform={uniform_rate}): {error}"));
@@ -7896,6 +8144,7 @@ mod goop_wash_tests {
             resistance: 5,
             step: 1,
             uniform_rate: false,
+            reach: GoopWashReach::Enemies,
         };
         let (get_model, init_kcolor) =
             find_goop_wash_callees(&source, &image).expect("find the callees");

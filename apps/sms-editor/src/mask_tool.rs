@@ -3374,7 +3374,13 @@ print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
                     colour[0],
                     colour[1],
                     colour[2],
-                    self.mask_reading(sample_mask_bilinear(&mask, size, u, v)),
+                    // The wash stops at level zero, and the coating shows where
+                    // the mask loses or ties -- so a texel of zero ties at zero
+                    // and stays coated however long it is sprayed. Keeping the
+                    // mask off the floor reserves zero for "already clean", so
+                    // the last of the coating can actually leave.
+                    self.mask_reading(sample_mask_bilinear(&mask, size, u, v))
+                        .max(1),
                 ]);
             }
         }
@@ -3427,6 +3433,46 @@ print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
             .store_front_projection_texcoord(slot, &matrices)
             .map_err(|error| format!("Could not store the goop coordinate: {error}"))?;
 
+        // Every material has to read the same konst, because what drives the
+        // wash writes one register: a material that claimed a different one
+        // keeps its coating for good, which reads as the wash stopping halfway
+        // when it is really one material never starting. Left to themselves the
+        // materials each take the first register they have spare, and those
+        // differ -- so a register all of them can take is chosen up front, by
+        // trying each against a copy that is thrown away.
+        let mut shared_konst = None;
+        for candidate in 0..4usize {
+            let mut trial = model.clone();
+            let mut taken = 0usize;
+            let mut refused = false;
+            for material in &preview.geometry.materials {
+                if material.tev_stages.is_empty() {
+                    continue;
+                }
+                let request = sms_formats::GoopLayerRequest {
+                    material_name: &material.name,
+                    texture_name: GOOP_LAYER_TEXTURE,
+                    texture: &texture,
+                    coordinate_slot: slot,
+                    level,
+                    preferred_konst: Some(candidate),
+                    step: self.mask_wash_step.clamp(1, 255) as u8,
+                    resistance: self.mask_wash_resistance.clamp(1, 255) as u8,
+                };
+                match trial.add_goop_layer(&request) {
+                    Ok(_) => taken += 1,
+                    Err(_) => {
+                        refused = true;
+                        break;
+                    }
+                }
+            }
+            if !refused && taken > 0 {
+                shared_konst = Some(candidate);
+                break;
+            }
+        }
+
         let mut authored = 0usize;
         let mut claimed_konst: Option<u8> = None;
         let mut failures = Vec::new();
@@ -3440,6 +3486,7 @@ print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
                 texture: &texture,
                 coordinate_slot: slot,
                 level,
+                preferred_konst: shared_konst,
                 // Recorded against this actor rather than the project, so a
                 // stubborn class can be tuned without dragging every other
                 // actor's wash along with it.
@@ -3448,8 +3495,18 @@ print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
             };
             match model.add_goop_layer(&request) {
                 Ok(report) => {
-                    // The wash has to write the register the layer reads, and
-                    // the bake takes whichever the material had spare.
+                    // With a shared register every material reports the same
+                    // one; without, this keeps the last, and the log below says
+                    // so rather than leaving it to be discovered in the game.
+                    if claimed_konst.is_some_and(|had| had != report.konst_register as u8) {
+                        failures.push(format!(
+                            "{} reads K{} where another material reads K{}, so one of them \
+                             will not wash",
+                            material.name,
+                            report.konst_register,
+                            claimed_konst.unwrap_or(0)
+                        ));
+                    }
                     claimed_konst = Some(report.konst_register as u8);
                     authored += 1;
                 }
@@ -3552,7 +3609,8 @@ print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
                     let texel = coat
                         .and_then(|coat| sample_texture(coat, u, v))
                         .unwrap_or([255, 255, 255, 255]);
-                    [texel[0], texel[1], texel[2], pixel.0[0]]
+                    // Zero would tie with the wash's floor and never leave.
+                    [texel[0], texel[1], texel[2], pixel.0[0].max(1)]
                 })
                 .collect()
         } else {
@@ -3815,6 +3873,7 @@ print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
         self.mask_wash_resistance = project.descriptor.mask_wash_resistance.max(1);
         self.mask_wash_step = project.descriptor.mask_wash_step.clamp(1, 255);
         self.mask_wash_uniform_rate = project.descriptor.mask_wash_uniform_rate;
+        self.mask_wash_reach = project.descriptor.mask_wash_reach.clone();
         self.mask_wash_settings_project = Some(id);
     }
 
@@ -3837,13 +3896,14 @@ print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
 
     /// Keeps the project's copy in step once a control moves.
     fn remember_mask_wash_settings(&mut self) {
-        let (coverage, invert, washable, resistance, step, uniform) = (
+        let (coverage, invert, washable, resistance, step, uniform, reach) = (
             self.mask_wash_phase,
             self.mask_wash_invert,
             self.mask_bake_washable,
             self.mask_wash_resistance,
             self.mask_wash_step,
             self.mask_wash_uniform_rate,
+            self.mask_wash_reach.clone(),
         );
         match self.current_project.as_mut() {
             Some(project) => {
@@ -3853,6 +3913,7 @@ print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
                     && project.descriptor.mask_wash_resistance == resistance
                     && project.descriptor.mask_wash_step == step
                     && project.descriptor.mask_wash_uniform_rate == uniform
+                    && project.descriptor.mask_wash_reach == reach
                 {
                     return;
                 }
@@ -3862,6 +3923,7 @@ print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
                 project.descriptor.mask_wash_resistance = resistance;
                 project.descriptor.mask_wash_step = step;
                 project.descriptor.mask_wash_uniform_rate = uniform;
+                project.descriptor.mask_wash_reach = reach;
             }
             None => return,
         }
@@ -4342,10 +4404,49 @@ print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
             }
             ui.label("Step");
         });
+        // Reach is a level rather than a set of switches: everything already
+        // covers what props covers, so having both would spend a second patch
+        // on a hook that never fires.
+        let mut reach = self.mask_wash_reach.clone();
+        egui::ComboBox::from_label("Wash reaches")
+            .selected_text(match reach.as_str() {
+                "enemies" => "Enemies",
+                "everything" => "Everything",
+                _ => "Enemies and props",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut reach, "enemies".to_string(), "Enemies")
+                    .on_hover_text("Only the enemy classes, the way retail delivers a spray");
+                ui.selectable_value(&mut reach, "props".to_string(), "Enemies and props")
+                    .on_hover_text(
+                        "Adds the road most scenery inherits -- boats, crates, the objects \
+                         that never override how they hear a spray",
+                    );
+                ui.selectable_value(&mut reach, "everything".to_string(), "Everything")
+                    .on_hover_text(
+                        "Hooks the spray where it is sent, ahead of every class -- so it \
+                         reaches actors that handle the message their own way, like the \
+                         Delfino bell. It also counts a spray one step earlier, so an actor \
+                         tuned at a narrower reach may wash faster",
+                    );
+            });
+        if reach != self.mask_wash_reach {
+            self.mask_wash_reach = reach;
+            self.remember_mask_wash_settings();
+        }
+        // Everything hooks ahead of the per-class cooldown already, so there is
+        // no gate left for this to open.
+        let rate_applies = self.mask_wash_reach != "everything";
         if ui
-            .checkbox(
-                &mut self.mask_wash_uniform_rate,
-                "Same wash rate for every actor",
+            .add_enabled(
+                rate_applies,
+                egui::Checkbox::new(
+                    &mut self.mask_wash_uniform_rate,
+                    "Same wash rate for every actor",
+                ),
+            )
+            .on_disabled_hover_text(
+                "Everything already counts the spray before an actor's class can gate it",
             )
             .on_hover_text(
                 "Count every spray. Off, an actor only washes when its own class lets                  water through -- Gesso clears its spray cooldown each hit and PoiHana                  does not, so the same coating takes far longer on one than the other",

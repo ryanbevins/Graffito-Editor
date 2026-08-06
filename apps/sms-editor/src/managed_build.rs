@@ -21,10 +21,10 @@ use crate::direct_boot::{
     dol_supports_goop_wash, install_goop_wash, patch_sms_dialogue_dol, patch_sms_direct_boot_dol,
     patch_sms_extended_collision_dol, patch_sms_goop_enemy_managers_dol,
     patch_sms_goop_layer_spawn_dol, patch_sms_sound_assignments_dol, patch_sms_stage_music_dol,
-    GoopWashSettings, RuntimeBalloonOverride, RuntimeDialogueOverride, RuntimeGoopLayerBinding,
-    RuntimeGoopManagerPatch, RuntimeMusicRoleOverride, RuntimeSoundAssignment,
-    RuntimeSoundAssignmentKind, RuntimeStageMusicOverride, RuntimeStageMusicTransition,
-    RuntimeStageTarget,
+    GoopWashReach, GoopWashSettings, RuntimeBalloonOverride, RuntimeDialogueOverride,
+    RuntimeGoopLayerBinding, RuntimeGoopManagerPatch, RuntimeMusicRoleOverride,
+    RuntimeSoundAssignment, RuntimeSoundAssignmentKind, RuntimeStageMusicOverride,
+    RuntimeStageMusicTransition, RuntimeStageTarget,
 };
 #[cfg(test)]
 use crate::project::ProjectSoundAssignment;
@@ -1540,6 +1540,11 @@ fn install_managed_runtime_patches(
             resistance: project.descriptor.mask_wash_resistance.max(1),
             step: project.descriptor.mask_wash_step.clamp(1, 255) as u8,
             uniform_rate: project.descriptor.mask_wash_uniform_rate,
+            reach: match project.descriptor.mask_wash_reach.as_str() {
+                "enemies" => GoopWashReach::Enemies,
+                "everything" => GoopWashReach::Everything,
+                _ => GoopWashReach::Props,
+            },
         });
     if let Some(wash) = goop_wash.filter(|_| dol_supports_goop_wash(&patched_bytes)) {
         patched_bytes = install_goop_wash(&patched_bytes, wash).map_err(|error| {

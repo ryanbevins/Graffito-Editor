@@ -286,6 +286,8 @@ pub(super) struct SmsProjectFile {
     pub(super) mask_wash_step: u32,
     #[serde(default = "uniform_rate_default")]
     pub(super) mask_wash_uniform_rate: bool,
+    #[serde(default = "wash_reach_default")]
+    pub(super) mask_wash_reach: String,
     /// The konst register the last bake claimed. The wash has to write the
     /// register the layer reads, and the bake takes whichever the material had
     /// spare, so it is recorded rather than assumed.
@@ -374,6 +376,7 @@ impl LegacySmsProjectFileV1 {
             mask_wash_resistance: 4,
             mask_wash_step: 1,
             mask_wash_uniform_rate: true,
+            mask_wash_reach: wash_reach_default(),
             mask_wash_konst: 0,
         }
     }
@@ -408,6 +411,7 @@ impl SmsProjectFile {
             mask_wash_resistance: 4,
             mask_wash_step: 1,
             mask_wash_uniform_rate: true,
+            mask_wash_reach: wash_reach_default(),
             mask_wash_konst: 0,
         }
     }
@@ -1095,6 +1099,17 @@ fn wash_step_default() -> u32 {
 /// its cooldown.
 fn uniform_rate_default() -> bool {
     true
+}
+
+/// How far the wash reaches: `enemies`, `props`, or `everything`.
+///
+/// Props by default, which keeps enemies behaving exactly as they did while
+/// covering scenery -- a coating baked onto a boat that never washes reads as
+/// the wash being broken rather than as a setting. `everything` hooks the send
+/// itself, which reaches classes that handle the message their own way, but
+/// counts a spray one step earlier and so is a deliberate choice.
+fn wash_reach_default() -> String {
+    "props".to_string()
 }
 
 #[cfg(test)]

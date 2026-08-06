@@ -524,6 +524,14 @@ pub struct GoopLayerRequest<'a> {
     /// The wash level to ship at. The coating shows where the mask does not
     /// exceed this, so 255 ships fully coated.
     pub level: u8,
+    /// The konst register to claim, where the caller needs every material to
+    /// agree on one.
+    ///
+    /// Left to itself each material takes the first register it has spare,
+    /// which differs between materials -- and whatever drives the wash at
+    /// runtime writes one register, so a material that claimed a different one
+    /// keeps its coating however long it is sprayed.
+    pub preferred_konst: Option<usize>,
     /// How much level a single water hit removes, for whatever drives the wash
     /// at runtime.
     ///
@@ -1517,12 +1525,23 @@ impl J3dRebuildDocument {
                     }
                 }
             }
-            let konst_register = claimed.iter().position(|used| !used).ok_or_else(|| {
-                unsupported(format!(
-                    "material {:?} reads all four konst registers",
-                    request.material_name
-                ))
-            })?;
+            let konst_register = match request.preferred_konst {
+                Some(wanted) => {
+                    if claimed.get(wanted).copied().unwrap_or(true) {
+                        return Err(unsupported(format!(
+                            "material {:?} already reads konst register K{wanted}",
+                            request.material_name
+                        )));
+                    }
+                    wanted
+                }
+                None => claimed.iter().position(|used| !used).ok_or_else(|| {
+                    unsupported(format!(
+                        "material {:?} reads all four konst registers",
+                        request.material_name
+                    ))
+                })?,
+            };
             // Alpha selectors for the four registers run from twenty eight.
             let konst_selector = 0x1c + konst_register as u8;
 
@@ -6036,6 +6055,7 @@ mod goop_layout_tests {
                 texture_name: "graffito_goop",
                 texture: &texture,
                 coordinate_slot: 1,
+                preferred_konst: None,
                 level: 200,
                 step: 1,
                 resistance: 1,
@@ -6539,6 +6559,32 @@ mod bake_repro {
                 }
             }
         }
+        let mut specular = 0usize;
+        let mut normal_texgen = 0usize;
+        for material in preview.materials.iter() {
+            let spec = material
+                .color_channels
+                .iter()
+                .any(|channel| channel.enable != 0 && channel.attenuation_fn == 0);
+            let env = material
+                .tex_gens
+                .iter()
+                .take(material.tex_gen_count as usize)
+                .any(|generator| generator.source <= 1);
+            if spec {
+                specular += 1;
+            }
+            if env {
+                normal_texgen += 1;
+            }
+            if spec || env {
+                println!("  {} spec={spec} env={env}", material.name);
+            }
+        }
+        println!(
+            "SPECULAR: {specular}  NORMAL-TEXGEN: {normal_texgen}  OF {}",
+            preview.materials.len()
+        );
         println!(
             "TRIANGLES: {} primary {} per-slot {:?}",
             preview.triangles.len(),
@@ -6644,6 +6690,7 @@ mod bake_repro {
                 texture_name: "goopmask",
                 texture: &texture,
                 coordinate_slot: 1,
+                preferred_konst: None,
                 level: 128,
                 step: 1,
                 resistance: 1,
