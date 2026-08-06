@@ -720,6 +720,23 @@ fn layer_pool_model_path(
         .then_some(candidate)
 }
 
+/// A triangle's own normal, for meshes that store none.
+fn face_normal(vertices: [[f32; 3]; 3]) -> [f32; 3] {
+    let edge0: [f32; 3] = std::array::from_fn(|axis| vertices[1][axis] - vertices[0][axis]);
+    let edge1: [f32; 3] = std::array::from_fn(|axis| vertices[2][axis] - vertices[0][axis]);
+    let normal = [
+        edge0[1] * edge1[2] - edge0[2] * edge1[1],
+        edge0[2] * edge1[0] - edge0[0] * edge1[2],
+        edge0[0] * edge1[1] - edge0[1] * edge1[0],
+    ];
+    let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+    if length > f32::EPSILON {
+        std::array::from_fn(|axis| normal[axis] / length)
+    } else {
+        [0.0, 1.0, 0.0]
+    }
+}
+
 const CANVAS: usize = 384;
 
 /// The texture an authored goop layer carries its coating and mask in.
@@ -1539,55 +1556,10 @@ impl SmsEditorApp {
         let preview = self.mask_preview.as_ref()?;
         let mask = self.active_mask();
         let mut pixels = vec![[26u8, 26, 32, 255]; CANVAS * CANVAS];
-        // Which stored set is the body's is not a given: PoiHana keeps only 70
-        // of its 476 triangles in slot 0 -- the eye and mouth -- and draws its
-        // body from a generated coordinate, so falling back to the material's
-        // own binding drew a projection under a tab that promises stored UVs.
-        // Take the stored set with the widest coverage that is not the goop
-        // one, and draw nothing where the model stores nothing.
-        let body_slot = {
-            let goop = self.authored_goop_coord();
-            (0..8)
-                .filter(|slot| Some(*slot) != goop)
-                .max_by_key(|slot| {
-                    preview
-                        .geometry
-                        .triangles
-                        .iter()
-                        .filter(|triangle| triangle.tex_coord_sets[*slot].is_some())
-                        .count()
-                })
-                .filter(|slot| {
-                    preview
-                        .geometry
-                        .triangles
-                        .iter()
-                        .any(|triangle| triangle.tex_coord_sets[*slot].is_some())
-                })
-        };
-        // The texture the body slot actually feeds, so the atlas can be seen
-        // against what it maps. A material generates from `GX_TG_TEX0 + slot`;
-        // the stage that reads that generator names the map.
-        let body_texture = body_slot.and_then(|slot| {
-            let source = slot as u8 + 4;
-            preview.geometry.materials.iter().find_map(|material| {
-                let generator = material
-                    .tex_gens
-                    .iter()
-                    .position(|generator| generator.source == source)?;
-                let map = material.tev_stages.iter().find_map(|stage| {
-                    (stage.order.tex_coord == Some(generator as u8))
-                        .then_some(stage.order.tex_map)
-                        .flatten()
-                })?;
-                let index = material
-                    .texture_indices
-                    .get(map as usize)
-                    .copied()
-                    .flatten()?;
-                preview.geometry.textures.get(index)
-            })
-        });
+        let body_slot = self.body_uv_slot();
+        let body_texture = self
+            .body_texture_index()
+            .and_then(|index| preview.geometry.textures.get(index));
 
         let authored = (self.mask_uv_layer == MaskUvLayer::Goop)
             .then(|| self.authored_mask())
@@ -2490,6 +2462,55 @@ impl SmsEditorApp {
         Some((animation, frame))
     }
 
+    /// The stored set that carries the body's own UV: the widest one that is
+    /// not the goop set.
+    ///
+    /// Which set that is cannot be assumed. PoiHana keeps only 70 of its 476
+    /// triangles in slot 0 -- the eye and the mouth -- and draws its body from
+    /// a generated coordinate, so slot 0 is not "the body UV" in general.
+    fn body_uv_slot(&self) -> Option<usize> {
+        let preview = self.mask_preview.as_ref()?;
+        let goop = self.authored_goop_coord();
+        let coverage = |slot: usize| {
+            preview
+                .geometry
+                .triangles
+                .iter()
+                .filter(|triangle| triangle.tex_coord_sets[slot].is_some())
+                .count()
+        };
+        (0..8)
+            .filter(|slot| Some(*slot) != goop)
+            .max_by_key(|slot| coverage(*slot))
+            .filter(|slot| coverage(*slot) > 0)
+    }
+
+    /// The texture the body slot feeds.
+    ///
+    /// A material generates from `GX_TG_TEX0 + slot`; the stage that reads that
+    /// generator names the map.
+    fn body_texture_index(&self) -> Option<usize> {
+        let preview = self.mask_preview.as_ref()?;
+        let slot = self.body_uv_slot()?;
+        let source = slot as u8 + 4;
+        preview.geometry.materials.iter().find_map(|material| {
+            let generator = material
+                .tex_gens
+                .iter()
+                .position(|generator| generator.source == source)?;
+            let map = material.tev_stages.iter().find_map(|stage| {
+                (stage.order.tex_coord == Some(generator as u8))
+                    .then_some(stage.order.tex_map)
+                    .flatten()
+            })?;
+            material
+                .texture_indices
+                .get(map as usize)
+                .copied()
+                .flatten()
+        })
+    }
+
     fn selected_mask_choice(&self) -> Option<MaskActorChoice> {
         let selected = self.mask_selected_actor.as_deref()?;
         self.mask_actor_choices()
@@ -2506,11 +2527,351 @@ impl SmsEditorApp {
     /// front projection where it does not -- so the unwrap being painted is
     /// the unwrap the wash reads.
     fn export_mask_gltf(&mut self) {
-        self.log.push(
-            "Export glTF is not wired yet: it will pack the body UV and the goop UV as \
-             separate sets, each with its own texture."
-                .to_string(),
+        let Some(preview) = self.mask_preview.as_ref() else {
+            self.log
+                .push("Select an actor before exporting.".to_string());
+            return;
+        };
+        let stem = self
+            .selected_mask_choice()
+            .and_then(|choice| {
+                let path = choice.model_path.replace(char::from(92), "/");
+                let mut parts = path.rsplit('/');
+                parts.next();
+                parts.next().map(str::to_string)
+            })
+            .unwrap_or_else(|| "actor".to_string());
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export glTF")
+            .add_filter("glTF", &["gltf"])
+            .set_file_name(format!("{stem}.gltf"))
+            .save_file()
+        else {
+            return;
+        };
+
+        // The goop set the wash actually reads, or the projection where the
+        // model has none, so what opens in Blender is the unwrap the wash
+        // reads rather than a second guess at one.
+        let goop_coord = self.authored_goop_coord();
+        let body_slot = self.body_uv_slot();
+        // glTF and PNG are both image space, where V falls. A body UV is
+        // stored that way already, which is why it came out right while the
+        // goop UV did not: a layer this tool bakes stores a projection, where
+        // V climbs, and so does the front projection used where a model has no
+        // layer at all. Flip those on the way out, and flip the map with them
+        // so the two still agree.
+        let goop_is_projected = match self.authored_mask() {
+            Some((_, name)) => name.as_deref() == Some(GOOP_LAYER_TEXTURE),
+            None => true,
+        };
+        let body_texture = self
+            .body_texture_index()
+            .and_then(|index| preview.geometry.textures.get(index));
+        let goop_texture = self
+            .authored_goop_binding()
+            .and_then(|(index, _)| preview.geometry.textures.get(index));
+
+        let mut positions: Vec<u8> = Vec::new();
+        let mut normals: Vec<u8> = Vec::new();
+        let mut coordinates: Vec<u8> = Vec::new();
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        let mut count = 0usize;
+        for (index, triangle) in preview.geometry.triangles.iter().enumerate() {
+            let body = body_slot
+                .and_then(|slot| triangle.tex_coord_sets[slot])
+                .unwrap_or([[0.0, 0.0]; 3]);
+            let goop = triangle
+                .mask_tex_coords
+                .or_else(|| goop_coord.and_then(|coord| triangle.tex_coord_sets[coord]))
+                .unwrap_or_else(|| {
+                    std::array::from_fn(|corner| preview.front_uv[index * 3 + corner])
+                });
+            let goop: [[f32; 2]; 3] = std::array::from_fn(|corner| {
+                if goop_is_projected {
+                    [goop[corner][0], 1.0 - goop[corner][1]]
+                } else {
+                    goop[corner]
+                }
+            });
+            // A face normal stands in where the model carries none, so the mesh
+            // still shades once it is open.
+            let fallback = face_normal(triangle.vertices);
+            for corner in 0..3 {
+                let vertex = triangle.vertices[corner];
+                for axis in 0..3 {
+                    min[axis] = min[axis].min(vertex[axis]);
+                    max[axis] = max[axis].max(vertex[axis]);
+                    positions.extend_from_slice(&vertex[axis].to_le_bytes());
+                }
+                let normal = triangle
+                    .normals
+                    .map(|normals| normals[corner])
+                    .unwrap_or(fallback);
+                for value in normal {
+                    normals.extend_from_slice(&value.to_le_bytes());
+                }
+                for value in body[corner] {
+                    coordinates.extend_from_slice(&value.to_le_bytes());
+                }
+                for value in goop[corner] {
+                    coordinates.extend_from_slice(&value.to_le_bytes());
+                }
+                count += 1;
+            }
+        }
+        if count == 0 {
+            self.log
+                .push("That actor has no geometry to export.".to_string());
+            return;
+        }
+
+        let directory = path.parent().map(|parent| parent.to_path_buf());
+        let name = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or(stem);
+        let beside = |suffix: &str| {
+            let file = format!("{name}{suffix}");
+            match &directory {
+                Some(directory) => directory.join(file),
+                None => std::path::PathBuf::from(file),
+            }
+        };
+
+        let write_texture = |texture: Option<&sms_formats::J3dTexturePreview>,
+                             suffix: &str,
+                             channel: Option<usize>,
+                             flip: bool|
+         -> Option<String> {
+            let texture = texture?;
+            // A layer this tool bakes carries its coating in the colour
+            // channels and its mask in alpha. Exporting the bytes as they sit
+            // hands Blender a rainbow with the mask hidden inside it; the mask
+            // is the thing being painted, so it is written as an image in its
+            // own right and the coating goes to a file of its own.
+            let pixels = match channel {
+                Some(channel) => texture
+                    .rgba
+                    .chunks_exact(4)
+                    .flat_map(|texel| {
+                        let value = texel[channel];
+                        [value, value, value, 255]
+                    })
+                    .collect(),
+                None => texture
+                    .rgba
+                    .chunks_exact(4)
+                    .flat_map(|texel| [texel[0], texel[1], texel[2], 255])
+                    .collect(),
+            };
+            let image = image::RgbaImage::from_raw(
+                u32::from(texture.width),
+                u32::from(texture.height),
+                pixels,
+            )?;
+            let image = if flip {
+                image::imageops::flip_vertical(&image)
+            } else {
+                image
+            };
+            image.save(beside(suffix)).ok()?;
+            Some(format!("{name}{suffix}"))
+        };
+        let body_image = write_texture(body_texture, "_body.png", None, false);
+        let goop_is_ours = goop_texture.is_some_and(|texture| texture.name == GOOP_LAYER_TEXTURE);
+        let goop_image = write_texture(
+            goop_texture,
+            "_goop.png",
+            Some(if goop_is_ours { 3 } else { 0 }),
+            goop_is_projected,
         );
+        if goop_is_ours {
+            write_texture(goop_texture, "_coat.png", None, goop_is_projected);
+        }
+
+        // glTF carries no node graph, so the comparison cannot ride in the
+        // file. It rides beside it: a script that builds the same test Blender
+        // can show live -- coated where the mask loses to the coverage, which
+        // is what the TEV stage does per pixel.
+        let coat_file = format!("{name}_coat.png");
+        let level = self.mask_wash_phase.clamp(0.0, 1.0);
+        let invert = self.mask_wash_invert;
+        let script = format!(
+            r#"# Rebuilds this actor's wash as Blender nodes, so painting the goop mask
+# shows what the game draws. Run from Blender's Text Editor with the mesh
+# selected, then scrub the "Coverage" value.
+#
+# Coated where mask <= coverage: the mask is a rank map, not a shape -- each
+# texel says how late the goop reaches it.
+import bpy, os
+
+HERE = r"{here}"
+COVERAGE = {level}
+INVERT = {invert}
+
+mesh = bpy.context.object
+material = mesh.data.materials[0]
+material.use_nodes = True
+tree = material.node_tree
+tree.nodes.clear()
+
+def image(name, colour):
+    node = tree.nodes.new("ShaderNodeTexImage")
+    path = os.path.join(HERE, name)
+    node.image = bpy.data.images.load(path, check_existing=True) if os.path.exists(path) else None
+    if node.image and not colour:
+        node.image.colorspace_settings.name = "Non-Color"
+    return node
+
+def uv(node, index):
+    source = tree.nodes.new("ShaderNodeUVMap")
+    layers = mesh.data.uv_layers
+    source.uv_map = layers[min(index, len(layers) - 1)].name
+    source.location = (node.location[0] - 260, node.location[1] - 70)
+    tree.links.new(source.outputs["UV"], node.inputs["Vector"])
+
+body = image("{body}", True)
+coat = image("{coat}", True)
+mask = image("{mask}", False)
+body.location = (-1120, 140)
+coat.location = (-1120, 560)
+mask.location = (-1120, -300)
+uv(body, 0)
+uv(coat, 1)
+uv(mask, 1)
+
+# Inverting the mask before the test rather than the result after it keeps the
+# control a blend: Invert's Fac runs 0..1, so it slides between the two
+# directions instead of snapping between them.
+invert = tree.nodes.new("ShaderNodeInvert")
+invert.label = "Invert"
+invert.inputs["Fac"].default_value = 1.0 if INVERT else 0.0
+invert.location = (-800, -320)
+tree.links.new(mask.outputs["Color"], invert.inputs["Color"])
+
+coverage = tree.nodes.new("ShaderNodeValue")
+coverage.label = "Coverage"
+coverage.outputs[0].default_value = COVERAGE
+coverage.location = (-800, -520)
+
+# Less Than, not Greater Than: with the invert ahead of it, Fac 0 leaves this
+# reading exactly what the game reads -- coated where the mask loses to the
+# coverage. Comparing the other way against an inverted mask tests
+# mask < 1 - coverage, which looks close but is a different threshold.
+compare = tree.nodes.new("ShaderNodeMath")
+compare.operation = "LESS_THAN"
+compare.location = (-540, -360)
+tree.links.new(invert.outputs["Color"], compare.inputs[0])
+tree.links.new(coverage.outputs[0], compare.inputs[1])
+
+mix = tree.nodes.new("ShaderNodeMix")
+mix.data_type = "RGBA"
+mix.location = (-240, 260)
+tree.links.new(compare.outputs[0], mix.inputs["Factor"])
+tree.links.new(body.outputs["Color"], mix.inputs[6])
+tree.links.new(coat.outputs["Color"], mix.inputs[7])
+
+# Straight into Surface with no Principled in the way, so the colour reads as
+# emission and the coating stays legible while it is being painted.
+output = tree.nodes.new("ShaderNodeOutputMaterial")
+output.location = (60, 260)
+tree.links.new(mix.outputs[2], output.inputs["Surface"])
+print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
+"#,
+            here = directory
+                .as_ref()
+                .map(|directory| directory.to_string_lossy().replace(char::from(92), "/"))
+                .unwrap_or_default(),
+            level = level,
+            invert = if invert { "True" } else { "False" },
+            body = body_image.clone().unwrap_or_default(),
+            coat = coat_file,
+            mask = goop_image.clone().unwrap_or_default(),
+        );
+        if let Err(error) = std::fs::write(beside("_wash.py"), script) {
+            self.log
+                .push(format!("Could not write the Blender script: {error}"));
+        }
+
+        let mut buffer = positions;
+        let normals_offset = buffer.len();
+        buffer.extend_from_slice(&normals);
+        let coordinates_offset = buffer.len();
+        buffer.extend_from_slice(&coordinates);
+        if let Err(error) = std::fs::write(beside(".bin"), &buffer) {
+            self.log
+                .push(format!("Could not write the buffer: {error}"));
+            return;
+        }
+
+        let mut images = Vec::new();
+        let mut textures = Vec::new();
+        let mut material = serde_json::json!({
+            "pbrMetallicRoughness": {"metallicFactor": 0, "roughnessFactor": 1},
+            "doubleSided": true,
+        });
+        if let Some(file) = body_image {
+            images.push(serde_json::json!({"uri": file}));
+            textures.push(serde_json::json!({"source": images.len() - 1}));
+            material["pbrMetallicRoughness"]["baseColorTexture"] =
+                serde_json::json!({"index": textures.len() - 1, "texCoord": 0});
+        }
+        if let Some(file) = goop_image {
+            // Bound to the second set, so the file opens with the goop map
+            // already sitting on the coordinate the wash reads.
+            images.push(serde_json::json!({"uri": file}));
+            textures.push(serde_json::json!({"source": images.len() - 1}));
+            material["emissiveTexture"] =
+                serde_json::json!({"index": textures.len() - 1, "texCoord": 1});
+            material["emissiveFactor"] = serde_json::json!([1.0, 1.0, 1.0]);
+        }
+
+        let document = serde_json::json!({
+            "asset": {"version": "2.0", "generator": "graffito"},
+            "scene": 0,
+            "scenes": [{"nodes": [0]}],
+            "nodes": [{"mesh": 0, "name": name}],
+            "meshes": [{"primitives": [{
+                "attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2, "TEXCOORD_1": 3},
+                "material": 0,
+                "mode": 4,
+            }]}],
+            "materials": [material],
+            "textures": textures,
+            "images": images,
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "count": count, "type": "VEC3",
+                 "min": min, "max": max},
+                {"bufferView": 1, "componentType": 5126, "count": count, "type": "VEC3"},
+                {"bufferView": 2, "byteOffset": 0, "componentType": 5126, "count": count,
+                 "type": "VEC2"},
+                {"bufferView": 2, "byteOffset": 8, "componentType": 5126, "count": count,
+                 "type": "VEC2"},
+            ],
+            "bufferViews": [
+                {"buffer": 0, "byteOffset": 0, "byteLength": normals_offset, "target": 34962},
+                {"buffer": 0, "byteOffset": normals_offset,
+                 "byteLength": coordinates_offset - normals_offset, "target": 34962},
+                {"buffer": 0, "byteOffset": coordinates_offset,
+                 "byteLength": buffer.len() - coordinates_offset, "byteStride": 16,
+                 "target": 34962},
+            ],
+            "buffers": [{"uri": format!("{name}.bin"), "byteLength": buffer.len()}],
+        });
+        match serde_json::to_vec(&document)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| std::fs::write(&path, bytes).map_err(|error| error.to_string()))
+        {
+            Ok(()) => self.log.push(format!(
+                "Exported {} triangles to {}. TEXCOORD_0 is the body UV, TEXCOORD_1 the goop \
+                 UV the wash reads.",
+                count / 3,
+                path.display()
+            )),
+            Err(error) => self.log.push(format!("Could not write the glTF: {error}")),
+        }
     }
 
     /// Takes a re-unwrapped goop UV back out of an edited glTF.
