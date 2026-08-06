@@ -6431,6 +6431,46 @@ mod bake_repro {
 
     #[test]
     #[ignore = "needs SMS_REPRO_BMD pointing at an extracted model"]
+    fn probe_stored_texcoords() {
+        let path = std::env::var("SMS_REPRO_BMD").expect("set SMS_REPRO_BMD");
+        let bytes = std::fs::read(&path).expect("read the model");
+        let rebuild = crate::j3d_rebuild::J3dRebuildDocument::parse(&bytes).expect("parse");
+        println!("STORED SLOTS: {:?}", rebuild.stored_texcoord_slots());
+        let parsed = crate::J3dFile::parse(&bytes).expect("parse preview");
+        let preview = parsed
+            .geometry_preview_with_loader_flags(crate::SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS)
+            .expect("geometry");
+        for (index, material) in preview.materials.iter().enumerate() {
+            let gens: Vec<String> = material
+                .tex_gens
+                .iter()
+                .enumerate()
+                .map(|(slot, gen)| format!("gen{slot}<-src{:#04x}", gen.source))
+                .collect();
+            println!("  mat{index} {}: {}", material.name, gens.join(" "));
+        }
+        let mut with_set = [0usize; 8];
+        let mut with_primary = 0usize;
+        for triangle in &preview.triangles {
+            if triangle.tex_coords.is_some() {
+                with_primary += 1;
+            }
+            for (slot, count) in with_set.iter_mut().enumerate() {
+                if triangle.tex_coord_sets[slot].is_some() {
+                    *count += 1;
+                }
+            }
+        }
+        println!(
+            "TRIANGLES: {} primary {} per-slot {:?}",
+            preview.triangles.len(),
+            with_primary,
+            with_set
+        );
+    }
+
+    #[test]
+    #[ignore = "needs SMS_REPRO_BMD pointing at an extracted model"]
     fn probe_wash_stages() {
         let path = std::env::var("SMS_REPRO_BMD").expect("set SMS_REPRO_BMD");
         let bytes = std::fs::read(&path).expect("read the model");

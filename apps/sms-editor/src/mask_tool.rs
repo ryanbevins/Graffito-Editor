@@ -1010,6 +1010,20 @@ impl SmsEditorApp {
     /// StayPakkun and BossGesso. An actor with neither is coated through the
     /// borrowed StayPakkun mask and a front projection.
     fn authored_mask(&self) -> Option<(AuthoredMaskTexture<'_>, Option<String>)> {
+        // The wash comparison names its own mask: `mask(goop UV) > K<n>_A` says
+        // which texture it samples. Ask it first. The stage renderer's mask
+        // binding is a guess -- it takes the material's first intensity
+        // texture, which on LandGesso is a toon ramp, so the tool drew a ramp
+        // as the mask and could not name it.
+        if let Some(texture) = self
+            .authored_goop_binding()
+            .and_then(|(index, _)| self.mask_preview.as_ref()?.geometry.textures.get(index))
+        {
+            return Some((
+                AuthoredMaskTexture::Model(texture),
+                Some(texture.name.clone()),
+            ));
+        }
         if let Some(texture) = self
             .mask_gpu_triangles
             .iter()
@@ -1052,21 +1066,7 @@ impl SmsEditorApp {
                 Some(texture.name.clone()),
             ));
         }
-        // The wash itself names its mask: `mask(goop UV) > K0_A` is a TEV
-        // comparison stage, and the stage's order says which texture it
-        // samples and through which coordinate set. Read the binding off the
-        // material directly -- it cannot be absent on a washable actor.
-        let (texture_index, _) = self.authored_goop_binding()?;
-        let texture = self
-            .mask_preview
-            .as_ref()?
-            .geometry
-            .textures
-            .get(texture_index)?;
-        Some((
-            AuthoredMaskTexture::Model(texture),
-            Some(texture.name.clone()),
-        ))
+        None
     }
 
     /// The wash-mask texture the actor's own model carries.
@@ -1539,22 +1539,81 @@ impl SmsEditorApp {
         let preview = self.mask_preview.as_ref()?;
         let mask = self.active_mask();
         let mut pixels = vec![[26u8, 26, 32, 255]; CANVAS * CANVAS];
-        let authored_background = (self.mask_uv_layer == MaskUvLayer::Goop)
+        // Which stored set is the body's is not a given: PoiHana keeps only 70
+        // of its 476 triangles in slot 0 -- the eye and mouth -- and draws its
+        // body from a generated coordinate, so falling back to the material's
+        // own binding drew a projection under a tab that promises stored UVs.
+        // Take the stored set with the widest coverage that is not the goop
+        // one, and draw nothing where the model stores nothing.
+        let body_slot = {
+            let goop = self.authored_goop_coord();
+            (0..8)
+                .filter(|slot| Some(*slot) != goop)
+                .max_by_key(|slot| {
+                    preview
+                        .geometry
+                        .triangles
+                        .iter()
+                        .filter(|triangle| triangle.tex_coord_sets[*slot].is_some())
+                        .count()
+                })
+                .filter(|slot| {
+                    preview
+                        .geometry
+                        .triangles
+                        .iter()
+                        .any(|triangle| triangle.tex_coord_sets[*slot].is_some())
+                })
+        };
+        // The texture the body slot actually feeds, so the atlas can be seen
+        // against what it maps. A material generates from `GX_TG_TEX0 + slot`;
+        // the stage that reads that generator names the map.
+        let body_texture = body_slot.and_then(|slot| {
+            let source = slot as u8 + 4;
+            preview.geometry.materials.iter().find_map(|material| {
+                let generator = material
+                    .tex_gens
+                    .iter()
+                    .position(|generator| generator.source == source)?;
+                let map = material.tev_stages.iter().find_map(|stage| {
+                    (stage.order.tex_coord == Some(generator as u8))
+                        .then_some(stage.order.tex_map)
+                        .flatten()
+                })?;
+                let index = material
+                    .texture_indices
+                    .get(map as usize)
+                    .copied()
+                    .flatten()?;
+                preview.geometry.textures.get(index)
+            })
+        });
+
+        let authored = (self.mask_uv_layer == MaskUvLayer::Goop)
             .then(|| self.authored_mask())
-            .flatten()
-            .map(|(texture, _)| texture);
+            .flatten();
+        // A layer this tool bakes stores its coordinate in the space the front
+        // projection produced it in, where V climbs with the screen; a retail
+        // or pool map stores image space, where V falls. Drawing both without
+        // a flip stands our own bakes on their heads while leaving HamuKuri
+        // and BossGesso upright, which is what baking appeared to break.
+        let projected = authored
+            .as_ref()
+            .is_some_and(|(_, name)| name.as_deref() == Some(GOOP_LAYER_TEXTURE));
+        let authored_background = authored.map(|(texture, _)| texture);
         if let Some(texture) = authored_background {
             // The map the wash actually reads, in its own orientation.
             for y in 0..CANVAS {
                 for x in 0..CANVAS {
                     let u = x as f32 / (CANVAS - 1) as f32;
-                    let v = y as f32 / (CANVAS - 1) as f32;
+                    let row = y as f32 / (CANVAS - 1) as f32;
+                    let v = if projected { 1.0 - row } else { row };
                     let value = texture.value(u, v);
                     let shade = (value as f32 * 0.6) as u8;
                     pixels[y * CANVAS + x] = [shade, shade, shade.saturating_add(14), 255];
                 }
             }
-        } else if let Some((size, values)) = &mask {
+        } else if let (Some((size, values)), MaskUvLayer::Goop) = (&mask, self.mask_uv_layer) {
             for y in 0..CANVAS {
                 for x in 0..CANVAS {
                     let u = x as f32 / (CANVAS - 1) as f32;
@@ -1562,6 +1621,23 @@ impl SmsEditorApp {
                     let value = sample_mask_bilinear(values, *size, u, v);
                     let shade = (value as f32 * 0.6) as u8;
                     pixels[y * CANVAS + x] = [shade, shade, shade.saturating_add(14), 255];
+                }
+            }
+        } else if let Some(texture) = body_texture {
+            // Dim, so the atlas over it stays the thing being read.
+            for y in 0..CANVAS {
+                for x in 0..CANVAS {
+                    let u = x as f32 / (CANVAS - 1) as f32;
+                    let v = y as f32 / (CANVAS - 1) as f32;
+                    let Some(texel) = sample_texture(texture, u, v) else {
+                        continue;
+                    };
+                    pixels[y * CANVAS + x] = [
+                        (texel[0] as f32 * 0.45) as u8,
+                        (texel[1] as f32 * 0.45) as u8,
+                        (texel[2] as f32 * 0.45) as u8,
+                        255,
+                    ];
                 }
             }
         }
@@ -1600,9 +1676,10 @@ impl SmsEditorApp {
                     continue;
                 };
                 let screen: [[f32; 2]; 3] = std::array::from_fn(|corner| {
+                    let row = uv[corner][1].clamp(0.0, 1.0);
                     [
                         uv[corner][0].clamp(0.0, 1.0) * (CANVAS - 1) as f32,
-                        uv[corner][1].clamp(0.0, 1.0) * (CANVAS - 1) as f32,
+                        if projected { 1.0 - row } else { row } * (CANVAS - 1) as f32,
                     ]
                 });
                 for corner in 0..3 {
@@ -1618,15 +1695,25 @@ impl SmsEditorApp {
                 MaskUvLayer::Goop => {
                     std::array::from_fn(|corner| preview.front_uv[index * 3 + corner])
                 }
-                MaskUvLayer::Body => match triangle.tex_coords.or(triangle.tex_coord_sets[0]) {
-                    Some(set) => set,
-                    None => continue,
-                },
+                MaskUvLayer::Body => {
+                    match body_slot.and_then(|slot| triangle.tex_coord_sets[slot]) {
+                        Some(set) => set,
+                        None => continue,
+                    }
+                }
             };
             let screen: [[f32; 2]; 3] = std::array::from_fn(|corner| {
+                let row = uv[corner][1].clamp(0.0, 1.0);
+                // The goop tab draws the front projection, which is screen
+                // space; the body tab draws a set the model stores, which is
+                // image space. Flipping both put the body atlas on its head.
+                let row = match self.mask_uv_layer {
+                    MaskUvLayer::Goop => 1.0 - row,
+                    MaskUvLayer::Body => row,
+                };
                 [
                     uv[corner][0].clamp(0.0, 1.0) * (CANVAS - 1) as f32,
-                    (1.0 - uv[corner][1].clamp(0.0, 1.0)) * (CANVAS - 1) as f32,
+                    row * (CANVAS - 1) as f32,
                 ]
             });
             line(screen[0], screen[1]);
