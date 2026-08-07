@@ -293,6 +293,10 @@ pub(super) struct SmsProjectFile {
     /// ones it authored from the ones it was handed.
     #[serde(default)]
     pub(super) mask_wash_vtables: Vec<u32>,
+    /// For each of those classes, the colour it paints on its own model:
+    /// material index, `GXTevRegID`, then the four signed channels.
+    #[serde(default)]
+    pub(super) mask_wash_tints: Vec<MaskWashTint>,
     /// The konst register the last bake claimed. The wash has to write the
     /// register the layer reads, and the bake takes whichever the material had
     /// spare, so it is recorded rather than assumed.
@@ -383,6 +387,7 @@ impl LegacySmsProjectFileV1 {
             mask_wash_uniform_rate: true,
             mask_wash_reach: wash_reach_default(),
             mask_wash_vtables: Vec::new(),
+            mask_wash_tints: Vec::new(),
             mask_wash_konst: 0,
         }
     }
@@ -419,6 +424,7 @@ impl SmsProjectFile {
             mask_wash_uniform_rate: true,
             mask_wash_reach: wash_reach_default(),
             mask_wash_vtables: Vec::new(),
+            mask_wash_tints: Vec::new(),
             mask_wash_konst: 0,
         }
     }
@@ -1115,6 +1121,20 @@ fn uniform_rate_default() -> bool {
 /// the wash being broken rather than as a setting. `everything` hooks the send
 /// itself, which reaches classes that handle the message their own way, but
 /// counts a spray one step earlier and so is a deliberate choice.
+/// A colour a class paints on its own model, carried so a wash can rebind it
+/// rather than replace it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct MaskWashTint {
+    /// The class's vtable, matching an entry in `mask_wash_vtables`.
+    pub(super) vtable: u32,
+    /// Which material the colour is painted on.
+    pub(super) material: u16,
+    /// `GXTevRegID` for the colour.
+    pub(super) register: u8,
+    /// The colour, as the signed values `GXColorS10` holds.
+    pub(super) color: [i16; 4],
+}
+
 fn wash_reach_default() -> String {
     "props".to_string()
 }

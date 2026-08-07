@@ -21,10 +21,10 @@ use crate::direct_boot::{
     dol_supports_goop_wash, install_goop_wash, patch_sms_dialogue_dol, patch_sms_direct_boot_dol,
     patch_sms_extended_collision_dol, patch_sms_goop_enemy_managers_dol,
     patch_sms_goop_layer_spawn_dol, patch_sms_sound_assignments_dol, patch_sms_stage_music_dol,
-    GoopWashReach, GoopWashSettings, RuntimeBalloonOverride, RuntimeDialogueOverride,
-    RuntimeGoopLayerBinding, RuntimeGoopManagerPatch, RuntimeMusicRoleOverride,
-    RuntimeSoundAssignment, RuntimeSoundAssignmentKind, RuntimeStageMusicOverride,
-    RuntimeStageMusicTransition, RuntimeStageTarget,
+    GoopWashActor, GoopWashReach, GoopWashSettings, RuntimeBalloonOverride,
+    RuntimeDialogueOverride, RuntimeGoopLayerBinding, RuntimeGoopManagerPatch,
+    RuntimeMusicRoleOverride, RuntimeSoundAssignment, RuntimeSoundAssignmentKind,
+    RuntimeStageMusicOverride, RuntimeStageMusicTransition, RuntimeStageTarget,
 };
 #[cfg(test)]
 use crate::project::ProjectSoundAssignment;
@@ -1554,7 +1554,26 @@ fn install_managed_runtime_patches(
     // sprayed was entering the stub and having konst packets bound into
     // materials that never asked for one, which is why baking Petey corrupted
     // PoiHana.
-    let wash_allowlist: Vec<u32> = project.descriptor.mask_wash_vtables.clone();
+    let wash_allowlist: Vec<GoopWashActor> = project
+        .descriptor
+        .mask_wash_vtables
+        .iter()
+        .map(|vtable| {
+            // A class that paints its own colour needs it rebound alongside the
+            // wash level; one that paints none takes the konst-only form.
+            let tint = project
+                .descriptor
+                .mask_wash_tints
+                .iter()
+                .find(|tint| tint.vtable == *vtable);
+            GoopWashActor {
+                vtable: *vtable,
+                tinted_material: tint.map(|tint| tint.material),
+                tint_register: tint.map_or(0, |tint| tint.register),
+                tint: tint.map_or([0; 4], |tint| tint.color),
+            }
+        })
+        .collect();
     // An empty allowlist means no filtering, which is right for the narrow
     // reaches and catastrophic for the widest one: it would hand the stub every
     // actor the spray touches and bind konst packets into models that never

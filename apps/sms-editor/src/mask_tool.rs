@@ -3441,8 +3441,29 @@ print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
         // materials each take the first register they have spare, and those
         // differ -- so a register all of them can take is chosen up front, by
         // trying each against a copy that is thrown away.
-        let mut shared_konst = None;
-        for candidate in 0..4usize {
+        // A class that paints its own colour on this model needs its wash level
+        // in K0 and nowhere else: the only packet form that carries a TEV
+        // colour alongside a konst writes K0 and takes no register argument. It
+        // is not free on Cataquack, so the bake moves the material's own use of
+        // it aside rather than refusing.
+        let tinted = self
+            .document
+            .as_ref()
+            .zip(self.registry.as_ref())
+            .and_then(|(document, registry)| {
+                let selected = self.mask_selected_actor.as_deref()?;
+                let object = document
+                    .objects
+                    .iter()
+                    .find(|object| object.id == selected)?;
+                registry
+                    .enemy_material_colors
+                    .iter()
+                    .find(|colour| colour.factory_name == object.factory_name)
+            })
+            .is_some();
+        let mut shared_konst = tinted.then_some(0usize);
+        for candidate in (0..4usize).filter(|_| !tinted) {
             let mut trial = model.clone();
             let mut taken = 0usize;
             let mut refused = false;
@@ -3943,38 +3964,142 @@ print("wash rebuilt. Scrub Coverage; Invert's Fac slides between directions.")
         self.persist_project_settings(false);
     }
 
+    /// The colours the classes wearing this model paint on it, if any.
+    ///
+    /// The material index is resolved against the model the tool has loaded,
+    /// because the runtime needs an index rather than a name.
+    fn wash_tints_for(
+        &self,
+        choice: &MaskActorChoice,
+        wearers: &[u32],
+    ) -> Vec<crate::project::MaskWashTint> {
+        let Some(registry) = self.registry.as_ref() else {
+            return Vec::new();
+        };
+        let Some(document) = self.document.as_ref() else {
+            return Vec::new();
+        };
+        let Some(preview) = self.mask_preview.as_ref() else {
+            return Vec::new();
+        };
+        let mut tints = Vec::new();
+        for other in self.mask_actor_choices() {
+            if other.model_path != choice.model_path {
+                continue;
+            }
+            let Some(object) = document
+                .objects
+                .iter()
+                .find(|object| object.id == other.object_id)
+            else {
+                continue;
+            };
+            let Some(class) = registry
+                .find_object(&object.factory_name)
+                .map(|definition| definition.class_name.clone())
+            else {
+                continue;
+            };
+            let Some(vtable) = crate::class_vtables::class_vtable(&class) else {
+                continue;
+            };
+            if !wearers.contains(&vtable) {
+                continue;
+            }
+            let Some(colour) = registry
+                .enemy_material_colors
+                .iter()
+                .find(|colour| colour.factory_name == object.factory_name)
+            else {
+                continue;
+            };
+            let Some(material) = preview
+                .geometry
+                .materials
+                .iter()
+                .position(|material| material.name == colour.material_name)
+            else {
+                continue;
+            };
+            tints.push(crate::project::MaskWashTint {
+                vtable,
+                material: material as u16,
+                // The registry counts registers the way the decomp names them,
+                // where zero is TEV register zero. `GXTevRegID` counts from
+                // `GX_TEVPREV`, so the same register is one higher -- and the
+                // manager that paints Cataquack passes exactly that.
+                register: colour.tev_register + 1,
+                // A channel the class does not assign keeps whatever the model
+                // authored, which is zero as far as this record is concerned.
+                color: std::array::from_fn(|index| colour.color[index].unwrap_or(0)),
+            });
+        }
+        tints
+    }
+
     /// Remembers the class this actor is, so a wash that reaches everything can
     /// tell the actors this project authored from the ones it is handed.
     ///
     /// The vtable is what an actor carries at offset zero, which is the only
     /// identity a stub can check in a load and a compare.
     fn remember_wash_vtable(&mut self, choice: &MaskActorChoice) {
-        let vtable =
-            self.document
-                .as_ref()
-                .zip(self.registry.as_ref())
-                .and_then(|(document, registry)| {
+        // The coating is in the model, not in the class, so every actor wearing
+        // that model wears it -- and every one of them has to be able to wash
+        // it off. Cataquack comes in two classes that share one model: baking
+        // on the blue one coated the red one too, and recording only the class
+        // that was baked left red gooped for good.
+        let wearers: Vec<u32> = {
+            let Some(document) = self.document.as_ref() else {
+                return;
+            };
+            let Some(registry) = self.registry.as_ref() else {
+                return;
+            };
+            self.mask_actor_choices()
+                .iter()
+                .filter(|other| other.model_path == choice.model_path)
+                .filter_map(|other| {
                     let object = document
                         .objects
                         .iter()
-                        .find(|object| object.id == choice.object_id)?;
+                        .find(|object| object.id == other.object_id)?;
                     let class = &registry.find_object(&object.factory_name)?.class_name;
                     crate::class_vtables::class_vtable(class)
-                });
-        let Some(vtable) = vtable else {
-            return;
+                })
+                .collect()
         };
-        if !self.mask_wash_vtables.contains(&vtable) {
-            self.mask_wash_vtables.push(vtable);
+        if wearers.is_empty() {
+            return;
         }
+        for vtable in &wearers {
+            if !self.mask_wash_vtables.contains(vtable) {
+                self.mask_wash_vtables.push(*vtable);
+            }
+        }
+        // Each wearer may paint its own colour on the shared model -- blue and
+        // red Cataquack differ by nothing else -- so the colour is recorded
+        // against the class that paints it, to be rebound rather than lost.
+        let tints = self.wash_tints_for(choice, &wearers);
         let changed = match self.current_project.as_mut() {
             Some(project) => {
-                if project.descriptor.mask_wash_vtables.contains(&vtable) {
-                    false
-                } else {
-                    project.descriptor.mask_wash_vtables.push(vtable);
-                    true
+                let mut changed = false;
+                for vtable in &wearers {
+                    if !project.descriptor.mask_wash_vtables.contains(vtable) {
+                        project.descriptor.mask_wash_vtables.push(*vtable);
+                        changed = true;
+                    }
                 }
+                for tint in tints {
+                    if !project.descriptor.mask_wash_tints.contains(&tint) {
+                        project
+                            .descriptor
+                            .mask_wash_tints
+                            .retain(|had| had.vtable != tint.vtable);
+                        project.descriptor.mask_wash_tints.push(tint);
+                        changed = true;
+                    }
+                }
+                changed
             }
             None => false,
         };

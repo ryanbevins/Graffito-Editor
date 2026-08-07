@@ -705,6 +705,42 @@ const MATERIAL_TABLE_KINDS: [J3dMaterialTableKind; 30] = [
     J3dMaterialTableKind::NbtScale,
 ];
 
+/// Moves a material's use of one konst register onto another.
+///
+/// A konst selector names its register in one of two shapes: `0x0C..0x0F`
+/// selects a whole `K<n>`, and `0x10..0x1F` selects one component of one --
+/// laid out component-major, so `K0_A` is `0x1C` and `K3_A` is `0x1F`. Both
+/// shapes have to be rewritten, and to the same component, or a stage that read
+/// an alpha starts reading a red.
+///
+/// The colour itself moves with it: the destination points at the same entry
+/// the source did, so the material draws exactly as it did before.
+fn remap_material_konst_register(record: &mut J3dMaterialInitRecord, from: usize, to: usize) {
+    if from == to {
+        return;
+    }
+    record.tev_konst_color_indices[to] = record.tev_konst_color_indices[from];
+    let moved = |selector: u8| -> u8 {
+        if (0x0C..=0x0F).contains(&selector) {
+            if usize::from(selector - 0x0C) == from {
+                return 0x0C + to as u8;
+            }
+        } else if (0x10..=0x1F).contains(&selector) {
+            let offset = selector - 0x10;
+            if usize::from(offset % 4) == from {
+                return 0x10 + (offset / 4) * 4 + to as u8;
+            }
+        }
+        selector
+    };
+    for selector in record.tev_konst_color_selectors.iter_mut() {
+        *selector = moved(*selector);
+    }
+    for selector in record.tev_konst_alpha_selectors.iter_mut() {
+        *selector = moved(*selector);
+    }
+}
+
 fn material_record_index(materials: &J3dMaterialSection, material_name: &str) -> Option<usize> {
     let name_index = materials
         .names
@@ -1525,13 +1561,25 @@ impl J3dRebuildDocument {
                     }
                 }
             }
+            let mut remap_konst: Option<(usize, usize)> = None;
             let konst_register = match request.preferred_konst {
                 Some(wanted) => {
                     if claimed.get(wanted).copied().unwrap_or(true) {
-                        return Err(unsupported(format!(
-                            "material {:?} already reads konst register K{wanted}",
-                            request.material_name
-                        )));
+                        // Insisting on a register the material already reads is
+                        // not a refusal: the tool owns this model, so the
+                        // material's own use of it moves to a register it does
+                        // not read. Which register a stage reads is arbitrary
+                        // to the material; which one *this* layer reads is not,
+                        // because the packet that carries a tint alongside it
+                        // can only write K0.
+                        let Some(spare) = claimed.iter().position(|used| !used) else {
+                            return Err(unsupported(format!(
+                                "material {:?} reads all four konst registers, so K{wanted} \
+                                 cannot be freed",
+                                request.material_name
+                            )));
+                        };
+                        remap_konst = Some((wanted, spare));
                     }
                     wanted
                 }
@@ -1581,6 +1629,12 @@ impl J3dRebuildDocument {
             record.tev_stage_indices[stage_count] = compare_stage as u16;
             record.tev_stage_indices[stage_count + 1] = clear_stage as u16;
             record.tev_stage_indices[stage_count + 2] = apply_stage as u16;
+            // Move the material's own use of this register aside first, so the
+            // colour it read goes with it and the entry below lands on a
+            // register nothing else reads.
+            if let Some((from, to)) = remap_konst {
+                remap_material_konst_register(record, from, to);
+            }
             record.tev_konst_color_indices[konst_register] = konst_index as u16;
             // The comparison reads K0's alpha; the stage after it reads no
             // konst at all, but a selector is still written for both.
@@ -6580,6 +6634,25 @@ mod bake_repro {
             if spec || env {
                 println!("  {} spec={spec} env={env}", material.name);
             }
+        }
+        for material in preview.materials.iter() {
+            let mut claimed = [false; 4];
+            for stage in material.tev_stages.iter() {
+                for selector in [stage.konst_color, stage.konst_alpha] {
+                    if (12..=15).contains(&selector) {
+                        claimed[(selector - 12) as usize] = true;
+                    } else if (16..=31).contains(&selector) {
+                        claimed[((selector - 16) & 3) as usize] = true;
+                    }
+                }
+            }
+            println!(
+                "  KONST {} stages={} claimed={:?} free={:?}",
+                material.name,
+                material.tev_stages.len(),
+                claimed,
+                (0..4).filter(|k| !claimed[*k]).collect::<Vec<_>>()
+            );
         }
         println!(
             "SPECULAR: {specular}  NORMAL-TEXGEN: {normal_texgen}  OF {}",

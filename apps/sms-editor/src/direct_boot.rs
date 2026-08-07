@@ -7217,7 +7217,16 @@ mod tests {
 /// rather than evicting one mid-wash.
 const GOOP_WASH_ENTRIES: u32 = 16;
 /// `{owner, colour, hits}` per entry.
-const GOOP_WASH_ENTRY_SIZE: u32 = 12;
+const GOOP_WASH_ENTRY_SIZE: u32 = 16;
+/// Where a material keeps the array of packets, on the model, and the stride
+/// -- read off `SMS_InitPacket_OneTevKColor`, which walks exactly this to find
+/// the packet it fills. Only material zero is inspected, so the stride between
+/// packets is not needed: a manager rebinding one rebinds them all.
+const GOOP_WASH_PACKET_ARRAY_OFFSET: i32 = 0x84;
+/// Within a packet, the block whoever bound last installed. Ours going missing
+/// from here means something rebound the material and the coating stopped
+/// being drawn.
+const GOOP_WASH_PACKET_BLOCK: i32 = 0x0C;
 const GOOP_WASH_ALIGNMENT: usize = 0x20;
 const GOOP_WASH_STACK_GAP: u32 = 0x4000;
 
@@ -7330,6 +7339,37 @@ fn find_goop_wash_dispatch_sites(source: &[u8], image: &DolImage) -> Result<Vec<
 }
 /// `HIT_MESSAGE_SPRAYED_BY_WATER` (HitActor.hpp:31).
 const GOOP_WASH_WATER_MESSAGE: u32 = 0xF;
+
+/// A class this project authored a layer on, and the colour it paints over its
+/// own model.
+///
+/// Two classes can share one model and be told apart by a TEV colour register
+/// they write per instance -- Cataquack ships blue and red that way. Binding a
+/// konst packet over such a material replaces the packet that colour rides on,
+/// so the register and its colour are carried here and rebound alongside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct GoopWashActor {
+    /// What the class's instances carry at offset zero.
+    pub(super) vtable: u32,
+    /// The material the colour is painted on, or `None` where the class paints
+    /// none and a konst-only packet is enough.
+    pub(super) tinted_material: Option<u16>,
+    /// `GXTevRegID` for that colour.
+    pub(super) tint_register: u8,
+    /// The colour itself, as the signed ten-bit values `GXColorS10` holds.
+    pub(super) tint: [i16; 4],
+}
+
+/// Bytes one allowed actor takes in the payload: its class, the material its
+/// colour is painted on, the register that colour uses, and the colour itself.
+const GOOP_WASH_ACTOR_SIZE: u32 = 16;
+/// What a record's `material` holds when the class paints no colour: an index
+/// no material can have, so the bind loop never matches it.
+const GOOP_WASH_NO_TINT: u16 = 0xFFFF;
+/// Diagnostic: bind the tint on every material rather than only the recorded
+/// one. If a colour survives with this on and not with it off, the index is
+/// what is wrong, not the packet.
+const GOOP_WASH_TINT_EVERY_MATERIAL: bool = false;
 
 /// How far a wash reaches.
 ///
@@ -7447,6 +7487,9 @@ fn goop_bge(words: i32) -> u32 {
     16 << 26 | 4 << 21 | ((words * 4) as u32 & 0xFFFC)
 }
 
+fn goop_lbz(rt: u32, d: i32, ra: u32) -> u32 {
+    34 << 26 | rt << 21 | ra << 16 | (d as u32 & 0xFFFF)
+}
 fn goop_lhz(rt: u32, d: i32, ra: u32) -> u32 {
     40 << 26 | rt << 21 | ra << 16 | (d as u32 & 0xFFFF)
 }
@@ -7485,8 +7528,10 @@ fn build_goop_wash_stub(
     stub_address: u32,
     get_model: u32,
     init_kcolor: u32,
+    init_combined: u32,
+    records_address: u32,
     settings: GoopWashSettings,
-    allowed: &[u32],
+    allowed: &[GoopWashActor],
 ) -> Result<Vec<u32>, String> {
     let mut words: Vec<u32> = Vec::new();
     let start_word = 0xFF00 | u32::from(settings.start_level);
@@ -7537,6 +7582,60 @@ fn build_goop_wash_stub(
     };
 
     // Find this actor's entry, or the first free slot.
+    // Vetting runs before the table is touched. An actor that already holds an
+    // entry never enters the claim path, and it needs the matched record just
+    // as much -- the bind below reads it, and the stack slot holding it is per
+    // invocation, so it has to be filled on every hit rather than the first.
+    let mut combined_calls: Vec<usize> = Vec::new();
+    let mut skip_stranger = Vec::new();
+    if !allowed.is_empty() {
+        // Walk the records rather than unrolling a compare per class: the
+        // matched one is needed later, to know whether the material being bound
+        // is the one this class paints and what colour to paint it.
+        words.push(goop_lwz(9, 0, 3));
+        words.push(goop_lis(10, records_address >> 16));
+        words.push(goop_ori(10, 10, records_address & 0xFFFF));
+        words.push(goop_li(12, allowed.len() as i32));
+        let walk = words.len();
+        words.push(goop_lwz(8, 0, 10));
+        words.push(goop_cmpw(8, 9));
+        let to_matched = words.len();
+        words.push(0); // beq matched
+        words.push(goop_addi(10, 10, GOOP_WASH_ACTOR_SIZE as i32));
+        words.push(goop_addi(12, 12, -1));
+        words.push(goop_cmplwi(12, 0));
+        words.push(goop_bne(walk as i32 - words.len() as i32));
+        skip_stranger.push(words.len());
+        words.push(0); // b done -- a class this project never authored
+        let matched = words.len();
+        words[to_matched] = goop_beq(matched as i32 - to_matched as i32);
+        // The record outlives the calls below, so it rides on the stack.
+        words.push(goop_stw(10, 0x0C, 1));
+    }
+
+    // Not all of what arrives is a `TLiveActor`: the send is to a `THitActor`, whose
+    // model pointer may be absent or may not be a model pointer at all.
+    // `getModel` walks 0x74 then 0x04 without checking either, so it reads
+    // address four and the game dies. Walk it here first and leave quietly if
+    // anything on the way is null, before a slot is spent on an actor that has
+    // nothing to wash.
+    let mut skip_null = Vec::new();
+    words.push(goop_lwz(9, GOOP_ACTOR_MODEL_OFFSET, 3));
+    words.push(goop_cmplwi(9, 0));
+    skip_null.push(words.len());
+    words.push(0);
+    words.push(goop_lwz(9, GOOP_MODEL_DATA_OFFSET, 9));
+    words.push(goop_cmplwi(9, 0));
+    skip_null.push(words.len());
+    words.push(0);
+    words.push(goop_lwz(9, GOOP_MODEL_DATA_OFFSET, 9));
+    words.push(goop_cmplwi(9, 0));
+    skip_null.push(words.len());
+    words.push(0);
+
+    // First sight: seed the level and bind the material to this entry's colour,
+    // once. Binding per hit would allocate a packet every time.
+
     words.push(goop_lis(11, table_address >> 16));
     words.push(goop_ori(11, 11, table_address & 0xFFFF));
     words.push(goop_li(12, GOOP_WASH_ENTRIES as i32));
@@ -7568,54 +7667,53 @@ fn build_goop_wash_stub(
     // why an actor with no layer was still walked and an absent model was still
     // dereferenced.
     let claim = words.len();
-    let mut skip_stranger = Vec::new();
-    if !allowed.is_empty() {
-        words.push(goop_lwz(9, 0, 3));
-        let mut to_known = Vec::new();
-        for vtable in allowed {
-            words.push(goop_lis(10, vtable >> 16));
-            words.push(goop_ori(10, 10, vtable & 0xFFFF));
-            words.push(goop_cmpw(9, 10));
-            to_known.push(words.len());
-            words.push(0);
-        }
-        skip_stranger.push(words.len());
-        words.push(0);
-        let known = words.len();
-        for at in to_known {
-            words[at] = goop_beq(known as i32 - at as i32);
-        }
-    }
-
-    // Not all of what arrives is a `TLiveActor`: the send is to a `THitActor`, whose
-    // model pointer may be absent or may not be a model pointer at all.
-    // `getModel` walks 0x74 then 0x04 without checking either, so it reads
-    // address four and the game dies. Walk it here first and leave quietly if
-    // anything on the way is null, before a slot is spent on an actor that has
-    // nothing to wash.
-    let mut skip_null = Vec::new();
-    words.push(goop_lwz(9, GOOP_ACTOR_MODEL_OFFSET, 3));
-    words.push(goop_cmplwi(9, 0));
-    skip_null.push(words.len());
-    words.push(0);
-    words.push(goop_lwz(9, GOOP_MODEL_DATA_OFFSET, 9));
-    words.push(goop_cmplwi(9, 0));
-    skip_null.push(words.len());
-    words.push(0);
-    words.push(goop_lwz(9, GOOP_MODEL_DATA_OFFSET, 9));
-    words.push(goop_cmplwi(9, 0));
-    skip_null.push(words.len());
-    words.push(0);
-
-    // First sight: seed the level and bind the material to this entry's colour,
-    // once. Binding per hit would allocate a packet every time.
     words.push(goop_stw(3, 0, 11));
     words.push(goop_lis(9, 0xFFFF));
     words.push(goop_ori(9, 9, start_word));
     words.push(goop_stw(9, 4, 11));
     words.push(goop_li(9, 0));
     words.push(goop_stw(9, 8, 11));
+    // Both roads meet here: a first sighting arrives having seeded the entry,
+    // and a later hit arrives having stepped it. Binding on every hit rather
+    // than only the first is what keeps a coating alive across a respawn --
+    // the actor's own manager rebinds its colour packet when it brings the
+    // enemy back, and that replaces ours.
+    let bind_entry = words.len();
     words.push(goop_stw(11, 0x28, 1));
+    // Binding allocates -- these packet inits call `operator new` -- so it has
+    // to happen when the slot has actually been taken from us, not on every
+    // hit. The entry remembers what we last installed on material zero; the
+    // manager rebinding on respawn replaces it, and that difference is the
+    // signal to bind again.
+    //
+    // An entry that remembers nothing always binds. Skipping that check made
+    // an actor with no packet at all compare zero against zero, decide the
+    // slot was still ours, and never bind -- so nothing washed.
+    let mut to_rebind: Vec<usize> = Vec::new();
+    words.push(goop_lwz(10, 12, 11));
+    words.push(goop_cmplwi(10, 0));
+    to_rebind.push(words.len());
+    words.push(0); // beq rebind -- nothing recorded yet
+    words.push(goop_lwz(9, GOOP_ACTOR_MODEL_OFFSET, 3));
+    words.push(goop_cmplwi(9, 0));
+    to_rebind.push(words.len());
+    words.push(0);
+    words.push(goop_lwz(9, GOOP_MODEL_DATA_OFFSET, 9));
+    words.push(goop_cmplwi(9, 0));
+    to_rebind.push(words.len());
+    words.push(0);
+    words.push(goop_lwz(9, GOOP_WASH_PACKET_ARRAY_OFFSET, 9));
+    words.push(goop_cmplwi(9, 0));
+    to_rebind.push(words.len());
+    words.push(0);
+    words.push(goop_lwz(9, GOOP_WASH_PACKET_BLOCK, 9));
+    words.push(goop_cmpw(9, 10));
+    let to_done_bound = words.len();
+    words.push(0); // beq done -- still ours
+    let rebind = words.len();
+    for at in to_rebind {
+        words[at] = goop_beq(rebind as i32 - at as i32);
+    }
     let bisect_before_model = if GOOP_WASH_BISECT < 2 {
         let slot = words.len();
         words.push(0); // b done
@@ -7649,6 +7747,41 @@ fn build_goop_wash_stub(
     words.push(goop_cmpw(9, 10));
     let to_bound = words.len();
     words.push(0); // bge bound
+                   // A class that paints its own colour on this material needs both bound at
+                   // once: these packet forms replace a material's packet rather than add to
+                   // it, so binding the konst alone would drop the colour. The combined form
+                   // is the only one carrying both -- and it writes K0 and takes no register
+                   // argument, which is why the bake pins such a layer to K0.
+    let mut to_plain = None;
+    let mut to_after = None;
+    if !allowed.is_empty() {
+        words.push(goop_lwz(10, 0x0C, 1));
+        words.push(goop_lhz(0, 4, 10));
+        if GOOP_WASH_TINT_EVERY_MATERIAL {
+            // Compare the record against itself, so the branch is never taken
+            // and every material takes the combined form.
+            words.push(goop_cmpw(0, 0));
+        } else {
+            words.push(goop_cmpw(9, 0));
+        }
+        to_plain = Some(words.len());
+        words.push(0); // bne plain
+        words.push(goop_lwz(3, 0x2C, 1));
+        words.push(goop_mr(4, 9));
+        words.push(goop_lbz(5, 6, 10));
+        words.push(goop_addi(6, 10, 8));
+        words.push(goop_lwz(11, 0x28, 1));
+        words.push(goop_addi(7, 11, 4));
+        let combined_call = words.len();
+        words.push(0);
+        combined_calls.push(combined_call);
+        to_after = Some(words.len());
+        words.push(0); // b after
+    }
+    if let Some(at) = to_plain {
+        let plain = words.len();
+        words[at] = goop_bne(plain as i32 - at as i32);
+    }
     words.push(goop_lwz(3, 0x2C, 1));
     words.push(goop_mr(4, 9));
     words.push(goop_li(5, kcolor));
@@ -7656,12 +7789,29 @@ fn build_goop_wash_stub(
     words.push(goop_addi(6, 11, 4));
     let init_call = words.len();
     words.push(0);
+    if let Some(at) = to_after {
+        let after = words.len();
+        words[at] = goop_b(after as i32 - at as i32);
+    }
     words.push(goop_lwz(9, 0x18, 1));
     words.push(goop_addi(9, 9, 1));
     words.push(goop_stw(9, 0x18, 1));
     words.push(goop_b(bind_loop as i32 - words.len() as i32));
     let bound = words.len();
     words[to_bound] = goop_bge(bound as i32 - to_bound as i32);
+    // Remember the block that owns material zero now, so the next hit can tell
+    // whether it is still ours.
+    words.push(goop_lwz(9, 0x2C, 1));
+    words.push(goop_lwz(9, GOOP_WASH_PACKET_ARRAY_OFFSET, 9));
+    words.push(goop_cmplwi(9, 0));
+    let to_skip_note = words.len();
+    words.push(0);
+    words.push(goop_lwz(9, GOOP_WASH_PACKET_BLOCK, 9));
+    words.push(goop_lwz(11, 0x28, 1));
+    words.push(goop_stw(9, 12, 11));
+    let noted = words.len();
+    words[to_skip_note] = goop_beq(noted as i32 - to_skip_note as i32);
+
     let to_done_claim = words.len();
     words.push(0);
 
@@ -7672,7 +7822,7 @@ fn build_goop_wash_stub(
     words.push(goop_cmplwi(9, settings.resistance));
     words.push(goop_bge(3));
     words.push(goop_stw(9, 8, 11));
-    let to_done_wait = words.len();
+    let to_bind_waiting = words.len();
     words.push(0);
     words.push(goop_li(9, 0));
     words.push(goop_stw(9, 8, 11));
@@ -7685,8 +7835,15 @@ fn build_goop_wash_stub(
     words.push(goop_b(2));
     words.push(goop_addi(5, 5, -step));
     words.push(goop_stw(5, 4, 11));
+    let to_bind_stepped = words.len();
+    words.push(0);
 
     let done = words.len();
+    words[to_done_bound] = goop_beq(done as i32 - to_done_bound as i32);
+    words[to_have_entry] = goop_beq(have_entry as i32 - to_have_entry as i32);
+    // Both repeat-hit exits jump back to the bind, which sits before them.
+    words[to_bind_waiting] = goop_b(bind_entry as i32 - to_bind_waiting as i32);
+    words[to_bind_stepped] = goop_b(bind_entry as i32 - to_bind_stepped as i32);
     if let Some(at) = bisect_before_bind {
         words[at] = goop_b(done as i32 - at as i32);
     }
@@ -7728,10 +7885,12 @@ fn build_goop_wash_stub(
     words[to_claim] = goop_beq(claim as i32 - to_claim as i32);
     words[to_done_full] = goop_b(done as i32 - to_done_full as i32);
     words[to_done_claim] = goop_b(done as i32 - to_done_claim as i32);
-    words[to_done_wait] = goop_b(done as i32 - to_done_wait as i32);
     words[get_model_call] =
         encode_branch(stub_address + (get_model_call as u32) * 4, get_model, true)?;
     words[init_call] = encode_branch(stub_address + (init_call as u32) * 4, init_kcolor, true)?;
+    for at in combined_calls {
+        words[at] = encode_branch(stub_address + (at as u32) * 4, init_combined, true)?;
+    }
     words[resume_word] = encode_branch(stub_address + (resume_word as u32) * 4, resume, false)?;
     Ok(words)
 }
@@ -7802,9 +7961,10 @@ fn find_goop_wash_signature(
 pub(super) fn patch_goop_wash_dol(
     source: &[u8],
     settings: GoopWashSettings,
-    allowed: &[u32],
+    allowed: &[GoopWashActor],
     get_model: u32,
     init_kcolor: u32,
+    init_combined: u32,
 ) -> Result<Vec<u8>, String> {
     if settings.konst_register > 3 {
         return Err(format!(
@@ -7896,15 +8056,23 @@ pub(super) fn patch_goop_wash_dol(
         stub_address,
         get_model,
         init_kcolor,
+        init_combined,
+        0,
         settings,
         allowed,
     )?;
     let stride = probe.len();
-    let table_address = stub_address
+    let records_address = stub_address
         .checked_add(
             u32::try_from(stride * hooks.len() * 4).map_err(|_| "stub too large".to_string())?,
         )
         .ok_or_else(|| "goop wash stub overflows the address space".to_string())?;
+    let records_size = u32::try_from(allowed.len())
+        .map_err(|_| "too many authored classes".to_string())?
+        * GOOP_WASH_ACTOR_SIZE;
+    let table_address = records_address
+        .checked_add(records_size)
+        .ok_or_else(|| "goop wash records overflow the address space".to_string())?;
 
     let mut stubs = Vec::with_capacity(hooks.len());
     for (index, hook) in hooks.iter().enumerate() {
@@ -7920,6 +8088,8 @@ pub(super) fn patch_goop_wash_dol(
             at,
             get_model,
             init_kcolor,
+            init_combined,
+            records_address,
             settings,
             allowed,
         )?;
@@ -7930,7 +8100,9 @@ pub(super) fn patch_goop_wash_dol(
     }
 
     let payload_size = align_up_usize(
-        stride * hooks.len() * 4 + (GOOP_WASH_ENTRIES * GOOP_WASH_ENTRY_SIZE) as usize,
+        stride * hooks.len() * 4
+            + records_size as usize
+            + (GOOP_WASH_ENTRIES * GOOP_WASH_ENTRY_SIZE) as usize,
         GOOP_WASH_ALIGNMENT,
     )?;
     let stub_end = stub_address
@@ -7951,6 +8123,21 @@ pub(super) fn patch_goop_wash_dol(
     for (_, stub) in &stubs {
         for word in stub {
             bytes.extend_from_slice(&word.to_be_bytes());
+        }
+    }
+    // The records the stub matches against, in the order it walks them.
+    for actor in allowed {
+        bytes.extend_from_slice(&actor.vtable.to_be_bytes());
+        bytes.extend_from_slice(
+            &actor
+                .tinted_material
+                .unwrap_or(GOOP_WASH_NO_TINT)
+                .to_be_bytes(),
+        );
+        bytes.push(actor.tint_register);
+        bytes.push(0);
+        for channel in actor.tint {
+            bytes.extend_from_slice(&channel.to_be_bytes());
         }
     }
     // The table stays zeroed: an owner of zero is what marks a slot free.
@@ -8003,6 +8190,20 @@ const GOOP_INIT_KCOLOR_SIGNATURE_OFFSET: u32 = 0x18;
 const GOOP_INIT_KCOLOR_TAG_OFFSET: u32 = 0x4C;
 const GOOP_INIT_KCOLOR_TAG: u32 = 0x3800_0006; // li r0, 6
 
+/// `SMS_InitPacket_OneTevColorAndOneTevKColor`, which binds a TEV colour
+/// register and a konst colour in one packet.
+///
+/// These packet forms replace a material's packet with one carrying the state
+/// they name, so binding a konst-only packet over a material drops whatever the
+/// actor had bound before it -- which is how a coating erased Cataquack's
+/// colour, since red and blue are one model told apart by a TEV register.
+const GOOP_WASH_COMBINED_SIGNATURE: [u32; 3] = [
+    0x93E1_006C, // stw r31, 0x6C(r1)
+    0x93C1_0068, // stw r30, 0x68(r1)
+    0x3BC7_0000, // addi r30, r7, 0
+];
+const GOOP_WASH_COMBINED_SIGNATURE_OFFSET: u32 = 0x10;
+
 /// Every address in a text section where `signature` appears, as the address of
 /// the word the match begins at.
 fn goop_signature_matches(
@@ -8050,6 +8251,16 @@ fn goop_word_at(source: &[u8], image: &DolImage, address: u32) -> Result<u32, St
 /// Found by their own code rather than by address, so a DOL this does not
 /// recognise is refused outright instead of being patched with calls into
 /// whatever happens to sit at a hard-coded address.
+fn find_goop_wash_combined(source: &[u8], image: &DolImage) -> Result<u32, String> {
+    find_goop_wash_signature(
+        source,
+        image,
+        &GOOP_WASH_COMBINED_SIGNATURE,
+        GOOP_WASH_COMBINED_SIGNATURE_OFFSET,
+        "SMS_InitPacket_OneTevColorAndOneTevKColor",
+    )
+}
+
 fn find_goop_wash_callees(source: &[u8], image: &DolImage) -> Result<(u32, u32), String> {
     let models = goop_signature_matches(source, image, &GOOP_GET_MODEL_SIGNATURE)?;
     let get_model = match models.as_slice() {
@@ -8090,11 +8301,19 @@ fn find_goop_wash_callees(source: &[u8], image: &DolImage) -> Result<(u32, u32),
 pub(super) fn install_goop_wash(
     source: &[u8],
     settings: GoopWashSettings,
-    allowed: &[u32],
+    allowed: &[GoopWashActor],
 ) -> Result<Vec<u8>, String> {
     let image = parse_dol(source)?;
     let (get_model, init_kcolor) = find_goop_wash_callees(source, &image)?;
-    patch_goop_wash_dol(source, settings, allowed, get_model, init_kcolor)
+    let init_combined = find_goop_wash_combined(source, &image)?;
+    patch_goop_wash_dol(
+        source,
+        settings,
+        allowed,
+        get_model,
+        init_kcolor,
+        init_combined,
+    )
 }
 
 /// Whether this DOL carries the code the wash needs.
@@ -8199,7 +8418,22 @@ mod goop_wash_tests {
                 reach: GoopWashReach::Everything,
                 ..settings
             },
-            &[0x803B_45D4, 0x803B_7378],
+            &[
+                // Petey, painting nothing of its own.
+                GoopWashActor {
+                    vtable: 0x803B_45D4,
+                    tinted_material: None,
+                    tint_register: 0,
+                    tint: [0; 4],
+                },
+                // Cataquack, which paints TEV register zero on its body.
+                GoopWashActor {
+                    vtable: 0x803B_7378,
+                    tinted_material: Some(0),
+                    tint_register: 0,
+                    tint: [-191, 8, 303, 0],
+                },
+            ],
         )
         .expect("install with an allowlist");
         let unfiltered = install_goop_wash(
@@ -8215,6 +8449,17 @@ mod goop_wash_tests {
             filtered.len() > unfiltered.len(),
             "the allowlist emitted no comparison"
         );
+        // The stub that actually carries records, so the record walk and the
+        // bind loop can be read rather than assumed.
+        {
+            let image = parse_dol(&filtered).expect("reparse");
+            if let Some(section) = image.sections.iter().find(|s| s.text && s.slot == 2) {
+                let words = section_words(&filtered, *section).expect("words");
+                for (index, word) in words.iter().enumerate().take(120) {
+                    println!("  TINT +{:#05x} (w{index:>3}) {:#010x}", index * 4, word);
+                }
+            }
+        }
 
         // Everything hooks the send itself, at every site the water manager
         // uses. All of them have to become branches: a missed one is an actor
