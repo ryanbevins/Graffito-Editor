@@ -310,6 +310,16 @@ impl SmsEditorApp {
                     self.tool = self.tool.after_toolbar_click(EditorTool::Mask);
                 }
 
+                let material_active = self.tool == EditorTool::Material;
+                if ui
+                    .selectable_label(material_active, "Material Library")
+                    .on_hover_text("Dress a stage's materials with effects taken from the game")
+                    .clicked()
+                {
+                    ui.close();
+                    self.tool = self.tool.after_toolbar_click(EditorTool::Material);
+                }
+
                 let vertex_active = self.tool == EditorTool::VertexPaint;
                 if ui
                     .selectable_label(vertex_active, "Vertex Paint Tool")
@@ -609,6 +619,12 @@ impl SmsEditorApp {
         }
 
         match self.bottom_tab {
+            // The Material Library takes the browser over while it is the
+            // tool, the way the Mask Tool takes over the viewport: the same
+            // furniture, holding what this tool is for.
+            BottomTab::Content if self.tool == EditorTool::Material => {
+                self.material_browser_panel(ui)
+            }
             BottomTab::Content => self.content_browser_panel(ui),
             BottomTab::Console => self.console(ui),
         }
@@ -1514,6 +1530,10 @@ impl SmsEditorApp {
         }
         if self.tool == EditorTool::Mask {
             self.mask_tool_panel(ui);
+            return;
+        }
+        if self.tool == EditorTool::Material {
+            self.material_library_panel(ui);
             return;
         }
         if self.content_browser_inspector_panel(ui) {
@@ -2774,7 +2794,7 @@ fn tool_shortcut(tool: EditorTool) -> &'static str {
         EditorTool::Move => "W",
         EditorTool::Rotate => "E",
         EditorTool::Scale => "R",
-        EditorTool::Goop | EditorTool::Mask => "Tools menu",
+        EditorTool::Goop | EditorTool::Mask | EditorTool::Material => "Tools menu",
         EditorTool::Place => "Content Browser",
     }
 }

@@ -46,6 +46,10 @@ struct Material {
     fog_params: vec4<f32>,
     fog_color: vec4<f32>,
     runtime_parameters: vec4<f32>,
+    // The Material Library's highlight: rgb, and how far to pull the shaded
+    // result toward it. Zero on every material that is not highlighted, so the
+    // cost of carrying it is one unused vec4 per material.
+    highlight: vec4<f32>,
 };
 
 struct VertexIn {
@@ -1096,8 +1100,14 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     if (!alpha_compare_passes(output.a)) {
         discard;
     }
-    return apply_source_independent_logic(
+    let shaded = apply_source_independent_logic(
         clamp(apply_fog(output, input.view_depth), vec4<f32>(0.0), vec4<f32>(1.0)),
+    );
+    // After fog, so a highlighted surface reads the same at any distance --
+    // the point of it is to be found across the map.
+    return vec4<f32>(
+        mix(shaded.rgb, material.highlight.rgb, material.highlight.a),
+        max(shaded.a, material.highlight.a),
     );
 }
 

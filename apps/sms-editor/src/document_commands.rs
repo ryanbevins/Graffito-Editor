@@ -4650,6 +4650,9 @@ impl SmsEditorApp {
         if self.tool == EditorTool::Goop && self.undo_goop() {
             return;
         }
+        if self.tool == EditorTool::Material && self.undo_material_library() {
+            return;
+        }
         if self.tool.uses_terrain_asset_undo() && self.undo_vertex_paint() {
             return;
         }

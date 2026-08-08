@@ -142,6 +142,66 @@ impl GpuViewportScene {
         }
     }
 
+    /// Tints one material, and clears whichever was tinted before.
+    ///
+    /// This is a uniform write on the frames where the selection changes, not
+    /// per-frame work: the highlight rides along in the material the GPU is
+    /// already binding for that draw. Painting it as an overlay instead meant
+    /// projecting every triangle of the material on the CPU every frame, which
+    /// on a whole map is the difference between free and unusable.
+    pub fn set_material_highlight(&self, highlights: &[(usize, [f32; 4])]) -> bool {
+        let Ok(mut shared) = self.shared.lock() else {
+            return false;
+        };
+        let mut changed = false;
+        let wanted = |index: usize| {
+            highlights
+                .iter()
+                .find(|(material, _)| *material == index)
+                .map(|(_, colour)| *colour)
+                .unwrap_or([0.0; 4])
+        };
+        for index in 0..shared.scene.materials.len() {
+            let next = wanted(index);
+            if shared.scene.materials[index].uniform.highlight == next {
+                continue;
+            }
+            shared.scene.materials[index].uniform.highlight = next;
+            shared.dirty_materials.insert(index);
+            changed = true;
+        }
+        // Deliberately no generation bump. Bumping it makes `ensure_scene`
+        // re-upload every texture and rebuild every buffer and bind group in
+        // the scene -- for a tint, on the frame the pointer moves. The dirty
+        // set alone is the cheap path: one `write_buffer` of one material.
+        changed
+    }
+
+    /// Sets which materials are previewing an effect, and clears the rest.
+    ///
+    /// Same shape as `set_material_highlight`: no generation bump, just the
+    /// dirty set, so turning an effect on is one uniform write rather than a
+    /// scene rebuild.
+    pub fn set_material_preview_scroll(&self, scrolls: &[(usize, [f32; 2])]) -> bool {
+        let Ok(mut shared) = self.shared.lock() else {
+            return false;
+        };
+        let mut changed = false;
+        for index in 0..shared.scene.materials.len() {
+            let next = scrolls
+                .iter()
+                .find(|(material, _)| *material == index)
+                .map(|(_, scroll)| *scroll);
+            if shared.scene.materials[index].preview_scroll == next {
+                continue;
+            }
+            shared.scene.materials[index].preview_scroll = next;
+            shared.dirty_materials.insert(index);
+            changed = true;
+        }
+        changed
+    }
+
     pub fn update_materials(&self, preview: &ModelPreview, material_indices: &[usize]) {
         if let Ok(mut shared) = self.shared.lock() {
             for index in material_indices.iter().copied() {
@@ -968,7 +1028,14 @@ impl GpuSceneData {
         let Some(destination) = self.materials.get_mut(index) else {
             return;
         };
+        // The highlight is the editor's, not the model's, so it survives a
+        // rebuild. A flipbook material re-uploads every time its frame changes,
+        // and dropping the tint there would make a highlighted material blink.
+        let highlight = destination.uniform.highlight;
+        let preview_scroll = destination.preview_scroll;
         *destination = GpuMaterialData::from_j3d(material, preview);
+        destination.uniform.highlight = highlight;
+        destination.preview_scroll = preview_scroll;
         apply_batch_material_overrides(&self.batches, index, destination);
     }
 }
@@ -1582,6 +1649,12 @@ struct GpuMaterialData {
     tex_matrices: [Option<J3dTexMatrix>; TEXTURE_SLOT_COUNT],
     animations: Vec<GpuMaterialAnimation>,
     runtime_wave: bool,
+    /// An effect the editor is previewing: texture units per second in U and V.
+    ///
+    /// Not something the model stores. It drives the same texture matrix a BTK
+    /// would, so what an author sees here is what the animation would do -- and
+    /// it costs nothing until something is dropped.
+    preview_scroll: Option<[f32; 2]>,
 }
 
 #[derive(Clone)]
@@ -1631,6 +1704,7 @@ impl GpuMaterialData {
             tex_matrices: material.tex_matrices,
             animations,
             runtime_wave: false,
+            preview_scroll: None,
         }
     }
 
@@ -1694,6 +1768,7 @@ impl GpuMaterialData {
             tex_matrices: [None; TEXTURE_SLOT_COUNT],
             animations: Vec::new(),
             runtime_wave: false,
+            preview_scroll: None,
         }
     }
 
@@ -1718,6 +1793,20 @@ impl GpuMaterialData {
             matrix.translation = srt.translation;
             let rows = texture_srt_rows(matrix);
             uniform.tex_matrix_rows[slot * 3..slot * 3 + 3].copy_from_slice(&rows);
+        }
+        if let Some(scroll) = self.preview_scroll {
+            for slot in 0..TEXTURE_SLOT_COUNT {
+                // Only where the material installed a texture matrix: without
+                // one the tex gen does not read these rows, so writing them
+                // would be invisible.
+                let Some(mut matrix) = self.tex_matrices.get(slot).copied().flatten() else {
+                    continue;
+                };
+                matrix.translation[0] += scroll[0] * elapsed_seconds;
+                matrix.translation[1] += scroll[1] * elapsed_seconds;
+                let rows = texture_srt_rows(matrix);
+                uniform.tex_matrix_rows[slot * 3..slot * 3 + 3].copy_from_slice(&rows);
+            }
         }
         uniform
     }
@@ -1969,6 +2058,10 @@ struct GpuMaterialUniform {
     fog_params: [f32; 4],
     fog_color: [f32; 4],
     runtime_parameters: [f32; 4],
+    /// Material Library highlight: rgb, then blend strength. Set outside the
+    /// J3D conversion, so rebuilding a material from its J3D source does not
+    /// clear it -- see `set_material_highlight`.
+    highlight: [f32; 4],
 }
 
 impl GpuMaterialUniform {
@@ -2834,7 +2927,10 @@ impl GpuViewportResources {
             .iter()
             .enumerate()
             .filter_map(|(index, material)| {
-                (!material.animations.is_empty() || material.runtime_wave).then_some(index)
+                (!material.animations.is_empty()
+                    || material.runtime_wave
+                    || material.preview_scroll.is_some())
+                .then_some(index)
             })
             .collect();
         for (index, material) in scene.materials.iter().enumerate() {
@@ -2914,7 +3010,10 @@ impl GpuViewportResources {
             .iter()
             .enumerate()
             .filter_map(|(index, material)| {
-                (!material.animations.is_empty() || material.runtime_wave).then_some(index)
+                (!material.animations.is_empty()
+                    || material.runtime_wave
+                    || material.preview_scroll.is_some())
+                .then_some(index)
             })
             .collect();
 
@@ -3024,7 +3123,10 @@ impl GpuViewportResources {
                 bind_group
             };
             self.material_bind_groups[index] = bind_group;
-            if material.animations.is_empty() && !material.runtime_wave {
+            if material.animations.is_empty()
+                && !material.runtime_wave
+                && material.preview_scroll.is_none()
+            {
                 self.animated_materials.remove(&index);
             } else {
                 self.animated_materials.insert(index);

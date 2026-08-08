@@ -56,6 +56,7 @@ mod goop_spawn;
 mod gpu_viewport;
 mod managed_build;
 mod mask_tool;
+mod material_library;
 mod model_assets;
 mod music_library;
 mod outliner;
@@ -140,12 +141,25 @@ enum EditorTool {
     Goop,
     /// Paints washable goop masks onto enemy actor models (Mask Tool).
     Mask,
+    /// Dresses a stage's materials with effects taken from the retail game.
+    Material,
     Place,
 }
 
 #[derive(Debug, Clone)]
 struct ObjectPaletteDragPayload {
     factory_name: String,
+}
+
+/// An effect being dragged out of the Material Library onto a surface.
+///
+/// Indices into the library rather than the sample itself: a payload that is
+/// three numbers stays cheap to clone every frame a drag is in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MaterialEffectDragPayload {
+    category: usize,
+    concept: usize,
+    effect: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,6 +311,7 @@ impl EditorTool {
             Self::Scale => "Scale",
             Self::Goop => "Goop",
             Self::Mask => "Mask",
+            Self::Material => "Material Library",
             Self::Place => "Place",
         }
     }
@@ -1315,6 +1330,33 @@ struct SmsEditorApp {
     mask_wash_uniform_rate: bool,
     /// How far the wash reaches: `enemies`, `props`, or `everything`.
     mask_wash_reach: String,
+    /// Material Library: which material slot is selected, if any.
+    material_library_selected: Option<usize>,
+    /// Material Library: the material under the pointer this frame.
+    material_library_hovered: Option<usize>,
+    /// Where the pointer was when that was last resolved.
+    material_library_hover_pos: Option<egui::Pos2>,
+    /// When the surface under the pointer was last resolved.
+    material_library_hover_time: f64,
+    /// Effects applied to materials, in the order they were applied.
+    material_library_assignments: Vec<material_library::MaterialEffectAssignment>,
+    /// The stage's model and animation edits as they stood before the library
+    /// touched them, taken once. Reset puts these back rather than deleting
+    /// every edit on those paths, which would throw away another tool's work.
+    material_library_baseline: Option<material_library::MaterialLibraryBaseline>,
+    /// Which render layers a click may land on, by `layer_slot`.
+    material_library_layers: [bool; material_library::PICK_LAYERS.len()],
+    /// Set by a viewport click: bring the selected slot into view once.
+    material_library_scroll_to_selected: bool,
+    /// The Material Library browser: which concept roots are open, which
+    /// category is being shown, and what is being searched for.
+    material_browser_expanded: std::collections::BTreeSet<usize>,
+    material_browser_category: Option<(usize, usize)>,
+    material_browser_query: String,
+    /// The sample the right-hand panel is showing, if one is open.
+    material_browser_inspecting: Option<(usize, usize, usize)>,
+    /// The sample it has read, kept so the archive is opened once.
+    material_sample: Option<material_library::SampleBreakdown>,
     /// The vtables of the classes this project has authored layers on, so a
     /// wash that reaches everything can let strangers past untouched.
     mask_wash_vtables: Vec<u32>,
@@ -1703,6 +1745,20 @@ impl Default for SmsEditorApp {
             mask_layer_pool_label: String::new(),
             mask_wash_uniform_rate: true,
             mask_wash_reach: "props".to_string(),
+            material_library_selected: None,
+            material_library_hovered: None,
+            material_library_hover_pos: None,
+            material_library_hover_time: 0.0,
+            material_library_assignments: Vec::new(),
+            material_library_baseline: None,
+            material_library_layers: material_library::default_pick_layers(),
+            material_library_scroll_to_selected: false,
+            // Effects open: what an author reaches for first.
+            material_browser_expanded: std::collections::BTreeSet::from([2]),
+            material_browser_category: None,
+            material_browser_query: String::new(),
+            material_browser_inspecting: None,
+            material_sample: None,
             mask_wash_vtables: Vec::new(),
             mask_bake_tpose: true,
             mask_idle_frame: 0.0,
