@@ -42,6 +42,7 @@ mod audio_preview;
 mod boolean_cut;
 mod browser_settings;
 mod camera;
+mod class_vtables;
 mod content_browser;
 mod content_thumbnails;
 mod dialogue;
@@ -54,6 +55,8 @@ mod goop;
 mod goop_spawn;
 mod gpu_viewport;
 mod managed_build;
+mod mask_tool;
+mod material_library;
 mod model_assets;
 mod music_library;
 mod outliner;
@@ -136,12 +139,27 @@ enum EditorTool {
     Rotate,
     Scale,
     Goop,
+    /// Paints washable goop masks onto enemy actor models (Mask Tool).
+    Mask,
+    /// Dresses a stage's materials with effects taken from the retail game.
+    Material,
     Place,
 }
 
 #[derive(Debug, Clone)]
 struct ObjectPaletteDragPayload {
     factory_name: String,
+}
+
+/// An effect being dragged out of the Material Library onto a surface.
+///
+/// Indices into the library rather than the sample itself: a payload that is
+/// three numbers stays cheap to clone every frame a drag is in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MaterialEffectDragPayload {
+    category: usize,
+    concept: usize,
+    effect: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +310,8 @@ impl EditorTool {
             Self::Rotate => "Rotate",
             Self::Scale => "Scale",
             Self::Goop => "Goop",
+            Self::Mask => "Mask",
+            Self::Material => "Material Library",
             Self::Place => "Place",
         }
     }
@@ -1274,6 +1294,119 @@ struct SmsEditorApp {
     pending_auto_refresh_root: Option<String>,
     last_auto_refresh_attempt_root: String,
     tool: EditorTool,
+    /// Mask Tool: the enemy actor factory currently loaded for painting.
+    mask_selected_actor: Option<String>,
+    /// Wash preview: 1.0 = fully coated, 0.0 = clean. The scalar the game
+    /// compares the mask against (K0_A), normalized.
+    mask_wash_phase: f32,
+    mask_wash_playing: bool,
+    /// Whether the wash clears the mask's dark values first rather than its
+    /// bright ones, turning the coating's recede inside out.
+    mask_wash_invert: bool,
+    /// Whether the goop layer is authored against the model's rest pose rather
+    /// than the idle animation it is standing in. A goop coordinate is a
+    /// projection over posed vertices, so the pose it is baked in is part of
+    /// the result: the same actor bent differently unwraps differently.
+    /// What the last bake or reset actually did, shown beside the buttons that
+    /// did it rather than only in the Console panel.
+    mask_author_status: String,
+    /// Whether the baked layer ships fully coated for the runtime to wash off,
+    /// rather than frozen at the coverage the preview is showing.
+    mask_bake_washable: bool,
+    /// How many water hits the runtime takes per step of the wash. Independent
+    /// of the level the layer is baked at, so a lightly coated actor can still
+    /// be stubborn to clean.
+    mask_wash_resistance: u32,
+    /// How much wash level one water hit removes. Raising it is how a class the
+    /// game feeds few water hits -- PoiHana keeps its spray cooldown running
+    /// where Gesso clears it every hit -- is brought into line without touching
+    /// what any other actor does.
+    mask_wash_step: u32,
+    /// Which per-layer pool folder this instance resolved to, and the
+    /// manager that chose it.
+    mask_layer_pool_label: String,
+    /// Whether every spray counts, or only the ones an actor's class lets past
+    /// its own cooldown.
+    mask_wash_uniform_rate: bool,
+    /// How far the wash reaches: `enemies`, `props`, or `everything`.
+    mask_wash_reach: String,
+    /// Material Library: which material slot is selected, if any.
+    material_library_selected: Option<usize>,
+    /// Material Library: the material under the pointer this frame.
+    material_library_hovered: Option<usize>,
+    /// Where the pointer was when that was last resolved.
+    material_library_hover_pos: Option<egui::Pos2>,
+    /// When the surface under the pointer was last resolved.
+    material_library_hover_time: f64,
+    /// Effects applied to materials, in the order they were applied.
+    material_library_assignments: Vec<material_library::MaterialEffectAssignment>,
+    /// The stage's model and animation edits as they stood before the library
+    /// touched them, taken once. Reset puts these back rather than deleting
+    /// every edit on those paths, which would throw away another tool's work.
+    material_library_baseline: Option<material_library::MaterialLibraryBaseline>,
+    /// Which render layers a click may land on, by `layer_slot`.
+    material_library_layers: [bool; material_library::PICK_LAYERS.len()],
+    /// Set by a viewport click: bring the selected slot into view once.
+    material_library_scroll_to_selected: bool,
+    /// The Material Library browser: which concept roots are open, which
+    /// category is being shown, and what is being searched for.
+    material_browser_expanded: std::collections::BTreeSet<usize>,
+    material_browser_category: Option<(usize, usize)>,
+    material_browser_query: String,
+    /// The sample the right-hand panel is showing, if one is open.
+    material_browser_inspecting: Option<(usize, usize, usize)>,
+    /// The sample it has read, kept so the archive is opened once.
+    material_sample: Option<material_library::SampleBreakdown>,
+    /// The vtables of the classes this project has authored layers on, so a
+    /// wash that reaches everything can let strangers past untouched.
+    mask_wash_vtables: Vec<u32>,
+    mask_bake_tpose: bool,
+    /// Where the idle animation is held while the layer is authored, in
+    /// seconds. The preview holds this frame rather than running on the wall
+    /// clock, so what is baked is what was on screen.
+    mask_idle_frame: f32,
+    /// The project whose wash settings have been taken, so they are restored
+    /// once rather than on every frame the panel draws.
+    mask_wash_settings_project: Option<String>,
+    /// What the panel reports about the selected actor's archive edit, worked
+    /// out when the actor is loaded rather than while drawing.
+    mask_edit_state: String,
+    mask_uv_layer: mask_tool::MaskUvLayer,
+    mask_view: mask_tool::MaskView,
+    mask_yaw: f32,
+    mask_pitch: f32,
+    mask_colour_source: mask_tool::MaskTextureSource,
+    mask_goop_image: Option<(usize, usize, Vec<u8>)>,
+    mask_mask_source: mask_tool::MaskTextureSource,
+    mask_preview: Option<mask_tool::MaskPreview>,
+    /// The selected actor, isolated from the stage preview and handed to the
+    /// same renderer the stage viewport uses. The Mask Tool draws through it so
+    /// an actor reads here exactly as it reads in the stage.
+    mask_gpu_scene: Option<gpu_viewport::GpuViewportScene>,
+    /// Where that actor sits in the stage, and how big it is there. The Mask
+    /// Tool's own bounds are the model's local ones, which is not where the
+    /// stage preview's copy of it stands.
+    mask_gpu_bounds: Option<([f32; 3], f32)>,
+    /// The actor's triangles as the stage holds them. The coating is
+    /// rasterized over these, so it lands on the model the renderer drew
+    /// rather than on a differently placed copy of it.
+    mask_gpu_triangles: Vec<PreviewTriangle>,
+    /// The stage's textures, for the coating pass to run the same alpha
+    /// cutout the renderer runs. Petey's petals are quads; their points are
+    /// cut by the texture's alpha, and a coating that skips the test coats
+    /// the whole quad and pokes past the drawn silhouette.
+    mask_gpu_textures: Vec<PreviewTexture>,
+    /// The isolated preview behind the Mask Tool's scene, kept so the wash
+    /// can update its materials in place.
+    mask_gpu_preview: Option<ModelPreview>,
+    /// Materials carrying the wash comparison, with the konst each sweeps.
+    mask_wash_materials: Vec<(usize, usize)>,
+    /// The konst value last pushed to the scene, so it only updates on change.
+    mask_wash_konst: Option<u8>,
+    mask_texture: Option<egui::TextureHandle>,
+    mask_mask: Vec<u8>,
+    mask_mask_size: usize,
+    mask_generated: bool,
     selected_goop_layer: usize,
     goop_authoring_mode: GoopAuthoringMode,
     simple_goop_paint_target: SimpleGoopPaintTarget,
@@ -1601,6 +1734,55 @@ impl Default for SmsEditorApp {
             pending_auto_refresh_root: None,
             last_auto_refresh_attempt_root: String::new(),
             tool: EditorTool::Move,
+            mask_selected_actor: None,
+            mask_wash_phase: 1.0,
+            mask_wash_playing: false,
+            mask_wash_invert: false,
+            mask_author_status: String::new(),
+            mask_bake_washable: true,
+            mask_wash_resistance: 4,
+            mask_wash_step: 1,
+            mask_layer_pool_label: String::new(),
+            mask_wash_uniform_rate: true,
+            mask_wash_reach: "props".to_string(),
+            material_library_selected: None,
+            material_library_hovered: None,
+            material_library_hover_pos: None,
+            material_library_hover_time: 0.0,
+            material_library_assignments: Vec::new(),
+            material_library_baseline: None,
+            material_library_layers: material_library::default_pick_layers(),
+            material_library_scroll_to_selected: false,
+            // Effects open: what an author reaches for first.
+            material_browser_expanded: std::collections::BTreeSet::from([2]),
+            material_browser_category: None,
+            material_browser_query: String::new(),
+            material_browser_inspecting: None,
+            material_sample: None,
+            mask_wash_vtables: Vec::new(),
+            mask_bake_tpose: true,
+            mask_idle_frame: 0.0,
+            mask_wash_settings_project: None,
+            mask_edit_state: String::new(),
+            mask_uv_layer: mask_tool::MaskUvLayer::Body,
+            mask_view: mask_tool::MaskView::Model,
+            mask_yaw: 0.0,
+            mask_pitch: 0.0,
+            mask_colour_source: mask_tool::MaskTextureSource::Generated,
+            mask_goop_image: None,
+            mask_mask_source: mask_tool::MaskTextureSource::Generated,
+            mask_preview: None,
+            mask_gpu_scene: None,
+            mask_gpu_bounds: None,
+            mask_gpu_triangles: Vec::new(),
+            mask_gpu_textures: Vec::new(),
+            mask_gpu_preview: None,
+            mask_wash_materials: Vec::new(),
+            mask_wash_konst: None,
+            mask_texture: None,
+            mask_mask: Vec::new(),
+            mask_mask_size: 0,
+            mask_generated: false,
             selected_goop_layer: 0,
             goop_authoring_mode: GoopAuthoringMode::Simple,
             simple_goop_paint_target: SimpleGoopPaintTarget::Auto,
@@ -1972,6 +2154,10 @@ impl eframe::App for SmsEditorApp {
             ui.separator();
             if self.embedded_dolphin.is_some() {
                 self.embedded_dolphin_viewport(ui, frame);
+            } else if self.tool == EditorTool::Mask {
+                // The Mask Tool takes the viewport over: it is a model editor,
+                // not a stage view, so the stage would only be in the way.
+                self.mask_tool_viewport(ui);
             } else {
                 self.viewport(ui);
             }

@@ -530,6 +530,23 @@ impl SmsEditorApp {
             return;
         }
 
+        // Before the tool's own input, and outside its tool check: an effect
+        // can be dragged onto the map without the Material Library being the
+        // active tool, the same way an object can be dragged out of the palette.
+        if self.handle_material_library_drop(rect, response) {
+            self.sync_material_library_highlight();
+            self.mark_viewport_interaction(ui);
+            return;
+        }
+
+        let material_library_clicked =
+            self.handle_material_library_viewport_input(ui, rect, response);
+        self.sync_material_library_highlight();
+        if material_library_clicked {
+            self.mark_viewport_interaction(ui);
+            return;
+        }
+
         if response.clicked() && self.hovered_gizmo_axis.is_none() && !gizmo_using_pointer {
             self.content_browser.inspector_active = false;
             if let Some(pos) = response.interact_pointer_pos() {
@@ -3344,6 +3361,9 @@ pub(super) fn transform_from_gizmo_drag(
         pointer_delta.x * drag.screen_direction.x + pointer_delta.y * drag.screen_direction.y;
     let axis = drag.axis.index();
     match drag.tool {
+        // Dressing materials is not a transform, so a gizmo drag never carries
+        // this tool.
+        EditorTool::Material => {}
         EditorTool::Move => {
             let mut value = drag.start_transform.translation[axis]
                 + projected_pixels * drag.world_units_per_pixel;
@@ -3384,6 +3404,7 @@ pub(super) fn transform_from_gizmo_drag(
         | EditorTool::VertexPaint
         | EditorTool::Boolean
         | EditorTool::Goop
+        | EditorTool::Mask
         | EditorTool::Place => {}
     }
     transform

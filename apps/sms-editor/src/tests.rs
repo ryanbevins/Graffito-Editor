@@ -2376,35 +2376,6 @@ fn npc_archive_models_are_supported_object_previews() {
 }
 
 #[test]
-fn manager_model_wait_animation_candidates_keep_the_exact_archive_scope() {
-    let object = SceneObject::new("gesso", "Gesso");
-    let candidates = starting_joint_animation_candidates(
-        &object,
-        r"C:\game\ricco0.szs!\rikugesso\geso_model1.bmd",
-        None,
-    );
-
-    assert_eq!(
-        &candidates[..2],
-        &[
-            "C:/game/ricco0.szs!/rikugesso/geso_wait1.bck".to_string(),
-            "C:/game/ricco0.szs!/rikugesso/geso_wait.bck".to_string(),
-        ]
-    );
-}
-
-#[test]
-fn unrelated_model_names_do_not_invent_wait_animations() {
-    let object = SceneObject::new("map object", "MapObjBase");
-    assert!(starting_joint_animation_candidates(
-        &object,
-        "stage.szs!/mapobj/normalblock.bmd",
-        None,
-    )
-    .is_empty());
-}
-
-#[test]
 fn world_model_path_normalization_deduplicates_scene_instances() {
     let world_models = BTreeSet::from([normalized_preview_asset_path(
         r"C:\game\dolpic0.szs!/map/map/sky.bmd",
@@ -5681,103 +5652,6 @@ fn probe_tables_roundtrip() {
 /// Lists resources in an exported stage archive matching a filter.
 /// `GRAFFITO_PROBE_SZS=<path> GRAFFITO_PROBE_MATCH=pollution cargo test
 /// probe_szs_contents -- --ignored --nocapture`
-/// Reproduces what the archive writer emits for a brand-new folder, so it can
-/// be compared against a folder that came from retail.
-/// `GRAFFITO_PROBE_SZS=<retail.szs> cargo test probe_rarc_new_folder --
-/// --ignored --nocapture`
-#[test]
-#[ignore]
-fn probe_rarc_new_folder() {
-    let Ok(path) = std::env::var("GRAFFITO_PROBE_SZS") else {
-        return;
-    };
-    let raw = std::fs::read(&path).expect("read archive");
-    let decoded = match sms_formats::decode_yaz0(&raw) {
-        Ok(decoded) => decoded,
-        Err(_) => raw.clone(),
-    };
-    let document = sms_formats::RarcDocument::parse(&decoded).expect("parse rarc");
-    let mut builder = sms_formats::RarcBuilder::from_document(&document).expect("builder");
-    builder
-        .insert_file(b"hamukuri_L00/default.bmd", vec![0_u8; 64])
-        .expect("insert model");
-    builder
-        .insert_file(b"hamukuri_L00/bas/hamukuri_walk.bas", vec![0_u8; 16])
-        .expect("insert bas");
-    let rebuilt = builder.into_document().expect("rebuild");
-    let bytes = rebuilt.to_bytes().expect("serialize");
-    let reparsed = sms_formats::RarcDocument::parse(&bytes).expect("reparse");
-    for node in &reparsed.nodes {
-        let name = String::from_utf8_lossy(&node.raw_name).to_string();
-        if !name.starts_with("hamukuri") {
-            continue;
-        }
-        println!(
-            "node name={name:?} type={:02X?} hash={:#06x} entries={}",
-            node.node_type, node.name_hash, node.entry_count
-        );
-        let first = node.first_entry_index as usize;
-        for offset in 0..node.entry_count as usize {
-            if let Some(entry) = reparsed.entries.get(first + offset) {
-                println!(
-                    "    entry name={:?} id={:#06x} flags={:#04x}",
-                    String::from_utf8_lossy(&entry.raw_name),
-                    entry.file_id,
-                    entry.flags
-                );
-            }
-        }
-    }
-}
-
-/// Dumps RARC directory nodes so a built archive can be compared against a
-/// retail one. Local diagnostic:
-/// `GRAFFITO_PROBE_SZS=<path.szs> GRAFFITO_PROBE_MATCH=hamukuri
-/// cargo test probe_rarc_nodes -- --ignored --nocapture`
-#[test]
-#[ignore]
-fn probe_rarc_nodes() {
-    let Ok(path) = std::env::var("GRAFFITO_PROBE_SZS") else {
-        return;
-    };
-    let needle = std::env::var("GRAFFITO_PROBE_MATCH")
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let raw = std::fs::read(&path).expect("read archive");
-    let decoded = match sms_formats::decode_yaz0(&raw) {
-        Ok(decoded) => decoded,
-        Err(_) => raw.clone(),
-    };
-    let document = sms_formats::RarcDocument::parse(&decoded).expect("parse rarc");
-    println!(
-        "nodes: {}, entries: {}",
-        document.nodes.len(),
-        document.entries.len()
-    );
-    for (index, node) in document.nodes.iter().enumerate() {
-        let name = String::from_utf8_lossy(&node.raw_name).to_string();
-        if !needle.is_empty() && !name.to_ascii_lowercase().contains(&needle) {
-            continue;
-        }
-        println!(
-            "node {index}: name={name:?} type={:02X?} hash={:#06x} entries={} first={}",
-            node.node_type, node.name_hash, node.entry_count, node.first_entry_index
-        );
-        let first = node.first_entry_index as usize;
-        for offset in 0..node.entry_count as usize {
-            if let Some(entry) = document.entries.get(first + offset) {
-                println!(
-                    "    entry: name={:?} id={:#06x} flags={:#04x} hash={:#06x}",
-                    String::from_utf8_lossy(&entry.raw_name),
-                    entry.file_id,
-                    entry.flags,
-                    entry.name_hash
-                );
-            }
-        }
-    }
-}
-
 #[test]
 #[ignore]
 fn probe_szs_contents() {
@@ -5840,6 +5714,344 @@ fn probe_resource_hashes() {
                 bytes.len(),
                 hash
             );
+        }
+    }
+}
+
+/// Reports what colour data an actor model's triangles carry, to see why one
+/// renders untinted. `GRAFFITO_PROBE_SZS=<stage.szs>
+/// GRAFFITO_PROBE_BMD=poihana/default.bmd
+/// cargo test probe_actor_colour -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_actor_colour() {
+    let Ok(path) = std::env::var("GRAFFITO_PROBE_SZS") else {
+        return;
+    };
+    let bmd = std::env::var("GRAFFITO_PROBE_BMD").expect("GRAFFITO_PROBE_BMD");
+    let assets = sms_formats::mount_scene_archive(std::path::Path::new(&path)).expect("mount");
+    let asset = assets
+        .iter()
+        .find(|a| {
+            a.path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .ends_with(&bmd.to_ascii_lowercase())
+        })
+        .unwrap_or_else(|| panic!("no asset ending {bmd}"));
+    let bytes = sms_formats::read_stage_asset_bytes(&asset.path).expect("read");
+    let model = sms_formats::J3dFile::parse(&bytes).expect("parse");
+
+    for flags in [
+        sms_formats::SMS_MAP_MODEL_LOAD_FLAGS,
+        0x0102_0000,
+        0x1102_0000,
+    ] {
+        let Ok(geometry) = model.geometry_preview_with_loader_flags(flags) else {
+            println!("flags {flags:#010x}: geometry failed");
+            continue;
+        };
+        let mut modes = std::collections::BTreeMap::new();
+        let mut with_color = 0usize;
+        let mut with_vertex = 0usize;
+        let mut sample = None;
+        for triangle in &geometry.triangles {
+            *modes
+                .entry(format!("{:?}", triangle.combine_mode))
+                .or_insert(0usize) += 1;
+            if let Some(color) = triangle.color {
+                with_color += 1;
+                if sample.is_none() {
+                    sample = Some(color);
+                }
+            }
+            if triangle.vertex_colors.is_some() || triangle.color_channels[0].is_some() {
+                with_vertex += 1;
+            }
+        }
+        println!(
+            "flags {flags:#010x}: {} tris, modes {modes:?}, color {with_color} (eg {sample:?}), vertex {with_vertex}, materials {}",
+            geometry.triangles.len(),
+            geometry.materials.len()
+        );
+        for material in geometry.materials.iter().take(4) {
+            println!(
+                "   [{}] mat {:?} k {:?} tev {:?} chan0 amb {:?} mat {:?} tex {:?}",
+                material.name,
+                material.material_colors,
+                material.tev_k_colors,
+                material.tev_colors,
+                material.ambient_colors,
+                material.material_colors[0],
+                material.texture_indices.iter().flatten().next()
+            );
+        }
+    }
+}
+
+/// Runs the mask preview's TEV evaluation against a real actor material, to
+/// confirm a toon-shaded body resolves to its own colour rather than grey.
+/// `GRAFFITO_PROBE_SZS=<stage.szs> GRAFFITO_PROBE_BMD=poihana/default.bmd
+/// cargo test probe_tev_colour -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_tev_colour() {
+    let Ok(path) = std::env::var("GRAFFITO_PROBE_SZS") else {
+        return;
+    };
+    let bmd = std::env::var("GRAFFITO_PROBE_BMD").expect("GRAFFITO_PROBE_BMD");
+    let assets = sms_formats::mount_scene_archive(std::path::Path::new(&path)).expect("mount");
+    let asset = assets
+        .iter()
+        .find(|a| {
+            a.path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .ends_with(&bmd.to_ascii_lowercase())
+        })
+        .expect("model");
+    let bytes = sms_formats::read_stage_asset_bytes(&asset.path).expect("read");
+    let model = sms_formats::J3dFile::parse(&bytes).expect("parse");
+    let geometry = model
+        .geometry_preview_with_loader_flags(0x0102_0000)
+        .expect("geometry");
+    for material in &geometry.materials {
+        // Sample the ramp at mid intensity, which is what a lit body reads.
+        // Ramps are skipped in the preview, so they read neutral.
+        let colour = crate::mask_tool::evaluate_tev(material, [0.75; 4], &|map, _coord| {
+            let neutral = geometry
+                .textures
+                .get(map)
+                .map(|texture| texture.name.to_ascii_lowercase().contains("toon"))
+                .unwrap_or(false);
+            if neutral {
+                [1.0; 4]
+            } else {
+                [0.6, 0.6, 0.6, 1.0]
+            }
+        });
+        println!(
+            "[{}] {} stages -> rgb {:?}",
+            material.name,
+            material.tev_stages.len(),
+            &colour[..3]
+        );
+    }
+}
+
+/// Bakes the stain into the real retail Stu model and round-trips it.
+/// `GRAFFITO_PROBE_BASE_ROOT=... cargo test probe_stain_bake -- --ignored
+/// --nocapture`
+#[test]
+#[ignore]
+fn probe_stain_bake() {
+    let Ok(base_root) = std::env::var("GRAFFITO_PROBE_BASE_ROOT") else {
+        return;
+    };
+    let base_root = std::path::Path::new(&base_root);
+    let archives = sms_formats::discover_scene_archives(base_root).expect("discover");
+    let bianco = archives
+        .iter()
+        .find(|archive| archive.stage_id == "bianco0")
+        .expect("bianco0");
+    let assets = sms_formats::mount_scene_archive(&bianco.path).expect("mount");
+    let find = |suffix: &str| {
+        assets
+            .iter()
+            .find(|asset| {
+                asset
+                    .path
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .ends_with(suffix)
+            })
+            .map(|asset| sms_formats::read_stage_asset_bytes(&asset.path).expect("read"))
+            .expect(suffix)
+    };
+    let model_bytes = find("hamukuri/default.bmd");
+    let stain_bytes = find("h_ma_rak.bti");
+
+    let mut model = sms_formats::J3dRebuildDocument::parse(&model_bytes).expect("parse model");
+    let stain = sms_formats::BtiFile::parse(&stain_bytes).expect("parse stain");
+
+    for section in &model.sections {
+        let sms_formats::J3dRebuildSectionData::Materials(materials) = &section.data else {
+            continue;
+        };
+        if let Some(names) = &materials.names {
+            for (index, entry) in names.entries.iter().enumerate() {
+                if entry.name == "_mat_body_top1" {
+                    println!("material index {index}");
+                }
+            }
+        }
+        for (index, record) in materials.material_init_records.iter().enumerate() {
+            println!(
+                "record {index}: alpha {:?} color {:?}",
+                record.tev_konst_alpha_selectors, record.tev_konst_color_selectors
+            );
+        }
+    }
+    let replaced = model
+        .replace_named_texture_from_bti("H_ma_rak_dummy", &stain)
+        .expect("replace texture");
+    let pinned = model
+        .pin_material_konst_alpha_half("_mat_body_top1")
+        .expect("pin alpha");
+    println!("replaced {replaced} texture slot(s), pinned {pinned} TEV stage(s)");
+    assert!(
+        replaced > 0,
+        "the dummy slot must exist in the retail model"
+    );
+    assert!(pinned > 0, "the stain material must use K0 alpha");
+
+    let encoded = model.to_bytes().expect("encode");
+    let reparsed = sms_formats::J3dRebuildDocument::parse(&encoded).expect("reparse");
+    let repinned = {
+        let mut copy = reparsed.clone();
+        copy.pin_material_konst_alpha_half("_mat_body_top1")
+            .expect("pin twice")
+    };
+    assert_eq!(repinned, 0, "a second pin must find nothing left to pin");
+
+    // The toggle's off state: unpinning must restore both pristine selector
+    // arrays exactly, including unrelated half selectors in inactive stages.
+    let mut unbaked = reparsed.clone();
+    let unpinned = unbaked
+        .pin_material_konst_alpha_half("_mat_body_top1")
+        .map(|_| 0usize)
+        .unwrap_or(0)
+        + unbaked
+            .unpin_material_konst_alpha_half("_mat_body_top1")
+            .expect("unpin");
+    assert_eq!(unpinned, pinned, "unpin must reverse exactly what pin did");
+    let pristine = sms_formats::J3dRebuildDocument::parse(&model_bytes).expect("pristine");
+    for (section, original) in unbaked.sections.iter().zip(pristine.sections.iter()) {
+        let (
+            sms_formats::J3dRebuildSectionData::Materials(edited),
+            sms_formats::J3dRebuildSectionData::Materials(reference),
+        ) = (&section.data, &original.data)
+        else {
+            continue;
+        };
+        for (record, reference_record) in edited
+            .material_init_records
+            .iter()
+            .zip(reference.material_init_records.iter())
+        {
+            assert_eq!(
+                record.tev_konst_alpha_selectors,
+                reference_record.tev_konst_alpha_selectors
+            );
+            assert_eq!(
+                record.tev_konst_color_selectors,
+                reference_record.tev_konst_color_selectors
+            );
+        }
+    }
+}
+
+/// Writes a wash level into each wired actor and reads it back, so baking is
+/// proven against the real models rather than assumed.
+#[test]
+#[ignore]
+fn probe_wash_bake_roundtrip() {
+    let Ok(root) = std::env::var("GRAFFITO_PROBE_ROOT") else {
+        return;
+    };
+    let user_stage = std::env::var("GRAFFITO_PROBE_USER_SZS").unwrap_or_default();
+    let actors = [
+        ("USER", "pakkun/pakun"),
+        ("USER", "bgeso/bgeso_body"),
+        ("bianco0.szs", "hamukuri/default"),
+        ("USER", "bosspakkun/bosspaku_model"),
+    ];
+    for (scene, needle) in actors {
+        let path = if scene == "USER" {
+            std::path::PathBuf::from(&user_stage)
+        } else {
+            std::path::Path::new(&root).join("scene").join(scene)
+        };
+        let Ok(assets) = sms_formats::mount_scene_archive(&path) else {
+            continue;
+        };
+        let Some(asset) = assets.iter().find(|a| {
+            let text = a
+                .path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase();
+            text.contains(needle) && (text.ends_with(".bmd") || text.ends_with(".bdl"))
+        }) else {
+            println!("{needle}: not found");
+            continue;
+        };
+        let Ok(bytes) = sms_formats::read_stage_asset_bytes(&asset.path) else {
+            continue;
+        };
+        let Ok(geometry) = sms_formats::J3dFile::parse(&bytes).and_then(|model| {
+            model.geometry_preview_with_loader_flags(sms_formats::SMS_MAP_MODEL_LOAD_FLAGS)
+        }) else {
+            continue;
+        };
+        let wash: Vec<String> = geometry
+            .materials
+            .iter()
+            .filter(|material| {
+                material
+                    .tev_stages
+                    .iter()
+                    .any(|stage| stage.color_op >= 8 || stage.alpha_op >= 8)
+            })
+            .map(|material| material.name.clone())
+            .collect();
+        let Ok(mut model) = sms_formats::J3dRebuildDocument::parse(&bytes) else {
+            println!("{needle}: rebuild parse failed");
+            continue;
+        };
+        println!("== {needle}: wash materials {wash:?}");
+        let mut written = 0usize;
+        for name in &wash {
+            let Some(register) = model.material_wash_konst_register(name) else {
+                println!("   [{name}] no konst register found");
+                continue;
+            };
+            match model.set_material_konst_alpha(name, register, 96) {
+                Ok(count) => {
+                    println!("   [{name}] konst register {register}, wrote {count}");
+                    written += count;
+                }
+                Err(error) => println!("   [{name}] write failed: {error}"),
+            }
+        }
+        if written == 0 {
+            continue;
+        }
+        match model.to_bytes() {
+            Ok(rebuilt) => {
+                // Read the level back out through the preview pipeline.
+                let level = sms_formats::J3dFile::parse(&rebuilt)
+                    .and_then(|model| {
+                        model.geometry_preview_with_loader_flags(
+                            sms_formats::SMS_MAP_MODEL_LOAD_FLAGS,
+                        )
+                    })
+                    .ok()
+                    .and_then(|geometry| {
+                        geometry.materials.iter().find_map(|material| {
+                            wash.contains(&material.name)
+                                .then(|| material.tev_k_colors.map(|konst| konst[3]))
+                        })
+                    });
+                println!(
+                    "   rebuilt {} bytes (was {}), konst alphas now {level:?}",
+                    rebuilt.len(),
+                    bytes.len()
+                );
+            }
+            Err(error) => println!("   rebuild failed: {error}"),
         }
     }
 }
@@ -5965,117 +6177,5 @@ fn probe_pollution_textures() {
             continue;
         };
         println!("{name}: textures = {:?}", model.texture_names());
-    }
-}
-
-/// Bakes the stain into the real retail Stu model and round-trips it.
-/// `GRAFFITO_PROBE_BASE_ROOT=... cargo test probe_stain_bake -- --ignored
-/// --nocapture`
-#[test]
-#[ignore]
-fn probe_stain_bake() {
-    let Ok(base_root) = std::env::var("GRAFFITO_PROBE_BASE_ROOT") else {
-        return;
-    };
-    let base_root = std::path::Path::new(&base_root);
-    let archives = sms_formats::discover_scene_archives(base_root).expect("discover");
-    let bianco = archives
-        .iter()
-        .find(|archive| archive.stage_id == "bianco0")
-        .expect("bianco0");
-    let assets = sms_formats::mount_scene_archive(&bianco.path).expect("mount");
-    let find = |suffix: &str| {
-        assets
-            .iter()
-            .find(|asset| {
-                asset
-                    .path
-                    .to_string_lossy()
-                    .to_ascii_lowercase()
-                    .ends_with(suffix)
-            })
-            .map(|asset| sms_formats::read_stage_asset_bytes(&asset.path).expect("read"))
-            .expect(suffix)
-    };
-    let model_bytes = find("hamukuri/default.bmd");
-    let stain_bytes = find("h_ma_rak.bti");
-
-    let mut model = sms_formats::J3dRebuildDocument::parse(&model_bytes).expect("parse model");
-    let stain = sms_formats::BtiFile::parse(&stain_bytes).expect("parse stain");
-
-    for section in &model.sections {
-        let sms_formats::J3dRebuildSectionData::Materials(materials) = &section.data else {
-            continue;
-        };
-        if let Some(names) = &materials.names {
-            for (index, entry) in names.entries.iter().enumerate() {
-                if entry.name == "_mat_body_top1" {
-                    println!("material index {index}");
-                }
-            }
-        }
-        for (index, record) in materials.material_init_records.iter().enumerate() {
-            println!(
-                "record {index}: alpha {:?} color {:?}",
-                record.tev_konst_alpha_selectors, record.tev_konst_color_selectors
-            );
-        }
-    }
-    let replaced = model
-        .replace_named_texture_from_bti("H_ma_rak_dummy", &stain)
-        .expect("replace texture");
-    let pinned = model
-        .pin_material_konst_alpha_half("_mat_body_top1")
-        .expect("pin alpha");
-    println!("replaced {replaced} texture slot(s), pinned {pinned} TEV stage(s)");
-    assert!(
-        replaced > 0,
-        "the dummy slot must exist in the retail model"
-    );
-    assert!(pinned > 0, "the stain material must use K0 alpha");
-
-    let encoded = model.to_bytes().expect("encode");
-    let reparsed = sms_formats::J3dRebuildDocument::parse(&encoded).expect("reparse");
-    let repinned = {
-        let mut copy = reparsed.clone();
-        copy.pin_material_konst_alpha_half("_mat_body_top1")
-            .expect("pin twice")
-    };
-    assert_eq!(repinned, 0, "a second pin must find nothing left to pin");
-
-    // The toggle's off state: unpinning must restore both pristine selector
-    // arrays exactly, including unrelated half selectors in inactive stages.
-    let mut unbaked = reparsed.clone();
-    let unpinned = unbaked
-        .pin_material_konst_alpha_half("_mat_body_top1")
-        .map(|_| 0usize)
-        .unwrap_or(0)
-        + unbaked
-            .unpin_material_konst_alpha_half("_mat_body_top1")
-            .expect("unpin");
-    assert_eq!(unpinned, pinned, "unpin must reverse exactly what pin did");
-    let pristine = sms_formats::J3dRebuildDocument::parse(&model_bytes).expect("pristine");
-    for (section, original) in unbaked.sections.iter().zip(pristine.sections.iter()) {
-        let (
-            sms_formats::J3dRebuildSectionData::Materials(edited),
-            sms_formats::J3dRebuildSectionData::Materials(reference),
-        ) = (&section.data, &original.data)
-        else {
-            continue;
-        };
-        for (record, reference_record) in edited
-            .material_init_records
-            .iter()
-            .zip(reference.material_init_records.iter())
-        {
-            assert_eq!(
-                record.tev_konst_alpha_selectors,
-                reference_record.tev_konst_alpha_selectors
-            );
-            assert_eq!(
-                record.tev_konst_color_selectors,
-                reference_record.tev_konst_color_selectors
-            );
-        }
     }
 }

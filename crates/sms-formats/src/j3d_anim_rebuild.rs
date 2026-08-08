@@ -360,6 +360,117 @@ impl J3dAnimationRebuildDocument {
     /// animations return the number of surviving bindings. Texture-SRT value
     /// banks are compacted and the surviving key-table offsets are rewritten so
     /// removed bindings cannot leave non-padding bytes outside the typed model.
+    /// Renames every material this animation drives.
+    ///
+    /// A sampled animation names the material it was authored against. Landing
+    /// it on a material of another name means saying so here, or the stage
+    /// loads an animation that drives nothing.
+    pub fn rename_material_bindings(&mut self, from: &str, to: &str) -> Result<usize> {
+        let mut renamed = 0;
+        for table in self.material_name_tables_mut() {
+            for entry in &mut table.entries {
+                if entry.name == from {
+                    // The name only. Its hash is derived at encode time, and
+                    // its offset is laid out then too.
+                    entry.name = to.to_string();
+                    renamed += 1;
+                }
+            }
+        }
+        Ok(renamed)
+    }
+
+    fn material_name_tables_mut(&mut self) -> Vec<&mut J3dAnimationNameTable> {
+        match &mut self.section {
+            J3dAnimationSection::TextureSrt(value) => vec![
+                &mut value.primary.material_names,
+                &mut value.post.material_names,
+            ],
+            J3dAnimationSection::TexturePattern(value) => vec![&mut value.material_names],
+            J3dAnimationSection::MaterialColor(value) => vec![&mut value.material_names],
+            J3dAnimationSection::TevRegister(value) => vec![
+                &mut value.color_registers.material_names,
+                &mut value.konst_registers.material_names,
+            ],
+            // Joint animation drives bones, which carry no material name.
+            J3dAnimationSection::JointKey(_) => Vec::new(),
+        }
+    }
+
+    /// Lays the animation out again from what it now holds.
+    ///
+    /// The encoder reproduces a parsed file byte for byte, writing each bank at
+    /// the offset it was read from -- which is what makes a round trip exact,
+    /// and what makes a *grown* animation unencodable: merged tracks have
+    /// nowhere to go past the section size the source declared. This assigns
+    /// fresh offsets, re-places the names, and sizes the section to fit, the
+    /// same way `canonicalize_material_layout` does for a model.
+    pub fn canonicalize_layout(&mut self) -> Result<()> {
+        let J3dAnimationSection::TextureSrt(value) = &mut self.section else {
+            return Err(unsupported(
+                "only scroll animations can be laid out again so far".to_string(),
+            ));
+        };
+        // Reconstruction metadata describes the bytes of the file this was read
+        // from. Once the layout moves it describes nothing, and replaying it
+        // would write the old file's leftovers over the new one's banks.
+        value.reconstruction.residue_regions.clear();
+        self.layout.padding.clear();
+
+        let mut cursor = TTK1_HEADER_SIZE;
+        layout_srt_set(&mut value.primary, &mut cursor)?;
+        layout_srt_set(&mut value.post, &mut cursor)?;
+
+        let size = align_up_usize(cursor, 0x20);
+        self.layout.actual_section_size = to_u32(size, "animation section size")?;
+        self.layout.declared_section_size = self.layout.actual_section_size;
+        Ok(())
+    }
+
+    /// Folds another animation's tracks into this one.
+    ///
+    /// A stage loads one animation file per model -- `map.btk` beside
+    /// `map.bmd` -- so an installed effect cannot ship as a file of its own. It
+    /// has to join the file already there, which means appending the incoming
+    /// tracks and shifting every index they hold into this file's pools.
+    ///
+    /// Both sides must be the same kind of animation. Merging is refused rather
+    /// than coerced: a scroll and a flipbook drive different machinery.
+    pub fn merge_animation(&mut self, source: &Self) -> Result<usize> {
+        let mut merged = self.clone();
+        let count = merged.merge_animation_in_place(source)?;
+        *self = merged;
+        Ok(count)
+    }
+
+    fn merge_animation_in_place(&mut self, source: &Self) -> Result<usize> {
+        let merged = self.merge_animation_sections(source)?;
+        // The banks just grew past what the source file declared, so the file
+        // has to be laid out again before it can be written at all.
+        self.canonicalize_layout()?;
+        Ok(merged)
+    }
+
+    fn merge_animation_sections(&mut self, source: &Self) -> Result<usize> {
+        match (&mut self.section, &source.section) {
+            (
+                J3dAnimationSection::TextureSrt(target),
+                J3dAnimationSection::TextureSrt(incoming),
+            ) => {
+                let mut merged = 0;
+                merged += merge_texture_srt_set(&mut target.primary, &incoming.primary)?;
+                merged += merge_texture_srt_set(&mut target.post, &incoming.post)?;
+                target.max_frame = target.max_frame.max(incoming.max_frame);
+                Ok(merged)
+            }
+            (left, right) => Err(unsupported(format!(
+                "cannot merge {} into {}",
+                animation_section_label(right),
+                animation_section_label(left)
+            ))),
+        }
+    }
+
     pub fn retain_material_bindings_named(&mut self, material_name: &str) -> Result<Option<usize>> {
         match &mut self.section {
             J3dAnimationSection::JointKey(_) => Ok(None),
@@ -410,6 +521,128 @@ impl J3dAnimationRebuildDocument {
                 Ok(Some(color + konst))
             }
         }
+    }
+}
+
+/// Appends one SRT set's tracks to another, shifting every index they carry.
+///
+/// A key table does not hold its values: it holds a count and an offset into
+/// the set's shared pool. Appending the incoming pools moves nothing that was
+/// already there, so the tracks that arrive are the only ones that need their
+/// offsets moved -- by exactly the length of the pool they landed behind.
+/// TTK1's header, before the first bank.
+const TTK1_HEADER_SIZE: usize = 0x60;
+
+fn align_up_usize(value: usize, alignment: usize) -> usize {
+    value.div_ceil(alignment) * alignment
+}
+
+/// Places one set's eight banks, and says where the next set starts.
+///
+/// An empty bank keeps an offset of zero rather than an address with nothing
+/// at it, which is how a shipping file spells "this set is unused" -- most BTKs
+/// carry no post-matrix set at all.
+fn layout_srt_set(value: &mut J3dTextureSrtSet, cursor: &mut usize) -> Result<()> {
+    // Names first, because their descriptors and their strings both live inside
+    // the table and the entries have to say where they landed.
+    let mut relative = 4 + value.material_names.entries.len() * 4;
+    for entry in &mut value.material_names.entries {
+        let (encoded, _, had_errors) = SHIFT_JIS.encode(&entry.name);
+        if had_errors {
+            return Err(unsupported("name cannot be represented in Shift-JIS"));
+        }
+        entry.relative_offset = to_u16(relative, "name offset")?;
+        relative += encoded.len() + 1;
+    }
+    let name_table_size = if value.material_names.entries.is_empty() {
+        0
+    } else {
+        relative
+    };
+
+    let banks: [usize; 8] = [
+        value.tables.len() * 0x12,
+        value.material_remap.len() * 2,
+        name_table_size,
+        value.texture_matrix_ids.len(),
+        value.centers.len() * 12,
+        value.scales.len() * 4,
+        value.rotations.len() * 2,
+        value.translations.len() * 4,
+    ];
+    for (slot, size) in banks.iter().enumerate() {
+        if *size == 0 {
+            value.offsets[slot] = 0;
+            continue;
+        }
+        *cursor = align_up_usize(*cursor, 4);
+        value.offsets[slot] = to_u32(*cursor, "animation bank offset")?;
+        *cursor += size;
+    }
+    Ok(())
+}
+
+fn merge_texture_srt_set(
+    target: &mut J3dTextureSrtSet,
+    source: &J3dTextureSrtSet,
+) -> Result<usize> {
+    if source.tables.is_empty() {
+        return Ok(0);
+    }
+    let scale_base = target.scales.len();
+    let rotation_base = target.rotations.len();
+    let translation_base = target.translations.len();
+    let center_base = target.centers.len();
+    let table_base = target.tables.len();
+
+    target.scales.extend_from_slice(&source.scales);
+    target.rotations.extend_from_slice(&source.rotations);
+    target.translations.extend_from_slice(&source.translations);
+    target.centers.extend_from_slice(&source.centers);
+    target
+        .texture_matrix_ids
+        .extend_from_slice(&source.texture_matrix_ids);
+
+    let shift = |key: J3dKeyTable, base: usize| -> Result<J3dKeyTable> {
+        let value_offset = u16::try_from(key.value_offset as usize + base)
+            .map_err(|_| unsupported("the merged animation carries too many keys".to_string()))?;
+        Ok(J3dKeyTable {
+            value_offset,
+            ..key
+        })
+    };
+    for table in &source.tables {
+        target.tables.push(J3dTransformKeyTable {
+            scale: shift(table.scale, scale_base)?,
+            rotation: shift(table.rotation, rotation_base)?,
+            translation: shift(table.translation, translation_base)?,
+        });
+    }
+    let _ = center_base;
+
+    // The remap says which track a material uses, so incoming entries point at
+    // where their tracks landed rather than where they came from.
+    for entry in &source.material_remap {
+        let moved = u16::try_from(*entry as usize + table_base).map_err(|_| {
+            unsupported("the merged animation drives too many materials".to_string())
+        })?;
+        target.material_remap.push(moved);
+    }
+    target
+        .material_names
+        .entries
+        .extend(source.material_names.entries.iter().cloned());
+
+    Ok(source.material_names.entries.len())
+}
+
+fn animation_section_label(section: &J3dAnimationSection) -> &'static str {
+    match section {
+        J3dAnimationSection::JointKey(_) => "a joint animation",
+        J3dAnimationSection::TexturePattern(_) => "a flipbook",
+        J3dAnimationSection::TextureSrt(_) => "a scroll",
+        J3dAnimationSection::MaterialColor(_) => "a colour animation",
+        J3dAnimationSection::TevRegister(_) => "a register animation",
     }
 }
 
@@ -1694,6 +1927,82 @@ mod tests {
         let mut rebuilt = [0; 16];
         write_header_tag(&mut rebuilt, parsed);
         assert_eq!(rebuilt, source);
+    }
+
+    /// Retargets one material's tracks out of a sampled animation and folds
+    /// them into another stage's.
+    ///
+    /// ```text
+    /// SMS_ANIM_SOURCE=<ricco map.btk> SMS_ANIM_SOURCE_MATERIAL=_0010sibuki1_1 \
+    /// SMS_ANIM_TARGET=<your map.btk> SMS_ANIM_TARGET_MATERIAL=_m_yane0 \
+    ///   cargo test -p sms-formats probe_animation_merge -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs SMS_ANIM_SOURCE and SMS_ANIM_TARGET"]
+    fn probe_animation_merge() {
+        let source_path = std::env::var("SMS_ANIM_SOURCE").expect("set SMS_ANIM_SOURCE");
+        let target_path = std::env::var("SMS_ANIM_TARGET").expect("set SMS_ANIM_TARGET");
+        let source_material =
+            std::env::var("SMS_ANIM_SOURCE_MATERIAL").expect("set SMS_ANIM_SOURCE_MATERIAL");
+        let target_material =
+            std::env::var("SMS_ANIM_TARGET_MATERIAL").expect("set SMS_ANIM_TARGET_MATERIAL");
+
+        let mut sampled = J3dAnimationRebuildDocument::parse(
+            std::fs::read(&source_path).expect("read the sampled animation"),
+        )
+        .expect("parse the sampled animation");
+        let mut target = J3dAnimationRebuildDocument::parse(
+            std::fs::read(&target_path).expect("read the target animation"),
+        )
+        .expect("parse the target animation");
+
+        let kept = sampled
+            .retain_material_bindings_named(&source_material)
+            .expect("retain")
+            .expect("the sampled animation drives that material");
+        let renamed = sampled
+            .rename_material_bindings(&source_material, &target_material)
+            .expect("rename");
+        println!("kept {kept} binding(s), renamed {renamed}");
+
+        let before = animation_material_names(&target);
+        let merged = target.merge_animation(&sampled).expect("merge");
+        println!("merged {merged} material(s)");
+
+        let encoded = target.to_bytes().expect("encode the merged animation");
+        let reparsed =
+            J3dAnimationRebuildDocument::parse(&encoded).expect("reparse the merged animation");
+        let after = animation_material_names(&reparsed);
+        println!("materials {} -> {}", before.len(), after.len());
+        for name in &after {
+            if !before.contains(name) {
+                println!("  new: {name:?}");
+            }
+        }
+        for name in &before {
+            assert!(
+                after.contains(name),
+                "merging dropped {name:?}, which the stage already animated"
+            );
+        }
+        assert!(
+            after.contains(&target_material),
+            "the retargeted material did not survive the merge"
+        );
+    }
+
+    fn animation_material_names(document: &J3dAnimationRebuildDocument) -> Vec<String> {
+        match &document.section {
+            J3dAnimationSection::TextureSrt(value) => value
+                .primary
+                .material_names
+                .entries
+                .iter()
+                .chain(value.post.material_names.entries.iter())
+                .map(|entry| entry.name.clone())
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     #[test]

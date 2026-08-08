@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 mod gltf_fixtures;
+mod material_index;
+mod material_library;
 
 const US_REGRESSION_FOLDER: &str = "SunshineUSExport";
 const EXPECTED_US_STAGE_COUNT: usize = 108;
@@ -29,6 +31,8 @@ fn run() -> Result<(), String> {
     match arguments.first().and_then(|argument| argument.to_str()) {
         Some("regression") => run_regression(repo_root, RegressionOptions::parse(arguments)?),
         Some("gltf-fixtures") => gltf_fixtures::run(repo_root, &arguments[1..]),
+        Some("material-index") => material_index::run(repo_root, &arguments[1..]),
+        Some("material-library") => material_library::run(repo_root, &arguments[1..]),
         Some("schema-bundle") => {
             run_schema_bundle(repo_root, SchemaBundleOptions::parse(arguments)?)
         }

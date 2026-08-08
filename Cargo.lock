@@ -1613,6 +1613,7 @@ dependencies = [
  "bytemuck",
  "eframe",
  "egui",
+ "image",
  "pollster",
  "raw-window-handle",
  "regex",
@@ -3499,6 +3500,7 @@ name = "sms-xtask"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "sms-formats",
  "sms-schema",
 ]
 

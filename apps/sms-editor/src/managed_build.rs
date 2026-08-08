@@ -18,9 +18,10 @@ use sms_scene::{
 use sms_schema::ObjectRegistry;
 
 use crate::direct_boot::{
-    patch_sms_dialogue_dol, patch_sms_direct_boot_dol, patch_sms_extended_collision_dol,
-    patch_sms_goop_enemy_managers_dol, patch_sms_goop_layer_spawn_dol,
-    patch_sms_sound_assignments_dol, patch_sms_stage_music_dol, RuntimeBalloonOverride,
+    dol_supports_goop_wash, install_goop_wash, patch_sms_dialogue_dol, patch_sms_direct_boot_dol,
+    patch_sms_extended_collision_dol, patch_sms_goop_enemy_managers_dol,
+    patch_sms_goop_layer_spawn_dol, patch_sms_sound_assignments_dol, patch_sms_stage_music_dol,
+    GoopWashActor, GoopWashReach, GoopWashSettings, RuntimeBalloonOverride,
     RuntimeDialogueOverride, RuntimeGoopLayerBinding, RuntimeGoopManagerPatch,
     RuntimeMusicRoleOverride, RuntimeSoundAssignment, RuntimeSoundAssignmentKind,
     RuntimeStageMusicOverride, RuntimeStageMusicTransition, RuntimeStageTarget,
@@ -1525,6 +1526,75 @@ fn install_managed_runtime_patches(
                 run.run_main_dol.display()
             )
         })?;
+    // Washing an authored goop layer off. The level and how stubborn it is come
+    // from the Mask Tool; the register comes from whichever one the bake claimed,
+    // since writing the wrong one leaves the coating sitting there looking like
+    // the wash never ran.
+    let goop_wash = project
+        .descriptor
+        .mask_bake_washable
+        .then(|| GoopWashSettings {
+            konst_register: project.descriptor.mask_wash_konst.min(3),
+            start_level: (project.descriptor.mask_wash_coverage.clamp(0.0, 1.0) * 255.0).round()
+                as u8,
+            resistance: project.descriptor.mask_wash_resistance.max(1),
+            step: project.descriptor.mask_wash_step.clamp(1, 255) as u8,
+            uniform_rate: project.descriptor.mask_wash_uniform_rate,
+            reach: match project.descriptor.mask_wash_reach.as_str() {
+                "enemies" => GoopWashReach::Enemies,
+                "everything" => GoopWashReach::Everything,
+                _ => GoopWashReach::Props,
+            },
+        });
+    // Only what this project authored, at every reach.
+    //
+    // The narrow hooks were treated as self-filtering because they are confined
+    // to classes that can carry a layer -- but that is a filter on the class,
+    // not on whether this actor was ever given a coating. Every enemy that got
+    // sprayed was entering the stub and having konst packets bound into
+    // materials that never asked for one, which is why baking Petey corrupted
+    // PoiHana.
+    let wash_allowlist: Vec<GoopWashActor> = project
+        .descriptor
+        .mask_wash_vtables
+        .iter()
+        .map(|vtable| {
+            // A class that paints its own colour needs it rebound alongside the
+            // wash level; one that paints none takes the konst-only form.
+            let tint = project
+                .descriptor
+                .mask_wash_tints
+                .iter()
+                .find(|tint| tint.vtable == *vtable);
+            GoopWashActor {
+                vtable: *vtable,
+                tinted_material: tint.map(|tint| tint.material),
+                tint_register: tint.map_or(0, |tint| tint.register),
+                tint: tint.map_or([0; 4], |tint| tint.color),
+            }
+        })
+        .collect();
+    // An empty allowlist means no filtering, which is right for the narrow
+    // reaches and catastrophic for the widest one: it would hand the stub every
+    // actor the spray touches and bind konst packets into models that never
+    // asked for one. Refuse rather than install something that crashes the game
+    // as soon as an unrelated actor is sprayed.
+    // An empty list means the wash cannot tell an authored actor from any
+    // other, so it would act on all of them. Nothing is installed rather than
+    // something that corrupts whatever gets sprayed.
+    let wash_knows_its_actors = !wash_allowlist.is_empty();
+    if let Some(wash) = goop_wash
+        .filter(|_| wash_knows_its_actors)
+        .filter(|_| dol_supports_goop_wash(&patched_bytes))
+    {
+        patched_bytes =
+            install_goop_wash(&patched_bytes, wash, &wash_allowlist).map_err(|error| {
+                format!(
+                    "Could not install the goop wash into '{}': {error}",
+                    run.run_main_dol.display()
+                )
+            })?;
+    }
     if !overrides.is_empty() {
         patched_bytes = patch_sms_stage_music_dol(&patched_bytes, &overrides)
             .map_err(|error| {

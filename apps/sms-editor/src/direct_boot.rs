@@ -7188,3 +7188,1415 @@ mod tests {
         assert!(address_is_in_text(&image.sections, patched.death_stub_address, 4).unwrap());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Washing an authored goop layer off at runtime.
+//
+// A goop layer draws where `mask(goop UV) <= K<n>_A`, so the coating recedes as
+// that konst register's alpha falls. Nothing in the retail game moves it for an
+// actor that never shipped with a wash, so this installs the code that does.
+//
+// It follows retail rather than inventing a scheme: the level comes from a
+// counter kept purely for the coating, the way BossPakkun counts water against
+// `mSLWaterMarkLimit` (bosspakkun.cpp:1790), not from hit points. That is what
+// keeps the wash cosmetic. Spraying still damages and still knocks the actor
+// about exactly as before; only the coating changes. The konst reaches the
+// material through `SMS_InitPacket_OneTevKColor`, the call Pakkun uses at
+// pakkun.cpp:948.
+//
+// The detour sits on `TSmallEnemy::decHpByWater`, reached through
+// `TSmallEnemy::receiveMessage` on HIT_MESSAGE_SPRAYED_BY_WATER
+// (smallEnemy.cpp:568). Actors that intercept the spray in their own
+// `receiveMessage` never arrive there and keep their coating; PoiHana is one.
+//
+// Each coated actor keeps its own level. One shared level made every coated
+// enemy wash together, and a newly spawned one arrived at whatever level the
+// last had reached.
+
+/// How many coated actors are tracked at once. Past this they are left alone
+/// rather than evicting one mid-wash.
+const GOOP_WASH_ENTRIES: u32 = 16;
+/// `{owner, colour, hits}` per entry.
+const GOOP_WASH_ENTRY_SIZE: u32 = 16;
+/// Where a material keeps the array of packets, on the model, and the stride
+/// -- read off `SMS_InitPacket_OneTevKColor`, which walks exactly this to find
+/// the packet it fills. Only material zero is inspected, so the stride between
+/// packets is not needed: a manager rebinding one rebinds them all.
+const GOOP_WASH_PACKET_ARRAY_OFFSET: i32 = 0x84;
+/// Within a packet, the block whoever bound last installed. Ours going missing
+/// from here means something rebound the material and the coating stopped
+/// being drawn.
+const GOOP_WASH_PACKET_BLOCK: i32 = 0x0C;
+const GOOP_WASH_ALIGNMENT: usize = 0x20;
+const GOOP_WASH_STACK_GAP: u32 = 0x4000;
+
+/// `TSmallEnemy::decHpByWater` clamps the water's attack to at least one, then
+/// compares it against the actor's hit points. The load of `mHitPoints` at 0x13C
+/// with its sign extension and compare names both the field and the shape of the
+/// test, and occurs once in the retail image.
+const GOOP_WASH_SIGNATURE: [u32; 5] = [
+    0x3880_0001, // li r4, 1
+    0x8803_013C, // lbz r0, 0x13C(r3)  -- mHitPoints
+    0x7C84_0734, // extsb r4, r4
+    0x7C00_2000, // cmpw r0, r4
+    0x4080_0010, // bge +0x10
+];
+/// Where the signature sits inside the function.
+const GOOP_WASH_SIGNATURE_OFFSET: u32 = 0x20;
+
+/// `TSmallEnemy::receiveMessage`, which is where the spray arrives before the
+/// cooldown decides whether to act on it.
+const GOOP_WASH_MESSAGE_SIGNATURE: [u32; 5] = [
+    0x3BE4_0000, // addi r31, r4, 0   -- sender
+    0x93C1_0050, // stw r30, 0x50(r1)
+    0x7C7E_1B78, // mr r30, r3        -- this
+    0x93A1_004C, // stw r29, 0x4C(r1)
+    0x3BA5_0000, // addi r29, r5, 0   -- message
+];
+const GOOP_WASH_MESSAGE_SIGNATURE_OFFSET: u32 = 0x10;
+
+/// `TMapObjBase::receiveMessage`, at the point it has already matched the water
+/// message and is about to dispatch to the subclass's `touchWater` through the
+/// vtable -- so the prop is still in `r3` and the message needs no re-testing.
+///
+/// Props reach the wash by a different road to enemies. A map object is a
+/// `TLiveActor` like any other, so the stub reads its model the same way; only
+/// the hook differs. It covers every class that does not override
+/// `receiveMessage`, plus `TMapObjGeneral` and `TMapObjTurn`, which call up to
+/// this one. The few that reimplement it -- switches, balls, planes, nails,
+/// messengers and the Delfino bell -- do not pass through here and are not
+/// washed by it.
+const GOOP_WASH_PROP_SIGNATURE: [u32; 5] = [
+    0x8183_0000, // lwz r12, 0(r3)      -- the vtable
+    0x818C_014C, // lwz r12, 0x14C(r12) -- touchWater
+    0x7D88_03A6, // mtlr r12
+    0x4E80_0021, // blrl                -- CodeWarrior dispatches through LR
+    0x4800_0008, // b
+];
+const GOOP_WASH_PROP_SIGNATURE_OFFSET: u32 = 0;
+
+/// The water manager dispatching `receiveMessage` on whatever the spray hit.
+///
+/// This is upstream of every class: the send happens before any actor's own
+/// handler runs, so hooking here reaches actors that reimplement or ignore the
+/// message -- the Delfino bell, switches, balls, planes, nails -- which neither
+/// of the other roads can.
+const GOOP_WASH_DISPATCH: [u32; 4] = [
+    0x8183_0000, // lwz r12, 0(r3)      -- the target's vtable
+    0x818C_00A0, // lwz r12, 0xA0(r12)  -- receiveMessage
+    0x7D88_03A6, // mtlr r12
+    0x4E80_0021, // blrl
+];
+/// `li r5, HIT_MESSAGE_SPRAYED_BY_WATER`, staged before the dispatch. The
+/// same dispatch shape carries every other message too, so the message is what
+/// tells a water send apart from the rest.
+const GOOP_WASH_WATER_ARGUMENT: u32 = 0x38A0_000F;
+/// How far back the message may have been staged.
+const GOOP_WASH_ARGUMENT_WINDOW: usize = 12;
+/// What retail has. A DOL with a different count is not one this understands.
+const GOOP_WASH_DISPATCH_SITES: usize = 4;
+
+/// Every site where the water manager tells something it has been sprayed.
+///
+/// Found by the dispatch's own instructions with the message staged ahead of
+/// it, and refused unless the count is exactly what retail carries -- the same
+/// bargain the single-site signatures make, so a DOL this does not recognise is
+/// rejected rather than patched at whatever happened to match.
+fn find_goop_wash_dispatch_sites(source: &[u8], image: &DolImage) -> Result<Vec<u32>, String> {
+    let mut sites = Vec::new();
+    for section in image
+        .sections
+        .iter()
+        .copied()
+        .filter(|section| section.text)
+    {
+        let words = section_words(source, section)?;
+        if words.len() < GOOP_WASH_DISPATCH.len() {
+            continue;
+        }
+        for index in 0..=words.len() - GOOP_WASH_DISPATCH.len() {
+            if words[index..index + GOOP_WASH_DISPATCH.len()] != GOOP_WASH_DISPATCH {
+                continue;
+            }
+            let from = index.saturating_sub(GOOP_WASH_ARGUMENT_WINDOW);
+            if !words[from..index].contains(&GOOP_WASH_WATER_ARGUMENT) {
+                continue;
+            }
+            let address = section
+                .address
+                .checked_add(u32::try_from(index * 4).map_err(|_| "index overflow".to_string())?)
+                .ok_or_else(|| "dispatch address overflows".to_string())?;
+            sites.push(address);
+        }
+    }
+    if sites.len() != GOOP_WASH_DISPATCH_SITES {
+        return Err(format!(
+            "Expected {GOOP_WASH_DISPATCH_SITES} water dispatch sites, found {}",
+            sites.len()
+        ));
+    }
+    Ok(sites)
+}
+/// `HIT_MESSAGE_SPRAYED_BY_WATER` (HitActor.hpp:31).
+const GOOP_WASH_WATER_MESSAGE: u32 = 0xF;
+
+/// A class this project authored a layer on, and the colour it paints over its
+/// own model.
+///
+/// Two classes can share one model and be told apart by a TEV colour register
+/// they write per instance -- Cataquack ships blue and red that way. Binding a
+/// konst packet over such a material replaces the packet that colour rides on,
+/// so the register and its colour are carried here and rebound alongside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct GoopWashActor {
+    /// What the class's instances carry at offset zero.
+    pub(super) vtable: u32,
+    /// The material the colour is painted on, or `None` where the class paints
+    /// none and a konst-only packet is enough.
+    pub(super) tinted_material: Option<u16>,
+    /// `GXTevRegID` for that colour.
+    pub(super) tint_register: u8,
+    /// The colour itself, as the signed ten-bit values `GXColorS10` holds.
+    pub(super) tint: [i16; 4],
+}
+
+/// Bytes one allowed actor takes in the payload: its class, the material its
+/// colour is painted on, the register that colour uses, and the colour itself.
+const GOOP_WASH_ACTOR_SIZE: u32 = 16;
+/// What a record's `material` holds when the class paints no colour: an index
+/// no material can have, so the bind loop never matches it.
+const GOOP_WASH_NO_TINT: u16 = 0xFFFF;
+/// Diagnostic: bind the tint on every material rather than only the recorded
+/// one. If a colour survives with this on and not with it off, the index is
+/// what is wrong, not the packet.
+const GOOP_WASH_TINT_EVERY_MATERIAL: bool = false;
+
+/// How far a wash reaches.
+///
+/// Kept as levels rather than independent switches: everything already covers
+/// what props covers, so the two together would spend a second text section on
+/// a hook that never fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GoopWashReach {
+    /// `TSmallEnemy`, by whichever of its two roads `uniform_rate` picks.
+    Enemies,
+    /// `TMapObjBase::receiveMessage`, which most scenery inherits.
+    Props,
+    /// The send itself, upstream of every class.
+    Everything,
+}
+
+/// What the runtime wash needs to know about an authored layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct GoopWashSettings {
+    /// The konst register the layer's comparison reads. The bake claims
+    /// whichever the material has spare, so it is rarely K0.
+    pub(super) konst_register: u8,
+    /// The alpha the coating starts at: the level it was baked at.
+    pub(super) start_level: u8,
+    /// Water hits per step, independent of the level, so how stubborn a coating
+    /// is does not follow from how much of it there is.
+    pub(super) resistance: u32,
+    /// Alpha removed per step.
+    pub(super) step: u8,
+    /// Whether to count every spray rather than only the ones the actor's class
+    /// lets through.
+    ///
+    /// `TSmallEnemy::receiveMessage` acts on water only while
+    /// `mSprayedByWaterCooldown` is clear. Gesso clears it on every hit and
+    /// PoiHana leaves it running, so the same coating washes off several times
+    /// faster on one than the other for reasons that have nothing to do with
+    /// the coating. Hooking the message instead of the damage step gives every
+    /// actor the same rate.
+    pub(super) uniform_rate: bool,
+    /// How far the wash reaches. Enemies and props arrive by their own roads;
+    /// everything is hooked upstream of both, where the spray is sent.
+    pub(super) reach: GoopWashReach,
+}
+
+impl Default for GoopWashSettings {
+    fn default() -> Self {
+        Self {
+            konst_register: 0,
+            start_level: 255,
+            resistance: 4,
+            step: 1,
+            uniform_rate: true,
+            reach: GoopWashReach::Enemies,
+        }
+    }
+}
+
+fn goop_lis(rt: u32, imm: u32) -> u32 {
+    15 << 26 | rt << 21 | (imm & 0xFFFF)
+}
+
+fn goop_ori(ra: u32, rs: u32, imm: u32) -> u32 {
+    24 << 26 | rs << 21 | ra << 16 | (imm & 0xFFFF)
+}
+
+fn goop_addi(rt: u32, ra: u32, imm: i32) -> u32 {
+    14 << 26 | rt << 21 | ra << 16 | (imm as u32 & 0xFFFF)
+}
+
+fn goop_li(rt: u32, imm: i32) -> u32 {
+    goop_addi(rt, 0, imm)
+}
+
+fn goop_lwz(rt: u32, d: i32, ra: u32) -> u32 {
+    32 << 26 | rt << 21 | ra << 16 | (d as u32 & 0xFFFF)
+}
+
+fn goop_stw(rs: u32, d: i32, ra: u32) -> u32 {
+    36 << 26 | rs << 21 | ra << 16 | (d as u32 & 0xFFFF)
+}
+
+fn goop_stwu(rs: u32, d: i32, ra: u32) -> u32 {
+    37 << 26 | rs << 21 | ra << 16 | (d as u32 & 0xFFFF)
+}
+
+fn goop_cmplwi(ra: u32, imm: u32) -> u32 {
+    10 << 26 | ra << 16 | (imm & 0xFFFF)
+}
+
+fn goop_cmpw(ra: u32, rb: u32) -> u32 {
+    31 << 26 | ra << 16 | rb << 11
+}
+
+fn goop_rlwinm(ra: u32, rs: u32, sh: u32, mb: u32, me: u32) -> u32 {
+    21 << 26 | rs << 21 | ra << 16 | sh << 11 | mb << 6 | me << 1
+}
+
+/// `b` this many instructions away.
+fn goop_b(words: i32) -> u32 {
+    18 << 26 | ((words * 4) as u32 & 0x03FF_FFFC)
+}
+
+/// `beq` this many instructions away.
+fn goop_beq(words: i32) -> u32 {
+    16 << 26 | 12 << 21 | 2 << 16 | ((words * 4) as u32 & 0xFFFC)
+}
+
+/// `bne` this many instructions away.
+fn goop_bne(words: i32) -> u32 {
+    16 << 26 | 4 << 21 | 2 << 16 | ((words * 4) as u32 & 0xFFFC)
+}
+
+/// `bge` this many instructions away.
+fn goop_bge(words: i32) -> u32 {
+    16 << 26 | 4 << 21 | ((words * 4) as u32 & 0xFFFC)
+}
+
+fn goop_lbz(rt: u32, d: i32, ra: u32) -> u32 {
+    34 << 26 | rt << 21 | ra << 16 | (d as u32 & 0xFFFF)
+}
+fn goop_lhz(rt: u32, d: i32, ra: u32) -> u32 {
+    40 << 26 | rt << 21 | ra << 16 | (d as u32 & 0xFFFF)
+}
+
+fn goop_mr(ra: u32, rs: u32) -> u32 {
+    31 << 26 | rs << 21 | ra << 16 | rs << 11 | 444 << 1
+}
+
+/// `J3DModel::mModelData`, then `J3DModelData::mMaterialNum`.
+/// `TLiveActor`'s `mMActor`, which `getModel` reads before the model itself.
+const GOOP_ACTOR_MODEL_OFFSET: i32 = 0x74;
+const GOOP_MODEL_DATA_OFFSET: i32 = 0x04;
+const GOOP_MATERIAL_NUM_OFFSET: i32 = 0x24;
+
+const GOOP_MFLR_R0: u32 = 0x7C08_02A6;
+/// `mfcr r0` and `mtcrf 0xFF, r0`. The stub compares, so it writes the
+/// condition register, and a hook that lands mid-function has to give it back.
+/// How much of the wash stub to emit, for narrowing a fault down to the piece
+/// that causes it. Zero saves and restores and does nothing else, which tests
+/// the hook itself; each step adds the next piece back.
+///
+/// 0 nothing  1 find the entry  2 read the model  3 everything
+const GOOP_WASH_BISECT: u8 = 3;
+const GOOP_MFCR_R0: u32 = 0x7C00_0026;
+const GOOP_MTCR_R0: u32 = 0x7C0F_F120;
+const GOOP_MTLR_R0: u32 = 0x7C08_03A6;
+
+/// The detour body.
+// Every one of these is a distinct scalar the emitted code needs, and bundling
+// them into a struct would only move the list somewhere else.
+#[allow(clippy::too_many_arguments)]
+fn build_goop_wash_stub(
+    table_address: u32,
+    displaced: u32,
+    resume: u32,
+    stub_address: u32,
+    get_model: u32,
+    init_kcolor: u32,
+    init_combined: u32,
+    records_address: u32,
+    settings: GoopWashSettings,
+    allowed: &[GoopWashActor],
+) -> Result<Vec<u32>, String> {
+    let mut words: Vec<u32> = Vec::new();
+    let start_word = 0xFF00 | u32::from(settings.start_level);
+    let kcolor = i32::from(settings.konst_register);
+    let step = i32::from(settings.step);
+
+    // Everything this stub touches has to be handed back exactly as it was.
+    //
+    // The enemy hooks land on a function's first instruction, where almost
+    // nothing is live and saving r3, r4 and the link register was enough.
+    // Reaching everything hooks the middle of a function instead -- one
+    // instruction before a virtual call, with the message in r5, the sender in
+    // r4, and whatever else the water manager is holding still live. Clobbering
+    // any of that corrupts the call that follows, which is what broke the game
+    // rather than any part of the wash itself.
+    words.push(GOOP_MFLR_R0);
+    words.push(goop_stwu(1, -0x50, 1));
+    words.push(goop_stw(0, 0x54, 1));
+    words.push(GOOP_MFCR_R0);
+    words.push(goop_stw(0, 0x4C, 1));
+    words.push(goop_stw(3, 0x20, 1));
+    words.push(goop_stw(4, 0x24, 1));
+    words.push(goop_stw(5, 0x30, 1));
+    words.push(goop_stw(6, 0x08, 1));
+    words.push(goop_stw(7, 0x34, 1));
+    words.push(goop_stw(8, 0x38, 1));
+    words.push(goop_stw(9, 0x3C, 1));
+    words.push(goop_stw(10, 0x40, 1));
+    words.push(goop_stw(11, 0x44, 1));
+    words.push(goop_stw(12, 0x48, 1));
+    let bisect_out = if GOOP_WASH_BISECT == 0 {
+        let slot = words.len();
+        words.push(0); // b done
+        Some(slot)
+    } else {
+        None
+    };
+
+    // Hooking the message rather than the damage step means every message
+    // arrives here, so anything that is not a spray leaves immediately.
+    let to_done_other_message = if settings.uniform_rate {
+        words.push(goop_cmplwi(5, GOOP_WASH_WATER_MESSAGE));
+        let slot = words.len();
+        words.push(0); // bne done
+        Some(slot)
+    } else {
+        None
+    };
+
+    // Find this actor's entry, or the first free slot.
+    // Vetting runs before the table is touched. An actor that already holds an
+    // entry never enters the claim path, and it needs the matched record just
+    // as much -- the bind below reads it, and the stack slot holding it is per
+    // invocation, so it has to be filled on every hit rather than the first.
+    let mut combined_calls: Vec<usize> = Vec::new();
+    let mut skip_stranger = Vec::new();
+    if !allowed.is_empty() {
+        // Walk the records rather than unrolling a compare per class: the
+        // matched one is needed later, to know whether the material being bound
+        // is the one this class paints and what colour to paint it.
+        words.push(goop_lwz(9, 0, 3));
+        words.push(goop_lis(10, records_address >> 16));
+        words.push(goop_ori(10, 10, records_address & 0xFFFF));
+        words.push(goop_li(12, allowed.len() as i32));
+        let walk = words.len();
+        words.push(goop_lwz(8, 0, 10));
+        words.push(goop_cmpw(8, 9));
+        let to_matched = words.len();
+        words.push(0); // beq matched
+        words.push(goop_addi(10, 10, GOOP_WASH_ACTOR_SIZE as i32));
+        words.push(goop_addi(12, 12, -1));
+        words.push(goop_cmplwi(12, 0));
+        words.push(goop_bne(walk as i32 - words.len() as i32));
+        skip_stranger.push(words.len());
+        words.push(0); // b done -- a class this project never authored
+        let matched = words.len();
+        words[to_matched] = goop_beq(matched as i32 - to_matched as i32);
+        // The record outlives the calls below, so it rides on the stack.
+        words.push(goop_stw(10, 0x0C, 1));
+    }
+
+    // Not all of what arrives is a `TLiveActor`: the send is to a `THitActor`, whose
+    // model pointer may be absent or may not be a model pointer at all.
+    // `getModel` walks 0x74 then 0x04 without checking either, so it reads
+    // address four and the game dies. Walk it here first and leave quietly if
+    // anything on the way is null, before a slot is spent on an actor that has
+    // nothing to wash.
+    let mut skip_null = Vec::new();
+    words.push(goop_lwz(9, GOOP_ACTOR_MODEL_OFFSET, 3));
+    words.push(goop_cmplwi(9, 0));
+    skip_null.push(words.len());
+    words.push(0);
+    words.push(goop_lwz(9, GOOP_MODEL_DATA_OFFSET, 9));
+    words.push(goop_cmplwi(9, 0));
+    skip_null.push(words.len());
+    words.push(0);
+    words.push(goop_lwz(9, GOOP_MODEL_DATA_OFFSET, 9));
+    words.push(goop_cmplwi(9, 0));
+    skip_null.push(words.len());
+    words.push(0);
+
+    // First sight: seed the level and bind the material to this entry's colour,
+    // once. Binding per hit would allocate a packet every time.
+
+    words.push(goop_lis(11, table_address >> 16));
+    words.push(goop_ori(11, 11, table_address & 0xFFFF));
+    words.push(goop_li(12, GOOP_WASH_ENTRIES as i32));
+    let scan = words.len();
+    words.push(goop_lwz(8, 0, 11));
+    words.push(goop_cmpw(8, 3));
+    let to_have_entry = words.len();
+    words.push(0);
+    words.push(goop_cmplwi(8, 0));
+    let to_claim = words.len();
+    words.push(0);
+    words.push(goop_addi(11, 11, GOOP_WASH_ENTRY_SIZE as i32));
+    words.push(goop_addi(12, 12, -1));
+    words.push(goop_cmplwi(12, 0));
+    let back = scan as i32 - words.len() as i32;
+    words.push(goop_bne(back));
+    let to_done_full = words.len();
+    words.push(0);
+
+    // Reaching everything means being handed whatever the spray touched --
+    // including actors this tool never authored. Binding a konst packet into
+    // one of those writes into a display list built for something else, which
+    // ends with the game executing data rather than crashing cleanly. An actor
+    // carries its class at offset zero, so the classes that were authored are
+    // baked in and anything else is let go untouched.
+    // `claim` has to name the first guard, not the first store: the scan
+    // reaches this path by branching to the label, so anything emitted above it
+    // is never executed. Both guards sat there and neither ever ran, which is
+    // why an actor with no layer was still walked and an absent model was still
+    // dereferenced.
+    let claim = words.len();
+    words.push(goop_stw(3, 0, 11));
+    words.push(goop_lis(9, 0xFFFF));
+    words.push(goop_ori(9, 9, start_word));
+    words.push(goop_stw(9, 4, 11));
+    words.push(goop_li(9, 0));
+    words.push(goop_stw(9, 8, 11));
+    // Both roads meet here: a first sighting arrives having seeded the entry,
+    // and a later hit arrives having stepped it. Binding on every hit rather
+    // than only the first is what keeps a coating alive across a respawn --
+    // the actor's own manager rebinds its colour packet when it brings the
+    // enemy back, and that replaces ours.
+    let bind_entry = words.len();
+    words.push(goop_stw(11, 0x28, 1));
+    // Binding allocates -- these packet inits call `operator new` -- so it has
+    // to happen when the slot has actually been taken from us, not on every
+    // hit. The entry remembers what we last installed on material zero; the
+    // manager rebinding on respawn replaces it, and that difference is the
+    // signal to bind again.
+    //
+    // An entry that remembers nothing always binds. Skipping that check made
+    // an actor with no packet at all compare zero against zero, decide the
+    // slot was still ours, and never bind -- so nothing washed.
+    let mut to_rebind: Vec<usize> = Vec::new();
+    words.push(goop_lwz(10, 12, 11));
+    words.push(goop_cmplwi(10, 0));
+    to_rebind.push(words.len());
+    words.push(0); // beq rebind -- nothing recorded yet
+    words.push(goop_lwz(9, GOOP_ACTOR_MODEL_OFFSET, 3));
+    words.push(goop_cmplwi(9, 0));
+    to_rebind.push(words.len());
+    words.push(0);
+    words.push(goop_lwz(9, GOOP_MODEL_DATA_OFFSET, 9));
+    words.push(goop_cmplwi(9, 0));
+    to_rebind.push(words.len());
+    words.push(0);
+    words.push(goop_lwz(9, GOOP_WASH_PACKET_ARRAY_OFFSET, 9));
+    words.push(goop_cmplwi(9, 0));
+    to_rebind.push(words.len());
+    words.push(0);
+    words.push(goop_lwz(9, GOOP_WASH_PACKET_BLOCK, 9));
+    words.push(goop_cmpw(9, 10));
+    let to_done_bound = words.len();
+    words.push(0); // beq done -- still ours
+    let rebind = words.len();
+    for at in to_rebind {
+        words[at] = goop_beq(rebind as i32 - at as i32);
+    }
+    let bisect_before_model = if GOOP_WASH_BISECT < 2 {
+        let slot = words.len();
+        words.push(0); // b done
+        Some(slot)
+    } else {
+        None
+    };
+    words.push(goop_lwz(3, 0x20, 1));
+    let get_model_call = words.len();
+    words.push(0);
+    // Bind every material, the way retail does (pakkun.cpp:946). Binding only
+    // the first covers a single-material actor and leaves the rest of a bigger
+    // one untouched: LandGesso draws from one material and washed, PoiHana
+    // draws from three and did not.
+    words.push(goop_stw(3, 0x2C, 1));
+    words.push(goop_lwz(10, GOOP_MODEL_DATA_OFFSET, 3));
+    words.push(goop_lhz(10, GOOP_MATERIAL_NUM_OFFSET, 10));
+    words.push(goop_stw(10, 0x1C, 1));
+    words.push(goop_li(9, 0));
+    words.push(goop_stw(9, 0x18, 1));
+    let bisect_before_bind = if GOOP_WASH_BISECT < 3 {
+        let slot = words.len();
+        words.push(0); // b done
+        Some(slot)
+    } else {
+        None
+    };
+    let bind_loop = words.len();
+    words.push(goop_lwz(9, 0x18, 1));
+    words.push(goop_lwz(10, 0x1C, 1));
+    words.push(goop_cmpw(9, 10));
+    let to_bound = words.len();
+    words.push(0); // bge bound
+                   // A class that paints its own colour on this material needs both bound at
+                   // once: these packet forms replace a material's packet rather than add to
+                   // it, so binding the konst alone would drop the colour. The combined form
+                   // is the only one carrying both -- and it writes K0 and takes no register
+                   // argument, which is why the bake pins such a layer to K0.
+    let mut to_plain = None;
+    let mut to_after = None;
+    if !allowed.is_empty() {
+        words.push(goop_lwz(10, 0x0C, 1));
+        words.push(goop_lhz(0, 4, 10));
+        if GOOP_WASH_TINT_EVERY_MATERIAL {
+            // Compare the record against itself, so the branch is never taken
+            // and every material takes the combined form.
+            words.push(goop_cmpw(0, 0));
+        } else {
+            words.push(goop_cmpw(9, 0));
+        }
+        to_plain = Some(words.len());
+        words.push(0); // bne plain
+        words.push(goop_lwz(3, 0x2C, 1));
+        words.push(goop_mr(4, 9));
+        words.push(goop_lbz(5, 6, 10));
+        words.push(goop_addi(6, 10, 8));
+        words.push(goop_lwz(11, 0x28, 1));
+        words.push(goop_addi(7, 11, 4));
+        let combined_call = words.len();
+        words.push(0);
+        combined_calls.push(combined_call);
+        to_after = Some(words.len());
+        words.push(0); // b after
+    }
+    if let Some(at) = to_plain {
+        let plain = words.len();
+        words[at] = goop_bne(plain as i32 - at as i32);
+    }
+    words.push(goop_lwz(3, 0x2C, 1));
+    words.push(goop_mr(4, 9));
+    words.push(goop_li(5, kcolor));
+    words.push(goop_lwz(11, 0x28, 1));
+    words.push(goop_addi(6, 11, 4));
+    let init_call = words.len();
+    words.push(0);
+    if let Some(at) = to_after {
+        let after = words.len();
+        words[at] = goop_b(after as i32 - at as i32);
+    }
+    words.push(goop_lwz(9, 0x18, 1));
+    words.push(goop_addi(9, 9, 1));
+    words.push(goop_stw(9, 0x18, 1));
+    words.push(goop_b(bind_loop as i32 - words.len() as i32));
+    let bound = words.len();
+    words[to_bound] = goop_bge(bound as i32 - to_bound as i32);
+    // Remember the block that owns material zero now, so the next hit can tell
+    // whether it is still ours.
+    words.push(goop_lwz(9, 0x2C, 1));
+    words.push(goop_lwz(9, GOOP_WASH_PACKET_ARRAY_OFFSET, 9));
+    words.push(goop_cmplwi(9, 0));
+    let to_skip_note = words.len();
+    words.push(0);
+    words.push(goop_lwz(9, GOOP_WASH_PACKET_BLOCK, 9));
+    words.push(goop_lwz(11, 0x28, 1));
+    words.push(goop_stw(9, 12, 11));
+    let noted = words.len();
+    words[to_skip_note] = goop_beq(noted as i32 - to_skip_note as i32);
+
+    let to_done_claim = words.len();
+    words.push(0);
+
+    // Seen before: count the hit, stepping the coating once enough have landed.
+    let have_entry = words.len();
+    words.push(goop_lwz(9, 8, 11));
+    words.push(goop_addi(9, 9, 1));
+    words.push(goop_cmplwi(9, settings.resistance));
+    words.push(goop_bge(3));
+    words.push(goop_stw(9, 8, 11));
+    let to_bind_waiting = words.len();
+    words.push(0);
+    words.push(goop_li(9, 0));
+    words.push(goop_stw(9, 8, 11));
+    words.push(goop_lwz(5, 4, 11));
+    words.push(goop_rlwinm(7, 5, 0, 24, 31));
+    words.push(goop_cmplwi(7, step as u32));
+    words.push(goop_bge(4));
+    words.push(goop_lis(5, 0xFFFF));
+    words.push(goop_ori(5, 5, 0xFF00)); // hold at clean rather than wrapping
+    words.push(goop_b(2));
+    words.push(goop_addi(5, 5, -step));
+    words.push(goop_stw(5, 4, 11));
+    let to_bind_stepped = words.len();
+    words.push(0);
+
+    let done = words.len();
+    words[to_done_bound] = goop_beq(done as i32 - to_done_bound as i32);
+    words[to_have_entry] = goop_beq(have_entry as i32 - to_have_entry as i32);
+    // Both repeat-hit exits jump back to the bind, which sits before them.
+    words[to_bind_waiting] = goop_b(bind_entry as i32 - to_bind_waiting as i32);
+    words[to_bind_stepped] = goop_b(bind_entry as i32 - to_bind_stepped as i32);
+    if let Some(at) = bisect_before_bind {
+        words[at] = goop_b(done as i32 - at as i32);
+    }
+    if let Some(at) = bisect_before_model {
+        words[at] = goop_b(done as i32 - at as i32);
+    }
+    if let Some(at) = bisect_out {
+        words[at] = goop_b(done as i32 - at as i32);
+    }
+    for at in skip_null {
+        words[at] = goop_beq(done as i32 - at as i32);
+    }
+    for at in skip_stranger {
+        words[at] = goop_b(done as i32 - at as i32);
+    }
+    words.push(goop_lwz(0, 0x4C, 1));
+    words.push(GOOP_MTCR_R0);
+    words.push(goop_lwz(3, 0x20, 1));
+    words.push(goop_lwz(4, 0x24, 1));
+    words.push(goop_lwz(5, 0x30, 1));
+    words.push(goop_lwz(6, 0x08, 1));
+    words.push(goop_lwz(7, 0x34, 1));
+    words.push(goop_lwz(8, 0x38, 1));
+    words.push(goop_lwz(9, 0x3C, 1));
+    words.push(goop_lwz(10, 0x40, 1));
+    words.push(goop_lwz(11, 0x44, 1));
+    words.push(goop_lwz(12, 0x48, 1));
+    words.push(goop_lwz(0, 0x54, 1));
+    words.push(goop_addi(1, 1, 0x50));
+    words.push(GOOP_MTLR_R0);
+    words.push(displaced);
+    let resume_word = words.len();
+    words.push(0);
+
+    if let Some(slot) = to_done_other_message {
+        words[slot] = goop_bne(done as i32 - slot as i32);
+    }
+    words[to_have_entry] = goop_beq(have_entry as i32 - to_have_entry as i32);
+    words[to_claim] = goop_beq(claim as i32 - to_claim as i32);
+    words[to_done_full] = goop_b(done as i32 - to_done_full as i32);
+    words[to_done_claim] = goop_b(done as i32 - to_done_claim as i32);
+    words[get_model_call] =
+        encode_branch(stub_address + (get_model_call as u32) * 4, get_model, true)?;
+    words[init_call] = encode_branch(stub_address + (init_call as u32) * 4, init_kcolor, true)?;
+    for at in combined_calls {
+        words[at] = encode_branch(stub_address + (at as u32) * 4, init_combined, true)?;
+    }
+    words[resume_word] = encode_branch(stub_address + (resume_word as u32) * 4, resume, false)?;
+    Ok(words)
+}
+
+/// Where `TSmallEnemy::decHpByWater` begins, found by its own instructions
+/// rather than a symbol table, and rejected unless it occurs exactly once.
+fn find_goop_wash_hook(source: &[u8], image: &DolImage) -> Result<u32, String> {
+    find_goop_wash_signature(
+        source,
+        image,
+        &GOOP_WASH_SIGNATURE,
+        GOOP_WASH_SIGNATURE_OFFSET,
+        "TSmallEnemy::decHpByWater",
+    )
+}
+
+/// A function located by a run of its own instructions, refused unless the run
+/// occurs exactly once.
+fn find_goop_wash_signature(
+    source: &[u8],
+    image: &DolImage,
+    signature: &[u32],
+    signature_offset: u32,
+    what: &str,
+) -> Result<u32, String> {
+    let mut found: Option<u32> = None;
+    for section in image
+        .sections
+        .iter()
+        .copied()
+        .filter(|section| section.text)
+    {
+        let start = usize::try_from(section.file_offset)
+            .map_err(|_| "DOL text section offset does not fit usize".to_string())?;
+        let end = usize::try_from(section.file_end()?)
+            .map_err(|_| "DOL text section end does not fit usize".to_string())?;
+        let bytes = source
+            .get(start..end)
+            .ok_or_else(|| format!("DOL section {} runs past the image", section.label()))?;
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+        if words.len() < signature.len() {
+            continue;
+        }
+        for index in 0..=words.len() - signature.len() {
+            if words[index..index + signature.len()] != *signature {
+                continue;
+            }
+            let address = section
+                .address
+                .checked_add(u32::try_from(index * 4).map_err(|_| "index overflow".to_string())?)
+                .ok_or_else(|| "signature address overflows".to_string())?;
+            let hook = address
+                .checked_sub(signature_offset)
+                .ok_or_else(|| "signature sits too early in the section".to_string())?;
+            if found.is_some_and(|earlier| earlier != hook) {
+                return Err(format!("Expected one {what}, found several candidates"));
+            }
+            found = Some(hook);
+        }
+    }
+    found.ok_or_else(|| format!("Could not find {what} in this DOL; the goop wash needs it"))
+}
+
+/// Installs the runtime wash, returning the patched image.
+pub(super) fn patch_goop_wash_dol(
+    source: &[u8],
+    settings: GoopWashSettings,
+    allowed: &[GoopWashActor],
+    get_model: u32,
+    init_kcolor: u32,
+    init_combined: u32,
+) -> Result<Vec<u8>, String> {
+    if settings.konst_register > 3 {
+        return Err(format!(
+            "Goop wash konst register K{} is outside K0..K3",
+            settings.konst_register
+        ));
+    }
+    if settings.resistance == 0 {
+        return Err("Goop wash resistance must be at least one water hit".to_string());
+    }
+    if settings.step == 0 {
+        return Err("Goop wash step must remove at least one level".to_string());
+    }
+
+    let image = parse_dol(source)?;
+    // The levels stack: props keeps the enemy road and adds its own, so raising
+    // the reach never takes an actor away from the wash. Everything replaces
+    // both, being upstream of each.
+    let enemy_hook = |image: &DolImage| -> Result<u32, String> {
+        if settings.uniform_rate {
+            find_goop_wash_signature(
+                source,
+                image,
+                &GOOP_WASH_MESSAGE_SIGNATURE,
+                GOOP_WASH_MESSAGE_SIGNATURE_OFFSET,
+                "TSmallEnemy::receiveMessage",
+            )
+        } else {
+            find_goop_wash_hook(source, image)
+        }
+    };
+    let hooks: Vec<u32> = match settings.reach {
+        GoopWashReach::Enemies => vec![enemy_hook(&image)?],
+        GoopWashReach::Props => vec![
+            enemy_hook(&image)?,
+            find_goop_wash_signature(
+                source,
+                &image,
+                &GOOP_WASH_PROP_SIGNATURE,
+                GOOP_WASH_PROP_SIGNATURE_OFFSET,
+                "TMapObjBase::receiveMessage",
+            )?,
+        ],
+        GoopWashReach::Everything => find_goop_wash_dispatch_sites(source, &image)?,
+    };
+    let mut hook_offsets = Vec::with_capacity(hooks.len());
+    let mut displaced = Vec::with_capacity(hooks.len());
+    for hook in &hooks {
+        let offset = usize::try_from(dol_file_offset(&image, *hook)?)
+            .map_err(|_| "goop wash hook offset does not fit usize".to_string())?;
+        displaced.push(
+            source
+                .get(offset..offset + 4)
+                .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                .ok_or_else(|| "goop wash hook runs past the image".to_string())?,
+        );
+        hook_offsets.push(offset);
+    }
+
+    let text_slot = (0..DOL_TEXT_SECTION_COUNT)
+        .find(|slot| {
+            !image
+                .sections
+                .iter()
+                .any(|section| section.text && section.slot == *slot)
+        })
+        .ok_or_else(|| "The DOL has no unused text section for the goop wash".to_string())?;
+
+    let mut loaded_end = 0u32;
+    for section in &image.sections {
+        loaded_end = loaded_end.max(section.address_end()?);
+    }
+    // `bss` is (start, end), the way every other reader here treats it -- not
+    // (address, size).
+    if let Some((_, bss_end)) = image.bss {
+        loaded_end = loaded_end.max(bss_end);
+    }
+    let stub_address = align_up_u32(loaded_end, GOOP_WASH_ALIGNMENT as u32)?;
+
+    // Two passes: the table follows the code, whose length depends on where the
+    // table is. Reaching everything means several hooks, and each needs its own
+    // copy -- the displaced instruction and the address to resume at differ per
+    // site -- but they share one table, so an actor is recorded once however
+    // many roads lead to it.
+    let probe = build_goop_wash_stub(
+        0,
+        displaced[0],
+        hooks[0] + 4,
+        stub_address,
+        get_model,
+        init_kcolor,
+        init_combined,
+        0,
+        settings,
+        allowed,
+    )?;
+    let stride = probe.len();
+    let records_address = stub_address
+        .checked_add(
+            u32::try_from(stride * hooks.len() * 4).map_err(|_| "stub too large".to_string())?,
+        )
+        .ok_or_else(|| "goop wash stub overflows the address space".to_string())?;
+    let records_size = u32::try_from(allowed.len())
+        .map_err(|_| "too many authored classes".to_string())?
+        * GOOP_WASH_ACTOR_SIZE;
+    let table_address = records_address
+        .checked_add(records_size)
+        .ok_or_else(|| "goop wash records overflow the address space".to_string())?;
+
+    let mut stubs = Vec::with_capacity(hooks.len());
+    for (index, hook) in hooks.iter().enumerate() {
+        let at = stub_address
+            .checked_add(
+                u32::try_from(index * stride * 4).map_err(|_| "stub too large".to_string())?,
+            )
+            .ok_or_else(|| "goop wash stub overflows the address space".to_string())?;
+        let stub = build_goop_wash_stub(
+            table_address,
+            displaced[index],
+            hook + 4,
+            at,
+            get_model,
+            init_kcolor,
+            init_combined,
+            records_address,
+            settings,
+            allowed,
+        )?;
+        if stub.len() != stride {
+            return Err("goop wash stub changed size between passes".to_string());
+        }
+        stubs.push((at, stub));
+    }
+
+    let payload_size = align_up_usize(
+        stride * hooks.len() * 4
+            + records_size as usize
+            + (GOOP_WASH_ENTRIES * GOOP_WASH_ENTRY_SIZE) as usize,
+        GOOP_WASH_ALIGNMENT,
+    )?;
+    let stub_end = stub_address
+        .checked_add(u32::try_from(payload_size).map_err(|_| "payload too large".to_string())?)
+        .ok_or_else(|| "goop wash payload overflows the address space".to_string())?;
+
+    let stack_top = find_stack_top(source, &image)?;
+    if stub_end.saturating_add(GOOP_WASH_STACK_GAP) > stack_top {
+        return Err(format!(
+            "Goop wash stub 0x{stub_address:08X}..0x{stub_end:08X} is too close to the stack top 0x{stack_top:08X}"
+        ));
+    }
+    reject_injected_range_overlap(&image, stub_address, stub_end)?;
+
+    let mut bytes = source.to_vec();
+    let file_offset = align_up_usize(bytes.len(), GOOP_WASH_ALIGNMENT)?;
+    bytes.resize(file_offset, 0);
+    for (_, stub) in &stubs {
+        for word in stub {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+    }
+    // The records the stub matches against, in the order it walks them.
+    for actor in allowed {
+        bytes.extend_from_slice(&actor.vtable.to_be_bytes());
+        bytes.extend_from_slice(
+            &actor
+                .tinted_material
+                .unwrap_or(GOOP_WASH_NO_TINT)
+                .to_be_bytes(),
+        );
+        bytes.push(actor.tint_register);
+        bytes.push(0);
+        for channel in actor.tint {
+            bytes.extend_from_slice(&channel.to_be_bytes());
+        }
+    }
+    // The table stays zeroed: an owner of zero is what marks a slot free.
+    bytes.resize(file_offset + payload_size, 0);
+
+    write_be_u32(
+        &mut bytes,
+        DOL_TEXT_FILE_OFFSETS + text_slot * 4,
+        u32::try_from(file_offset)
+            .map_err(|_| "goop wash file offset does not fit u32".to_string())?,
+    )?;
+    write_be_u32(&mut bytes, DOL_TEXT_ADDRESSES + text_slot * 4, stub_address)?;
+    write_be_u32(
+        &mut bytes,
+        DOL_TEXT_SIZES + text_slot * 4,
+        u32::try_from(payload_size)
+            .map_err(|_| "goop wash payload size does not fit u32".to_string())?,
+    )?;
+    for (index, hook) in hooks.iter().enumerate() {
+        let (at, _) = stubs[index];
+        write_be_u32(
+            &mut bytes,
+            hook_offsets[index],
+            encode_branch(*hook, at, false)?,
+        )?;
+    }
+    Ok(bytes)
+}
+
+/// `TLiveActor::getModel` is three instructions -- `mMActor->unk4` and a
+/// return -- which is distinctive enough to find on its own.
+const GOOP_GET_MODEL_SIGNATURE: [u32; 3] = [
+    0x8063_0074, // lwz r3, 0x74(r3)
+    0x8063_0004, // lwz r3, 0x04(r3)
+    0x4E80_0020, // blr
+];
+
+/// The `SMS_InitPacket_*TevKColor` family shares a prologue, so the prologue
+/// alone finds three functions. They part company at the tag each stores in its
+/// packet user data: six for the one-colour form, one for two colours, zero for
+/// the colour-and-fog form.
+const GOOP_INIT_KCOLOR_SIGNATURE: [u32; 4] = [
+    0x3BC6_0000, // addi r30, r6, 0
+    0x93A1_005C, // stw r29, 0x5C(r1)
+    0x7CBD_2B78, // mr r29, r5
+    0x80E3_0004, // lwz r7, 0x04(r3)
+];
+const GOOP_INIT_KCOLOR_SIGNATURE_OFFSET: u32 = 0x18;
+/// Where the tag is stored, and what the one-colour form stores there.
+const GOOP_INIT_KCOLOR_TAG_OFFSET: u32 = 0x4C;
+const GOOP_INIT_KCOLOR_TAG: u32 = 0x3800_0006; // li r0, 6
+
+/// `SMS_InitPacket_OneTevColorAndOneTevKColor`, which binds a TEV colour
+/// register and a konst colour in one packet.
+///
+/// These packet forms replace a material's packet with one carrying the state
+/// they name, so binding a konst-only packet over a material drops whatever the
+/// actor had bound before it -- which is how a coating erased Cataquack's
+/// colour, since red and blue are one model told apart by a TEV register.
+const GOOP_WASH_COMBINED_SIGNATURE: [u32; 3] = [
+    0x93E1_006C, // stw r31, 0x6C(r1)
+    0x93C1_0068, // stw r30, 0x68(r1)
+    0x3BC7_0000, // addi r30, r7, 0
+];
+const GOOP_WASH_COMBINED_SIGNATURE_OFFSET: u32 = 0x10;
+
+/// Every address in a text section where `signature` appears, as the address of
+/// the word the match begins at.
+fn goop_signature_matches(
+    source: &[u8],
+    image: &DolImage,
+    signature: &[u32],
+) -> Result<Vec<u32>, String> {
+    let mut matches = Vec::new();
+    for section in image
+        .sections
+        .iter()
+        .copied()
+        .filter(|section| section.text)
+    {
+        let words = section_words(source, section)?;
+        if words.len() < signature.len() {
+            continue;
+        }
+        for index in 0..=words.len() - signature.len() {
+            if words[index..index + signature.len()] != *signature {
+                continue;
+            }
+            let address = section
+                .address
+                .checked_add(u32::try_from(index * 4).map_err(|_| "index overflow".to_string())?)
+                .ok_or_else(|| "signature address overflows".to_string())?;
+            matches.push(address);
+        }
+    }
+    Ok(matches)
+}
+
+/// Reads one instruction.
+fn goop_word_at(source: &[u8], image: &DolImage, address: u32) -> Result<u32, String> {
+    let offset = usize::try_from(dol_file_offset(image, address)?)
+        .map_err(|_| "address offset does not fit usize".to_string())?;
+    source
+        .get(offset..offset + 4)
+        .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .ok_or_else(|| format!("address 0x{address:08X} runs past the image"))
+}
+
+/// The two functions the wash stub calls.
+///
+/// Found by their own code rather than by address, so a DOL this does not
+/// recognise is refused outright instead of being patched with calls into
+/// whatever happens to sit at a hard-coded address.
+fn find_goop_wash_combined(source: &[u8], image: &DolImage) -> Result<u32, String> {
+    find_goop_wash_signature(
+        source,
+        image,
+        &GOOP_WASH_COMBINED_SIGNATURE,
+        GOOP_WASH_COMBINED_SIGNATURE_OFFSET,
+        "SMS_InitPacket_OneTevColorAndOneTevKColor",
+    )
+}
+
+fn find_goop_wash_callees(source: &[u8], image: &DolImage) -> Result<(u32, u32), String> {
+    let models = goop_signature_matches(source, image, &GOOP_GET_MODEL_SIGNATURE)?;
+    let get_model = match models.as_slice() {
+        [only] => *only,
+        [] => return Err("Could not find TLiveActor::getModel in this DOL".to_string()),
+        several => {
+            return Err(format!(
+                "Expected one TLiveActor::getModel, found {}",
+                several.len()
+            ))
+        }
+    };
+
+    let mut packets = Vec::new();
+    for address in goop_signature_matches(source, image, &GOOP_INIT_KCOLOR_SIGNATURE)? {
+        let start = address
+            .checked_sub(GOOP_INIT_KCOLOR_SIGNATURE_OFFSET)
+            .ok_or_else(|| "packet signature sits too early in the section".to_string())?;
+        if goop_word_at(source, image, start + GOOP_INIT_KCOLOR_TAG_OFFSET)? == GOOP_INIT_KCOLOR_TAG
+        {
+            packets.push(start);
+        }
+    }
+    let init_kcolor = match packets.as_slice() {
+        [only] => *only,
+        [] => return Err("Could not find SMS_InitPacket_OneTevKColor in this DOL".to_string()),
+        several => {
+            return Err(format!(
+                "Expected one SMS_InitPacket_OneTevKColor, found {}",
+                several.len()
+            ))
+        }
+    };
+    Ok((get_model, init_kcolor))
+}
+
+/// Installs the runtime wash, finding everything it needs in the image.
+pub(super) fn install_goop_wash(
+    source: &[u8],
+    settings: GoopWashSettings,
+    allowed: &[GoopWashActor],
+) -> Result<Vec<u8>, String> {
+    let image = parse_dol(source)?;
+    let (get_model, init_kcolor) = find_goop_wash_callees(source, &image)?;
+    let init_combined = find_goop_wash_combined(source, &image)?;
+    patch_goop_wash_dol(
+        source,
+        settings,
+        allowed,
+        get_model,
+        init_kcolor,
+        init_combined,
+    )
+}
+
+/// Whether this DOL carries the code the wash needs.
+///
+/// A custom or cut-down executable will not, and packaging one is not an error
+/// -- it simply has nothing to hook. Returning this separately keeps that case
+/// apart from a wash that should have installed and failed.
+pub(super) fn dol_supports_goop_wash(source: &[u8]) -> bool {
+    let Ok(image) = parse_dol(source) else {
+        return false;
+    };
+    find_goop_wash_hook(source, &image).is_ok() && find_goop_wash_callees(source, &image).is_ok()
+}
+
+#[cfg(test)]
+mod goop_wash_tests {
+    use super::*;
+
+    /// Props arrive at the wash through `TMapObjBase::receiveMessage` rather
+    /// than through the enemy classes, so the hook is a different one and worth
+    /// checking against the retail image on its own. The signature is anchored
+    /// past the message test, where the prop is still in `r3`.
+    #[test]
+    #[ignore = "requires SMS_BASE_ROOT pointing at the extracted retail game"]
+    fn the_wash_installs_on_the_props_road() {
+        let base = std::env::var("SMS_BASE_ROOT").expect("set SMS_BASE_ROOT");
+        let path = std::path::Path::new(&base)
+            .join("sys")
+            .join("main.dol.orig");
+        let source = std::fs::read(&path).expect("read the original DOL");
+        let image = parse_dol(&source).expect("parse");
+
+        let hook = find_goop_wash_signature(
+            &source,
+            &image,
+            &GOOP_WASH_PROP_SIGNATURE,
+            GOOP_WASH_PROP_SIGNATURE_OFFSET,
+            "TMapObjBase::receiveMessage",
+        )
+        .expect("find the props hook");
+        println!("PROP HOOK: {hook:#010x}");
+
+        let settings = GoopWashSettings {
+            konst_register: 1,
+            start_level: 143,
+            resistance: 5,
+            step: 1,
+            uniform_rate: true,
+            reach: GoopWashReach::Props,
+        };
+        let patched = install_goop_wash(&source, settings, &[]).expect("install for props");
+        assert!(patched.len() > source.len());
+
+        let after = parse_dol(&patched).expect("reparse");
+        let offset = usize::try_from(dol_file_offset(&after, hook).expect("hook offset"))
+            .expect("offset fits");
+        let word = u32::from_be_bytes([
+            patched[offset],
+            patched[offset + 1],
+            patched[offset + 2],
+            patched[offset + 3],
+        ]);
+        assert_eq!(
+            word >> 26,
+            18,
+            "the props hook is not a branch: {word:#010x}"
+        );
+
+        // The stub itself, so an address inside it can be read as an
+        // instruction rather than guessed at.
+        {
+            let image = parse_dol(&patched).expect("reparse for dump");
+            if let Some(section) = image.sections.iter().find(|s| s.text && s.slot == 2) {
+                let words = section_words(&patched, *section).expect("stub words");
+                for (index, word) in words.iter().enumerate().take(80) {
+                    println!("  STUB +{:#05x} (w{index:>3}) {:#010x}", index * 4, word);
+                }
+            }
+        }
+
+        // Where the stub actually lands, so a crash address can be read
+        // against it rather than against the unpatched image.
+        {
+            let image = parse_dol(&patched).expect("reparse for layout");
+            for section in image.sections.iter().filter(|section| section.text) {
+                println!(
+                    "  TEXT slot {} {:#010x}..{:#010x}",
+                    section.slot,
+                    section.address,
+                    section.address_end().unwrap()
+                );
+            }
+        }
+
+        // With an allowlist the stub must let a stranger past: a class it was
+        // not told about arrives at the same hook and must leave untouched,
+        // because binding a konst packet into a display list built for
+        // something else ends with the game executing data.
+        let filtered = install_goop_wash(
+            &source,
+            GoopWashSettings {
+                reach: GoopWashReach::Everything,
+                ..settings
+            },
+            &[
+                // Petey, painting nothing of its own.
+                GoopWashActor {
+                    vtable: 0x803B_45D4,
+                    tinted_material: None,
+                    tint_register: 0,
+                    tint: [0; 4],
+                },
+                // Cataquack, which paints TEV register zero on its body.
+                GoopWashActor {
+                    vtable: 0x803B_7378,
+                    tinted_material: Some(0),
+                    tint_register: 0,
+                    tint: [-191, 8, 303, 0],
+                },
+            ],
+        )
+        .expect("install with an allowlist");
+        let unfiltered = install_goop_wash(
+            &source,
+            GoopWashSettings {
+                reach: GoopWashReach::Everything,
+                ..settings
+            },
+            &[],
+        )
+        .expect("install without one");
+        assert!(
+            filtered.len() > unfiltered.len(),
+            "the allowlist emitted no comparison"
+        );
+        // The stub that actually carries records, so the record walk and the
+        // bind loop can be read rather than assumed.
+        {
+            let image = parse_dol(&filtered).expect("reparse");
+            if let Some(section) = image.sections.iter().find(|s| s.text && s.slot == 2) {
+                let words = section_words(&filtered, *section).expect("words");
+                for (index, word) in words.iter().enumerate().take(120) {
+                    println!("  TINT +{:#05x} (w{index:>3}) {:#010x}", index * 4, word);
+                }
+            }
+        }
+
+        // Everything hooks the send itself, at every site the water manager
+        // uses. All of them have to become branches: a missed one is an actor
+        // that silently never washes.
+        let sites = find_goop_wash_dispatch_sites(&source, &image).expect("find the dispatch");
+        println!(
+            "DISPATCH SITES: {}",
+            sites
+                .iter()
+                .map(|site| format!("{site:#010x}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let universal = GoopWashSettings {
+            reach: GoopWashReach::Everything,
+            ..settings
+        };
+        let patched_all = install_goop_wash(&source, universal, &[]).expect("install everywhere");
+        let after_all = parse_dol(&patched_all).expect("reparse");
+        for site in &sites {
+            let offset = usize::try_from(dol_file_offset(&after_all, *site).expect("site offset"))
+                .expect("offset fits");
+            let word = u32::from_be_bytes([
+                patched_all[offset],
+                patched_all[offset + 1],
+                patched_all[offset + 2],
+                patched_all[offset + 3],
+            ]);
+            assert_eq!(
+                word >> 26,
+                18,
+                "site {site:#010x} is not a branch: {word:#010x}"
+            );
+        }
+
+        // Installing both roads has to leave two stubs standing, not one
+        // overwriting the other.
+        let enemies = GoopWashSettings {
+            reach: GoopWashReach::Enemies,
+            ..settings
+        };
+        let both = install_goop_wash(&source, enemies, &[]).expect("install for enemies");
+        let both = install_goop_wash(&both, settings, &[]).expect("install for props too");
+        assert!(
+            both.len() > patched.len(),
+            "the second install added nothing"
+        );
+    }
+
+    /// The hook is found by its own instructions, and the stub reaches the game
+    /// through the DOL's section table. Both are checked against the retail
+    /// image rather than a fixture, since a signature that matches something
+    /// else is exactly the failure worth catching.
+    #[test]
+    #[ignore = "requires SMS_BASE_ROOT pointing at the extracted retail game"]
+    fn the_wash_installs_against_the_retail_dol() {
+        let base = std::env::var("SMS_BASE_ROOT").expect("set SMS_BASE_ROOT");
+        let path = std::path::Path::new(&base)
+            .join("sys")
+            .join("main.dol.orig");
+        let source = std::fs::read(&path).expect("read the original DOL");
+
+        let image = parse_dol(&source).expect("parse");
+        let hook = find_goop_wash_hook(&source, &image).expect("find decHpByWater");
+        println!("HOOK: {hook:#010x}");
+
+        // Both hooks, since they find different functions and the message form
+        // carries an extra guard that the damage-step form does not.
+        for uniform_rate in [false, true] {
+            let settings = GoopWashSettings {
+                konst_register: 1,
+                start_level: 143,
+                resistance: 5,
+                step: 1,
+                uniform_rate,
+                reach: GoopWashReach::Enemies,
+            };
+            let patched = install_goop_wash(&source, settings, &[])
+                .unwrap_or_else(|error| panic!("install (uniform={uniform_rate}): {error}"));
+            assert!(patched.len() > source.len());
+            let after = parse_dol(&patched).expect("reparse");
+            let hook = if uniform_rate {
+                find_goop_wash_signature(
+                    &source,
+                    &image,
+                    &GOOP_WASH_MESSAGE_SIGNATURE,
+                    GOOP_WASH_MESSAGE_SIGNATURE_OFFSET,
+                    "receiveMessage",
+                )
+                .expect("find receiveMessage")
+            } else {
+                find_goop_wash_hook(&source, &image).expect("find decHpByWater")
+            };
+            let offset = dol_file_offset(&after, hook).expect("hook offset") as usize;
+            let word = u32::from_be_bytes([
+                patched[offset],
+                patched[offset + 1],
+                patched[offset + 2],
+                patched[offset + 3],
+            ]);
+            assert_eq!(
+                word >> 26,
+                18,
+                "uniform={uniform_rate}: hook is not a branch"
+            );
+            println!(
+                "uniform={uniform_rate}: hook {hook:#010x}, {} bytes",
+                patched.len()
+            );
+        }
+
+        let settings = GoopWashSettings {
+            konst_register: 1,
+            start_level: 143,
+            resistance: 5,
+            step: 1,
+            uniform_rate: false,
+            reach: GoopWashReach::Enemies,
+        };
+        let (get_model, init_kcolor) =
+            find_goop_wash_callees(&source, &image).expect("find the callees");
+        println!("GET_MODEL: {get_model:#010x}  INIT_KCOLOR: {init_kcolor:#010x}");
+        let patched = install_goop_wash(&source, settings, &[]).expect("install the wash");
+        assert!(patched.len() > source.len());
+        if let Some(out) = std::env::var_os("SMS_WASH_OUT") {
+            std::fs::write(out, &patched).expect("write the patched DOL");
+        }
+
+        let after = parse_dol(&patched).expect("reparse");
+        let offset = dol_file_offset(&after, hook).expect("hook offset") as usize;
+        let word = u32::from_be_bytes([
+            patched[offset],
+            patched[offset + 1],
+            patched[offset + 2],
+            patched[offset + 3],
+        ]);
+        assert_eq!(word >> 26, 18, "the hook should be an unconditional branch");
+        println!("PATCHED SIZE: {}", patched.len());
+    }
+}
