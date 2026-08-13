@@ -666,16 +666,43 @@ impl StageDocument {
     /// Reads a stage asset from the document's detached semantic archive when
     /// the path addresses its mounted stage source. Common files and other
     /// external assets retain the normal filesystem/archive reader behavior.
+    /// The archive-relative resource path behind an asset path, when the
+    /// asset lives inside this document's stage archive. Editing tools key
+    /// their archive edits by this path.
+    pub fn archive_resource_path_for_asset(&self, path: impl AsRef<Path>) -> Option<Vec<u8>> {
+        let source_path = self.stage_archive_source_path.as_ref()?;
+        semantic_resource_path_for_asset(source_path, path.as_ref())
+    }
+
     pub fn read_asset_bytes(&self, path: impl AsRef<Path>) -> Result<Vec<u8>> {
         let path = path.as_ref();
-        if let (Some(archive), Some(source_path)) =
-            (&self.stage_archive, &self.stage_archive_source_path)
-        {
+        // An edit is keyed by the archive-relative path, which only needs the
+        // archive's source path to work out -- not the archive itself. Asking
+        // for both meant a document that knows where its stage came from but
+        // has not loaded it read straight past every edit to the file on disk:
+        // an authored goop layer was written, kept, and shipped in a build,
+        // while every preview showed the actor exactly as it was before.
+        if let Some(source_path) = &self.stage_archive_source_path {
             if let Some(raw_resource_path) = semantic_resource_path_for_asset(source_path, path) {
                 if raw_resource_path == b"map/map.col" && self.death_barrier.is_some() {
                     if let Some(resource) = self.effective_resource_clone(&raw_resource_path)? {
                         return Ok(resource.to_bytes()?);
                     }
+                }
+                // Typed model edits win over general resource edits, because
+                // that is the order a build applies them in: resources first,
+                // so a later typed edit can update what they placed. Reading
+                // them the other way round returned the resource a catalogue
+                // copy had put there and never reached the model, so an
+                // authored goop layer shipped in a build and appeared in no
+                // preview.
+                if let Some(edit) = self
+                    .archive_edits
+                    .models
+                    .iter()
+                    .find(|edit| edit.raw_resource_path == raw_resource_path)
+                {
+                    return Ok(edit.document.to_bytes()?);
                 }
                 if let Some(edit) = self
                     .archive_edits
@@ -685,15 +712,11 @@ impl StageDocument {
                 {
                     return Ok(edit.document.to_bytes()?);
                 }
-                if let Some(edit) = self
-                    .archive_edits
-                    .models
-                    .iter()
-                    .find(|edit| edit.raw_resource_path == raw_resource_path)
-                {
-                    return Ok(edit.document.to_bytes()?);
-                }
             }
+        }
+        if let (Some(archive), Some(source_path)) =
+            (&self.stage_archive, &self.stage_archive_source_path)
+        {
             if let Some(bytes) = read_matching_semantic_stage_asset(archive, source_path, path)? {
                 return Ok(bytes);
             }
@@ -4440,6 +4463,46 @@ mod tests {
         assert!(second_manifest
             .changed_files
             .contains(&PathBuf::from("second.bin")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A model edit is how an authored goop layer reaches a build, and it has
+    /// to survive a save and a reopen or the editor shows the actor clean
+    /// while the build still carries the layer.
+    #[test]
+    fn project_round_trip_keeps_a_model_edit() {
+        let root = unique_test_project_root("model-edit-round-trip");
+        let mut saved = empty_document("dolpic");
+        saved.objects = vec![SceneObject::new("edited-object", "Coin")];
+
+        // A minimal but real rebuild document: an untouched model parses and
+        // re-serialises, which is all the edit has to carry.
+        let model = sms_formats::J3dRebuildDocument {
+            file_type: *b"bmd3",
+            version_tag: *b"SVR1",
+            reserved_words: [0xffff_ffff; 3],
+            declared_section_count: 0,
+            sections: Vec::new(),
+        };
+        saved
+            .archive_edits
+            .replace_model(b"bosspakkun/bosspaku_model.bmd".to_vec(), model.clone());
+        saved.queue_editor_overlay_change().unwrap();
+        saved.save_project_folder(&root).unwrap();
+
+        let mut reopened = empty_document("dolpic");
+        assert!(reopened.load_project_folder(&root).unwrap());
+        assert_eq!(
+            reopened.archive_edits.models.len(),
+            1,
+            "the model edit did not survive the round trip"
+        );
+        assert_eq!(
+            reopened.archive_edits.models[0].raw_resource_path,
+            b"bosspakkun/bosspaku_model.bmd".to_vec()
+        );
+        assert_eq!(reopened.archive_edits.models[0].document, model);
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -229,6 +229,10 @@ fn default_camera_speed() -> f32 {
 
 /// Stage-sized default for projects saved before the navigation distance was
 /// stored, matching `reset_camera`.
+fn default_mask_wash_coverage() -> f32 {
+    1.0
+}
+
 fn default_stage_geometry_clickable() -> bool {
     true
 }
@@ -267,6 +271,37 @@ pub(super) struct SmsProjectFile {
     /// existing projects behave as before.
     #[serde(default = "default_stage_geometry_clickable")]
     pub(super) stage_geometry_clickable: bool,
+    /// How much goop the Mask Tool coats an actor with, and whether the wash
+    /// clears the mask's dark values first. Authoring settings rather than
+    /// scene data, so they belong with the project rather than the stage.
+    #[serde(default = "default_mask_wash_coverage")]
+    pub(super) mask_wash_coverage: f32,
+    #[serde(default)]
+    pub(super) mask_wash_invert: bool,
+    #[serde(default = "washable_default")]
+    pub(super) mask_bake_washable: bool,
+    #[serde(default = "resistance_default")]
+    pub(super) mask_wash_resistance: u32,
+    #[serde(default = "wash_step_default")]
+    pub(super) mask_wash_step: u32,
+    #[serde(default = "uniform_rate_default")]
+    pub(super) mask_wash_uniform_rate: bool,
+    #[serde(default = "wash_reach_default")]
+    pub(super) mask_wash_reach: String,
+    /// Classes this project has authored goop layers on, as the vtables their
+    /// instances carry. A wash that reaches every actor uses them to tell the
+    /// ones it authored from the ones it was handed.
+    #[serde(default)]
+    pub(super) mask_wash_vtables: Vec<u32>,
+    /// For each of those classes, the colour it paints on its own model:
+    /// material index, `GXTevRegID`, then the four signed channels.
+    #[serde(default)]
+    pub(super) mask_wash_tints: Vec<MaskWashTint>,
+    /// The konst register the last bake claimed. The wash has to write the
+    /// register the layer reads, and the bake takes whichever the material had
+    /// spare, so it is recorded rather than assumed.
+    #[serde(default)]
+    pub(super) mask_wash_konst: u8,
 }
 
 #[derive(Deserialize)]
@@ -344,6 +379,16 @@ impl LegacySmsProjectFileV1 {
             sound_assignments: self.sound_assignments,
             launch: self.launch,
             stage_geometry_clickable: default_stage_geometry_clickable(),
+            mask_wash_coverage: default_mask_wash_coverage(),
+            mask_wash_invert: false,
+            mask_bake_washable: true,
+            mask_wash_resistance: 4,
+            mask_wash_step: 1,
+            mask_wash_uniform_rate: true,
+            mask_wash_reach: wash_reach_default(),
+            mask_wash_vtables: Vec::new(),
+            mask_wash_tints: Vec::new(),
+            mask_wash_konst: 0,
         }
     }
 }
@@ -371,6 +416,16 @@ impl SmsProjectFile {
             sound_assignments: BTreeMap::new(),
             launch: ProjectLaunchConfiguration::default(),
             stage_geometry_clickable: default_stage_geometry_clickable(),
+            mask_wash_coverage: default_mask_wash_coverage(),
+            mask_wash_invert: false,
+            mask_bake_washable: true,
+            mask_wash_resistance: 4,
+            mask_wash_step: 1,
+            mask_wash_uniform_rate: true,
+            mask_wash_reach: wash_reach_default(),
+            mask_wash_vtables: Vec::new(),
+            mask_wash_tints: Vec::new(),
+            mask_wash_konst: 0,
         }
     }
 
@@ -1036,6 +1091,52 @@ fn new_project_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{nanos:032x}-{:08x}-{sequence:08x}", std::process::id())
+}
+
+/// A layer is authored to be washed off unless the author says otherwise.
+fn washable_default() -> bool {
+    true
+}
+
+/// Four water hits per step: slow enough to watch, fast enough to finish.
+fn resistance_default() -> u32 {
+    4
+}
+
+/// One level per hit unless the author asks for more.
+fn wash_step_default() -> u32 {
+    1
+}
+
+/// Count every spray, rather than only the ones an actor's class lets past
+/// its cooldown.
+fn uniform_rate_default() -> bool {
+    true
+}
+
+/// How far the wash reaches: `enemies`, `props`, or `everything`.
+///
+/// Props by default, which keeps enemies behaving exactly as they did while
+/// covering scenery -- a coating baked onto a boat that never washes reads as
+/// the wash being broken rather than as a setting. `everything` hooks the send
+/// itself, which reaches classes that handle the message their own way, but
+/// counts a spray one step earlier and so is a deliberate choice.
+/// A colour a class paints on its own model, carried so a wash can rebind it
+/// rather than replace it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct MaskWashTint {
+    /// The class's vtable, matching an entry in `mask_wash_vtables`.
+    pub(super) vtable: u32,
+    /// Which material the colour is painted on.
+    pub(super) material: u16,
+    /// `GXTevRegID` for the colour.
+    pub(super) register: u8,
+    /// The colour, as the signed values `GXColorS10` holds.
+    pub(super) color: [i16; 4],
+}
+
+fn wash_reach_default() -> String {
+    "props".to_string()
 }
 
 #[cfg(test)]
