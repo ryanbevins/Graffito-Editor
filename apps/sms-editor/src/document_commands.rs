@@ -1804,10 +1804,23 @@ fn manager_constructs_actor_or_managed_variant(
         return true;
     }
 
-    semantic_record_type(&manager.factory_name) == "PoiHanaManager"
-        && semantic_record_type(&actor.factory_name) == "PoiHanaRed"
-        && manager.spawned_actor_class.as_deref() == Some("TPoiHana")
-        && actor.class_name == "TPoiHanaRed"
+    // Subclasses a manager legitimately manages: the manager constructs the
+    // base class, and the variant derives from it, so a pool of the base
+    // manager can carry it. `TPoiHanaRed : TPoiHana` and
+    // `TStayPakkun : TPakkun` (Enemy/Pakkun.hpp), whose init takes the
+    // manager like any other.
+    const MANAGED_VARIANTS: [(&str, &str, &str, &str); 2] = [
+        ("PoiHanaManager", "PoiHanaRed", "TPoiHana", "TPoiHanaRed"),
+        ("PakkunManager", "StayPakkun", "TPakkun", "TStayPakkun"),
+    ];
+    MANAGED_VARIANTS.iter().any(
+        |(manager_factory, actor_factory, base_class, variant_class)| {
+            semantic_record_type(&manager.factory_name) == *manager_factory
+                && semantic_record_type(&actor.factory_name) == *actor_factory
+                && manager.spawned_actor_class.as_deref() == Some(*base_class)
+                && actor.class_name == *variant_class
+        },
+    )
 }
 
 fn prepare_catalog_enemy_manager_pool(
@@ -4077,6 +4090,30 @@ impl SmsEditorApp {
             }
             repaired
         };
+
+        // A clone that lost its character registration crashes the stage on
+        // load: the manager dereferences the registration it fails to find.
+        // Restoring it is idempotent, so it runs on every repair.
+        if !clone.template.character_records.is_empty() {
+            let current = self
+                .document
+                .as_ref()
+                .ok_or_else(|| "no stage is open".to_string())?
+                .effective_resource_clone(b"map/tables.bin")
+                .map_err(|error| error.to_string())?;
+            let (merged, changed) =
+                merge_character_table(current, &clone.template.character_records)?;
+            if changed {
+                let document = self
+                    .document
+                    .as_mut()
+                    .ok_or_else(|| "no stage is open".to_string())?;
+                document.archive_edits.upsert_resource(
+                    b"map/tables.bin".to_vec(),
+                    sms_scene::StageResourceDocument::Placement(merged),
+                );
+            }
+        }
         let missing = {
             let document = self
                 .document
@@ -4428,7 +4465,7 @@ impl SmsEditorApp {
         }
     }
 
-    fn apply_object_edit(&mut self, label: &str, record: ObjectUndoRecord) {
+    pub(super) fn apply_object_edit(&mut self, label: &str, record: ObjectUndoRecord) {
         self.apply_object_edit_inner(label, record, true);
     }
 

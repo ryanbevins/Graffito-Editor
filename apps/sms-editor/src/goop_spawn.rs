@@ -1183,6 +1183,7 @@ impl SmsEditorApp {
         stain: &sms_formats::BtiFile,
         included: &dyn Fn(&str) -> bool,
         protect_from_runtime: bool,
+        require_pinned_blend: bool,
     ) -> usize {
         const DUMMY_TEXTURE: &str = "H_ma_rak_dummy";
         const STAIN_MATERIAL: &str = "_mat_body_top1";
@@ -1213,14 +1214,20 @@ impl SmsEditorApp {
                 continue;
             };
             let already_pinned = model.material_konst_alpha_half_is_pinned(STAIN_MATERIAL);
-            if !already_pinned && !model.can_pin_material_konst_alpha_half(STAIN_MATERIAL) {
+            let can_pin = model.can_pin_material_konst_alpha_half(STAIN_MATERIAL);
+            // A Stu cap needs the blend pinned on or the stain never shows; an
+            // actor whose goop is a runtime-animated mask (Pakkun fades its
+            // coating as Mario sprays it) has no such material and must keep
+            // driving its own alpha, so only the texture is swapped there.
+            if require_pinned_blend && !already_pinned && !can_pin {
                 continue;
             }
             let mut baked = model.clone();
-            if !already_pinned {
+            if !already_pinned && can_pin {
                 match baked.pin_material_konst_alpha_half(STAIN_MATERIAL) {
                     Ok(count) if count > 0 => {}
-                    Ok(_) => continue,
+                    Ok(_) if require_pinned_blend => continue,
+                    Ok(_) => {}
                     Err(error) => {
                         self.log.push(format!(
                             "Could not pin the stain blend in {}: {error}",
@@ -1357,7 +1364,7 @@ impl SmsEditorApp {
         };
 
         let baked_models =
-            self.bake_stain_into_models(&stain, &Self::outside_layer_pool_folders, false);
+            self.bake_stain_into_models(&stain, &Self::outside_layer_pool_folders, false, true);
 
         if baked_models == 0 {
             self.log.push(
@@ -1417,7 +1424,7 @@ impl SmsEditorApp {
         })
     }
 
-    /// Whether any copied Stu model carries the baked stain.
+    /// Whether a base-pool Stu model carries the baked stain.
     pub(super) fn stu_stain_baked(&self) -> bool {
         const STAIN_MATERIAL: &str = "_mat_body_top1";
         let Some(document) = self.document.as_ref() else {
@@ -1889,6 +1896,210 @@ impl SmsEditorApp {
                 .log
                 .push(format!("Could not write the layer bindings: {error}")),
         }
+    }
+
+    /// The goop layer a placed actor samples, read from its manager name.
+    pub(super) fn selected_actor_goop_layer(object: &SceneObject) -> Option<usize> {
+        let manager = object.raw_param("manager_name")?;
+        let (_, suffix) = manager.rsplit_once("_L")?;
+        (suffix.len() == 2 && suffix.chars().all(|item| item.is_ascii_digit()))
+            .then(|| suffix.parse().ok())
+            .flatten()
+    }
+
+    /// Binds the selected placed actor to a goop layer, or back to the stage.
+    ///
+    /// The actor is rebound to that layer's clone bundle, whose model copy
+    /// carries the layer's baked goop texture shielded from the runtime's
+    /// stage-wide replacement -- so the actor wears the goop it stands in.
+    /// `None` returns it to its base manager and the stage texture.
+    pub(super) fn set_selected_actor_goop_layer(&mut self, layer: Option<usize>) {
+        let Some(object) = self.selected_object().cloned() else {
+            return;
+        };
+        let Some(current_manager) = object.raw_param("manager_name").map(str::to_owned) else {
+            self.log
+                .push("That actor has no manager to rebind.".to_string());
+            return;
+        };
+        let base_manager = match current_manager.rsplit_once("_L") {
+            Some((base, suffix))
+                if suffix.len() == 2 && suffix.chars().all(|item| item.is_ascii_digit()) =>
+            {
+                base.to_string()
+            }
+            _ => current_manager.clone(),
+        };
+        let target_manager = match layer {
+            Some(index) => format!("{base_manager}{}", Self::layer_pool_suffix(index)),
+            None => base_manager.clone(),
+        };
+        if target_manager == current_manager {
+            return;
+        }
+
+        if let Some(index) = layer {
+            let manager_factory = {
+                let (Some(document), Some(registry)) =
+                    (self.document.as_ref(), self.registry.as_ref())
+                else {
+                    return;
+                };
+                let Some(instance) = enemy_manager_instances(document, registry)
+                    .get(&base_manager)
+                    .cloned()
+                else {
+                    self.log.push(format!(
+                        "Could not rebind '{}': {base_manager:?} is not a decomp-identified \
+                         TEnemyManager in this stage.",
+                        object.id
+                    ));
+                    return;
+                };
+                instance.factory_name
+            };
+            let actor_factory = object.factory_name.clone();
+            let suffix = Self::layer_pool_suffix(index);
+            let clone_exists = self.document.as_ref().is_some_and(|document| {
+                document
+                    .objects
+                    .iter()
+                    .any(|item| item.raw_param("manager_name") == Some(target_manager.as_str()))
+            });
+            let prepared = if clone_exists {
+                self.ensure_cloned_manager_pool_resources(&actor_factory, &base_manager, &suffix)
+                    .map(|_| ())
+            } else {
+                self.ensure_cloned_enemy_manager_pool(
+                    &actor_factory,
+                    &manager_factory,
+                    &base_manager,
+                    &suffix,
+                )
+                .map(|message| self.log.push(message))
+            };
+            if let Err(error) = prepared {
+                self.log.push(format!(
+                    "Could not prepare the layer {index:02} bundle: {error}"
+                ));
+                return;
+            }
+            let folders = match self.cloned_manager_folders(&actor_factory, &base_manager, &suffix)
+            {
+                Ok(folders) => folders,
+                Err(error) => {
+                    self.log.push(format!(
+                        "Could not locate the layer's model folder: {error}"
+                    ));
+                    return;
+                }
+            };
+            match self.stain_for_layer(index) {
+                Some(stain) => {
+                    let baked = self.bake_stain_into_models(
+                        &stain,
+                        &|path: &str| {
+                            let path = path.to_ascii_lowercase();
+                            folders.iter().any(|folder| {
+                                let folder = folder.to_ascii_lowercase();
+                                path == folder || path.starts_with(&format!("{folder}/"))
+                            })
+                        },
+                        true,
+                        false,
+                    );
+                    self.log.push(format!(
+                        "Baked layer {index:02}'s goop texture into {baked} model(s)."
+                    ));
+                }
+                None => self.log.push(format!(
+                    "Layer {index:02} has no goop texture available; the actor keeps its \
+                     current look."
+                )),
+            }
+        }
+
+        // The parameter editor refuses manager_name on a retail-placed actor
+        // ("no owned dependency"), which is right in general: relinking to a
+        // manager that does not exist would break export. Here the target
+        // manager was just created and owned by its pool carrier, so the link
+        // resolves and the edit is applied directly.
+        let Some(mut after) = self.selected_object().cloned() else {
+            return;
+        };
+        let before = after.clone();
+        after.set_raw_param("manager_name", target_manager.clone());
+        // The actor's own character stays on the base registration: export
+        // re-applies parameters and refuses a changed character_name (it owns
+        // a registration), and the model comes through the manager's keeper
+        // anyway, so only the manager needs to move. Writing the base also
+        // repairs actors a previous build had suffixed, which failed export.
+        if let Some(character) = before.raw_param("character_name") {
+            let base = match character.rsplit_once("_L") {
+                Some((base, digits))
+                    if digits.len() == 2 && digits.chars().all(|item| item.is_ascii_digit()) =>
+                {
+                    base.to_string()
+                }
+                _ => character.to_string(),
+            };
+            after.set_raw_param("character_name", base);
+        }
+        sms_scene::sync_scene_object_parameter_aliases(&mut after);
+        if let Some(sms_scene::PlacementBinding::Authored(authored)) = after.placement.as_mut() {
+            for dependency in &mut authored.dependencies {
+                if dependency.record.name != current_manager {
+                    continue;
+                }
+                dependency.record.name.clone_from(&target_manager);
+                // The payload must move with the name: the clone bundle's
+                // manager record points at the clone's character, and export
+                // refuses two same-named records with different payloads.
+                let fields = match &mut dependency.record.payload {
+                    sms_formats::JDramaRecordPayload::Fields { fields }
+                    | sms_formats::JDramaRecordPayload::Actor { fields, .. } => fields,
+                    _ => continue,
+                };
+                for field in fields {
+                    if field.name != "character_name" {
+                        continue;
+                    }
+                    if let sms_formats::JDramaFieldValue::String(value) = &mut field.value {
+                        let base = match value.rsplit_once("_L") {
+                            Some((base, digits))
+                                if digits.len() == 2
+                                    && digits.chars().all(|item| item.is_ascii_digit()) =>
+                            {
+                                base.to_string()
+                            }
+                            _ => value.clone(),
+                        };
+                        *value = match layer {
+                            Some(index) => {
+                                format!("{base}{}", Self::layer_pool_suffix(index))
+                            }
+                            None => base,
+                        };
+                    }
+                }
+            }
+        }
+        self.apply_object_edit(
+            "Bound actor to a goop layer",
+            ObjectUndoRecord {
+                deltas: vec![ObjectDelta::Update {
+                    before: Box::new(before),
+                    after: Box::new(after),
+                }],
+                resource_deltas: Vec::new(),
+                route_delta: None,
+                dialogue_delta: None,
+            },
+        );
+        self.log.push(match layer {
+            Some(index) => format!("'{}' now samples goop layer {index:02}.", object.id),
+            None => format!("'{}' returned to the stage goop texture.", object.id),
+        });
     }
 
     /// The Spawning section of the goop inspector.
