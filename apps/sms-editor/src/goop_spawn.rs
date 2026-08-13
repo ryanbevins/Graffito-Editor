@@ -1644,6 +1644,7 @@ impl SmsEditorApp {
                 })
             },
             true,
+            true,
         ))
     }
 
@@ -1995,7 +1996,7 @@ impl SmsEditorApp {
                 }
             };
             match self.stain_for_layer(index) {
-                Some(stain) => {
+                Ok(stain) => {
                     let baked = self.bake_stain_into_models(
                         &stain,
                         &|path: &str| {
@@ -2012,9 +2013,9 @@ impl SmsEditorApp {
                         "Baked layer {index:02}'s goop texture into {baked} model(s)."
                     ));
                 }
-                None => self.log.push(format!(
-                    "Layer {index:02} has no goop texture available; the actor keeps its \
-                     current look."
+                Err(error) => self.log.push(format!(
+                    "Could not read goop layer {index:02}'s texture; the actor keeps its \
+                     current look: {error}"
                 )),
             }
         }

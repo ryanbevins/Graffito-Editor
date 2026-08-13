@@ -198,6 +198,7 @@ pub(super) fn render_preview_offscreen(
         power_preference: wgpu::PowerPreference::HighPerformance,
         force_fallback_adapter: false,
         compatible_surface: None,
+        apply_limit_buckets: false,
     }))
     .map_err(|error| format!("request WGPU adapter: {error}"))?;
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -271,7 +272,9 @@ pub(super) fn render_preview_offscreen(
         .map_err(|error| format!("receive WGPU map result: {error}"))?
         .map_err(|error| format!("map WGPU readback: {error}"))?;
 
-    let mapped = slice.get_mapped_range();
+    let mapped = slice
+        .get_mapped_range()
+        .map_err(|error| format!("read WGPU mapped range: {error}"))?;
     let mut image =
         egui::ColorImage::filled([size[0] as usize, size[1] as usize], egui::Color32::BLACK);
     for y in 0..size[1] as usize {
@@ -4101,7 +4104,7 @@ fn create_wave_mask_pipeline(
             module: shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
-            buffers: &[GpuVertex::layout()],
+            buffers: &[Some(GpuVertex::layout())],
         },
         fragment: Some(wgpu::FragmentState {
             module: shader,
@@ -4149,7 +4152,7 @@ fn create_pipeline(
             module: shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
-            buffers: &[GpuVertex::layout()],
+            buffers: &[Some(GpuVertex::layout())],
         },
         fragment: Some(wgpu::FragmentState {
             module: shader,

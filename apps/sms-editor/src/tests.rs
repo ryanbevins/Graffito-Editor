@@ -1,6 +1,17 @@
 use super::*;
 use sms_authoring::{AssetId, ModelInstanceExportMode, ModelInstancePlacement};
 
+fn run_test_ui(
+    context: &egui::Context,
+    input: egui::RawInput,
+    mut add_contents: impl FnMut(&mut egui::Ui),
+) -> egui::FullOutput {
+    let mut output = context.run_ui(input, |ui| add_contents(ui));
+    // Unit tests have no renderer to consume egui's font and texture uploads.
+    output.textures_delta.clear();
+    output
+}
+
 #[test]
 fn content_dock_window_clamp_does_not_replace_the_preferred_height() {
     assert_eq!(preferred_content_dock_height(700.0, 320.0, false), 700.0);
@@ -10,8 +21,12 @@ fn content_dock_window_clamp_does_not_replace_the_preferred_height() {
 #[test]
 fn animated_viewport_repaint_is_bounded_to_the_sunshine_frame_clock() {
     let ctx = egui::Context::default();
-    let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
-    let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+    // Let egui finish its startup texture/font passes before measuring the
+    // viewport's own requested cadence.
+    for _ in 0..3 {
+        let _ = run_test_ui(&ctx, egui::RawInput::default(), |_| {});
+    }
+    let output = run_test_ui(&ctx, egui::RawInput::default(), |ui| {
         crate::viewport_ui::request_viewport_animation_repaint(ui.ctx());
     });
     let repaint_delay = output
@@ -278,22 +293,23 @@ fn transform_shortcuts_do_not_exit_goop_mode() {
 
 fn keyboard_input(key: egui::Key, modifiers: egui::Modifiers) -> egui::RawInput {
     egui::RawInput {
-        modifiers,
-        events: vec![egui::Event::Key {
-            key,
-            physical_key: Some(key),
-            pressed: true,
-            repeat: false,
-            modifiers,
-        }],
+        events: vec![
+            egui::Event::ModifiersChanged(modifiers),
+            egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed: true,
+                repeat: false,
+                modifiers,
+            },
+        ],
         ..egui::RawInput::default()
     }
 }
 
 fn clipboard_input(event: egui::Event) -> egui::RawInput {
     egui::RawInput {
-        modifiers: egui::Modifiers::CTRL,
-        events: vec![event],
+        events: vec![egui::Event::ModifiersChanged(egui::Modifiers::CTRL), event],
         ..egui::RawInput::default()
     }
 }
@@ -324,7 +340,7 @@ fn shortcut_test_document(object: SceneObject) -> StageDocument {
 #[test]
 fn viewport_focus_allows_world_edit_shortcuts_while_text_edit_focus_owns_them() {
     let context = egui::Context::default();
-    let _ = context.run_ui(egui::RawInput::default(), |ui| {
+    let _ = run_test_ui(&context, egui::RawInput::default(), |ui| {
         let viewport = ui.allocate_response(egui::vec2(100.0, 100.0), egui::Sense::click());
         viewport.request_focus();
     });
@@ -338,33 +354,40 @@ fn viewport_focus_allows_world_edit_shortcuts_while_text_edit_focus_owns_them() 
         document: Some(shortcut_test_document(object.clone())),
         ..SmsEditorApp::default()
     };
-    let _ = context.run_ui(
+    let _ = run_test_ui(
+        &context,
         keyboard_input(egui::Key::Delete, egui::Modifiers::NONE),
         |ui| app.handle_editor_shortcuts(ui.ctx()),
     );
     assert!(app.document.as_ref().unwrap().objects.is_empty());
 
-    let _ = context.run_ui(keyboard_input(egui::Key::Z, egui::Modifiers::CTRL), |ui| {
-        app.handle_editor_shortcuts(ui.ctx())
-    });
+    let _ = run_test_ui(
+        &context,
+        keyboard_input(egui::Key::Z, egui::Modifiers::CTRL),
+        |ui| app.handle_editor_shortcuts(ui.ctx()),
+    );
     assert_eq!(
         app.document.as_ref().unwrap().objects,
         std::slice::from_ref(&object)
     );
-    let _ = context.run_ui(keyboard_input(egui::Key::Y, egui::Modifiers::CTRL), |ui| {
-        app.handle_editor_shortcuts(ui.ctx())
-    });
+    let _ = run_test_ui(
+        &context,
+        keyboard_input(egui::Key::Y, egui::Modifiers::CTRL),
+        |ui| app.handle_editor_shortcuts(ui.ctx()),
+    );
     assert!(app.document.as_ref().unwrap().objects.is_empty());
-    let _ = context.run_ui(keyboard_input(egui::Key::Z, egui::Modifiers::CTRL), |ui| {
-        app.handle_editor_shortcuts(ui.ctx())
-    });
+    let _ = run_test_ui(
+        &context,
+        keyboard_input(egui::Key::Z, egui::Modifiers::CTRL),
+        |ui| app.handle_editor_shortcuts(ui.ctx()),
+    );
     assert_eq!(
         app.document.as_ref().unwrap().objects,
         std::slice::from_ref(&object)
     );
 
     app.selected_object_id = Some(object.id.clone());
-    let copy_output = context.run_ui(clipboard_input(egui::Event::Copy), |ui| {
+    let copy_output = run_test_ui(&context, clipboard_input(egui::Event::Copy), |ui| {
         app.handle_editor_shortcuts(ui.ctx());
     });
     assert!(copy_output.platform_output.commands.iter().any(|command| {
@@ -373,7 +396,8 @@ fn viewport_focus_allows_world_edit_shortcuts_while_text_edit_focus_owns_them() 
             egui::OutputCommand::CopyText(text) if text == "Graffito Editor object"
         )
     }));
-    let _ = context.run_ui(
+    let _ = run_test_ui(
+        &context,
         clipboard_input(egui::Event::Paste("Graffito Editor object".to_string())),
         |ui| app.handle_editor_shortcuts(ui.ctx()),
     );
@@ -384,9 +408,11 @@ fn viewport_focus_allows_world_edit_shortcuts_while_text_edit_focus_owns_them() 
         object.transform.translation
     );
 
-    let _ = context.run_ui(keyboard_input(egui::Key::D, egui::Modifiers::CTRL), |ui| {
-        app.handle_editor_shortcuts(ui.ctx())
-    });
+    let _ = run_test_ui(
+        &context,
+        keyboard_input(egui::Key::D, egui::Modifiers::CTRL),
+        |ui| app.handle_editor_shortcuts(ui.ctx()),
+    );
     let objects = &app.document.as_ref().unwrap().objects;
     assert_eq!(objects.len(), 3);
     assert_eq!(
@@ -396,7 +422,7 @@ fn viewport_focus_allows_world_edit_shortcuts_while_text_edit_focus_owns_them() 
 
     let text_context = egui::Context::default();
     let mut text = String::new();
-    let _ = text_context.run_ui(egui::RawInput::default(), |ui| {
+    let _ = run_test_ui(&text_context, egui::RawInput::default(), |ui| {
         ui.text_edit_singleline(&mut text).request_focus();
     });
     assert!(text_editor_owns_shortcuts(&text_context));
@@ -419,7 +445,8 @@ fn modal_grab_suppresses_global_edit_shortcuts() {
         ..SmsEditorApp::default()
     };
 
-    let _ = context.run_ui(
+    let _ = run_test_ui(
+        &context,
         keyboard_input(egui::Key::Delete, egui::Modifiers::NONE),
         |ui| app.handle_editor_shortcuts(ui.ctx()),
     );
