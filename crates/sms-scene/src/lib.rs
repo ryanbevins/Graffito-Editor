@@ -1502,6 +1502,31 @@ impl StageDocument {
             })
     }
 
+    /// Returns whether a placed actor is killed during another placed actor's
+    /// initial load and therefore should not appear in the initial viewport.
+    pub fn object_is_runtime_initially_hidden(&self, object: &SceneObject) -> bool {
+        let Some(registry) = self.registry.as_ref() else {
+            return false;
+        };
+        let Some(runtime_name) = object.raw_param("name") else {
+            return false;
+        };
+
+        registry.runtime_name_references.iter().any(|reference| {
+            reference.initially_hidden
+                && reference.record_name == runtime_name
+                && matches!(
+                    &reference.target,
+                    sms_schema::RuntimeNameReferenceTarget::Actor { factory_name }
+                        if factory_name == &object.factory_name
+                )
+                && self
+                    .objects
+                    .iter()
+                    .any(|owner| owner.factory_name == reference.factory_name)
+        })
+    }
+
     /// Returns the decomp-derived preview definition for this object's factory.
     pub fn object_preview_definition(
         &self,
@@ -4263,6 +4288,32 @@ mod tests {
     }
 
     #[test]
+    fn runtime_killed_named_actor_is_hidden_only_when_its_owner_is_placed() {
+        let mut document = empty_document("pinnaBeach1");
+        let mut gate = SceneObject::new("gate", "MareGate");
+        gate.set_raw_param("name", "efMareGate");
+        document.objects.push(gate);
+        let mut registry = ObjectRegistry::default();
+        registry
+            .runtime_name_references
+            .push(sms_schema::RuntimeNameReferenceDefinition {
+                factory_name: "Cannon".to_string(),
+                target: sms_schema::RuntimeNameReferenceTarget::Actor {
+                    factory_name: "MareGate".to_string(),
+                },
+                required: false,
+                initially_hidden: true,
+                record_name: "efMareGate".to_string(),
+                source_file: "src/Enemy/cannon.cpp".to_string(),
+            });
+        document.registry = Some(registry);
+
+        assert!(!document.object_is_runtime_initially_hidden(&document.objects[0]));
+        document.objects.push(SceneObject::new("cannon", "Cannon"));
+        assert!(document.object_is_runtime_initially_hidden(&document.objects[0]));
+    }
+
+    #[test]
     fn queues_an_explicit_empty_editor_overlay() {
         let mut doc = empty_document("dolpic");
         doc.queue_editor_overlay_change().unwrap();
@@ -6462,6 +6513,39 @@ mod tests {
             "unexpected runtime-scale issues: {:?}",
             document.load_issues
         );
+    }
+
+    #[test]
+    #[ignore = "requires the extracted retail game"]
+    fn retail_pinna_cannon_uses_default_model_and_hides_its_gate_initially() {
+        let base_root = std::env::var_os("SMS_BASE_ROOT")
+            .map(PathBuf::from)
+            .expect("set SMS_BASE_ROOT to the extracted game's root");
+        let registry = sms_schema::bundled_object_registry()
+            .expect("load bundled enemy schema")
+            .registry;
+        let document = StageDocument::open(&base_root, "pinnaBeach1")
+            .expect("open pinnaBeach1")
+            .with_registry(registry);
+        let cannon = document
+            .objects
+            .iter()
+            .find(|object| object.factory_name == "Cannon")
+            .expect("pinnaBeach1 cannon placement");
+        let gate = document
+            .objects
+            .iter()
+            .find(|object| object.raw_param("name") == Some("efMareGate"))
+            .expect("pinnaBeach1 efMareGate placement");
+        let preview = document.actor_preview(cannon).expect("cannon preview");
+
+        assert!(preview
+            .model_path
+            .replace('\\', "/")
+            .to_ascii_lowercase()
+            .ends_with("/cannon/default.bmd"));
+        assert_eq!(preview.load_flags, 0x1022_0000);
+        assert!(document.object_is_runtime_initially_hidden(gate));
     }
 
     #[test]

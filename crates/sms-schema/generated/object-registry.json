@@ -2,7 +2,7 @@
   "format_version": 1,
   "source_revision": "01ffd369c94b23be158abde1254c277879c04a9f",
   "source_fingerprint": 15545920352673147969,
-  "generator_fingerprint": 12879722444608376315,
+  "generator_fingerprint": 13141471545228029090,
   "registry": {
     "objects": [
       {
@@ -48134,6 +48134,34 @@
         ]
       },
       {
+        "factory_name": "CannonManager",
+        "class_name": "TCannonManager",
+        "model_index": null,
+        "spawned_actor_class": "TCannon",
+        "parameter_path": "/enemy/cannon.prm",
+        "models": [
+          {
+            "model_name": "default.bmd",
+            "load_flags": 270663680,
+            "source_file": "src/Enemy/smallEnemy.cpp"
+          }
+        ]
+      },
+      {
+        "factory_name": "ChuuHanaManager",
+        "class_name": "TChuuHanaManager",
+        "model_index": null,
+        "spawned_actor_class": "TChuuHana",
+        "parameter_path": "/enemy/chuuhana.prm",
+        "models": [
+          {
+            "model_name": "default.bmd",
+            "load_flags": 270663680,
+            "source_file": "src/Enemy/smallEnemy.cpp"
+          }
+        ]
+      },
+      {
         "factory_name": "CoasterKillerManager",
         "class_name": "TCoasterKillerManager",
         "model_index": null,
@@ -49783,6 +49811,17 @@
       {
         "factory_name": "Cannon",
         "target": {
+          "kind": "actor",
+          "factory_name": "MareGate"
+        },
+        "required": false,
+        "initially_hidden": true,
+        "record_name": "efMareGate",
+        "source_file": "src/Enemy/cannon.cpp"
+      },
+      {
+        "factory_name": "Cannon",
+        "target": {
           "kind": "enemy_manager"
         },
         "required": false,
@@ -50355,7 +50394,11 @@
         "manager_factories": [
           "AmiNokoManager"
         ],
-        "runtime_uniform_scale": null
+        "runtime_uniform_scale": {
+          "low_parameter": "mSLBodyScaleLow",
+          "high_parameter": "mSLBodyScaleHigh",
+          "source_file": "src/Enemy/smallEnemy.cpp"
+        }
       },
       {
         "factory_name": "AnimalBird",
@@ -50435,7 +50478,11 @@
         "manager_factories": [
           "BombHeiManager"
         ],
-        "runtime_uniform_scale": null
+        "runtime_uniform_scale": {
+          "low_parameter": "mSLBodyScaleLow",
+          "high_parameter": "mSLBodyScaleHigh",
+          "source_file": "src/Enemy/smallEnemy.cpp"
+        }
       },
       {
         "factory_name": "BossDangoHamuKuri",
@@ -50612,8 +50659,14 @@
         "primary_model": null,
         "named_models": [],
         "indexed_models": [],
-        "manager_factories": [],
-        "runtime_uniform_scale": null
+        "manager_factories": [
+          "CannonManager"
+        ],
+        "runtime_uniform_scale": {
+          "low_parameter": "mSLBodyScaleLow",
+          "high_parameter": "mSLBodyScaleHigh",
+          "source_file": "src/Enemy/smallEnemy.cpp"
+        }
       },
       {
         "factory_name": "CoasterKiller",
@@ -50656,7 +50709,11 @@
         "manager_factories": [
           "DebuTelesaManager"
         ],
-        "runtime_uniform_scale": null
+        "runtime_uniform_scale": {
+          "low_parameter": "mSLBodyScaleLow",
+          "high_parameter": "mSLBodyScaleHigh",
+          "source_file": "src/Enemy/smallEnemy.cpp"
+        }
       },
       {
         "factory_name": "DoroHamuKuri",
@@ -50784,7 +50841,11 @@
         "manager_factories": [
           "ElecNokonokoManager"
         ],
-        "runtime_uniform_scale": null
+        "runtime_uniform_scale": {
+          "low_parameter": "mSLBodyScaleLow",
+          "high_parameter": "mSLBodyScaleHigh",
+          "source_file": "src/Enemy/smallEnemy.cpp"
+        }
       },
       {
         "factory_name": "FireHamuKuri",
@@ -51105,7 +51166,11 @@
         "manager_factories": [
           "KazekunManager"
         ],
-        "runtime_uniform_scale": null
+        "runtime_uniform_scale": {
+          "low_parameter": "mSLBodyScaleLow",
+          "high_parameter": "mSLBodyScaleHigh",
+          "source_file": "src/Enemy/smallEnemy.cpp"
+        }
       },
       {
         "factory_name": "Killer",
@@ -51118,7 +51183,11 @@
         "manager_factories": [
           "KillerManager"
         ],
-        "runtime_uniform_scale": null
+        "runtime_uniform_scale": {
+          "low_parameter": "mSLBodyScaleLow",
+          "high_parameter": "mSLBodyScaleHigh",
+          "source_file": "src/Enemy/smallEnemy.cpp"
+        }
       },
       {
         "factory_name": "Koopa",
@@ -51170,7 +51239,11 @@
         "manager_factories": [
           "KukkuManager"
         ],
-        "runtime_uniform_scale": null
+        "runtime_uniform_scale": {
+          "low_parameter": "mSLBodyScaleLow",
+          "high_parameter": "mSLBodyScaleHigh",
+          "source_file": "src/Enemy/smallEnemy.cpp"
+        }
       },
       {
         "factory_name": "Kumokun",
@@ -51516,7 +51589,11 @@
         "manager_factories": [
           "PopoManager"
         ],
-        "runtime_uniform_scale": null
+        "runtime_uniform_scale": {
+          "low_parameter": "mSLBodyScaleLow",
+          "high_parameter": "mSLBodyScaleHigh",
+          "source_file": "src/Enemy/smallEnemy.cpp"
+        }
       },
       {
         "factory_name": "PukuPuku",
@@ -51687,7 +51764,11 @@
         "manager_factories": [
           "TabePukuManager"
         ],
-        "runtime_uniform_scale": null
+        "runtime_uniform_scale": {
+          "low_parameter": "mSLBodyScaleLow",
+          "high_parameter": "mSLBodyScaleHigh",
+          "source_file": "src/Enemy/smallEnemy.cpp"
+        }
       },
       {
         "factory_name": "TamaNoko",
@@ -51803,7 +51884,11 @@
         "manager_factories": [
           "YumboManager"
         ],
-        "runtime_uniform_scale": null
+        "runtime_uniform_scale": {
+          "low_parameter": "mSLBodyScaleLow",
+          "high_parameter": "mSLBodyScaleHigh",
+          "source_file": "src/Enemy/smallEnemy.cpp"
+        }
       }
     ],
     "enemy_material_colors": [

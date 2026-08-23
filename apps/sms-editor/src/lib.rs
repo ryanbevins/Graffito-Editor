@@ -3588,7 +3588,7 @@ impl SmsEditorApp {
             BTreeMap::<(String, u32, String), CachedObjectModelPreview>::new();
         let mut accessory_model_cache = BTreeMap::<String, CachedAccessoryModelPreview>::new();
         for object in &document.objects {
-            if object.is_pool_only() {
+            if object.is_pool_only() || document.object_is_runtime_initially_hidden(object) {
                 continue;
             }
             let explicit_model_path = object_preview_model_path(object, &world_model_paths);

@@ -1083,8 +1083,15 @@ pub struct RuntimeNameReferenceDefinition {
     pub factory_name: String,
     pub target: RuntimeNameReferenceTarget,
     pub required: bool,
+    /// The owner resolves this actor by name and kills it during initial load.
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub initially_hidden: bool,
     pub record_name: String,
     pub source_file: String,
+}
+
+fn bool_is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1677,6 +1684,7 @@ impl SchemaGenerator {
                         factory_name: object.factory_name.clone(),
                         target: reference.target,
                         required: reference.required,
+                        initially_hidden: reference.initially_hidden,
                         record_name: reference.record_name,
                         source_file: reference.source_file,
                     }
@@ -3234,7 +3242,13 @@ fn extract_class_inheritance(text: &str, inheritance: &mut BTreeMap<String, Stri
     )
     .expect("valid class inheritance regex");
     for captures in class_re.captures_iter(text) {
-        inheritance.insert(captures[1].to_string(), captures[2].to_string());
+        // The decomp contains a few local factory-only class declarations
+        // which inherit JDrama::TNameRef even though the real public class was
+        // already declared with its gameplay base. SourceInventory visits
+        // headers before sources, so retain that canonical relationship.
+        inheritance
+            .entry(captures[1].to_string())
+            .or_insert_with(|| captures[2].to_string());
     }
 }
 
@@ -3288,6 +3302,7 @@ fn extract_runtime_map_obj_dependencies(
 struct ExtractedRuntimeNameReference {
     target: RuntimeNameReferenceTarget,
     required: bool,
+    initially_hidden: bool,
     record_name: String,
     source_file: String,
 }
@@ -3311,6 +3326,10 @@ fn extract_runtime_name_references(
         .expect("valid runtime graph dependency regex");
     let mario_water_gun_re =
         Regex::new(r"SMS_GetMarioWaterGun\s*\(").expect("valid Mario water-gun dependency regex");
+    let named_actor_search_re = Regex::new(
+        r#"(?s)([A-Za-z_][A-Za-z0-9_]*)\s*=\s*JDrama::TNameRefGen::search\s*<\s*([A-Za-z_][A-Za-z0-9_]*)\s*>\s*\(\s*"([^"]+)"\s*\)\s*;"#,
+    )
+    .expect("valid named actor search regex");
     let mut by_class = BTreeMap::<String, BTreeSet<ExtractedRuntimeNameReference>>::new();
     let nerve_re = Regex::new(r"(?m)^\s*DEFINE_NERVE\s*\([^)]*\)\s*\{")
         .expect("valid nerve implementation regex");
@@ -3327,12 +3346,41 @@ fn extract_runtime_name_references(
             continue;
         };
         let references = by_class.entry(method[1].to_string()).or_default();
+        for search in named_actor_search_re.captures_iter(body) {
+            let Some(whole) = search.get(0) else {
+                continue;
+            };
+            let variable = &search[1];
+            let remaining_without_whitespace = body[whole.end()..]
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>();
+            let initially_hidden =
+                remaining_without_whitespace.contains(&format!("{variable}->kill();"));
+            if !initially_hidden {
+                continue;
+            }
+            let target_class = &search[2];
+            references.insert(ExtractedRuntimeNameReference {
+                target: RuntimeNameReferenceTarget::Actor {
+                    factory_name: target_class
+                        .strip_prefix('T')
+                        .unwrap_or(target_class)
+                        .to_string(),
+                },
+                required: false,
+                initially_hidden,
+                record_name: search[3].to_string(),
+                source_file: source_file.to_string(),
+            });
+        }
         for call in shine_demo_re.captures_iter(body) {
             references.insert(ExtractedRuntimeNameReference {
                 target: RuntimeNameReferenceTarget::Actor {
                     factory_name: "Shine".to_string(),
                 },
                 required: false,
+                initially_hidden: false,
                 record_name: call[1].to_string(),
                 source_file: source_file.to_string(),
             });
@@ -3341,6 +3389,7 @@ fn extract_runtime_name_references(
                     type_name: "CameraMapInfo".to_string(),
                 },
                 required: false,
+                initially_hidden: false,
                 record_name: call[2].to_string(),
                 source_file: source_file.to_string(),
             });
@@ -3351,6 +3400,7 @@ fn extract_runtime_name_references(
                     factory_name: "Shine".to_string(),
                 },
                 required: false,
+                initially_hidden: false,
                 record_name: call[1].to_string(),
                 source_file: source_file.to_string(),
             });
@@ -3359,6 +3409,7 @@ fn extract_runtime_name_references(
             references.insert(ExtractedRuntimeNameReference {
                 target: RuntimeNameReferenceTarget::EnemyManager,
                 required: false,
+                initially_hidden: false,
                 record_name: call[1].to_string(),
                 source_file: source_file.to_string(),
             });
@@ -3367,6 +3418,7 @@ fn extract_runtime_name_references(
             references.insert(ExtractedRuntimeNameReference {
                 target: RuntimeNameReferenceTarget::Graph,
                 required: true,
+                initially_hidden: false,
                 record_name: call[1].to_string(),
                 source_file: source_file.to_string(),
             });
@@ -3379,6 +3431,7 @@ fn extract_runtime_name_references(
             references.insert(ExtractedRuntimeNameReference {
                 target: RuntimeNameReferenceTarget::MarioWaterGun,
                 required: true,
+                initially_hidden: false,
                 record_name: "SMS_GetMarioWaterGun".to_string(),
                 source_file: source_file.to_string(),
             });
@@ -3405,6 +3458,7 @@ fn extract_runtime_name_references(
                     factory_name: "Shine".to_string(),
                 },
                 required: true,
+                initially_hidden: false,
                 record_name: call[1].to_string(),
                 source_file: source_file.to_string(),
             });
@@ -3413,6 +3467,7 @@ fn extract_runtime_name_references(
                     type_name: "CameraMapInfo".to_string(),
                 },
                 required: true,
+                initially_hidden: false,
                 record_name: call[2].to_string(),
                 source_file: source_file.to_string(),
             });
@@ -3423,6 +3478,7 @@ fn extract_runtime_name_references(
                     factory_name: "Shine".to_string(),
                 },
                 required: true,
+                initially_hidden: false,
                 record_name: call[1].to_string(),
                 source_file: source_file.to_string(),
             });
@@ -3431,6 +3487,7 @@ fn extract_runtime_name_references(
             references.insert(ExtractedRuntimeNameReference {
                 target: RuntimeNameReferenceTarget::EnemyManager,
                 required: true,
+                initially_hidden: false,
                 record_name: call[1].to_string(),
                 source_file: source_file.to_string(),
             });
@@ -3439,6 +3496,7 @@ fn extract_runtime_name_references(
             references.insert(ExtractedRuntimeNameReference {
                 target: RuntimeNameReferenceTarget::Graph,
                 required: true,
+                initially_hidden: false,
                 record_name: call[1].to_string(),
                 source_file: source_file.to_string(),
             });
@@ -6265,6 +6323,11 @@ mod tests {
                 SMS_GetMarioWaterGun();
             }
 
+            void TControllerEnemy::loadAfter() {
+                mGate = JDrama::TNameRefGen::search<TMareGate>("efMareGate");
+                mGate->kill();
+            }
+
             DEFINE_NERVE(TNerveFlowerEnemyHide, TLiveActor) {
                 TFlowerEnemy* enemy = (TFlowerEnemy*)spine->getBody();
                 gpConductor->makeOneEnemyAppear(
@@ -6307,6 +6370,15 @@ mod tests {
         assert!(extracted["TEquipmentEnemy"].iter().any(|reference| {
             reference.record_name == "SMS_GetMarioWaterGun"
                 && matches!(reference.target, RuntimeNameReferenceTarget::MarioWaterGun)
+        }));
+        assert!(extracted["TControllerEnemy"].iter().any(|reference| {
+            reference.record_name == "efMareGate"
+                && reference.initially_hidden
+                && matches!(
+                    &reference.target,
+                    RuntimeNameReferenceTarget::Actor { factory_name }
+                        if factory_name == "MareGate"
+                )
         }));
     }
 
@@ -6578,6 +6650,24 @@ mod tests {
             inherited_enemy_models("THamuKuriLauncherManager", &models, &inheritance).unwrap()[0]
                 .load_flags,
             0x1021_0000
+        );
+    }
+
+    #[test]
+    fn canonical_header_inheritance_survives_factory_only_redeclaration() {
+        let mut inheritance = BTreeMap::new();
+        extract_class_inheritance(
+            "class TCannonManager : public TSmallEnemyManager {};",
+            &mut inheritance,
+        );
+        extract_class_inheritance(
+            "class TCannonManager : public JDrama::TNameRef {};",
+            &mut inheritance,
+        );
+
+        assert_eq!(
+            inheritance.get("TCannonManager").map(String::as_str),
+            Some("TSmallEnemyManager")
         );
     }
 
