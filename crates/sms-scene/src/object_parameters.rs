@@ -15,6 +15,8 @@ use crate::{
 pub const OBJECT_PARAMETER_NAME: &str = "name";
 pub const OBJECT_PARAMETER_CHARACTER_NAME: &str = "character_name";
 pub const GENERATED_CLONE_RUNTIME_PREFIX: &str = "GraffitoClone_";
+pub const CANNON_MOLE_DISABLED_RUNTIME_PREFIX: &str = "GraffitoClone0";
+pub const CANNON_MOLE_ENABLED_RUNTIME_PREFIX: &str = "GraffitoClone1";
 
 /// Returns the stable TNameRef identity owned by a newly cloned placement.
 ///
@@ -23,6 +25,22 @@ pub const GENERATED_CLONE_RUNTIME_PREFIX: &str = "GraffitoClone_";
 /// field is safe to duplicate.
 pub fn generated_clone_runtime_name(object_id: &str) -> String {
     format!("{GENERATED_CLONE_RUNTIME_PREFIX}{object_id}")
+}
+
+pub fn cannon_mole_override_runtime_name(object: &SceneObject) -> Option<String> {
+    if object.factory_name != "Cannon" {
+        return None;
+    }
+    match object.cannon_mole_enabled? {
+        false => Some(format!(
+            "{CANNON_MOLE_DISABLED_RUNTIME_PREFIX}{}",
+            object.id
+        )),
+        true if matches!(object.placement, Some(PlacementBinding::Existing(_))) => {
+            Some(format!("{CANNON_MOLE_ENABLED_RUNTIME_PREFIX}{}", object.id))
+        }
+        true => None,
+    }
 }
 const SOURCE_PARAMETER_ALIASES: [(&str, &str); 11] = [
     (OBJECT_PARAMETER_CHARACTER_NAME, "stream_string_0"),

@@ -1756,6 +1756,7 @@ fn reconcile_scene_objects_with_owned_dialogue_names(
             )));
         };
         let dialogue_owns_name = dialogue_owned_runtime_names.contains(&object.id);
+        let cannon_mole_runtime_name = crate::cannon_mole_override_runtime_name(object);
         let generated_clone_name = crate::generated_clone_runtime_name(&object.id);
         let clone_owns_name = matches!(binding, PlacementBinding::CloneOf(_))
             && object.raw_param(crate::OBJECT_PARAMETER_NAME)
@@ -1763,6 +1764,12 @@ fn reconcile_scene_objects_with_owned_dialogue_names(
         if dialogue_owns_name && runtime_actor_names.contains_key(&object.id) {
             return Err(stage_export_error(format!(
                 "object '{}' cannot use both an editor-generated dialogue identity and another runtime TNameRef binding",
+                object.id
+            )));
+        }
+        if dialogue_owns_name && cannon_mole_runtime_name.is_some() {
+            return Err(stage_export_error(format!(
+                "object '{}' cannot use both an editor-generated dialogue identity and a Cannon mole override",
                 object.id
             )));
         }
@@ -1790,6 +1797,9 @@ fn reconcile_scene_objects_with_owned_dialogue_names(
                     crate::ParameterApplyMode::AllCanonical,
                 )?;
                 if let Some(runtime_name) = runtime_actor_names.get(&object.id) {
+                    record.name.clone_from(runtime_name);
+                }
+                if let Some(runtime_name) = &cannon_mole_runtime_name {
                     record.name.clone_from(runtime_name);
                 }
                 match binding {
@@ -1823,6 +1833,9 @@ fn reconcile_scene_objects_with_owned_dialogue_names(
                     crate::ParameterApplyMode::AllCanonical,
                 )?;
                 if let Some(runtime_name) = runtime_actor_names.get(&object.id) {
+                    record.name.clone_from(runtime_name);
+                }
+                if let Some(runtime_name) = &cannon_mole_runtime_name {
                     record.name.clone_from(runtime_name);
                 }
                 authored.push((placement, object, record));
@@ -3329,6 +3342,54 @@ mod tests {
         assert_eq!(placements[0].transform.translation, [10.0, 20.0, 30.0]);
         assert_eq!(placements[1].name, "first");
         assert_eq!(placements[1].transform.translation, [40.0, 50.0, 60.0]);
+    }
+
+    #[test]
+    fn existing_cannon_mole_override_exports_a_unique_runtime_mode_name() {
+        let fixture = StageFixture::new("existing-cannon-mole-mode");
+        let mut document = fixture.document();
+        placement_record_mut(document.stage_archive.as_mut().unwrap(), &address(&[0]))
+            .unwrap()
+            .type_name = "Cannon".to_string();
+        document.objects[0].factory_name = "Cannon".to_string();
+
+        document.objects[0].cannon_mole_enabled = Some(false);
+        let disabled = SourceFreeStageArchive::parse(&document.build_stage_archive().unwrap())
+            .unwrap()
+            .object_placements()[0]
+            .name
+            .clone();
+        assert_eq!(
+            disabled,
+            format!(
+                "{}{}",
+                crate::CANNON_MOLE_DISABLED_RUNTIME_PREFIX,
+                document.objects[0].id
+            )
+        );
+
+        document.objects[0].cannon_mole_enabled = Some(true);
+        let enabled = SourceFreeStageArchive::parse(&document.build_stage_archive().unwrap())
+            .unwrap()
+            .object_placements()[0]
+            .name
+            .clone();
+        assert_eq!(
+            enabled,
+            format!(
+                "{}{}",
+                crate::CANNON_MOLE_ENABLED_RUNTIME_PREFIX,
+                document.objects[0].id
+            )
+        );
+
+        document.objects[0].cannon_mole_enabled = None;
+        let inherited = SourceFreeStageArchive::parse(&document.build_stage_archive().unwrap())
+            .unwrap()
+            .object_placements()[0]
+            .name
+            .clone();
+        assert_eq!(inherited, "first");
     }
 
     #[test]

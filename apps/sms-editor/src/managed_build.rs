@@ -509,7 +509,7 @@ fn build_managed_game_with_compiled_dialogue_inner(
                 dialogue_overrides: &runtime.talk,
                 balloon_overrides: &runtime.balloon,
                 extended_collision_required,
-                authored_cannon_required: requires_authored_cannon_runtime(document),
+                authored_cannon_required: requires_cannon_runtime_patch(document),
                 direct_boot,
             },
             cancelled,
@@ -1382,16 +1382,17 @@ fn required_goop_manager_runtime_patches(
     Ok(patches)
 }
 
-fn requires_authored_cannon_runtime(document: &StageDocument) -> bool {
+fn requires_cannon_runtime_patch(document: &StageDocument) -> bool {
     document.objects.iter().any(|object| {
         object.factory_name == "Cannon"
-            && matches!(
-                object.placement,
-                Some(
-                    sms_scene::PlacementBinding::CloneOf(_)
-                        | sms_scene::PlacementBinding::Authored(_)
-                )
-            )
+            && (object.cannon_mole_enabled.is_some()
+                || matches!(
+                    object.placement,
+                    Some(
+                        sms_scene::PlacementBinding::CloneOf(_)
+                            | sms_scene::PlacementBinding::Authored(_)
+                    )
+                ))
     })
 }
 
@@ -3436,7 +3437,7 @@ mod tests {
     }
 
     #[test]
-    fn authored_cannon_runtime_patch_is_selected_only_for_editor_owned_cannons() {
+    fn cannon_runtime_patch_is_selected_for_owned_or_explicitly_configured_cannons() {
         let mut retail_cannon = sms_scene::SceneObject::new("retail", "Cannon");
         retail_cannon.set_raw_param(sms_scene::OBJECT_PARAMETER_NAME, "砲台");
         retail_cannon.placement = Some(sms_scene::PlacementBinding::Existing(
@@ -3445,9 +3446,21 @@ mod tests {
                 record_path: vec![0],
             },
         ));
-        assert!(!requires_authored_cannon_runtime(&document_with_objects(
+        assert!(!requires_cannon_runtime_patch(&document_with_objects(
             vec![retail_cannon]
         )));
+
+        let mut configured_retail_cannon = sms_scene::SceneObject::new("retail-off", "Cannon");
+        configured_retail_cannon.cannon_mole_enabled = Some(false);
+        configured_retail_cannon.placement = Some(sms_scene::PlacementBinding::Existing(
+            sms_scene::PlacementAddress {
+                raw_resource_path: b"map/scene.bin".to_vec(),
+                record_path: vec![0],
+            },
+        ));
+        assert!(requires_cannon_runtime_patch(&document_with_objects(vec![
+            configured_retail_cannon
+        ])));
 
         let mut unrelated = sms_scene::SceneObject::new("unrelated", "Coin");
         unrelated.set_raw_param(
@@ -3460,7 +3473,7 @@ mod tests {
                 record_path: vec![1],
             },
         ));
-        assert!(!requires_authored_cannon_runtime(&document_with_objects(
+        assert!(!requires_cannon_runtime_patch(&document_with_objects(
             vec![unrelated]
         )));
 
@@ -3479,9 +3492,9 @@ mod tests {
                 pool_only: false,
             },
         ));
-        assert!(requires_authored_cannon_runtime(&document_with_objects(
-            vec![authored_cannon]
-        )));
+        assert!(requires_cannon_runtime_patch(&document_with_objects(vec![
+            authored_cannon
+        ])));
     }
 
     #[test]

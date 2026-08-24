@@ -36,7 +36,7 @@ const STAGE_MUSIC_MARKER: &[u8] = b"SMS_EDITOR_STAGE_MUSIC_V1\0";
 const DIALOGUE_MARKER: &[u8] = b"GRAFFITO_DIALOGUE_OVERRIDE_V1\0";
 const BALLOON_DIALOGUE_MARKER: &[u8] = b"GRAFFITO_BALLOON_OVERRIDE_V1\0";
 const EXTENDED_COLLISION_MARKER: &[u8] = b"GRAFFITO_EXTENDED_COLLISION_V1\0";
-const AUTHORED_CANNON_MARKER: &[u8] = b"GRAFFITO_AUTHORED_CANNON_V2\0";
+const AUTHORED_CANNON_MARKER: &[u8] = b"GRAFFITO_AUTHORED_CANNON_V3\0";
 const RETAIL_COLLISION_GRID_SIZE_BITS: u32 = 1024.0_f32.to_bits();
 const RETAIL_COLLISION_GRID_RECIPROCAL_BITS: u32 = (1.0_f32 / 1024.0).to_bits();
 const EXTENDED_COLLISION_GRID_SIZE_BITS: u32 = 65_536.0_f32.to_bits();
@@ -931,14 +931,14 @@ pub(super) fn patch_sms_authored_cannon_dol(
                 section,
                 word_index: word_index + 2,
             };
-            let anchor = WordAnchor {
+            let object_branch = WordAnchor {
                 section,
                 word_index: word_index + 4,
             };
             let interactive_target =
                 decode_conditional_branch_target(sequence[2], interactive_branch.address()?)?;
             if interactive_target
-                != anchor
+                != object_branch
                     .address()?
                     .checked_add(4)
                     .ok_or_else(|| "TCannon interactive branch address overflows u32".to_string())?
@@ -946,10 +946,13 @@ pub(super) fn patch_sms_authored_cannon_dol(
                 continue;
             }
             candidates.push(CannonAreaHook {
-                anchor,
+                anchor: interactive_branch,
                 this_register,
                 interactive_target,
-                object_target: decode_conditional_branch_target(sequence[4], anchor.address()?)?,
+                object_target: decode_conditional_branch_target(
+                    sequence[4],
+                    object_branch.address()?,
+                )?,
             });
         }
     }
@@ -1020,7 +1023,7 @@ pub(super) fn patch_sms_authored_cannon_dol(
     let mut load_state_candidates = Vec::new();
     let init_address = hook.anchor.address()?;
     let init_area_store_address = init_address
-        .checked_sub(5 * 4)
+        .checked_sub(3 * 4)
         .ok_or_else(|| "TCannon init area-store address underflows u32".to_string())?;
     for section in image
         .sections
@@ -1106,23 +1109,25 @@ pub(super) fn patch_sms_authored_cannon_dol(
     let prefix_a = u32::from_be_bytes(prefix[0..4].try_into().expect("four prefix bytes"));
     let prefix_b = u32::from_be_bytes(prefix[4..8].try_into().expect("four prefix bytes"));
     let prefix_c = u32::from_be_bytes(prefix[8..12].try_into().expect("four prefix bytes"));
-    let prefix_d = u16::from_be_bytes(prefix[12..14].try_into().expect("two prefix bytes"));
-    const INTERACTIVE_EXIT_WORD: usize = 24;
-    const OBJECT_EXIT_WORD: usize = 25;
-    const LOAD_AFTER_STUB_WORD: usize = 26;
-    const LOAD_AFTER_SKIP_EXIT_WORD: usize = 48;
-    const LOAD_AFTER_GATE_EXIT_WORD: usize = 49;
-    const LOAD_STATE_STUB_WORD: usize = 50;
-    const LOAD_STATE_EXIT_WORD: usize = 74;
+    let disabled_suffix = u16::from_be_bytes(*b"e0");
+    let enabled_suffix = u16::from_be_bytes(*b"e1");
+    const INTERACTIVE_EXIT_WORD: usize = 28;
+    const OBJECT_EXIT_WORD: usize = 29;
+    const LOAD_AFTER_STUB_WORD: usize = 30;
+    const LOAD_AFTER_SKIP_EXIT_WORD: usize = 53;
+    const LOAD_AFTER_GATE_EXIT_WORD: usize = 54;
+    const LOAD_STATE_STUB_WORD: usize = 55;
+    const LOAD_STATE_FORCE_ON_WORD: usize = 80;
+    const LOAD_STATE_EXIT_WORD: usize = 82;
     let interactive_exit = stub_address + INTERACTIVE_EXIT_WORD as u32 * 4;
     let object_exit = stub_address + OBJECT_EXIT_WORD as u32 * 4;
     let load_after_stub = stub_address + LOAD_AFTER_STUB_WORD as u32 * 4;
     let load_after_skip_exit = stub_address + LOAD_AFTER_SKIP_EXIT_WORD as u32 * 4;
     let load_after_gate_exit = stub_address + LOAD_AFTER_GATE_EXIT_WORD as u32 * 4;
     let load_state_stub = stub_address + LOAD_STATE_STUB_WORD as u32 * 4;
+    let load_state_force_on = stub_address + LOAD_STATE_FORCE_ON_WORD as u32 * 4;
     let load_state_exit = stub_address + LOAD_STATE_EXIT_WORD as u32 * 4;
     let mut stub = vec![
-        0,                                            // Existing area 9 compare: beq interactive.
         encode_d_form(32, 12, hook.this_register, 4), // TNameRef::mName
         encode_cmplwi(12, 0),
         0,
@@ -1141,11 +1146,16 @@ pub(super) fn patch_sms_authored_cannon_dol(
         encode_d_form(32, 10, 12, 8),
         encode_cmplw(10, 11),
         0,
-        encode_d_form(40, 10, 12, 12), // "e_"
-        encode_cmplwi(10, prefix_d),
+        encode_d_form(40, 10, 12, 12),
+        encode_cmplwi(10, disabled_suffix),
         0,
-        encode_li(10, 5),
-        encode_d_form(38, 10, hook.this_register, 0x230),
+        0,
+        encode_d_form(34, 10, hook.this_register, 0x230),
+        encode_cmplwi(10, 5),
+        0,
+        encode_cmplwi(10, 9),
+        0,
+        0,
         encode_branch(interactive_exit, hook.interactive_target, false)?,
         encode_branch(object_exit, hook.object_target, false)?,
         0, // A real area other than 5 has no gate lookup to preserve.
@@ -1168,7 +1178,8 @@ pub(super) fn patch_sms_authored_cannon_dol(
         encode_cmplw(10, 11),
         0,
         encode_d_form(40, 10, 12, 12),
-        encode_cmplwi(10, prefix_d),
+        encode_cmplwi(10, enabled_suffix),
+        0,
         0,
         encode_branch(load_after_skip_exit, load_after_hook.skip_target, false)?,
         encode_branch(load_after_gate_exit, load_after_hook.gate_target, false)?,
@@ -1197,7 +1208,15 @@ pub(super) fn patch_sms_authored_cannon_dol(
         encode_cmplw(10, 11),
         0,
         encode_d_form(40, 10, 12, 12),
-        encode_cmplwi(10, prefix_d),
+        encode_cmplwi(10, disabled_suffix),
+        0,
+        encode_li(load_state_hook.area_register, 0),
+        encode_d_form(
+            38,
+            load_state_hook.area_register,
+            load_state_hook.this_register,
+            0x230,
+        ),
         0,
         encode_li(load_state_hook.area_register, 5),
         encode_d_form(
@@ -1208,20 +1227,28 @@ pub(super) fn patch_sms_authored_cannon_dol(
         ),
         encode_branch(load_state_exit, load_state_hook.resume_target, false)?,
     ];
-    stub[0] = encode_beq(stub_address, interactive_exit)?;
-    stub[3] = encode_beq(stub_address + 3 * 4, object_exit)?;
-    for index in [8usize, 13, 18, 21] {
-        stub[index] = encode_bne(stub_address + index as u32 * 4, object_exit)?;
+    stub[2] = encode_beq(stub_address + 2 * 4, stub_address + 22 * 4)?;
+    for index in [7usize, 12, 17] {
+        stub[index] = encode_bne(stub_address + index as u32 * 4, stub_address + 22 * 4)?;
     }
+    stub[20] = encode_beq(stub_address + 20 * 4, object_exit)?;
+    stub[21] = encode_branch(stub_address + 21 * 4, interactive_exit, false)?;
+    stub[24] = encode_beq(stub_address + 24 * 4, interactive_exit)?;
+    stub[26] = encode_beq(stub_address + 26 * 4, interactive_exit)?;
+    stub[27] = encode_branch(stub_address + 27 * 4, object_exit, false)?;
     stub[LOAD_AFTER_STUB_WORD] = encode_bne(load_after_stub, load_after_skip_exit)?;
-    stub[LOAD_AFTER_STUB_WORD + 3] = encode_beq(load_after_stub + 3 * 4, load_after_gate_exit)?;
-    for index in [34usize, 39, 44, 47] {
+    stub[33] = encode_beq(stub_address + 33 * 4, load_after_gate_exit)?;
+    for index in [38usize, 43, 48] {
         stub[index] = encode_bne(stub_address + index as u32 * 4, load_after_gate_exit)?;
     }
-    stub[LOAD_STATE_STUB_WORD + 3] = encode_beq(load_state_stub + 3 * 4, load_state_exit)?;
-    for index in [58usize, 63, 68, 71] {
+    stub[51] = encode_beq(stub_address + 51 * 4, load_after_gate_exit)?;
+    stub[52] = encode_branch(stub_address + 52 * 4, load_after_skip_exit, false)?;
+    stub[58] = encode_beq(stub_address + 58 * 4, load_state_exit)?;
+    for index in [63usize, 68, 73] {
         stub[index] = encode_bne(stub_address + index as u32 * 4, load_state_exit)?;
     }
+    stub[76] = encode_bne(stub_address + 76 * 4, load_state_force_on)?;
+    stub[79] = encode_branch(stub_address + 79 * 4, load_state_exit, false)?;
 
     let payload_bytes = stub
         .len()
@@ -6204,7 +6231,7 @@ mod tests {
     }
 
     #[test]
-    fn authored_cannon_patch_preserves_retail_areas_and_gates_on_owned_names() {
+    fn authored_cannon_patch_supports_per_instance_mole_modes_and_retail_defaults() {
         let layout = SyntheticLayout {
             text_address: 0x8000_4000,
             hook_word: 0x80,
@@ -6315,8 +6342,8 @@ mod tests {
         }
 
         let patched = patch_sms_authored_cannon_dol(&source, true).unwrap();
-        let hook_address = layout.text_address + (cannon_word as u32 + 4) * 4;
-        let hook = read_be_u32(&patched, SYNTHETIC_TEXT_OFFSET + (cannon_word + 4) * 4).unwrap();
+        let hook_address = layout.text_address + (cannon_word as u32 + 2) * 4;
+        let hook = read_be_u32(&patched, SYNTHETIC_TEXT_OFFSET + (cannon_word + 2) * 4).unwrap();
         assert!(is_unconditional_branch(hook));
         let stub_address = decode_branch_target(hook, hook_address).unwrap();
         let image = parse_dol(&patched).unwrap();
@@ -6326,20 +6353,27 @@ mod tests {
         let words = section_words(&patched, stub_anchor.section).unwrap();
         let words = &words[stub_anchor.word_index..];
         assert_eq!(
-            decode_conditional_branch_target(words[0], stub_address).unwrap(),
-            stub_address + 24 * 4,
-            "retail area 9 still selects the interactive branch"
+            decode_conditional_branch_target(words[20], stub_address + 20 * 4).unwrap(),
+            stub_address + 29 * 4,
+            "the disabled-mole identity selects object mode"
         );
-        assert_eq!(words[1], encode_d_form(32, 12, 31, 4));
-        assert_eq!(words[2], encode_cmplwi(12, 0));
-        assert_eq!(words[22], encode_li(10, 5));
-        assert_eq!(words[23], encode_d_form(38, 10, 31, 0x230));
+        assert_eq!(words[0], encode_d_form(32, 12, 31, 4));
+        assert_eq!(words[18], encode_d_form(40, 10, 12, 12));
+        assert_eq!(words[19], encode_cmplwi(10, u16::from_be_bytes(*b"e0")));
         assert_eq!(
-            decode_branch_target(words[24], stub_address + 24 * 4).unwrap(),
+            decode_branch_target(words[21], stub_address + 21 * 4).unwrap(),
+            stub_address + 28 * 4,
+            "authored and explicitly enabled identities select interactive mode"
+        );
+        assert_eq!(words[22], encode_d_form(34, 10, 31, 0x230));
+        assert_eq!(words[23], encode_cmplwi(10, 5));
+        assert_eq!(words[25], encode_cmplwi(10, 9));
+        assert_eq!(
+            decode_branch_target(words[28], stub_address + 28 * 4).unwrap(),
             interactive_target
         );
         assert_eq!(
-            decode_branch_target(words[25], stub_address + 25 * 4).unwrap(),
+            decode_branch_target(words[29], stub_address + 29 * 4).unwrap(),
             object_target
         );
         let load_after_hook =
@@ -6350,20 +6384,26 @@ mod tests {
                 layout.text_address + (load_after_word as u32 + 2) * 4,
             )
             .unwrap(),
-            stub_address + 26 * 4
+            stub_address + 30 * 4
         );
         assert_eq!(
-            decode_conditional_branch_target(words[26], stub_address + 26 * 4).unwrap(),
-            stub_address + 48 * 4,
+            decode_conditional_branch_target(words[30], stub_address + 30 * 4).unwrap(),
+            stub_address + 53 * 4,
             "non-area-5 retail Cannons still skip the gate lookup"
         );
+        assert_eq!(words[50], encode_cmplwi(10, u16::from_be_bytes(*b"e1")));
         assert_eq!(
-            decode_branch_target(words[48], stub_address + 48 * 4).unwrap(),
-            load_after_skip,
-            "editor-owned Cannons skip the Pinna-only gate lookup"
+            decode_conditional_branch_target(words[51], stub_address + 51 * 4).unwrap(),
+            stub_address + 54 * 4,
+            "an explicitly enabled retail Cannon preserves its Pinna gate behavior"
         );
         assert_eq!(
-            decode_branch_target(words[49], stub_address + 49 * 4).unwrap(),
+            decode_branch_target(words[53], stub_address + 53 * 4).unwrap(),
+            load_after_skip,
+            "authored and disabled Cannons skip the Pinna-only gate lookup"
+        );
+        assert_eq!(
+            decode_branch_target(words[54], stub_address + 54 * 4).unwrap(),
             layout.text_address + (load_after_word as u32 + 3) * 4,
             "retail area-5 Cannons preserve the gate lookup"
         );
@@ -6375,18 +6415,29 @@ mod tests {
                 layout.text_address + (load_state_word as u32 + 1) * 4,
             )
             .unwrap(),
-            stub_address + 50 * 4
+            stub_address + 55 * 4
         );
-        assert_eq!(words[50], encode_d_form(38, 0, 31, 0x230));
-        assert_eq!(words[72], encode_li(0, 5));
-        assert_eq!(words[73], encode_d_form(38, 0, 31, 0x230));
+        assert_eq!(words[55], encode_d_form(38, 0, 31, 0x230));
+        assert_eq!(words[75], encode_cmplwi(10, u16::from_be_bytes(*b"e0")));
+        assert_eq!(words[77], encode_li(0, 0));
+        assert_eq!(words[78], encode_d_form(38, 0, 31, 0x230));
+        assert_eq!(words[80], encode_li(0, 5));
+        assert_eq!(words[81], encode_d_form(38, 0, 31, 0x230));
         assert_eq!(
-            decode_branch_target(words[74], stub_address + 74 * 4).unwrap(),
+            decode_branch_target(words[82], stub_address + 82 * 4).unwrap(),
             layout.text_address + (load_state_word as u32 + 2) * 4,
             "the final-load hook resumes immediately after the replaced store"
         );
         let prefix = sms_scene::GENERATED_CLONE_RUNTIME_PREFIX.as_bytes();
         assert_eq!(prefix, b"GraffitoClone_");
+        assert_eq!(
+            sms_scene::CANNON_MOLE_DISABLED_RUNTIME_PREFIX,
+            "GraffitoClone0"
+        );
+        assert_eq!(
+            sms_scene::CANNON_MOLE_ENABLED_RUNTIME_PREFIX,
+            "GraffitoClone1"
+        );
         assert!(patched
             .windows(AUTHORED_CANNON_MARKER.len())
             .any(|window| window == AUTHORED_CANNON_MARKER));

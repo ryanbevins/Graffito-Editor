@@ -87,11 +87,12 @@ pub use object_authoring::{
 pub(crate) use object_parameters::validate_object_parameter_links_with_owned_name;
 pub use object_parameters::{
     apply_all_object_parameters, apply_dirty_object_parameter_edits, apply_object_parameter_edits,
-    editable_object_parameters, editable_parameters_for_object, generated_clone_runtime_name,
-    seed_scene_object_parameters, sync_scene_object_parameter_aliases, EditableSceneParameter,
-    ObjectParameterBitFlag, ObjectParameterChoice, ObjectParameterIndexedChoice,
-    ObjectParameterInfo, ObjectParameterKind, ParameterApplyMode, GENERATED_CLONE_RUNTIME_PREFIX,
-    OBJECT_PARAMETER_CHARACTER_NAME, OBJECT_PARAMETER_NAME,
+    cannon_mole_override_runtime_name, editable_object_parameters, editable_parameters_for_object,
+    generated_clone_runtime_name, seed_scene_object_parameters,
+    sync_scene_object_parameter_aliases, EditableSceneParameter, ObjectParameterBitFlag,
+    ObjectParameterChoice, ObjectParameterIndexedChoice, ObjectParameterInfo, ObjectParameterKind,
+    ParameterApplyMode, CANNON_MOLE_DISABLED_RUNTIME_PREFIX, CANNON_MOLE_ENABLED_RUNTIME_PREFIX,
+    GENERATED_CLONE_RUNTIME_PREFIX, OBJECT_PARAMETER_CHARACTER_NAME, OBJECT_PARAMETER_NAME,
 };
 pub use route_authoring::{
     BezierHandles, RouteAssignmentSuggestion, RouteAuthoringDocument, RouteAuthoringError,
@@ -1520,10 +1521,11 @@ impl StageDocument {
                     sms_schema::RuntimeNameReferenceTarget::Actor { factory_name }
                         if factory_name == &object.factory_name
                 )
-                && self
-                    .objects
-                    .iter()
-                    .any(|owner| owner.factory_name == reference.factory_name)
+                && self.objects.iter().any(|owner| {
+                    owner.factory_name == reference.factory_name
+                        && !(owner.factory_name == "Cannon"
+                            && owner.cannon_mole_enabled == Some(false))
+                })
         })
     }
 
@@ -1797,6 +1799,11 @@ pub struct SceneObject {
     /// transformed into the destination world collision during export.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authored_world_collision: Option<sms_formats::ColFile>,
+    /// Per-instance override for `TCannon`'s interactive Chorobei branch.
+    /// `None` preserves retail area behavior for imported Cannons and the
+    /// editor's interactive default for authored/duplicated Cannons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cannon_mole_enabled: Option<bool>,
     /// Version of editor-owned safe defaults applied to an authored record.
     ///
     /// Retail/imported objects remain zero. Missing values in older project
@@ -1972,6 +1979,7 @@ impl SceneObject {
             authoring_defaults_version: 0,
             runtime_references: Vec::new(),
             authored_world_collision: None,
+            cannon_mole_enabled: None,
         }
     }
 
@@ -4318,6 +4326,10 @@ mod tests {
         assert!(!document.object_is_runtime_initially_hidden(&document.objects[0]));
         document.objects.push(SceneObject::new("cannon", "Cannon"));
         assert!(document.object_is_runtime_initially_hidden(&document.objects[0]));
+        document.objects[1].cannon_mole_enabled = Some(false);
+        assert!(!document.object_is_runtime_initially_hidden(&document.objects[0]));
+        document.objects[1].cannon_mole_enabled = Some(true);
+        assert!(document.object_is_runtime_initially_hidden(&document.objects[0]));
     }
 
     #[test]
@@ -6531,19 +6543,28 @@ mod tests {
         let registry = sms_schema::bundled_object_registry()
             .expect("load bundled enemy schema")
             .registry;
-        let document = StageDocument::open(&base_root, "pinnaBeach1")
+        let mut document = StageDocument::open(&base_root, "pinnaBeach1")
             .expect("open pinnaBeach1")
             .with_registry(registry);
-        let cannon = document
+        let cannon_id = document
             .objects
             .iter()
             .find(|object| object.factory_name == "Cannon")
-            .expect("pinnaBeach1 cannon placement");
-        let gate = document
+            .expect("pinnaBeach1 cannon placement")
+            .id
+            .clone();
+        let gate_id = document
             .objects
             .iter()
             .find(|object| object.raw_param("name") == Some("efMareGate"))
-            .expect("pinnaBeach1 efMareGate placement");
+            .expect("pinnaBeach1 efMareGate placement")
+            .id
+            .clone();
+        let cannon = document
+            .objects
+            .iter()
+            .find(|object| object.id == cannon_id)
+            .unwrap();
         let preview = document.actor_preview(cannon).expect("cannon preview");
 
         assert!(preview
@@ -6552,7 +6573,24 @@ mod tests {
             .to_ascii_lowercase()
             .ends_with("/cannon/default.bmd"));
         assert_eq!(preview.load_flags, 0x1022_0000);
+        let gate = document
+            .objects
+            .iter()
+            .find(|object| object.id == gate_id)
+            .unwrap();
         assert!(document.object_is_runtime_initially_hidden(gate));
+        document
+            .objects
+            .iter_mut()
+            .find(|object| object.id == cannon_id)
+            .unwrap()
+            .cannon_mole_enabled = Some(false);
+        let gate = document
+            .objects
+            .iter()
+            .find(|object| object.id == gate_id)
+            .unwrap();
+        assert!(!document.object_is_runtime_initially_hidden(gate));
     }
 
     #[test]

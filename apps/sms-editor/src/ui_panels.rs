@@ -1765,6 +1765,20 @@ impl SmsEditorApp {
                 }
             }
 
+            if object.factory_name == "Cannon" {
+                ui.separator();
+                let mut mole_enabled = object.cannon_mole_enabled.unwrap_or(true);
+                if ui
+                    .checkbox(&mut mole_enabled, "Mole enabled")
+                    .on_hover_text(
+                        "Controls TCannon's interactive Chorobei branch for this instance. Turning it off keeps the Cannon as a solid object without creating the mole or bomb-throwing behavior.",
+                    )
+                    .changed()
+                {
+                    self.update_selected_cannon_mole_enabled(mole_enabled);
+                }
+            }
+
             ui.separator();
             ui.heading("Params");
             let editable_parameters = self

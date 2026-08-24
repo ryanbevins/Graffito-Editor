@@ -1864,6 +1864,9 @@ fn object_from_catalog_template(
         ..Transform::default()
     };
     object.authored_world_collision = template.authored_world_collision.clone();
+    if object.factory_name == "Cannon" {
+        object.cannon_mole_enabled = Some(true);
+    }
     sms_scene::seed_scene_object_parameters(&mut object, &prototype)
         .map_err(|error| error.to_string())?;
     if uses_versioned_defaults {
@@ -3964,6 +3967,33 @@ impl SmsEditorApp {
                     after: Box::new(after),
                 }],
                 resource_deltas: Vec::new(),
+            },
+        );
+    }
+
+    pub(super) fn update_selected_cannon_mole_enabled(&mut self, enabled: bool) {
+        let Some(before) = self.selected_object().cloned() else {
+            return;
+        };
+        if before.factory_name != "Cannon" || before.cannon_mole_enabled == Some(enabled) {
+            return;
+        }
+        let mut after = before.clone();
+        after.cannon_mole_enabled = Some(enabled);
+        self.apply_object_edit(
+            if enabled {
+                "Enabled Cannon mole"
+            } else {
+                "Disabled Cannon mole"
+            },
+            ObjectUndoRecord {
+                deltas: vec![ObjectDelta::Update {
+                    before: Box::new(before),
+                    after: Box::new(after),
+                }],
+                resource_deltas: Vec::new(),
+                route_delta: None,
+                dialogue_delta: None,
             },
         );
     }
@@ -7261,6 +7291,7 @@ mod tests {
             runtime_references: Vec::new(),
             manager_capacity_dependencies: Vec::new(),
             authored_world_collision: None,
+            cannon_mole_enabled: None,
             authoring_defaults_version: 0,
         });
         assert_eq!(authored_runtime_readiness_error(&document, false), None);
@@ -8981,6 +9012,38 @@ mod tests {
             message.contains("Could not edit parameter 'resource_name'")
                 && message.contains("respawn")
         }));
+    }
+
+    #[test]
+    fn cannon_mole_toggle_updates_existing_objects_and_is_undoable() {
+        let mut object = SceneObject::new("retail-cannon", "Cannon");
+        object.placement = Some(sms_scene::PlacementBinding::Existing(
+            sms_scene::PlacementAddress {
+                raw_resource_path: b"map/scene.bin".to_vec(),
+                record_path: vec![0],
+            },
+        ));
+        let mut app = SmsEditorApp {
+            selected_object_id: Some(object.id.clone()),
+            saved_objects: vec![object.clone()],
+            document: Some(command_test_document(vec![object])),
+            ..SmsEditorApp::default()
+        };
+
+        app.update_selected_cannon_mole_enabled(false);
+        assert_eq!(
+            app.selected_object().unwrap().cannon_mole_enabled,
+            Some(false)
+        );
+        assert_eq!(app.undo_stack.len(), 1);
+
+        app.undo();
+        assert_eq!(app.selected_object().unwrap().cannon_mole_enabled, None);
+        app.redo();
+        assert_eq!(
+            app.selected_object().unwrap().cannon_mole_enabled,
+            Some(false)
+        );
     }
 
     #[test]
