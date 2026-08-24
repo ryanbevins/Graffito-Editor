@@ -90,8 +90,8 @@ pub use object_parameters::{
     editable_object_parameters, editable_parameters_for_object, generated_clone_runtime_name,
     seed_scene_object_parameters, sync_scene_object_parameter_aliases, EditableSceneParameter,
     ObjectParameterBitFlag, ObjectParameterChoice, ObjectParameterIndexedChoice,
-    ObjectParameterInfo, ObjectParameterKind, ParameterApplyMode, OBJECT_PARAMETER_CHARACTER_NAME,
-    OBJECT_PARAMETER_NAME,
+    ObjectParameterInfo, ObjectParameterKind, ParameterApplyMode, GENERATED_CLONE_RUNTIME_PREFIX,
+    OBJECT_PARAMETER_CHARACTER_NAME, OBJECT_PARAMETER_NAME,
 };
 pub use route_authoring::{
     BezierHandles, RouteAssignmentSuggestion, RouteAuthoringDocument, RouteAuthoringError,

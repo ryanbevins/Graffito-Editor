@@ -5338,7 +5338,7 @@ mod tests {
         let build = sms_scene::ObjectAuthoringCatalog::build_with_base_root(
             &archives, &registry, &base_root,
         );
-        let targets = ["HamuKuri", "PoiHana", "MameGesso"];
+        let targets = ["HamuKuri", "PoiHana", "MameGesso", "Cannon"];
         let mut retail_document = StageDocument::open(&base_root, "dolpic0")
             .expect("open retail dolpic0")
             .with_registry(registry.clone());
@@ -5453,6 +5453,18 @@ mod tests {
                     .iter()
                     .find(|object| object.id == *object_id)
                     .unwrap();
+                if factory_name == "Cannon" {
+                    assert!(object.runtime_references.iter().any(|reference| {
+                        reference.required_factory_name == "MareGate"
+                            && reference.runtime_name == "efMareGate"
+                            && !reference.required
+                            && reference.target_object_id.is_none()
+                    }));
+                    assert!(document
+                        .objects
+                        .iter()
+                        .all(|candidate| { candidate.raw_param("name") != Some("efMareGate") }));
+                }
                 let expected_model_path = format!(
                     "!/{}",
                     String::from_utf8_lossy(template.preview_resource_path.as_ref().unwrap())
@@ -5548,6 +5560,75 @@ mod tests {
             failures.is_empty(),
             "retail enemy drag preview failures: {failures:#?}"
         );
+    }
+
+    #[test]
+    #[ignore = "requires SMS_BASE_ROOT with extracted retail stages"]
+    fn retail_pinna_cannon_clone_raises_its_manager_capacity() {
+        fn visit<'a>(record: &'a JDramaRecord, out: &mut Vec<&'a JDramaRecord>) {
+            out.push(record);
+            if let JDramaRecordPayload::Group { children, .. } = &record.payload {
+                for child in children {
+                    visit(child, out);
+                }
+            }
+        }
+
+        let base_root = std::env::var_os("SMS_BASE_ROOT")
+            .map(PathBuf::from)
+            .expect("set SMS_BASE_ROOT to the extracted game's root");
+        let registry = sms_schema::bundled_object_registry()
+            .expect("load bundled decomp-derived object registry")
+            .registry;
+        let mut document = StageDocument::open(&base_root, "pinnaBeach1")
+            .expect("open retail pinnaBeach1")
+            .with_registry(registry.clone());
+        let source = document
+            .objects
+            .iter()
+            .find(|object| object.factory_name == "Cannon")
+            .expect("retail Pinna cannon")
+            .clone();
+        let clone = duplicate_object_for_spawn(
+            source,
+            "GraffitoClone_pinnaBeach1-cannon".to_string(),
+            [-3550.0, 100.0, 6800.0],
+            Some(&registry),
+        );
+        document.objects.push(clone);
+
+        let rebuilt = document.build_stage_archive().expect("build cannon clone");
+        let archive =
+            sms_scene::SourceFreeStageArchive::parse(&rebuilt).expect("reopen rebuilt pinnaBeach1");
+        let StageResourceDocument::Placement(scene) = archive
+            .resource(b"map/scene.bin")
+            .expect("rebuilt map/scene.bin")
+        else {
+            panic!("map/scene.bin remains a placement document");
+        };
+        let mut records = Vec::new();
+        visit(&scene.root, &mut records);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| semantic_record_type(&record.type_name) == "Cannon")
+                .count(),
+            2,
+            "rebuilt Pinna stage contains both cannon placements"
+        );
+        let manager = records
+            .iter()
+            .find(|record| semantic_record_type(&record.type_name) == "CannonManager")
+            .expect("Pinna CannonManager");
+        let fields = match &manager.payload {
+            JDramaRecordPayload::Fields { fields }
+            | JDramaRecordPayload::Actor { fields, .. }
+            | JDramaRecordPayload::Group { fields, .. } => fields,
+            JDramaRecordPayload::Empty => panic!("CannonManager has typed fields"),
+        };
+        assert!(fields
+            .iter()
+            .any(|field| { field.name == "capacity" && field.value == JDramaFieldValue::U32(2) }));
     }
 
     #[test]

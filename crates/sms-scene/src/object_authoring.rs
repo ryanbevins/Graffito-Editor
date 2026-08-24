@@ -4711,6 +4711,48 @@ mod tests {
             );
         }
 
+        let cannon = build.catalog.find("Cannon").unwrap_or_else(|| {
+            panic!(
+                "missing Cannon; warnings: {:?}",
+                build
+                    .warnings
+                    .iter()
+                    .filter(|warning| warning.message.contains("Cannon"))
+                    .collect::<Vec<_>>()
+            )
+        });
+        for manager_factory in ["CannonManager", "EffectExplosionManager"] {
+            assert!(cannon.dependencies.iter().any(|dependency| {
+                semantic_type_name(&dependency.record.type_name) == manager_factory
+            }));
+        }
+        assert!(cannon.runtime_actor_references.iter().any(|reference| {
+            reference.required_factory_name == "MareGate"
+                && reference.runtime_name == "efMareGate"
+                && !reference.required
+        }));
+        for path in [
+            "cannon/default.bmd",
+            "cannon/cannon_dom.bmd",
+            "cannon/tyorobe_model1.bmd",
+            "cannon/cannondom.col",
+            "cannon/cannonfuta.col",
+            "cannon/jpa/ms_cannon_smoke.jpa",
+            "map/params/enemy/cannon.prm",
+        ] {
+            assert!(
+                cannon
+                    .resources
+                    .iter()
+                    .any(|resource| { normalized_path(&resource.raw_resource_path) == path }),
+                "Cannon template omitted runtime resource {path}"
+            );
+        }
+        assert_eq!(
+            cannon.preview_resource_path.as_deref().map(normalized_path),
+            Some("cannon/default.bmd".to_string())
+        );
+
         let namekuri = build
             .catalog
             .find("NameKuri")

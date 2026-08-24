@@ -36,6 +36,7 @@ const STAGE_MUSIC_MARKER: &[u8] = b"SMS_EDITOR_STAGE_MUSIC_V1\0";
 const DIALOGUE_MARKER: &[u8] = b"GRAFFITO_DIALOGUE_OVERRIDE_V1\0";
 const BALLOON_DIALOGUE_MARKER: &[u8] = b"GRAFFITO_BALLOON_OVERRIDE_V1\0";
 const EXTENDED_COLLISION_MARKER: &[u8] = b"GRAFFITO_EXTENDED_COLLISION_V1\0";
+const AUTHORED_CANNON_MARKER: &[u8] = b"GRAFFITO_AUTHORED_CANNON_V1\0";
 const RETAIL_COLLISION_GRID_SIZE_BITS: u32 = 1024.0_f32.to_bits();
 const RETAIL_COLLISION_GRID_RECIPROCAL_BITS: u32 = (1.0_f32 / 1024.0).to_bits();
 const EXTENDED_COLLISION_GRID_SIZE_BITS: u32 = 65_536.0_f32.to_bits();
@@ -842,6 +843,222 @@ pub(super) fn patch_sms_sound_assignments_dol(
     for (offset, sound_id) in patches {
         write_be_u32(&mut bytes, offset, sound_id)?;
     }
+    parse_dol(&bytes)?;
+    Ok(bytes)
+}
+
+/// Lets editor-authored Cannons initialize their Chorobei and moving collision
+/// outside the two retail areas which normally enable the complete enemy.
+///
+/// Retail `TCannon::init` selects the interactive branch only for areas 5 and
+/// 9. The editor owns cloned/authored runtime names beginning with
+/// `GraffitoClone_`, so the hook extends that exact predicate without changing
+/// ornamental retail Cannons in other stages or spoofing the current area (the
+/// latter would make `loadAfter` dereference Pinna's absent `efMareGate`).
+pub(super) fn patch_sms_authored_cannon_dol(
+    source: &[u8],
+    required: bool,
+) -> Result<Vec<u8>, String> {
+    if !required {
+        return Ok(source.to_vec());
+    }
+    if source
+        .windows(AUTHORED_CANNON_MARKER.len())
+        .any(|window| window == AUTHORED_CANNON_MARKER)
+    {
+        return Ok(source.to_vec());
+    }
+
+    #[derive(Clone, Copy)]
+    struct CannonAreaHook {
+        anchor: WordAnchor,
+        this_register: u8,
+        interactive_target: u32,
+        object_target: u32,
+    }
+
+    let image = parse_dol(source)?;
+    let mut candidates = Vec::new();
+    for section in image
+        .sections
+        .iter()
+        .copied()
+        .filter(|section| section.text)
+    {
+        let words = section_words(source, section)?;
+        for word_index in 0..words.len().saturating_sub(4) {
+            if word_index < 7 {
+                continue;
+            }
+            let sequence = &words[word_index..word_index + 5];
+            let Some((area_register, this_register, area_offset)) = decode_lbz(sequence[0]) else {
+                continue;
+            };
+            let setup = &words[word_index - 7..word_index];
+            if area_register != 0
+                || area_offset != 0x230
+                || decode_d_form(setup[0], 48) != Some((0, this_register, 0x34))
+                || decode_d_form(setup[3], 52) != Some((0, this_register, 0x234))
+                || decode_lbz(setup[5]) != Some((0, 3, 0x0e))
+                || decode_d_form(setup[6], 38) != Some((0, this_register, 0x230))
+                || !is_cmplwi(sequence[1], area_register, 5)
+                || !is_beq(sequence[2])
+                || !is_cmplwi(sequence[3], area_register, 9)
+                || !is_bne(sequence[4])
+            {
+                continue;
+            }
+            let interactive_branch = WordAnchor {
+                section,
+                word_index: word_index + 2,
+            };
+            let anchor = WordAnchor {
+                section,
+                word_index: word_index + 4,
+            };
+            let interactive_target =
+                decode_conditional_branch_target(sequence[2], interactive_branch.address()?)?;
+            if interactive_target
+                != anchor
+                    .address()?
+                    .checked_add(4)
+                    .ok_or_else(|| "TCannon interactive branch address overflows u32".to_string())?
+            {
+                continue;
+            }
+            candidates.push(CannonAreaHook {
+                anchor,
+                this_register,
+                interactive_target,
+                object_target: decode_conditional_branch_target(sequence[4], anchor.address()?)?,
+            });
+        }
+    }
+    let hook_anchor = require_unique_anchor(
+        candidates
+            .iter()
+            .map(|candidate| candidate.anchor)
+            .collect(),
+        "TCannon authored interactive-area branch",
+    )?;
+    let hook = candidates
+        .into_iter()
+        .find(|candidate| candidate.anchor == hook_anchor)
+        .expect("the unique Cannon hook came from the candidate set");
+
+    let text_slot = (0..DOL_TEXT_SECTION_COUNT)
+        .rev()
+        .find(|slot| {
+            !image
+                .sections
+                .iter()
+                .any(|section| section.text && section.slot == *slot)
+        })
+        .ok_or_else(|| {
+            "The DOL has no unused text section for authored Cannon support".to_string()
+        })?;
+    let file_offset = align_up_usize(source.len(), FILE_ALIGNMENT as usize)?;
+    let loaded_end = image
+        .sections
+        .iter()
+        .map(|section| section.address_end())
+        .chain(image.bss.map(|(_, end)| Ok(end)))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .ok_or_else(|| "The DOL has no loaded sections".to_string())?;
+    let stub_address = align_up_u32(loaded_end, FILE_ALIGNMENT)?;
+    let prefix: [u8; 14] = sms_scene::GENERATED_CLONE_RUNTIME_PREFIX
+        .as_bytes()
+        .try_into()
+        .map_err(|_| "The generated clone runtime prefix must remain 14 bytes".to_string())?;
+    let prefix_a = u32::from_be_bytes(prefix[0..4].try_into().expect("four prefix bytes"));
+    let prefix_b = u32::from_be_bytes(prefix[4..8].try_into().expect("four prefix bytes"));
+    let prefix_c = u32::from_be_bytes(prefix[8..12].try_into().expect("four prefix bytes"));
+    let prefix_d = u16::from_be_bytes(prefix[12..14].try_into().expect("two prefix bytes"));
+    const INTERACTIVE_EXIT_WORD: usize = 22;
+    const OBJECT_EXIT_WORD: usize = 23;
+    let interactive_exit = stub_address + INTERACTIVE_EXIT_WORD as u32 * 4;
+    let object_exit = stub_address + OBJECT_EXIT_WORD as u32 * 4;
+    let mut stub = vec![
+        0,                                            // Existing area 9 compare: beq interactive.
+        encode_d_form(32, 12, hook.this_register, 4), // TNameRef::mName
+        encode_cmplwi(12, 0),
+        0,
+        encode_d_form(15, 11, 0, (prefix_a >> 16) as u16 as i16),
+        encode_d_form(24, 11, 11, prefix_a as u16 as i16),
+        encode_d_form(32, 10, 12, 0),
+        encode_cmplw(10, 11),
+        0,
+        encode_d_form(15, 11, 0, (prefix_b >> 16) as u16 as i16),
+        encode_d_form(24, 11, 11, prefix_b as u16 as i16),
+        encode_d_form(32, 10, 12, 4),
+        encode_cmplw(10, 11),
+        0,
+        encode_d_form(15, 11, 0, (prefix_c >> 16) as u16 as i16),
+        encode_d_form(24, 11, 11, prefix_c as u16 as i16),
+        encode_d_form(32, 10, 12, 8),
+        encode_cmplw(10, 11),
+        0,
+        encode_d_form(40, 10, 12, 12), // "e_"
+        encode_cmplwi(10, prefix_d),
+        0,
+        encode_branch(interactive_exit, hook.interactive_target, false)?,
+        encode_branch(object_exit, hook.object_target, false)?,
+    ];
+    stub[0] = encode_beq(stub_address, interactive_exit)?;
+    stub[3] = encode_beq(stub_address + 3 * 4, object_exit)?;
+    for index in [8usize, 13, 18, 21] {
+        stub[index] = encode_bne(stub_address + index as u32 * 4, object_exit)?;
+    }
+
+    let payload_bytes = stub
+        .len()
+        .checked_mul(4)
+        .and_then(|size| size.checked_add(AUTHORED_CANNON_MARKER.len()))
+        .ok_or_else(|| "Authored Cannon payload size overflows usize".to_string())?;
+    let payload_size = align_up_usize(payload_bytes, FILE_ALIGNMENT as usize)?;
+    let stub_end = stub_address
+        .checked_add(u32::try_from(payload_size).map_err(|_| {
+            "Authored Cannon payload size does not fit the DOL address space".to_string()
+        })?)
+        .ok_or_else(|| "Authored Cannon payload range overflows u32".to_string())?;
+    let stack_top = find_stack_top(source, &image)?;
+    if stub_end
+        .checked_add(MIN_STAGE_MUSIC_STACK_GAP)
+        .is_none_or(|safe_end| safe_end > stack_top)
+    {
+        return Err(format!(
+            "Authored Cannon stub 0x{stub_address:08X}..0x{stub_end:08X} is too close to the original stack top 0x{stack_top:08X}"
+        ));
+    }
+    reject_injected_range_overlap(&image, stub_address, stub_end)?;
+
+    let mut bytes = source.to_vec();
+    bytes.resize(file_offset, 0);
+    for word in stub {
+        bytes.extend_from_slice(&word.to_be_bytes());
+    }
+    bytes.extend_from_slice(AUTHORED_CANNON_MARKER);
+    bytes.resize(file_offset + payload_size, 0);
+    write_be_u32(
+        &mut bytes,
+        DOL_TEXT_FILE_OFFSETS + text_slot * 4,
+        u32::try_from(file_offset)
+            .map_err(|_| "Authored Cannon file offset does not fit u32".to_string())?,
+    )?;
+    write_be_u32(&mut bytes, DOL_TEXT_ADDRESSES + text_slot * 4, stub_address)?;
+    write_be_u32(
+        &mut bytes,
+        DOL_TEXT_SIZES + text_slot * 4,
+        u32::try_from(payload_size)
+            .map_err(|_| "Authored Cannon payload size does not fit u32".to_string())?,
+    )?;
+    write_be_u32(
+        &mut bytes,
+        hook.anchor.file_offset()?,
+        encode_branch(hook.anchor.address()?, stub_address, false)?,
+    )?;
     parse_dol(&bytes)?;
     Ok(bytes)
 }
@@ -5766,6 +5983,147 @@ mod tests {
     }
 
     #[test]
+    fn authored_cannon_patch_preserves_retail_areas_and_gates_on_owned_names() {
+        let layout = SyntheticLayout {
+            text_address: 0x8000_4000,
+            hook_word: 0x80,
+            movie_word: 0xc0,
+            setter_word: 0xe0,
+        };
+        let mut source = synthetic_dol(layout);
+        write_be_u32(&mut source, DOL_TEXT_SIZES, 0x20).unwrap();
+        write_be_u32(
+            &mut source,
+            SYNTHETIC_ENTRY_OFFSET,
+            encode_branch(0x8000_3100, 0x8000_3108, true).unwrap(),
+        )
+        .unwrap();
+        write_be_u32(
+            &mut source,
+            SYNTHETIC_ENTRY_OFFSET + 8,
+            encode_d_form(15, 1, 0, 0x8040_u16 as i16),
+        )
+        .unwrap();
+        write_be_u32(
+            &mut source,
+            SYNTHETIC_ENTRY_OFFSET + 12,
+            encode_d_form(14, 1, 1, 0),
+        )
+        .unwrap();
+        write_be_u32(&mut source, SYNTHETIC_ENTRY_OFFSET + 16, PPC_BLR).unwrap();
+        let cannon_word = 0x170;
+        for (index, word) in [
+            encode_d_form(48, 0, 31, 0x34),
+            encode_d_form(15, 3, 0, 0x803e_u16 as i16),
+            encode_d_form(14, 3, 3, 0x6000),
+            encode_d_form(52, 0, 31, 0x234),
+            encode_mr_word(29, 24),
+            encode_d_form(34, 0, 3, 0x0e),
+            encode_d_form(38, 0, 31, 0x230),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            write_be_u32(
+                &mut source,
+                SYNTHETIC_TEXT_OFFSET + (cannon_word - 7 + index) * 4,
+                word,
+            )
+            .unwrap();
+        }
+        let interactive_target = layout.text_address + (cannon_word as u32 + 5) * 4;
+        let object_target = layout.text_address + (cannon_word as u32 + 0x20) * 4;
+        let sequence = [
+            0x881f_0230,
+            encode_cmplwi(0, 5),
+            encode_beq(
+                layout.text_address + (cannon_word as u32 + 2) * 4,
+                interactive_target,
+            )
+            .unwrap(),
+            encode_cmplwi(0, 9),
+            encode_bne(
+                layout.text_address + (cannon_word as u32 + 4) * 4,
+                object_target,
+            )
+            .unwrap(),
+        ];
+        for (index, word) in sequence.into_iter().enumerate() {
+            write_be_u32(
+                &mut source,
+                SYNTHETIC_TEXT_OFFSET + (cannon_word + index) * 4,
+                word,
+            )
+            .unwrap();
+        }
+
+        let patched = patch_sms_authored_cannon_dol(&source, true).unwrap();
+        let hook_address = layout.text_address + (cannon_word as u32 + 4) * 4;
+        let hook = read_be_u32(&patched, SYNTHETIC_TEXT_OFFSET + (cannon_word + 4) * 4).unwrap();
+        assert!(is_unconditional_branch(hook));
+        let stub_address = decode_branch_target(hook, hook_address).unwrap();
+        let image = parse_dol(&patched).unwrap();
+        let stub_anchor = address_to_word_anchor(&image, stub_address)
+            .unwrap()
+            .expect("authored Cannon stub text section");
+        let words = section_words(&patched, stub_anchor.section).unwrap();
+        let words = &words[stub_anchor.word_index..];
+        assert_eq!(
+            decode_conditional_branch_target(words[0], stub_address).unwrap(),
+            stub_address + 22 * 4,
+            "retail area 9 still selects the interactive branch"
+        );
+        assert_eq!(words[1], encode_d_form(32, 12, 31, 4));
+        assert_eq!(words[2], encode_cmplwi(12, 0));
+        assert_eq!(
+            decode_branch_target(words[22], stub_address + 22 * 4).unwrap(),
+            interactive_target
+        );
+        assert_eq!(
+            decode_branch_target(words[23], stub_address + 23 * 4).unwrap(),
+            object_target
+        );
+        let prefix = sms_scene::GENERATED_CLONE_RUNTIME_PREFIX.as_bytes();
+        assert_eq!(prefix, b"GraffitoClone_");
+        assert!(patched
+            .windows(AUTHORED_CANNON_MARKER.len())
+            .any(|window| window == AUTHORED_CANNON_MARKER));
+        assert_eq!(
+            patch_sms_authored_cannon_dol(&patched, true).unwrap(),
+            patched,
+            "the authored Cannon patch is idempotent"
+        );
+    }
+
+    #[test]
+    fn authored_cannon_patch_rejects_an_unknown_required_dol() {
+        let layout = SyntheticLayout {
+            text_address: 0x8000_4000,
+            hook_word: 0x80,
+            movie_word: 0xc0,
+            setter_word: 0xe0,
+        };
+        let source = synthetic_dol(layout);
+        assert_eq!(
+            patch_sms_authored_cannon_dol(&source, false).unwrap(),
+            source
+        );
+        let error = patch_sms_authored_cannon_dol(&source, true).unwrap_err();
+        assert!(error.contains("TCannon authored interactive-area branch"));
+    }
+
+    #[test]
+    #[ignore = "requires SMS_BASE_ROOT with an extracted JP or US retail game"]
+    fn local_retail_authored_cannon_patch_is_semantically_located() {
+        let path = PathBuf::from(std::env::var_os("SMS_BASE_ROOT").expect("SMS_BASE_ROOT"))
+            .join("sys/main.dol");
+        let source = fs::read(path).unwrap();
+        let patched = patch_sms_authored_cannon_dol(&source, true).unwrap();
+        assert_ne!(patched, source);
+        parse_dol(&patched).unwrap();
+    }
+
+    #[test]
     fn telesa_pollution_pool_reset_clears_hidden_and_starts_fade_in() {
         let layout = SyntheticLayout {
             text_address: 0x8000_4000,
@@ -6983,8 +7341,10 @@ mod tests {
             ]),
         )
         .unwrap_or_else(|error| panic!("composed goop manager patches: {error}"));
+        let cannon = patch_sms_authored_cannon_dol(&goop, true)
+            .unwrap_or_else(|error| panic!("composed authored Cannon support: {error}"));
         let music = patch_sms_stage_music_dol(
-            &goop,
+            &cannon,
             &[
                 RuntimeStageMusicOverride {
                     area_index: 1,
@@ -7094,6 +7454,10 @@ mod tests {
         .unwrap_or_else(|error| panic!("composed direct boot: {error}"));
         parse_dol(&direct.bytes).unwrap();
         assert!(direct.bytes.len() >= dialogue.len());
+        assert!(direct
+            .bytes
+            .windows(AUTHORED_CANNON_MARKER.len())
+            .any(|window| window == AUTHORED_CANNON_MARKER));
     }
 
     #[test]

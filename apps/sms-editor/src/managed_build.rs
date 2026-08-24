@@ -18,13 +18,14 @@ use sms_scene::{
 use sms_schema::ObjectRegistry;
 
 use crate::direct_boot::{
-    dol_supports_goop_wash, install_goop_wash, patch_sms_dialogue_dol, patch_sms_direct_boot_dol,
-    patch_sms_extended_collision_dol, patch_sms_goop_enemy_managers_dol,
-    patch_sms_goop_layer_spawn_dol, patch_sms_sound_assignments_dol, patch_sms_stage_music_dol,
-    GoopWashActor, GoopWashReach, GoopWashSettings, RuntimeBalloonOverride,
-    RuntimeDialogueOverride, RuntimeGoopLayerBinding, RuntimeGoopManagerPatch,
-    RuntimeMusicRoleOverride, RuntimeSoundAssignment, RuntimeSoundAssignmentKind,
-    RuntimeStageMusicOverride, RuntimeStageMusicTransition, RuntimeStageTarget,
+    dol_supports_goop_wash, install_goop_wash, patch_sms_authored_cannon_dol,
+    patch_sms_dialogue_dol, patch_sms_direct_boot_dol, patch_sms_extended_collision_dol,
+    patch_sms_goop_enemy_managers_dol, patch_sms_goop_layer_spawn_dol,
+    patch_sms_sound_assignments_dol, patch_sms_stage_music_dol, GoopWashActor, GoopWashReach,
+    GoopWashSettings, RuntimeBalloonOverride, RuntimeDialogueOverride, RuntimeGoopLayerBinding,
+    RuntimeGoopManagerPatch, RuntimeMusicRoleOverride, RuntimeSoundAssignment,
+    RuntimeSoundAssignmentKind, RuntimeStageMusicOverride, RuntimeStageMusicTransition,
+    RuntimeStageTarget,
 };
 #[cfg(test)]
 use crate::project::ProjectSoundAssignment;
@@ -508,6 +509,7 @@ fn build_managed_game_with_compiled_dialogue_inner(
                 dialogue_overrides: &runtime.talk,
                 balloon_overrides: &runtime.balloon,
                 extended_collision_required,
+                authored_cannon_required: requires_authored_cannon_runtime(document),
                 direct_boot,
             },
             cancelled,
@@ -1380,6 +1382,15 @@ fn required_goop_manager_runtime_patches(
     Ok(patches)
 }
 
+fn requires_authored_cannon_runtime(document: &StageDocument) -> bool {
+    document.objects.iter().any(|object| {
+        object.factory_name == "Cannon"
+            && object
+                .raw_param(sms_scene::OBJECT_PARAMETER_NAME)
+                .is_some_and(|name| name.starts_with(sms_scene::GENERATED_CLONE_RUNTIME_PREFIX))
+    })
+}
+
 struct ManagedRuntimePatchInputs<'a> {
     registry: Option<&'a ObjectRegistry>,
     goop_manager_patches: &'a BTreeSet<RuntimeGoopManagerPatch>,
@@ -1387,6 +1398,7 @@ struct ManagedRuntimePatchInputs<'a> {
     dialogue_overrides: &'a [RuntimeDialogueOverride],
     balloon_overrides: &'a [RuntimeBalloonOverride],
     extended_collision_required: bool,
+    authored_cannon_required: bool,
     direct_boot: Option<(RuntimeStageTarget, usize)>,
 }
 
@@ -1403,6 +1415,7 @@ fn install_managed_runtime_patches(
         dialogue_overrides,
         balloon_overrides,
         extended_collision_required,
+        authored_cannon_required,
         direct_boot,
     } = inputs;
     check_cancelled(cancelled)?;
@@ -1513,6 +1526,13 @@ fn install_managed_runtime_patches(
         .map_err(|error| {
             format!(
                 "Could not install packaged goop enemy-manager support into '{}': {error}",
+                run.run_main_dol.display()
+            )
+        })?;
+    patched_bytes = patch_sms_authored_cannon_dol(&patched_bytes, authored_cannon_required)
+        .map_err(|error| {
+            format!(
+                "Could not install packaged authored Cannon support into '{}': {error}",
                 run.run_main_dol.display()
             )
         })?;
@@ -1717,6 +1737,7 @@ fn install_managed_stage_music(
             dialogue_overrides: &[],
             balloon_overrides: &[],
             extended_collision_required: false,
+            authored_cannon_required: false,
             direct_boot: None,
         },
         cancelled,
@@ -3276,6 +3297,56 @@ mod tests {
     };
     use std::hash::{DefaultHasher, Hash, Hasher};
 
+    fn document_with_objects(objects: Vec<sms_scene::SceneObject>) -> StageDocument {
+        StageDocument {
+            stage_id: "fixture".to_string(),
+            base_root: PathBuf::new(),
+            assets: Vec::new(),
+            objects,
+            changed_files: BTreeMap::new(),
+            stage_archive: None,
+            stage_archive_source_path: None,
+            archive_edits: StageArchiveEdits::default(),
+            registry: None,
+            route_authoring: None,
+            goop_authoring: None,
+            dialogue_authoring: None,
+            dialogue_library: Default::default(),
+            load_issues: Vec::new(),
+            lighting: Default::default(),
+            death_barrier: None,
+            actor_previews: BTreeMap::new(),
+            loaded_project: None,
+        }
+    }
+
+    #[test]
+    fn authored_cannon_runtime_patch_is_selected_only_for_editor_owned_cannons() {
+        let mut retail_cannon = sms_scene::SceneObject::new("retail", "Cannon");
+        retail_cannon.set_raw_param(sms_scene::OBJECT_PARAMETER_NAME, "砲台");
+        assert!(!requires_authored_cannon_runtime(&document_with_objects(
+            vec![retail_cannon]
+        )));
+
+        let mut unrelated = sms_scene::SceneObject::new("unrelated", "Coin");
+        unrelated.set_raw_param(
+            sms_scene::OBJECT_PARAMETER_NAME,
+            sms_scene::generated_clone_runtime_name("unrelated"),
+        );
+        assert!(!requires_authored_cannon_runtime(&document_with_objects(
+            vec![unrelated]
+        )));
+
+        let mut authored_cannon = sms_scene::SceneObject::new("authored", "Cannon");
+        authored_cannon.set_raw_param(
+            sms_scene::OBJECT_PARAMETER_NAME,
+            sms_scene::generated_clone_runtime_name("authored"),
+        );
+        assert!(requires_authored_cannon_runtime(&document_with_objects(
+            vec![authored_cannon]
+        )));
+    }
+
     #[test]
     fn finalized_stage_detects_extended_world_collision_requirements() {
         let mut archive = SourceFreeStageArchive::new().unwrap();
@@ -3897,6 +3968,7 @@ mod tests {
                 dialogue_overrides: &[override_],
                 balloon_overrides: &[],
                 extended_collision_required: false,
+                authored_cannon_required: false,
                 direct_boot: None,
             },
             &AtomicBool::new(false),
@@ -3969,6 +4041,7 @@ mod tests {
                 dialogue_overrides: &[],
                 balloon_overrides: &[],
                 extended_collision_required: false,
+                authored_cannon_required: false,
                 direct_boot: None,
             },
             &AtomicBool::new(false),
@@ -4559,6 +4632,7 @@ mod tests {
                 dialogue_overrides: &[],
                 balloon_overrides: &[],
                 extended_collision_required: false,
+                authored_cannon_required: false,
                 direct_boot: None,
             },
             &AtomicBool::new(false),
@@ -4686,6 +4760,7 @@ mod tests {
                 dialogue_overrides: &[],
                 balloon_overrides: &[],
                 extended_collision_required: false,
+                authored_cannon_required: false,
                 direct_boot: None,
             },
             &AtomicBool::new(false),
