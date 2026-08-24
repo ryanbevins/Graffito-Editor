@@ -1014,6 +1014,16 @@ fn append_active_object_collisions(
     resources: &BTreeMap<String, ColFile>,
     preview: &mut CollisionPreviewBuild,
 ) {
+    for object in document
+        .objects
+        .iter()
+        .filter(|object| !object.is_pool_only())
+    {
+        if let Some(collision) = &object.authored_world_collision {
+            preview.append_file_with_transform(collision, Some(object.transform));
+        }
+    }
+
     let Some(registry) = document.registry.as_ref() else {
         return;
     };

@@ -1385,9 +1385,13 @@ fn required_goop_manager_runtime_patches(
 fn requires_authored_cannon_runtime(document: &StageDocument) -> bool {
     document.objects.iter().any(|object| {
         object.factory_name == "Cannon"
-            && object
-                .raw_param(sms_scene::OBJECT_PARAMETER_NAME)
-                .is_some_and(|name| name.starts_with(sms_scene::GENERATED_CLONE_RUNTIME_PREFIX))
+            && matches!(
+                object.placement,
+                Some(
+                    sms_scene::PlacementBinding::CloneOf(_)
+                        | sms_scene::PlacementBinding::Authored(_)
+                )
+            )
     })
 }
 
@@ -2054,6 +2058,7 @@ fn prepare_managed_run_mirror_from_source_with_cancel(
     }
     let build_root = ensure_owned_build_root(project)?;
     let run_root = ensure_child_directory(&build_root, Path::new(RUN_ROOT_NAME))?;
+    let authored_stage_ids = saved_authored_stage_ids(project)?;
     let mut stats = MirrorStats::default();
     clean_stale_run_entries(&run_root, &inventory, &mut stats, cancelled)?;
     for directory in &inventory.directories {
@@ -2071,6 +2076,13 @@ fn prepare_managed_run_mirror_from_source_with_cancel(
             continue;
         }
         let destination = run_root.join(&file.relative);
+        if file.relative != source_relative_path
+            && is_saved_authored_stage_archive(&file.relative, &authored_stage_ids)
+            && preserve_existing_managed_file(&destination)?
+        {
+            stats.reused_files += 1;
+            continue;
+        }
         match mirror_regular_file(&file.source, &destination, cancelled)? {
             MirroredFileAction::Copied => stats.copied_files += 1,
             MirroredFileAction::Reused => stats.reused_files += 1,
@@ -2137,6 +2149,109 @@ fn prepare_managed_run_mirror_from_source_with_cancel(
         reused_files: stats.reused_files,
         removed_entries: stats.removed_entries,
     })
+}
+
+fn saved_authored_stage_ids(project: &OpenProject) -> Result<BTreeSet<String>, String> {
+    let stages_root = project.data_root().join("files/editor/stages");
+    let metadata = match fs::symlink_metadata(&stages_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect saved project stages '{}': {error}",
+                stages_root.display()
+            ));
+        }
+    };
+    validate_directory_metadata(&metadata, &stages_root, "saved project stage directory")?;
+
+    let mut stage_ids = BTreeSet::new();
+    for entry in fs::read_dir(&stages_root).map_err(|error| {
+        format!(
+            "Could not enumerate saved project stages '{}': {error}",
+            stages_root.display()
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            format!(
+                "Could not read a saved project stage entry in '{}': {error}",
+                stages_root.display()
+            )
+        })?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            format!(
+                "Could not inspect saved project stage '{}': {error}",
+                path.display()
+            )
+        })?;
+        reject_link_or_reparse(&metadata, &path, "saved project stage")?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(stage_id) = file_name.strip_suffix(".scene.json") else {
+            continue;
+        };
+        if !stage_id.is_empty() {
+            stage_ids.insert(stage_id.to_ascii_lowercase());
+        }
+    }
+    Ok(stage_ids)
+}
+
+fn is_saved_authored_stage_archive(relative: &Path, stage_ids: &BTreeSet<String>) -> bool {
+    let extension_is_archive = relative
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("szs") || extension.eq_ignore_ascii_case("arc")
+        });
+    extension_is_archive
+        && relative
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stage_ids.contains(&stem.to_ascii_lowercase()))
+        && relative
+            .parent()
+            .is_some_and(|parent| path_ends_with_ascii_case(parent, &["files", "data", "scene"]))
+}
+
+fn path_ends_with_ascii_case(path: &Path, expected: &[&str]) -> bool {
+    let components = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    components.len() >= expected.len()
+        && components[components.len() - expected.len()..]
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+}
+
+fn preserve_existing_managed_file(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            reject_link_or_reparse(&metadata, path, "existing authored managed stage")?;
+            if !metadata.is_file() {
+                return Err(format!(
+                    "Existing authored managed stage is not a regular file: {}",
+                    path.display()
+                ));
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Could not inspect existing authored managed stage '{}': {error}",
+            path.display()
+        )),
+    }
 }
 
 fn install_managed_extended_mem1_bi2(
@@ -3324,6 +3439,12 @@ mod tests {
     fn authored_cannon_runtime_patch_is_selected_only_for_editor_owned_cannons() {
         let mut retail_cannon = sms_scene::SceneObject::new("retail", "Cannon");
         retail_cannon.set_raw_param(sms_scene::OBJECT_PARAMETER_NAME, "砲台");
+        retail_cannon.placement = Some(sms_scene::PlacementBinding::Existing(
+            sms_scene::PlacementAddress {
+                raw_resource_path: b"map/scene.bin".to_vec(),
+                record_path: vec![0],
+            },
+        ));
         assert!(!requires_authored_cannon_runtime(&document_with_objects(
             vec![retail_cannon]
         )));
@@ -3333,15 +3454,31 @@ mod tests {
             sms_scene::OBJECT_PARAMETER_NAME,
             sms_scene::generated_clone_runtime_name("unrelated"),
         );
+        unrelated.placement = Some(sms_scene::PlacementBinding::CloneOf(
+            sms_scene::PlacementAddress {
+                raw_resource_path: b"map/scene.bin".to_vec(),
+                record_path: vec![1],
+            },
+        ));
         assert!(!requires_authored_cannon_runtime(&document_with_objects(
             vec![unrelated]
         )));
 
         let mut authored_cannon = sms_scene::SceneObject::new("authored", "Cannon");
-        authored_cannon.set_raw_param(
-            sms_scene::OBJECT_PARAMETER_NAME,
-            sms_scene::generated_clone_runtime_name("authored"),
-        );
+        authored_cannon.set_raw_param(sms_scene::OBJECT_PARAMETER_NAME, "砲台");
+        authored_cannon.placement = Some(sms_scene::PlacementBinding::Authored(
+            sms_scene::AuthoredPlacement {
+                raw_resource_path: b"map/scene.bin".to_vec(),
+                target_group_index: 0,
+                prototype: sms_formats::JDramaRecord {
+                    type_name: "Cannon".to_string(),
+                    name: "砲台".to_string(),
+                    payload: sms_formats::JDramaRecordPayload::Empty,
+                },
+                dependencies: Vec::new(),
+                pool_only: false,
+            },
+        ));
         assert!(requires_authored_cannon_runtime(&document_with_objects(
             vec![authored_cannon]
         )));
@@ -4677,6 +4814,55 @@ mod tests {
             &EXTENDED_DOLPHIN_MEM1_BYTES.to_be_bytes()
         );
         assert_ne!(run_bi2, base_bi2);
+    }
+
+    #[test]
+    fn building_one_saved_stage_does_not_restore_another_saved_stage_to_retail() {
+        let fixture = fixture();
+        let pinna_source = fixture.base_root.join("files/data/scene/pinnaBeach1.szs");
+        fs::write(&pinna_source, b"retail-pinna").unwrap();
+        let stages_root = fixture.data_root.join("files/editor/stages");
+        fs::create_dir_all(&stages_root).unwrap();
+        fs::write(stages_root.join("pinnaBeach1.scene.json"), b"{}").unwrap();
+
+        let pinna = prepare_managed_run_mirror_from_source(
+            &fixture.project,
+            &fixture.base_root,
+            &pinna_source,
+            b"authored-pinna-with-extra-cannon",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(&pinna.stage_output_path).unwrap(),
+            b"authored-pinna-with-extra-cannon"
+        );
+
+        prepare_managed_run_mirror_from_source(
+            &fixture.project,
+            &fixture.base_root,
+            &fixture.source_path,
+            b"authored-bianco",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(&pinna.stage_output_path).unwrap(),
+            b"authored-pinna-with-extra-cannon",
+            "building another scene must preserve the last coherent build of every saved project scene"
+        );
+
+        fs::remove_file(stages_root.join("pinnaBeach1.scene.json")).unwrap();
+        prepare_managed_run_mirror_from_source(
+            &fixture.project,
+            &fixture.base_root,
+            &fixture.source_path,
+            b"second-authored-bianco",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(&pinna.stage_output_path).unwrap(),
+            b"retail-pinna",
+            "removing a project scene must let the mirror reconcile its archive back to the base game"
+        );
     }
 
     #[test]

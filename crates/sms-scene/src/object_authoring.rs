@@ -3,9 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use sms_formats::{
-    mount_scene_archive, parse_jdrama_object_records, read_stage_asset_bytes, JDramaDocument,
-    JDramaField, JDramaFieldValue, JDramaRecord, JDramaRecordPayload, SceneArchiveInfo,
-    StageAssetKind,
+    mount_scene_archive, parse_jdrama_object_records, read_stage_asset_bytes, ColFile, ColGroup,
+    ColTriangle, ColVertex, J3dFile, JDramaDocument, JDramaField, JDramaFieldValue, JDramaRecord,
+    JDramaRecordPayload, JDramaTransform, SceneArchiveInfo, StageAssetKind,
+    SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS,
 };
 use sms_schema::{
     EnemyActorDefinition, EnemyManagerDefinition, ObjectDefinition, ObjectRegistry,
@@ -252,6 +253,11 @@ pub struct ObjectAuthoringTemplate {
     pub required_graph_names: Vec<String>,
     pub resources: Vec<ObjectAuthoringResource>,
     pub preview_resource_path: Option<Vec<u8>>,
+    /// Actor-local collision extracted from a disconnected retail world-map
+    /// component. Some actors render a model whose fixed hull is part of the
+    /// source stage's `map/map.col`, while their runtime class only creates
+    /// collision for moving pieces.
+    pub authored_world_collision: Option<ColFile>,
     pub source_stage: String,
 }
 
@@ -681,6 +687,7 @@ fn build_from_sources_with_common(
 
     let mut templates = BTreeMap::new();
     for (factory_name, factory_candidates) in candidates {
+        let world_collision_candidates = factory_candidates.clone();
         let mut variants: BTreeMap<(u32, Vec<u8>), Vec<Candidate>> = BTreeMap::new();
         for candidate in factory_candidates {
             variants
@@ -766,6 +773,26 @@ fn build_from_sources_with_common(
 
         let runtime_actor_references = runtime_actor_references(&candidate.factory_name, registry);
         let preview_resource_path = preview_resource_path(&candidate, &resources, registry);
+        let authored_world_collision = match extract_authored_world_collision(
+            &candidate.factory_name,
+            &world_collision_candidates,
+            preview_resource_path.as_deref(),
+            &resources,
+            &sources,
+        ) {
+            Ok(collision) => collision,
+            Err(message) => {
+                warnings.push(ObjectAuthoringCatalogWarning {
+                    source_stage: candidate.source_stage.clone(),
+                    source_asset_path: Some(candidate.source_asset_path.clone()),
+                    message: format!(
+                        "Could not recover baked world collision for '{}': {message}",
+                        candidate.factory_name
+                    ),
+                });
+                None
+            }
+        };
         templates.insert(
             factory_name,
             ObjectAuthoringTemplate {
@@ -780,6 +807,7 @@ fn build_from_sources_with_common(
                 required_graph_names: candidate.graph_names.into_iter().collect(),
                 resources,
                 preview_resource_path,
+                authored_world_collision,
                 source_stage: candidate.source_stage,
             },
         );
@@ -1090,14 +1118,23 @@ fn resolve_dependencies(
                 .map(str::to_owned),
         );
     }
-    let runtime_manager_names = registry
+    let required_manager_names = manager_names.clone();
+    let runtime_manager_requirements = registry
         .runtime_name_references
         .iter()
-        .filter(|reference| reference.factory_name == actor_factory && reference.required)
+        .filter(|reference| reference.factory_name == actor_factory)
         .filter(|reference| matches!(reference.target, RuntimeNameReferenceTarget::EnemyManager))
-        .map(|reference| reference.record_name.clone())
-        .collect::<BTreeSet<_>>();
-    manager_names.extend(runtime_manager_names.iter().cloned());
+        .fold(
+            BTreeMap::<String, bool>::new(),
+            |mut requirements, reference| {
+                requirements
+                    .entry(reference.record_name.clone())
+                    .and_modify(|required| *required |= reference.required)
+                    .or_insert(reference.required);
+                requirements
+            },
+        );
+    manager_names.extend(runtime_manager_requirements.keys().cloned());
     if manager_names.is_empty() {
         return Ok(Vec::new());
     }
@@ -1116,7 +1153,7 @@ fn resolve_dependencies(
             .filter(|(_, item)| item.record.name == name)
             .filter(|(_, item)| {
                 let factory = semantic_type_name(&item.record.type_name);
-                (runtime_manager_names.contains(&name)
+                (runtime_manager_requirements.contains_key(&name)
                     && find_enemy_manager(registry, factory).is_some())
                     || enemy.is_some_and(|enemy| {
                         enemy
@@ -1152,20 +1189,26 @@ fn resolve_dependencies(
                 .then_with(|| a.0.cmp(&b.0))
                 .then_with(|| a.1.cmp(&b.1))
         });
+        let required = required_manager_names.contains(&name)
+            || runtime_manager_requirements
+                .get(&name)
+                .copied()
+                .unwrap_or(false);
         match found.len() {
             1 => dependencies.push(found.remove(0).2),
-            0 => {
+            0 if required => {
                 return Err(format!(
                     "required manager {name:?} has no exact compatible record in source stage {}",
                     source.source_stage
                 ));
             }
-            count => {
+            count if required => {
                 return Err(format!(
                     "required manager {name:?} has {count} exact compatible records in source stage {}; a unique dependency cannot be authored safely",
                     source.source_stage
                 ));
             }
+            _ => {}
         }
     }
     dependencies.sort_by(|a, b| {
@@ -2372,6 +2415,305 @@ fn preview_resource_path(
                 .find(|resource| normalized_path(&resource.raw_resource_path).ends_with(".bmd"))
         })
         .map(|resource| resource.raw_resource_path.clone())
+}
+
+/// `TCannon` constructs collision for its moving barrel, lid, and opening at
+/// runtime, but retail keeps the fixed red hull as a disconnected component
+/// in the stage world collision. Recover that component from any retail
+/// Cannon placement and retain it in actor-local space for custom stages.
+fn extract_authored_world_collision(
+    factory_name: &str,
+    candidates: &[Candidate],
+    preview_resource_path: Option<&[u8]>,
+    resources: &[ObjectAuthoringResource],
+    sources: &[&CatalogSource],
+) -> Result<Option<ColFile>, String> {
+    if factory_name != "Cannon" {
+        return Ok(None);
+    }
+
+    let preview_path = preview_resource_path
+        .ok_or_else(|| "the Cannon template has no unambiguous preview model".to_string())?;
+    let model_resource = resources
+        .iter()
+        .find(|resource| resource.raw_resource_path == preview_path)
+        .ok_or_else(|| {
+            format!(
+                "preview model {} is absent from the resolved resource closure",
+                String::from_utf8_lossy(preview_path)
+            )
+        })?;
+    let model_bytes =
+        read_stage_asset_bytes(&model_resource.source_asset_path).map_err(|error| {
+            format!(
+                "read preview model {}: {error}",
+                model_resource.source_asset_path.display()
+            )
+        })?;
+    let model = J3dFile::parse(&model_bytes)
+        .and_then(|model| model.geometry_preview_with_loader_flags(SMS_SM_J3D_ACT_MODEL_LOAD_FLAGS))
+        .map_err(|error| format!("parse Cannon preview geometry: {error}"))?;
+
+    let mut recovered = Vec::<(f32, String, ColFile)>::new();
+    let mut failures = Vec::new();
+    for candidate in candidates {
+        let JDramaRecordPayload::Actor { transform, .. } = &candidate.record.payload else {
+            continue;
+        };
+        if transform
+            .scale
+            .iter()
+            .any(|scale| !scale.is_finite() || scale.abs() < 1.0e-6)
+        {
+            continue;
+        }
+        let Some(source) = sources
+            .iter()
+            .find(|source| source.source_stage == candidate.source_stage)
+        else {
+            continue;
+        };
+        let Some(world_resource) = source
+            .resources
+            .iter()
+            .find(|resource| normalized_path(&resource.raw_resource_path) == "map/map.col")
+        else {
+            continue;
+        };
+        let result = (|| {
+            let bytes =
+                read_stage_asset_bytes(&world_resource.source_asset_path).map_err(|error| {
+                    format!(
+                        "read {}: {error}",
+                        world_resource.source_asset_path.display()
+                    )
+                })?;
+            let world = ColFile::parse(&bytes).map_err(|error| {
+                format!(
+                    "parse {}: {error}",
+                    world_resource.source_asset_path.display()
+                )
+            })?;
+            extract_matching_collision_component(
+                &world,
+                transform,
+                model.bounds_min,
+                model.bounds_max,
+            )
+        })();
+        match result {
+            Ok(Some(collision)) => {
+                let scale_penalty = transform
+                    .scale
+                    .iter()
+                    .map(|scale| (scale.abs() - 1.0).abs())
+                    .sum();
+                recovered.push((scale_penalty, candidate.source_stage.clone(), collision));
+            }
+            Ok(None) => {}
+            Err(error) => failures.push(format!("{}: {error}", candidate.source_stage)),
+        }
+    }
+
+    recovered.sort_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    if let Some((_, _, collision)) = recovered.into_iter().next() {
+        return Ok(Some(collision));
+    }
+    if failures.is_empty() {
+        Err(
+            "no retail Cannon placement had one isolated map.col component matching the model hull"
+                .to_string(),
+        )
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+fn extract_matching_collision_component(
+    world: &ColFile,
+    transform: &JDramaTransform,
+    model_bounds_min: [f32; 3],
+    model_bounds_max: [f32; 3],
+) -> Result<Option<ColFile>, String> {
+    #[derive(Clone, Copy)]
+    struct TriangleRef {
+        group_index: usize,
+        triangle_index: usize,
+        vertex_indices: [u16; 3],
+    }
+
+    let triangles = world
+        .groups()
+        .iter()
+        .enumerate()
+        .flat_map(|(group_index, group)| {
+            group
+                .triangles
+                .iter()
+                .enumerate()
+                .map(move |(triangle_index, triangle)| TriangleRef {
+                    group_index,
+                    triangle_index,
+                    vertex_indices: triangle.vertex_indices,
+                })
+        })
+        .collect::<Vec<_>>();
+    let mut parents = (0..triangles.len()).collect::<Vec<_>>();
+    fn root(parents: &mut [usize], mut index: usize) -> usize {
+        while parents[index] != index {
+            parents[index] = parents[parents[index]];
+            index = parents[index];
+        }
+        index
+    }
+    fn union(parents: &mut [usize], left: usize, right: usize) {
+        let left = root(parents, left);
+        let right = root(parents, right);
+        if left != right {
+            parents[right] = left;
+        }
+    }
+    let mut first_triangle_by_vertex = BTreeMap::<u16, usize>::new();
+    for (triangle_index, triangle) in triangles.iter().enumerate() {
+        for vertex_index in triangle.vertex_indices {
+            if let Some(first) = first_triangle_by_vertex.insert(vertex_index, triangle_index) {
+                union(&mut parents, first, triangle_index);
+            }
+        }
+    }
+    let mut components = BTreeMap::<usize, Vec<usize>>::new();
+    for triangle_index in 0..triangles.len() {
+        let component = root(&mut parents, triangle_index);
+        components
+            .entry(component)
+            .or_default()
+            .push(triangle_index);
+    }
+
+    const BOUNDS_TOLERANCE: f32 = 8.0;
+    let model_extent =
+        std::array::from_fn::<_, 3, _>(|axis| model_bounds_max[axis] - model_bounds_min[axis]);
+    let mut matches = Vec::new();
+    for component in components.values() {
+        if component.len() < 8 {
+            continue;
+        }
+        let vertex_indices = component
+            .iter()
+            .flat_map(|triangle_index| triangles[*triangle_index].vertex_indices)
+            .collect::<BTreeSet<_>>();
+        let mut local_min = [f32::INFINITY; 3];
+        let mut local_max = [f32::NEG_INFINITY; 3];
+        let mut all_inside = true;
+        for vertex_index in &vertex_indices {
+            let Some(vertex) = world.vertices().get(usize::from(*vertex_index)) else {
+                return Err(format!(
+                    "collision references missing vertex {vertex_index}"
+                ));
+            };
+            let local = inverse_transform_point(vertex.position, transform);
+            for axis in 0..3 {
+                local_min[axis] = local_min[axis].min(local[axis]);
+                local_max[axis] = local_max[axis].max(local[axis]);
+                all_inside &= local[axis] >= model_bounds_min[axis] - BOUNDS_TOLERANCE
+                    && local[axis] <= model_bounds_max[axis] + BOUNDS_TOLERANCE;
+            }
+        }
+        if !all_inside {
+            continue;
+        }
+        let extent = std::array::from_fn::<_, 3, _>(|axis| local_max[axis] - local_min[axis]);
+        if extent[0] < model_extent[0] * 0.7
+            || extent[1] < model_extent[1] * 0.5
+            || extent[2] < model_extent[2] * 0.7
+        {
+            continue;
+        }
+        matches.push(component.clone());
+    }
+    if matches.len() != 1 {
+        return Ok(None);
+    }
+
+    let selected = &matches[0];
+    let selected_set = selected.iter().copied().collect::<BTreeSet<_>>();
+    let old_vertex_indices = selected
+        .iter()
+        .flat_map(|triangle_index| triangles[*triangle_index].vertex_indices)
+        .collect::<BTreeSet<_>>();
+    let mut vertex_remap = BTreeMap::new();
+    let mut vertices = Vec::with_capacity(old_vertex_indices.len());
+    for old_index in old_vertex_indices {
+        let new_index = u16::try_from(vertices.len())
+            .map_err(|_| "authored collision component has more than 65535 vertices".to_string())?;
+        vertex_remap.insert(old_index, new_index);
+        let source = world.vertices()[usize::from(old_index)];
+        vertices.push(ColVertex::from(inverse_transform_point(
+            source.position,
+            transform,
+        )));
+    }
+    let groups = world
+        .groups()
+        .iter()
+        .enumerate()
+        .filter_map(|(group_index, group)| {
+            let triangles = group
+                .triangles
+                .iter()
+                .enumerate()
+                .filter_map(|(triangle_index, triangle)| {
+                    let flat_index = triangles.iter().position(|entry| {
+                        entry.group_index == group_index && entry.triangle_index == triangle_index
+                    })?;
+                    selected_set.contains(&flat_index).then(|| ColTriangle {
+                        vertex_indices: triangle.vertex_indices.map(|index| vertex_remap[&index]),
+                        attribute_0: triangle.attribute_0,
+                        attribute_1: triangle.attribute_1,
+                        data: triangle.data,
+                    })
+                })
+                .collect::<Vec<_>>();
+            (!triangles.is_empty()).then_some(ColGroup {
+                surface_type: group.surface_type,
+                has_per_triangle_data: group.has_per_triangle_data,
+                triangles,
+            })
+        })
+        .collect();
+    Ok(Some(ColFile::new(vertices, groups)))
+}
+
+fn inverse_transform_point(mut point: [f32; 3], transform: &JDramaTransform) -> [f32; 3] {
+    for (axis, value) in point.iter_mut().enumerate() {
+        *value -= transform.translation[axis];
+    }
+    for axis in (0..3).rev() {
+        let radians = -transform.rotation[axis].to_radians();
+        let (sin, cos) = radians.sin_cos();
+        point = match axis {
+            0 => [
+                point[0],
+                point[1] * cos - point[2] * sin,
+                point[1] * sin + point[2] * cos,
+            ],
+            1 => [
+                point[0] * cos + point[2] * sin,
+                point[1],
+                -point[0] * sin + point[2] * cos,
+            ],
+            _ => [
+                point[0] * cos - point[1] * sin,
+                point[0] * sin + point[1] * cos,
+                point[2],
+            ],
+        };
+    }
+    std::array::from_fn(|axis| point[axis] / transform.scale[axis])
 }
 
 fn candidate_enemy_manager<'a>(
@@ -4721,10 +5063,22 @@ mod tests {
                     .collect::<Vec<_>>()
             )
         });
-        for manager_factory in ["CannonManager", "EffectExplosionManager"] {
-            assert!(cannon.dependencies.iter().any(|dependency| {
-                semantic_type_name(&dependency.record.type_name) == manager_factory
-            }));
+        for manager_factory in ["CannonManager", "BombHeiManager", "EffectExplosionManager"] {
+            assert!(
+                cannon.dependencies.iter().any(|dependency| {
+                    semantic_type_name(&dependency.record.type_name) == manager_factory
+                }),
+                "Cannon template from {} omitted reachable manager {manager_factory}; dependencies: {:?}",
+                cannon.source_stage,
+                cannon
+                    .dependencies
+                    .iter()
+                    .map(|dependency| (
+                        semantic_type_name(&dependency.record.type_name),
+                        dependency.record.name.as_str()
+                    ))
+                    .collect::<Vec<_>>()
+            );
         }
         assert!(cannon.runtime_actor_references.iter().any(|reference| {
             reference.required_factory_name == "MareGate"
@@ -4739,6 +5093,7 @@ mod tests {
             "cannon/cannonfuta.col",
             "cannon/jpa/ms_cannon_smoke.jpa",
             "map/params/enemy/cannon.prm",
+            "bombhei/nejibomb_model1.bmd",
         ] {
             assert!(
                 cannon
@@ -4748,9 +5103,30 @@ mod tests {
                 "Cannon template omitted runtime resource {path}"
             );
         }
+        for (extension, description) in [(".bck", "animation"), (".bas", "sound script")] {
+            assert!(
+                cannon.resources.iter().any(|resource| {
+                    let path = normalized_path(&resource.raw_resource_path);
+                    path.starts_with("bombhei/") && path.ends_with(extension)
+                }),
+                "Cannon template omitted BombHei {description} resources"
+            );
+        }
         assert_eq!(
             cannon.preview_resource_path.as_deref().map(normalized_path),
             Some("cannon/default.bmd".to_string())
+        );
+        let hull = cannon
+            .authored_world_collision
+            .as_ref()
+            .expect("Cannon template recovers its retail map.col hull");
+        assert_eq!(hull.vertices().len(), 90);
+        assert_eq!(
+            hull.groups()
+                .iter()
+                .map(|group| group.triangles.len())
+                .sum::<usize>(),
+            168
         );
 
         let namekuri = build
@@ -4881,6 +5257,7 @@ mod tests {
                 &["hamukuri/default.bmd", "hamukuri/wait.bck", "map/scene.ral"],
             ),
             preview_resource_path: None,
+            authored_world_collision: None,
             source_stage: "bianco0".to_string(),
         }
     }

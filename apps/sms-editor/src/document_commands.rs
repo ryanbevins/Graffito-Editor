@@ -604,6 +604,8 @@ fn refresh_registry_derived_object_fields_with_resource_deltas(
 struct CatalogResourceRepair {
     resource_writes: usize,
     runtime_links_added: usize,
+    dependency_records_added: usize,
+    world_collisions_added: usize,
     repaired_factories: Vec<String>,
     errors: Vec<String>,
 }
@@ -979,6 +981,57 @@ fn repair_authored_catalog_resources(
                         target_object_id: None,
                     });
                 repair.runtime_links_added += 1;
+                added_links = true;
+            }
+
+            let Some(sms_scene::PlacementBinding::Authored(authored)) = &mut object.placement
+            else {
+                continue;
+            };
+            if object.authored_world_collision.is_none() {
+                if let Some(collision) = &template.authored_world_collision {
+                    object.authored_world_collision = Some(collision.clone());
+                    repair.world_collisions_added += 1;
+                    added_links = true;
+                }
+            }
+            for dependency in &template.dependencies {
+                let same_identity = |existing: &sms_scene::AuthoredPlacementDependency| {
+                    let existing_target = existing.target.clone().unwrap_or(
+                        sms_scene::AuthoredPlacementDependencyTarget::IndexedGroup {
+                            group_index: existing.target_group_index,
+                        },
+                    );
+                    existing_target == dependency.target
+                        && semantic_record_type(&existing.record.type_name)
+                            == semantic_record_type(&dependency.record.type_name)
+                        && existing.record.name == dependency.record.name
+                };
+                if authored
+                    .dependencies
+                    .iter()
+                    .any(|existing| same_identity(existing) && existing.record == dependency.record)
+                {
+                    continue;
+                }
+                if authored.dependencies.iter().any(same_identity) {
+                    repair.errors.push(format!(
+                        "{} object '{}' has an incompatible saved dependency {} named {:?}",
+                        template.factory_name,
+                        object.id,
+                        semantic_record_type(&dependency.record.type_name),
+                        dependency.record.name
+                    ));
+                    continue;
+                }
+                authored
+                    .dependencies
+                    .push(sms_scene::AuthoredPlacementDependency {
+                        target: Some(dependency.target.clone()),
+                        target_group_index: dependency.group_index,
+                        record: dependency.record.clone(),
+                    });
+                repair.dependency_records_added += 1;
                 added_links = true;
             }
         }
@@ -1461,6 +1514,18 @@ fn apply_new_authored_shine_defaults(
     Ok(true)
 }
 
+fn apply_new_authored_cannon_defaults(
+    prototype: &mut sms_formats::JDramaRecord,
+    factory_name: &str,
+    object_id: &str,
+) -> bool {
+    if factory_name != "Cannon" || semantic_record_type(&prototype.type_name) != "Cannon" {
+        return false;
+    }
+    prototype.name = sms_scene::generated_clone_runtime_name(object_id);
+    true
+}
+
 fn migrate_legacy_authored_shine_defaults(object: &mut SceneObject) -> Result<bool, String> {
     if object.authoring_defaults_version >= sms_scene::OBJECT_AUTHORING_DEFAULTS_VERSION {
         return Ok(false);
@@ -1502,6 +1567,32 @@ fn migrate_legacy_authored_shine_defaults(object: &mut SceneObject) -> Result<bo
     object.insert_source_raw_param("in_stage", in_stage.to_string());
     object.authoring_defaults_version = sms_scene::OBJECT_AUTHORING_DEFAULTS_VERSION;
     Ok(true)
+}
+
+fn migrate_legacy_authored_cannon_defaults(object: &mut SceneObject) -> bool {
+    let Some(sms_scene::PlacementBinding::Authored(authored)) = object.placement.as_ref() else {
+        return false;
+    };
+    if object.factory_name != "Cannon"
+        || semantic_record_type(&authored.prototype.type_name) != "Cannon"
+    {
+        return false;
+    }
+
+    let runtime_name = sms_scene::generated_clone_runtime_name(&object.id);
+    if authored.prototype.name == runtime_name
+        && object.raw_param(sms_scene::OBJECT_PARAMETER_NAME) == Some(runtime_name.as_str())
+    {
+        return false;
+    }
+
+    let Some(sms_scene::PlacementBinding::Authored(authored)) = &mut object.placement else {
+        unreachable!("authored Cannon placement was checked above");
+    };
+    authored.prototype.name.clone_from(&runtime_name);
+    object.insert_source_raw_param(sms_scene::OBJECT_PARAMETER_NAME, runtime_name);
+    object.authoring_defaults_version = sms_scene::OBJECT_AUTHORING_DEFAULTS_VERSION;
+    true
 }
 
 fn character_record_equal(
@@ -1755,7 +1846,8 @@ fn object_from_catalog_template(
         .collect::<Vec<_>>();
     rewrite_catalog_graph_names(&mut prototype, &mut dependencies, graph_name_rewrites)?;
     reset_catalog_prototype_transform(&mut prototype, translation)?;
-    let uses_versioned_defaults = apply_new_authored_shine_defaults(&mut prototype, &id)?;
+    let uses_versioned_defaults = apply_new_authored_shine_defaults(&mut prototype, &id)?
+        || apply_new_authored_cannon_defaults(&mut prototype, &factory_name, &id);
     let mut object = SceneObject::new(id, factory_name);
     object.runtime_references = template
         .runtime_actor_references
@@ -1771,6 +1863,7 @@ fn object_from_catalog_template(
         translation,
         ..Transform::default()
     };
+    object.authored_world_collision = template.authored_world_collision.clone();
     sms_scene::seed_scene_object_parameters(&mut object, &prototype)
         .map_err(|error| error.to_string())?;
     if uses_versioned_defaults {
@@ -2745,6 +2838,7 @@ impl SmsEditorApp {
 
     pub(super) fn reconcile_loaded_authored_catalog_resources(&mut self) {
         let mut migrated_shines = Vec::new();
+        let mut migrated_cannons = Vec::new();
         if let Some(document) = &mut self.document {
             for object in &mut document.objects {
                 match migrate_legacy_authored_shine_defaults(object) {
@@ -2754,6 +2848,9 @@ impl SmsEditorApp {
                         "Could not update legacy authored Shine '{}': {error}",
                         object.id
                     )),
+                }
+                if migrate_legacy_authored_cannon_defaults(object) {
+                    migrated_cannons.push(object.id.clone());
                 }
             }
         }
@@ -2876,10 +2973,13 @@ impl SmsEditorApp {
         }
         if repair.resource_writes == 0
             && repair.runtime_links_added == 0
+            && repair.dependency_records_added == 0
+            && repair.world_collisions_added == 0
             && maintenance.migrated_resources == 0
             && maintenance.pruned_resources == 0
             && runtime_goop_writes == 0
             && migrated_shines.is_empty()
+            && migrated_cannons.is_empty()
             && removed_inactive_manager_pools.is_empty()
         {
             return;
@@ -2911,6 +3011,20 @@ impl SmsEditorApp {
             self.log.push(format!(
                 "Reconciled {} decomp-derived runtime actor link(s) for existing authored class(es): {}. Select required targets in the inspector and save before launching.",
                 repair.runtime_links_added,
+                repair.repaired_factories.join(", ")
+            ));
+        }
+        if repair.dependency_records_added > 0 {
+            self.log.push(format!(
+                "Reconciled {} missing runtime manager/dependency record(s) for existing authored class(es): {}. Save the project before launching.",
+                repair.dependency_records_added,
+                repair.repaired_factories.join(", ")
+            ));
+        }
+        if repair.world_collisions_added > 0 {
+            self.log.push(format!(
+                "Recovered {} retail world-collision hull(s) for existing authored class(es): {}. Save and rebuild the project before launching.",
+                repair.world_collisions_added,
                 repair.repaired_factories.join(", ")
             ));
         }
@@ -2949,6 +3063,13 @@ impl SmsEditorApp {
                 "Updated {} legacy authored Shine(s) to safe standalone spawn defaults: {}. Save the project before launching.",
                 migrated_shines.len(),
                 migrated_shines.join(", ")
+            ));
+        }
+        if !migrated_cannons.is_empty() {
+            self.log.push(format!(
+                "Updated {} legacy authored Cannon(s) to an editor-owned runtime identity: {}. Save the project before launching.",
+                migrated_cannons.len(),
+                migrated_cannons.join(", ")
             ));
         }
     }
@@ -5259,9 +5380,10 @@ fn preview_triangle_ranges_for_model_index(
 mod tests {
     use super::*;
     use sms_formats::{
-        decode_bti_texture, BmgEntry, BmgFile, BmgMessage, BmgMessageToken, J3dFile,
-        JDramaDocument, JDramaField, JDramaFieldValue, JDramaRecord, JDramaRecordPayload, PrmFile,
-        RarcBuilder, SpcDataEntry, SpcDocument, SpcInstruction, SpcSymbol,
+        decode_bti_texture, BmgEntry, BmgFile, BmgMessage, BmgMessageToken, ColFile, ColGroup,
+        ColTriangle, ColVertex, J3dFile, JDramaDocument, JDramaField, JDramaFieldValue,
+        JDramaRecord, JDramaRecordPayload, PrmFile, RarcBuilder, SpcDataEntry, SpcDocument,
+        SpcInstruction, SpcSymbol,
     };
 
     fn command_test_document(objects: Vec<SceneObject>) -> StageDocument {
@@ -5308,6 +5430,7 @@ mod tests {
             required_graph_names: Vec::new(),
             resources: Vec::new(),
             preview_resource_path: Some(b"hamukuri/default.bmd".to_vec()),
+            authored_world_collision: None,
             source_stage: "bianco0".to_string(),
         };
 
@@ -6036,6 +6159,7 @@ mod tests {
             required_graph_names: Vec::new(),
             resources,
             preview_resource_path: None,
+            authored_world_collision: None,
             source_stage: "fixture0".to_string(),
         }
     }
@@ -6177,6 +6301,7 @@ mod tests {
             required_graph_names: Vec::new(),
             resources: Vec::new(),
             preview_resource_path: None,
+            authored_world_collision: None,
             source_stage: "fixture0".to_string(),
         }
     }
@@ -6217,6 +6342,48 @@ mod tests {
         );
         assert_eq!(duplicate.raw_param("collection_type"), Some("normal"));
         assert_eq!(duplicate.raw_param("shine_id"), Some("104"));
+    }
+
+    #[test]
+    fn authored_cannons_receive_and_migrate_editor_owned_runtime_names() {
+        let mut prototype = JDramaRecord {
+            type_name: "Cannon".to_string(),
+            name: "砲台".to_string(),
+            payload: JDramaRecordPayload::Empty,
+        };
+        assert!(apply_new_authored_cannon_defaults(
+            &mut prototype,
+            "Cannon",
+            "fixture0-obj-0008"
+        ));
+        assert_eq!(prototype.name, "GraffitoClone_fixture0-obj-0008");
+
+        let mut legacy = SceneObject::new("fixture0-obj-0009", "Cannon");
+        legacy.insert_source_raw_param("name", "砲台");
+        legacy.placement = Some(sms_scene::PlacementBinding::Authored(
+            sms_scene::AuthoredPlacement {
+                raw_resource_path: b"map/scene.bin".to_vec(),
+                target_group_index: 2,
+                prototype: JDramaRecord {
+                    type_name: "Cannon".to_string(),
+                    name: "砲台".to_string(),
+                    payload: JDramaRecordPayload::Empty,
+                },
+                dependencies: Vec::new(),
+                pool_only: false,
+            },
+        ));
+
+        assert!(migrate_legacy_authored_cannon_defaults(&mut legacy));
+        assert_eq!(
+            legacy.raw_param("name"),
+            Some("GraffitoClone_fixture0-obj-0009")
+        );
+        let Some(sms_scene::PlacementBinding::Authored(authored)) = &legacy.placement else {
+            unreachable!()
+        };
+        assert_eq!(authored.prototype.name, "GraffitoClone_fixture0-obj-0009");
+        assert!(!migrate_legacy_authored_cannon_defaults(&mut legacy));
     }
 
     #[test]
@@ -7093,6 +7260,7 @@ mod tests {
             asset_hints: Vec::new(),
             runtime_references: Vec::new(),
             manager_capacity_dependencies: Vec::new(),
+            authored_world_collision: None,
             authoring_defaults_version: 0,
         });
         assert_eq!(authored_runtime_readiness_error(&document, false), None);
@@ -7219,6 +7387,7 @@ mod tests {
             required_graph_names: Vec::new(),
             resources: Vec::new(),
             preview_resource_path: None,
+            authored_world_collision: None,
             source_stage: "fixture0".to_string(),
         };
 
@@ -7308,6 +7477,7 @@ mod tests {
             required_graph_names: Vec::new(),
             resources: Vec::new(),
             preview_resource_path: None,
+            authored_world_collision: None,
             source_stage: "fixture0".to_string(),
         };
         let registry = ObjectRegistry {
@@ -7688,6 +7858,7 @@ mod tests {
             required_graph_names: vec!["route_a".to_string()],
             resources: Vec::new(),
             preview_resource_path: None,
+            authored_world_collision: None,
             source_stage: "fixture0".to_string(),
         };
         let rewrites = BTreeMap::from([("route_a".to_string(), "route_a_authored".to_string())]);
@@ -7756,6 +7927,23 @@ mod tests {
                 pool_only: false,
             },
         ));
+        let retail_hull = ColFile::new(
+            vec![
+                ColVertex::new(-1.0, 0.0, -1.0),
+                ColVertex::new(1.0, 0.0, -1.0),
+                ColVertex::new(0.0, 1.0, 1.0),
+            ],
+            vec![ColGroup {
+                surface_type: 0,
+                has_per_triangle_data: false,
+                triangles: vec![ColTriangle {
+                    vertex_indices: [0, 1, 2],
+                    attribute_0: 0,
+                    attribute_1: 0,
+                    data: None,
+                }],
+            }],
+        );
         let template = sms_scene::ObjectAuthoringTemplate {
             factory_name: "FixtureEnemy".to_string(),
             group_index: 4,
@@ -7765,7 +7953,17 @@ mod tests {
                 runtime_name: "fixture reward".to_string(),
                 required: true,
             }],
-            dependencies: Vec::new(),
+            dependencies: vec![sms_scene::ObjectAuthoringDependency {
+                group_index: 4,
+                target: sms_scene::AuthoredPlacementDependencyTarget::IndexedGroup {
+                    group_index: 4,
+                },
+                record: JDramaRecord {
+                    type_name: "FixtureBombManager".to_string(),
+                    name: "fixture bomb manager".to_string(),
+                    payload: JDramaRecordPayload::Fields { fields: Vec::new() },
+                },
+            }],
             character_records: Vec::new(),
             character_resource_records: Vec::new(),
             table_dependencies: Vec::new(),
@@ -7776,6 +7974,7 @@ mod tests {
                 fixed_runtime_path: false,
             }],
             preview_resource_path: None,
+            authored_world_collision: Some(retail_hull.clone()),
             source_stage: "fixture0".to_string(),
         };
         let mut document = command_test_document(vec![object]);
@@ -7784,6 +7983,12 @@ mod tests {
             repair_authored_catalog_resources(&mut document, std::slice::from_ref(&template));
         assert_eq!(repair.resource_writes, 1);
         assert_eq!(repair.runtime_links_added, 1);
+        assert_eq!(repair.dependency_records_added, 1);
+        assert_eq!(repair.world_collisions_added, 1);
+        assert_eq!(
+            document.objects[0].authored_world_collision.as_ref(),
+            Some(&retail_hull)
+        );
         assert_eq!(
             document.objects[0].runtime_references,
             [sms_scene::SceneRuntimeReferenceBinding {
@@ -7798,11 +8003,19 @@ mod tests {
             document.has_effective_resource(b"fixtureanm/runtime.prm"),
             "repair should add the newly discovered runtime resource"
         );
+        let Some(sms_scene::PlacementBinding::Authored(authored)) = &document.objects[0].placement
+        else {
+            unreachable!()
+        };
+        assert_eq!(authored.dependencies.len(), 1);
+        assert_eq!(authored.dependencies[0].record.name, "fixture bomb manager");
 
         let second =
             repair_authored_catalog_resources(&mut document, std::slice::from_ref(&template));
         assert_eq!(second.resource_writes, 0);
         assert_eq!(second.runtime_links_added, 0);
+        assert_eq!(second.dependency_records_added, 0);
+        assert_eq!(second.world_collisions_added, 0);
         assert!(second.repaired_factories.is_empty());
         assert_eq!(document.archive_edits.resources.len(), 1);
     }
@@ -7875,6 +8088,137 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires SMS_BASE_ROOT, SMS_PROJECT_ROOT, and SMS_CANNON_STAGE_ID"]
+    fn authored_project_cannon_repairs_and_exports_its_bombhei_pool() {
+        fn normalized(path: &[u8]) -> String {
+            String::from_utf8_lossy(path)
+                .replace('\\', "/")
+                .trim_matches('/')
+                .to_ascii_lowercase()
+        }
+
+        let base_root = std::env::var_os("SMS_BASE_ROOT")
+            .map(PathBuf::from)
+            .expect("set SMS_BASE_ROOT to the extracted game root");
+        let project_root = std::env::var_os("SMS_PROJECT_ROOT")
+            .map(PathBuf::from)
+            .expect("set SMS_PROJECT_ROOT to the Graffito project data root");
+        let stage_id = std::env::var("SMS_CANNON_STAGE_ID")
+            .expect("set SMS_CANNON_STAGE_ID to the authored Cannon stage");
+        let registry = sms_schema::bundled_object_registry()
+            .expect("load bundled decomp schema")
+            .registry;
+        let archives = sms_formats::discover_scene_archives(&base_root)
+            .expect("discover retail scene archives");
+        let catalog = sms_scene::ObjectAuthoringCatalog::build_with_base_root(
+            &archives, &registry, &base_root,
+        )
+        .catalog;
+        let template = catalog
+            .find("Cannon")
+            .expect("Cannon authoring template")
+            .clone();
+        let bomb_resources = template
+            .resources
+            .iter()
+            .filter(|resource| normalized(&resource.raw_resource_path).starts_with("bombhei/"))
+            .map(|resource| resource.raw_resource_path.clone())
+            .collect::<Vec<_>>();
+        assert!(bomb_resources
+            .iter()
+            .any(|path| { normalized(path) == "bombhei/nejibomb_model1.bmd" }));
+        assert!(bomb_resources
+            .iter()
+            .any(|path| normalized(path).ends_with(".bck")));
+        assert!(bomb_resources
+            .iter()
+            .any(|path| normalized(path).ends_with(".bas")));
+        let cannon_hull = template
+            .authored_world_collision
+            .as_ref()
+            .expect("retail Cannon hull collision");
+        let cannon_hull_triangles = cannon_hull
+            .groups()
+            .iter()
+            .map(|group| group.triangles.len())
+            .sum::<usize>();
+        assert_eq!(cannon_hull_triangles, 168);
+
+        let mut document =
+            StageDocument::open_authored_project_stage(&base_root, &stage_id, &project_root)
+                .expect("open authored Cannon project stage");
+        document.set_registry(registry);
+        let repair =
+            repair_authored_catalog_resources(&mut document, std::slice::from_ref(&template));
+        assert!(repair.errors.is_empty(), "{:?}", repair.errors);
+        let cannon = document
+            .objects
+            .iter()
+            .find(|object| {
+                object.factory_name == "Cannon"
+                    && matches!(
+                        &object.placement,
+                        Some(sms_scene::PlacementBinding::Authored(_))
+                    )
+            })
+            .expect("authored Cannon object");
+        let Some(sms_scene::PlacementBinding::Authored(authored)) = &cannon.placement else {
+            unreachable!()
+        };
+        assert_eq!(cannon.authored_world_collision.as_ref(), Some(cannon_hull));
+        assert!(authored.dependencies.iter().any(|dependency| {
+            semantic_record_type(&dependency.record.type_name) == "BombHeiManager"
+        }));
+        for path in &bomb_resources {
+            assert!(
+                document.has_effective_resource(path),
+                "repaired stage omitted {}",
+                normalized(path)
+            );
+        }
+
+        let source_world_triangle_count = match document
+            .effective_resource_clone(b"map/map.col")
+            .expect("resolve source world collision")
+            .expect("source world collision")
+        {
+            sms_scene::StageResourceDocument::Collision(collision) => collision
+                .groups()
+                .iter()
+                .map(|group| group.triangles.len())
+                .sum::<usize>(),
+            _ => panic!("source map/map.col is not collision"),
+        };
+        let rebuilt = document
+            .build_stage_archive()
+            .expect("build repaired stage");
+        let reopened = sms_scene::SourceFreeStageArchive::parse(&rebuilt)
+            .expect("reopen repaired stage archive");
+        for path in &bomb_resources {
+            assert!(
+                reopened.resource(path).is_some(),
+                "rebuilt stage omitted {}",
+                normalized(path)
+            );
+        }
+        let rebuilt_world = match reopened
+            .resource(b"map/map.col")
+            .expect("rebuilt world collision")
+        {
+            sms_scene::StageResourceDocument::Collision(collision) => collision,
+            _ => panic!("rebuilt map/map.col is not collision"),
+        };
+        assert_eq!(
+            rebuilt_world
+                .groups()
+                .iter()
+                .map(|group| group.triangles.len())
+                .sum::<usize>(),
+            source_world_triangle_count + cannon_hull_triangles
+        );
+    }
+
+    #[test]
     fn catalog_preflight_reuses_existing_runtime_path_without_overwrite() {
         let raw_resource_path = b"mapobj/shared.prm".to_vec();
         let catalog_resource = empty_parameter_document();
@@ -7905,6 +8249,7 @@ mod tests {
                 fixed_runtime_path: false,
             }],
             preview_resource_path: None,
+            authored_world_collision: None,
             source_stage: "retail-source".to_string(),
         };
 
@@ -8004,6 +8349,7 @@ mod tests {
                 fixed_runtime_path: false,
             }],
             preview_resource_path: Some(raw_resource_path.clone()),
+            authored_world_collision: None,
             source_stage: "retail-source".to_string(),
         };
 
@@ -8472,6 +8818,7 @@ mod tests {
                 fixed_runtime_path: false,
             }],
             preview_resource_path: None,
+            authored_world_collision: None,
             source_stage: "fixture0".to_string(),
         };
         let preflight = preflight_catalog_resources(&document, &template).unwrap();
@@ -8790,6 +9137,7 @@ mod tests {
             required_graph_names: vec!["manager_route".to_string()],
             resources: Vec::new(),
             preview_resource_path: None,
+            authored_world_collision: None,
             source_stage: "fixture0".to_string(),
         };
         let object = object_from_catalog_template(

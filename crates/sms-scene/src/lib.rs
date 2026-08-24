@@ -1791,6 +1791,12 @@ pub struct SceneObject {
     /// Editor-selected actors that satisfy fixed runtime name lookups.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_references: Vec<SceneRuntimeReferenceBinding>,
+    /// Retail world-collision geometry that belongs to an authored actor but
+    /// is baked into the source stage's `map/map.col` instead of constructed
+    /// by the actor at runtime. Vertices are stored in actor-local space and
+    /// transformed into the destination world collision during export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_world_collision: Option<sms_formats::ColFile>,
     /// Version of editor-owned safe defaults applied to an authored record.
     ///
     /// Retail/imported objects remain zero. Missing values in older project
@@ -1965,6 +1971,7 @@ impl SceneObject {
             manager_capacity_dependencies: Vec::new(),
             authoring_defaults_version: 0,
             runtime_references: Vec::new(),
+            authored_world_collision: None,
         }
     }
 

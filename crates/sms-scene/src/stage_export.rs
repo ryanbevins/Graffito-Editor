@@ -15,7 +15,7 @@ use sms_formats::{
 use crate::{
     ObjectRegistry, PlacementAddress, PlacementBinding, Result, SceneError, SceneObject,
     SourceFreeStageArchive, StageDocument, StageObjectPlacement, StageOrigin,
-    StageResourceDocument,
+    StageResourceDocument, Transform,
 };
 
 const WORLD_COLLISION_PATH: &[u8] = b"map/map.col";
@@ -397,7 +397,17 @@ impl StageDocument {
         // the retained document remains independently encodable.
         let baseline = archive.encode()?;
 
-        apply_resource_edits(&mut archive, edits)?;
+        let mut effective_edits = edits.clone();
+        for object in self.objects.iter().filter(|object| !object.is_pool_only()) {
+            let Some(collision) = &object.authored_world_collision else {
+                continue;
+            };
+            effective_edits.append_collision(
+                b"map/map.col".to_vec(),
+                transform_authored_world_collision(collision, object.transform),
+            );
+        }
+        apply_resource_edits(&mut archive, &effective_edits)?;
         if let Some(death_barrier) = self.death_barrier {
             let collision = match archive.resource(b"map/map.col") {
                 Some(StageResourceDocument::Collision(collision)) => collision,
@@ -430,7 +440,7 @@ impl StageDocument {
             has_goop,
         )?;
         reconcile_scene_lighting(&mut archive, &self.lighting)?;
-        let inserted_placement_roots = apply_placement_inserts(&mut archive, edits)?;
+        let inserted_placement_roots = apply_placement_inserts(&mut archive, &effective_edits)?;
         let dialogue_owned_runtime_names = self
             .objects
             .iter()
@@ -460,6 +470,51 @@ impl StageDocument {
             changed,
         })
     }
+}
+
+fn transform_authored_world_collision(collision: &ColFile, transform: Transform) -> ColFile {
+    let mut transformed = collision.clone();
+    for vertex in transformed.vertices_mut() {
+        vertex.position = transform_authored_collision_point(vertex.position, transform);
+    }
+    if transform.scale.into_iter().product::<f32>() < 0.0 {
+        for triangle in transformed
+            .groups_mut()
+            .iter_mut()
+            .flat_map(|group| &mut group.triangles)
+        {
+            triangle.vertex_indices.swap(1, 2);
+        }
+    }
+    transformed
+}
+
+fn transform_authored_collision_point(mut point: [f32; 3], transform: Transform) -> [f32; 3] {
+    for (value, scale) in point.iter_mut().zip(transform.scale) {
+        *value *= scale;
+    }
+    for axis in 0..3 {
+        let radians = transform.rotation_degrees[axis].to_radians();
+        let (sin, cos) = radians.sin_cos();
+        point = match axis {
+            0 => [
+                point[0],
+                point[1] * cos - point[2] * sin,
+                point[1] * sin + point[2] * cos,
+            ],
+            1 => [
+                point[0] * cos + point[2] * sin,
+                point[1],
+                -point[0] * sin + point[2] * cos,
+            ],
+            _ => [
+                point[0] * cos - point[1] * sin,
+                point[0] * sin + point[1] * cos,
+                point[2],
+            ],
+        };
+    }
+    std::array::from_fn(|axis| point[axis] + transform.translation[axis])
 }
 
 fn apply_runtime_texture_replacements(
@@ -4119,6 +4174,45 @@ mod tests {
             4_213
         );
         assert_eq!(reopened.encode().unwrap(), rebuilt);
+    }
+
+    #[test]
+    fn authored_actor_world_collision_is_transformed_and_baked_idempotently() {
+        let fixture = StageFixture::new("authored-actor-world-collision");
+        let mut document = fixture.document();
+        install_world_collision_resources(&mut document);
+        document.objects[0].transform = Transform {
+            translation: [100.0, 20.0, 300.0],
+            rotation_degrees: [0.0, 90.0, 0.0],
+            scale: [2.0, 3.0, 4.0],
+        };
+        document.objects[0].authored_world_collision = Some(authored_collision(0x4300, 10.0, 5));
+
+        let first = document.build_stage_archive().unwrap();
+        let second = document.build_stage_archive().unwrap();
+        assert_eq!(first, second, "build must not accumulate collision edits");
+        assert!(document.archive_edits.collisions.is_empty());
+
+        let reopened = SourceFreeStageArchive::parse(&first).unwrap();
+        let StageResourceDocument::Collision(collision) =
+            reopened.resource(WORLD_COLLISION_PATH).unwrap()
+        else {
+            panic!("rebuilt world collision has wrong kind");
+        };
+        assert_eq!(collision.vertices().len(), 6);
+        assert_eq!(collision.groups().len(), 2);
+        let authored_vertices = &collision.vertices()[3..];
+        for (actual, expected) in authored_vertices.iter().zip([
+            [100.0, 20.0, 280.0],
+            [100.0, 20.0, 278.0],
+            [104.0, 20.0, 280.0],
+        ]) {
+            for (actual, expected) in actual.position.iter().zip(expected) {
+                assert!((*actual - expected).abs() < 0.001);
+            }
+        }
+        assert_eq!(collision.groups()[1].surface_type, 0x4300);
+        assert_eq!(collision.groups()[1].triangles[0].vertex_indices, [3, 4, 5]);
     }
 
     #[test]

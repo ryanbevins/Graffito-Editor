@@ -2462,6 +2462,7 @@ mod tests {
             required_graph_names: Vec::new(),
             resources: Vec::new(),
             preview_resource_path: None,
+            authored_world_collision: None,
             source_stage: "retail0".to_string(),
         }
     }
