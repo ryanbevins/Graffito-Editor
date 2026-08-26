@@ -93,6 +93,31 @@ fn nozzle_box_palette_entry_uses_a_readable_name() {
 }
 
 #[test]
+fn warp_palette_entries_use_player_facing_names() {
+    let mut object = ObjectDefinition {
+        factory_name: "MapObjChangeStage".to_string(),
+        class_name: "TMapObjChangeStage".to_string(),
+        category: "MapObj".to_string(),
+        source: sms_schema::SchemaSource::MarNameRefGen,
+        display_name: None,
+        preview_model: None,
+        hidden: false,
+        unsafe_to_edit: false,
+    };
+    assert_eq!(
+        crate::ui_panels::object_palette_display_name(&object),
+        "Warp Zone"
+    );
+
+    object.factory_name = "JellyGate".to_string();
+    object.class_name = "TModelGate".to_string();
+    assert_eq!(
+        crate::ui_panels::object_palette_display_name(&object),
+        "Painted M Portal"
+    );
+}
+
+#[test]
 fn editor_layout_defaults_to_the_unreal_style_workspace() {
     let app = SmsEditorApp::default();
 

@@ -1761,6 +1761,15 @@ fn reconcile_scene_objects_with_owned_dialogue_names(
         let clone_owns_name = matches!(binding, PlacementBinding::CloneOf(_))
             && object.raw_param(crate::OBJECT_PARAMETER_NAME)
                 == Some(generated_clone_name.as_str());
+        let named_warp_owns_name = object
+            .raw_param(crate::OBJECT_PARAMETER_NAME)
+            .and_then(|name| {
+                registry.and_then(|registry| {
+                    registry.find_named_object_model(&object.factory_name, name)
+                })
+            })
+            .is_some_and(|definition| definition.warp_destination_area.is_some());
+        validate_stage_change_destination(object)?;
         if dialogue_owns_name && runtime_actor_names.contains_key(&object.id) {
             return Err(stage_export_error(format!(
                 "object '{}' cannot use both an editor-generated dialogue identity and another runtime TNameRef binding",
@@ -1789,7 +1798,7 @@ fn reconcile_scene_objects_with_owned_dialogue_names(
                     &record,
                     object,
                     binding,
-                    dialogue_owns_name || clone_owns_name,
+                    dialogue_owns_name || clone_owns_name || named_warp_owns_name,
                 )?;
                 crate::apply_object_parameter_edits(
                     &mut record,
@@ -1825,7 +1834,7 @@ fn reconcile_scene_objects_with_owned_dialogue_names(
                     &record,
                     object,
                     binding,
-                    dialogue_owns_name,
+                    dialogue_owns_name || named_warp_owns_name,
                 )?;
                 crate::apply_object_parameter_edits(
                     &mut record,
@@ -1979,6 +1988,28 @@ fn reconcile_scene_objects_with_owned_dialogue_names(
     });
     for address in deletions {
         archive.remove_placement_record(&address.raw_resource_path, &address.record_path)?;
+    }
+    Ok(())
+}
+
+fn validate_stage_change_destination(object: &SceneObject) -> Result<()> {
+    if object.factory_name != "MapObjChangeStage" {
+        return Ok(());
+    }
+    let Some(raw) = object.raw_param("stage_id") else {
+        return Ok(());
+    };
+    let destination = raw.parse::<u32>().map_err(|error| {
+        stage_export_error(format!(
+            "warp zone '{}' has invalid stage_id {raw:?}: {error}",
+            object.id
+        ))
+    })?;
+    if destination > u32::from(u16::MAX) {
+        return Err(stage_export_error(format!(
+            "warp zone '{}' stage_id {} exceeds the retail TMapObjChangeStage u16 range",
+            object.id, destination
+        )));
     }
     Ok(())
 }
@@ -3914,6 +3945,18 @@ mod tests {
             .collect::<Vec<_>>();
         stage_ids.sort_unstable();
         assert_eq!(stage_ids, [17, 29]);
+    }
+
+    #[test]
+    fn warp_zone_rejects_destinations_that_retail_would_truncate() {
+        let mut warp = SceneObject::new("warp", "MapObjChangeStage");
+        warp.insert_source_raw_param("stage_id", "65535");
+        validate_stage_change_destination(&warp).expect("u16 maximum is representable");
+
+        warp.set_raw_param("stage_id", "65536");
+        let error = validate_stage_change_destination(&warp).unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
+        assert!(error.to_string().contains("u16"));
     }
 
     #[test]

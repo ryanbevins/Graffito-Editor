@@ -240,6 +240,16 @@ impl StageDocument {
         }
         enrich_monte_parameter_info(&mut descriptors, object, self.registry.as_ref());
         enrich_named_object_model_parameter_info(&mut descriptors, object, self.registry.as_ref());
+        for descriptor in &mut descriptors {
+            if descriptor.key == OBJECT_PARAMETER_NAME
+                && descriptor
+                    .info
+                    .as_ref()
+                    .is_some_and(|info| !info.choices.is_empty())
+            {
+                descriptor.read_only_reason = None;
+            }
+        }
         Ok(descriptors)
     }
 }
@@ -528,6 +538,32 @@ fn object_parameter_info(record_type: &str, key: &str) -> Option<ObjectParameter
         indexed_choice: None,
         integer_range: None,
     };
+
+    if record_type == "MapObjChangeStage" {
+        let info = match key {
+            "stage_id" => ObjectParameterInfo {
+                choices: vec![
+                    choice("2", "Bianco Hills", "Opens the Bianco Hills episode select."),
+                    choice("3", "Ricco Harbor", "Opens the Ricco Harbor episode select."),
+                    choice("4", "Gelato Beach", "Opens the Gelato Beach episode select."),
+                    choice("5", "Pinna Park", "Opens the Pinna Park episode select."),
+                    choice("6", "Sirena Beach", "Opens the Sirena Beach episode select."),
+                    choice("8", "Pianta Village", "Opens the Pianta Village episode select."),
+                ],
+                integer_range: Some([0, u16::MAX as i64]),
+                ..plain(
+                    "World destination",
+                    "World area passed to TMarDirector::setNextStage when Mario overlaps this zone. Retail world areas 2, 3, 4, 5, 6, and 8 open their episode-select screens. The zone uses a 100-unit radius and height before object scale is applied.",
+                )
+            },
+            "resource_name" => plain(
+                "Warp resource",
+                "Must remain ChangeStage. This binds the retail overlap hit-volume data used by TMapObjChangeStage.",
+            ),
+            _ => return None,
+        };
+        return Some(info);
+    }
 
     if record_type.starts_with("NPCMonte") {
         let info = match key {
@@ -987,36 +1023,40 @@ fn enrich_named_object_model_parameter_info(
     let mut variants = registry
         .named_object_models
         .iter()
-        .filter(|definition| definition.factory_name == object.factory_name)
+        .filter(|definition| {
+            definition.factory_name == object.factory_name
+                && definition.warp_destination_area.is_some()
+        })
         .collect::<Vec<_>>();
     if variants.is_empty() {
         return;
     }
     variants.sort_by(|left, right| {
-        left.model_path
-            .cmp(&right.model_path)
+        left.warp_destination_area
+            .cmp(&right.warp_destination_area)
             .then_with(|| left.object_name.cmp(&right.object_name))
     });
 
     for parameter in parameters {
+        if parameter.key == OBJECT_PARAMETER_NAME {
+            parameter.read_only_reason = None;
+        }
         parameter.info = match parameter.key.as_str() {
             OBJECT_PARAMETER_NAME => Some(ObjectParameterInfo {
                 display_name: Some("Gate variant".to_string()),
                 bit_flags: Vec::new(),
-                description: "TModelGate::loadAfter compares this exact JDrama name against the decomp gateNames table. The matching table index selects the gate model, BTK/BRK/BPK animation family, warp destination, and persistent visibility flag; an unknown name falls back to the first gate variant.".to_string(),
+                description: "Painted M portal destination. TModelGate::loadAfter selects the model and animations from this exact JDrama name, while TMario::warpIn maps the same table index to a world. Retail has complete warp cases for Bianco Hills, Ricco Harbor, and Gelato Beach only.".to_string(),
                 choices: variants
                     .iter()
                     .map(|definition| ObjectParameterChoice {
                         raw_value: definition.object_name.clone(),
-                        label: named_object_variant_label(
-                            &definition.object_name,
-                            &definition.model_path,
-                        ),
+                        label: named_object_variant_label(definition),
                         description: format!(
-                            "Exact decomp selector {}. Loads {} with model-loader flags 0x{:08X}.",
+                            "Exact decomp selector {}. Loads {} with model-loader flags 0x{:08X} and opens the {} episode select.",
                             definition.object_name,
                             definition.model_path,
-                            definition.load_flags
+                            definition.load_flags,
+                            warp_world_name(definition.warp_destination_area.unwrap())
                         ),
                     })
                     .collect(),
@@ -1036,14 +1076,24 @@ fn enrich_named_object_model_parameter_info(
     }
 }
 
-fn named_object_variant_label(object_name: &str, model_path: &str) -> String {
-    let model_name = model_path
-        .rsplit('/')
-        .next()
-        .unwrap_or(model_path)
-        .strip_suffix(".bmd")
-        .unwrap_or(model_path);
-    format!("{object_name} ({model_name})")
+fn named_object_variant_label(definition: &sms_schema::NamedObjectModelDefinition) -> String {
+    definition
+        .warp_destination_area
+        .map(warp_world_name)
+        .unwrap_or(definition.object_name.as_str())
+        .to_string()
+}
+
+fn warp_world_name(area: u8) -> &'static str {
+    match area {
+        2 => "Bianco Hills",
+        3 => "Ricco Harbor",
+        4 => "Gelato Beach",
+        5 => "Pinna Park",
+        6 => "Sirena Beach",
+        8 => "Pianta Village",
+        _ => "Unknown world",
+    }
 }
 
 fn install_npc_palette_choice(info: &mut ObjectParameterInfo, count: usize) {
@@ -1551,6 +1601,7 @@ mod editability_tests {
                     object_name: "GateToRicco".to_string(),
                     model_path: "/scene/map/map/gate/05_gate02rico.bmd".to_string(),
                     load_flags: 0x1110_0000,
+                    warp_destination_area: Some(3),
                     source_file: "src/MoveBG/ModelGate.cpp".to_string(),
                 },
                 sms_schema::NamedObjectModelDefinition {
@@ -1558,6 +1609,7 @@ mod editability_tests {
                     object_name: "Gate".to_string(),
                     model_path: "/scene/map/map/gate/05_gate01.bmd".to_string(),
                     load_flags: 0x1110_0000,
+                    warp_destination_area: Some(2),
                     source_file: "src/MoveBG/ModelGate.cpp".to_string(),
                 },
             ],
@@ -1580,16 +1632,67 @@ mod editability_tests {
                 .unwrap()
                 .choices
                 .iter()
-                .map(|choice| choice.raw_value.as_str())
+                .map(|choice| (choice.raw_value.as_str(), choice.label.as_str()))
                 .collect::<Vec<_>>(),
-            ["Gate", "GateToRicco"]
+            [("Gate", "Bianco Hills"), ("GateToRicco", "Ricco Harbor")]
         );
+        assert!(name.read_only_reason.is_none());
         assert!(name.info.as_ref().unwrap().choices[1]
             .description
             .contains("05_gate02rico.bmd"));
         assert_eq!(
             parameters[1].info.as_ref().unwrap().display_name.as_deref(),
             Some("Character registration")
+        );
+    }
+
+    #[test]
+    fn overlap_warp_zone_offers_every_retail_world_select() {
+        let parameters = editable_object_parameters(&JDramaRecord {
+            type_name: "MapObjChangeStage".to_string(),
+            name: "warp".to_string(),
+            payload: JDramaRecordPayload::Actor {
+                transform: sms_formats::JDramaTransform {
+                    translation: [0.0; 3],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: "warp character".to_string(),
+                light_map: sms_formats::JDramaLightMap::default(),
+                fields: vec![
+                    JDramaField {
+                        name: "resource_name".to_string(),
+                        value: JDramaFieldValue::String("ChangeStage".to_string()),
+                    },
+                    JDramaField {
+                        name: "stage_id".to_string(),
+                        value: JDramaFieldValue::U32(2),
+                    },
+                ],
+            },
+        })
+        .unwrap();
+        let destination = parameters
+            .iter()
+            .find(|parameter| parameter.key == "stage_id")
+            .unwrap();
+        assert_eq!(
+            destination
+                .info
+                .as_ref()
+                .unwrap()
+                .choices
+                .iter()
+                .map(|choice| (choice.raw_value.as_str(), choice.label.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("2", "Bianco Hills"),
+                ("3", "Ricco Harbor"),
+                ("4", "Gelato Beach"),
+                ("5", "Pinna Park"),
+                ("6", "Sirena Beach"),
+                ("8", "Pianta Village"),
+            ]
         );
     }
 

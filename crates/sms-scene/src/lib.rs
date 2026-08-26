@@ -5833,6 +5833,7 @@ mod tests {
                 object_name: "GateToRicco".to_string(),
                 model_path: "/scene/map/map/gate/05_gate02rico.bmd".to_string(),
                 load_flags: 0x1110_0000,
+                warp_destination_area: Some(3),
                 source_file: "src/MoveBG/ModelGate.cpp".to_string(),
             }],
             ..ObjectRegistry::default()

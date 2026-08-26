@@ -1230,6 +1230,10 @@ impl SmsEditorApp {
                         } else {
                             "Special Sky placement is unavailable because this stage cannot accept another TSky record."
                         }
+                    } else if object.factory_name == "MapObjChangeStage" {
+                        "Overlap warp zone: an invisible, scalable 100-unit cylinder that opens the selected world's episode-select screen when Mario touches it."
+                    } else if object.factory_name == "JellyGate" {
+                        "Painted M portal: a visible Delfino-style gate with selectable Bianco Hills, Ricco Harbor, or Gelato Beach destination and matching retail resources."
                     } else if current_stage_clone {
                         "Placement source: current-stage clone of an existing typed record."
                     } else if catalog_default.is_some() {
@@ -2310,6 +2314,11 @@ impl SmsEditorApp {
 }
 
 pub(super) fn object_palette_display_name(object: &ObjectDefinition) -> String {
+    match object.factory_name.as_str() {
+        "MapObjChangeStage" => return "Warp Zone".to_string(),
+        "JellyGate" => return "Painted M Portal".to_string(),
+        _ => {}
+    }
     if let Some(display_name) = object
         .display_name
         .as_deref()

@@ -1792,6 +1792,7 @@ impl SmsEditorApp {
             {
                 let placeable = true;
                 let title = object_palette_display_name(object);
+                let search_text = object_content_search_text(object, &title);
                 let retail_template = self.object_authoring_catalog.find(&object.factory_name);
                 items.push(ContentItemSummary {
                     id: ContentItemId::Object(object.factory_name.clone()),
@@ -1800,14 +1801,7 @@ impl SmsEditorApp {
                     title,
                     subtitle: object.factory_name.clone(),
                     detail: format!("{} / {}", object.category, object.class_name),
-                    search_text: format!(
-                        "{} {} {} {}",
-                        object.factory_name,
-                        object.class_name,
-                        object.category,
-                        object.display_name.as_deref().unwrap_or_default()
-                    )
-                    .to_ascii_lowercase(),
+                    search_text,
                     capabilities: ContentCapabilities {
                         place: placeable,
                         preview: retail_template
@@ -2959,6 +2953,18 @@ impl SmsEditorApp {
             .get(raw_id)
             .and_then(|index| self.game_content_index.entries.get(*index))
     }
+}
+
+fn object_content_search_text(object: &ObjectDefinition, title: &str) -> String {
+    format!(
+        "{} {} {} {} {}",
+        title,
+        object.factory_name,
+        object.class_name,
+        object.category,
+        object.display_name.as_deref().unwrap_or_default()
+    )
+    .to_ascii_lowercase()
 }
 
 #[derive(Default)]
@@ -4209,6 +4215,33 @@ mod unified_browser_tests {
         assert!(!query_matches(
             "bianco hills scene archive",
             "hills texture"
+        ));
+    }
+
+    #[test]
+    fn object_search_includes_player_facing_palette_names() {
+        let mut object = ObjectDefinition {
+            factory_name: "MapObjChangeStage".to_string(),
+            class_name: "TMapObjChangeStage".to_string(),
+            category: "MapObj".to_string(),
+            source: sms_schema::SchemaSource::MarNameRefGen,
+            display_name: None,
+            preview_model: None,
+            hidden: false,
+            unsafe_to_edit: false,
+        };
+        let title = object_palette_display_name(&object);
+        assert!(query_matches(
+            &object_content_search_text(&object, &title),
+            "warp zone"
+        ));
+
+        object.factory_name = "JellyGate".to_string();
+        object.class_name = "TModelGate".to_string();
+        let title = object_palette_display_name(&object);
+        assert!(query_matches(
+            &object_content_search_text(&object, &title),
+            "painted portal"
         ));
     }
 

@@ -648,6 +648,11 @@ pub struct NamedObjectModelDefinition {
     pub object_name: String,
     pub model_path: String,
     pub load_flags: u32,
+    /// Explicit world-area destination selected for this table index by the
+    /// retail actor consumer. `None` means the model name is cosmetic only and
+    /// the consumer falls back to its default destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warp_destination_area: Option<u8>,
     pub source_file: String,
 }
 
@@ -1853,6 +1858,8 @@ impl SchemaGenerator {
     ) -> Result<()> {
         let source_path = "src/MoveBG/ModelGate.cpp";
         let source = sources.required(source_path)?.text();
+        let warp_source_path = "src/Player/MarioAutodemo.cpp";
+        let warp_source = sources.required(warp_source_path)?.text();
         let factory_name = registry
             .objects
             .iter()
@@ -1863,8 +1870,15 @@ impl SchemaGenerator {
                 source_path: self.repo_root.join(source_path),
                 expected: "registered TModelGate factory",
             })?;
+        let warp_destinations = extract_model_gate_warp_destinations(warp_source);
+        ensure_extracted(
+            SchemaExtractor::NamedObjectModels,
+            self.repo_root.join(warp_source_path),
+            warp_destinations.len(),
+            "TModelGate index-to-world warp destinations",
+        )?;
         registry.named_object_models =
-            extract_model_gate_named_models(source, factory_name, source_path);
+            extract_model_gate_named_models(source, factory_name, source_path, &warp_destinations);
         ensure_extracted(
             SchemaExtractor::NamedObjectModels,
             self.repo_root.join(source_path),
@@ -4402,6 +4416,7 @@ fn extract_model_gate_named_models(
     text: &str,
     factory_name: &str,
     source_file: &str,
+    warp_destinations: &BTreeMap<usize, u8>,
 ) -> Vec<NamedObjectModelDefinition> {
     let arrays = extract_cpp_string_arrays(text);
     let Some(object_names) = arrays.get("gateNames") else {
@@ -4426,12 +4441,38 @@ fn extract_model_gate_named_models(
     object_names
         .iter()
         .zip(model_names)
-        .map(|(object_name, model_name)| NamedObjectModelDefinition {
-            factory_name: factory_name.to_string(),
-            object_name: object_name.clone(),
-            model_path: model_format.replace("%s", model_name),
-            load_flags,
-            source_file: source_file.to_string(),
+        .enumerate()
+        .map(
+            |(index, (object_name, model_name))| NamedObjectModelDefinition {
+                factory_name: factory_name.to_string(),
+                object_name: object_name.clone(),
+                model_path: model_format.replace("%s", model_name),
+                load_flags,
+                warp_destination_area: warp_destinations.get(&index).copied(),
+                source_file: source_file.to_string(),
+            },
+        )
+        .collect()
+}
+
+fn extract_model_gate_warp_destinations(text: &str) -> BTreeMap<usize, u8> {
+    let Some(method) = Regex::new(r"(?:void|BOOL)\s+TMario::warpIn\s*\([^)]*\)\s*\{")
+        .expect("valid TMario::warpIn regex")
+        .find(text)
+    else {
+        return BTreeMap::new();
+    };
+    let Some(body) = braced_body(text, method.end() - 1) else {
+        return BTreeMap::new();
+    };
+    let case_re = Regex::new(r"(?s)case\s+([0-9]+)\s*:\s*\{?\s*nextStage\s*=\s*([0-9]+)\s*;")
+        .expect("valid TModelGate warp case regex");
+    case_re
+        .captures_iter(body)
+        .filter_map(|captures| {
+            let index = captures[1].parse::<usize>().ok()?;
+            let area = captures[2].parse::<u8>().ok()?;
+            Some((index, area))
         })
         .collect()
 }
@@ -7378,6 +7419,7 @@ mod tests {
             .expect("decomp-derived name-selected gate model");
         assert_eq!(gate.model_path, "/scene/map/map/gate/05_gate02rico.bmd");
         assert_eq!(gate.load_flags, 0x1110_0000);
+        assert_eq!(gate.warp_destination_area, Some(3));
         assert_eq!(
             first
                 .collision_surfaces
@@ -8268,6 +8310,19 @@ mod tests {
                     snprintf(buf, sizeof(buf), "/scene/map/map/gate/%s.bmd",
                              gateMActorNames[unk71]);
                     unk78 = SMS_MakeMActor("/scene/map/map/gate", buf, 0, 0x11100000);
+                }
+            "#,
+        );
+        fixture.write(
+            "src/Player/MarioAutodemo.cpp",
+            r#"
+                void TMario::warpIn() {
+                    u8 nextStage = 2;
+                    switch (destination) {
+                    case 0: nextStage = 2; break;
+                    case 1: nextStage = 3; break;
+                    case 2: nextStage = 4; break;
+                    }
                 }
             "#,
         );

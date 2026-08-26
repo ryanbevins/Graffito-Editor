@@ -1229,7 +1229,9 @@ fn resolve_character_records(
     registry: &ObjectRegistry,
 ) -> Result<ResolvedCharacterRecords, String> {
     let mut names = BTreeSet::new();
-    if !uses_resolved_primary_manager(actor, dependencies, registry) {
+    if !uses_resolved_primary_manager(actor, dependencies, registry)
+        && !self_loads_named_object_model(actor, registry)
+    {
         if let Some(name) = record_character_name(actor) {
             names.insert(name.to_string());
         }
@@ -1309,6 +1311,20 @@ fn resolve_character_records(
         target_records,
         resource_records,
     })
+}
+
+fn self_loads_named_object_model(actor: &JDramaRecord, registry: &ObjectRegistry) -> bool {
+    let Some(definition) = find_object(registry, &actor.type_name) else {
+        return false;
+    };
+    // A decomp-extracted named-model binding proves that the actor selects and
+    // loads its own model in runtime code. Retail TModelGate still serializes
+    // a decorative character name, but never registers or resolves it through
+    // ObjChara/SmplChara; requiring that nonexistent record hides a valid gate.
+    registry
+        .named_object_models
+        .iter()
+        .any(|model| model.factory_name == definition.factory_name)
 }
 
 fn uses_resolved_primary_manager(
@@ -1403,6 +1419,29 @@ fn resolve_resources(
             &candidate.source_stage,
             &resource_folder.folder,
             &format!("NPC {} runtime resource folder", candidate.factory_name),
+        )?;
+    }
+    let named_model_folders = registry
+        .named_object_models
+        .iter()
+        .filter(|definition| definition.factory_name == candidate.factory_name)
+        .filter_map(|definition| {
+            definition
+                .model_path
+                .rsplit_once('/')
+                .map(|(folder, _)| folder)
+        })
+        .collect::<BTreeSet<_>>();
+    for folder in named_model_folders {
+        // Name-selected actors can be retargeted after placement. Import the
+        // complete decomp-derived model directory so every safe selector and
+        // its matching animation family remains available in custom stages.
+        add_stage_folder(
+            &mut out,
+            sources,
+            &candidate.source_stage,
+            folder,
+            &format!("{} name-selected model family", candidate.factory_name),
         )?;
     }
     for dependency in &candidate.dependencies {
@@ -2328,16 +2367,20 @@ fn preview_resource_path(
     registry: &ObjectRegistry,
 ) -> Option<Vec<u8>> {
     let exact_enemy_manager = candidate_enemy_manager(candidate, registry);
-    let preferred = reference_field(&candidate.record, "resource_name")
-        .and_then(|resource_name| {
-            registry
-                .find_map_obj_model_override(&candidate.factory_name, resource_name)
-                .map(|definition| definition.model_path.as_str())
-                .or_else(|| {
-                    registry
-                        .find_map_obj_resource(resource_name)
-                        .and_then(|resource| resource.primary_model.as_deref())
-                })
+    let preferred = registry
+        .find_named_object_model(&candidate.factory_name, &candidate.record.name)
+        .map(|definition| definition.model_path.as_str())
+        .or_else(|| {
+            reference_field(&candidate.record, "resource_name").and_then(|resource_name| {
+                registry
+                    .find_map_obj_model_override(&candidate.factory_name, resource_name)
+                    .map(|definition| definition.model_path.as_str())
+                    .or_else(|| {
+                        registry
+                            .find_map_obj_resource(resource_name)
+                            .and_then(|resource| resource.primary_model.as_deref())
+                    })
+            })
         })
         .or_else(|| {
             registry
@@ -2365,7 +2408,7 @@ fn preview_resource_path(
             .iter()
             .filter(|resource| {
                 let path = normalized_path(&resource.raw_resource_path);
-                let preferred = normalize_text_path(preferred);
+                let preferred = normalize_runtime_reference(preferred);
                 path == preferred || path.ends_with(&format!("/{preferred}"))
             })
             .collect::<Vec<_>>();
@@ -2397,7 +2440,7 @@ fn preview_resource_path(
             // exact character-folder scoping is not safe to guess. Returning
             // no preview is preferable to attaching a different enemy body.
             let ambiguous_preferred = preferred.is_some_and(|preferred| {
-                let preferred = normalize_text_path(preferred);
+                let preferred = normalize_runtime_reference(preferred);
                 resources
                     .iter()
                     .filter(|resource| {
@@ -4152,6 +4195,39 @@ mod tests {
     }
 
     #[test]
+    fn self_loaded_named_model_does_not_require_a_character_registration() {
+        let registry = ObjectRegistry {
+            objects: vec![object("JellyGate", "TModelGate")],
+            named_object_models: vec![sms_schema::NamedObjectModelDefinition {
+                factory_name: "JellyGate".into(),
+                object_name: "Gate".into(),
+                model_path: "/scene/map/map/gate/05_gate01.bmd".into(),
+                load_flags: 0x1110_0000,
+                warp_destination_area: Some(2),
+                source_file: "src/MoveBG/ModelGate.cpp".into(),
+            }],
+            ..ObjectRegistry::default()
+        };
+        let mut gate = actor("JellyGate", "Gate", 0);
+        let JDramaRecordPayload::Actor { character_name, .. } = &mut gate.payload else {
+            unreachable!()
+        };
+        *character_name = "Gate character without a registration".into();
+        let mut source = source("dolpic10", document(vec![(4, vec![gate])]));
+        source.resources = resources("dolpic10.szs", &["map/map/gate/05_gate01.bmd"]);
+        let mut warnings = Vec::new();
+
+        let catalog = build_from_sources_with_common(&[source], &registry, None, &mut warnings);
+
+        let template = catalog
+            .find("JellyGate")
+            .expect("self-loaded gate model makes the actor authorable");
+        assert!(template.character_records.is_empty());
+        assert!(template.character_resource_records.is_empty());
+        assert!(warnings.is_empty(), "{warnings:#?}");
+    }
+
+    #[test]
     fn map_object_closure_uses_required_manager_override_collision_and_companions() {
         let registry = ObjectRegistry {
             objects: vec![
@@ -4527,6 +4603,72 @@ mod tests {
         assert_eq!(
             preview_resource_path(&candidate, &resources, &registry).as_deref(),
             Some(b"hamukuri/default.bmd".as_slice())
+        );
+    }
+
+    #[test]
+    fn named_gate_imports_the_switchable_resource_family_and_exact_preview() {
+        let registry = ObjectRegistry {
+            named_object_models: vec![
+                sms_schema::NamedObjectModelDefinition {
+                    factory_name: "JellyGate".into(),
+                    object_name: "Gate".into(),
+                    model_path: "/scene/map/map/gate/05_gate01.bmd".into(),
+                    load_flags: 0x1110_0000,
+                    warp_destination_area: Some(2),
+                    source_file: "src/MoveBG/ModelGate.cpp".into(),
+                },
+                sms_schema::NamedObjectModelDefinition {
+                    factory_name: "JellyGate".into(),
+                    object_name: "GateToRicco".into(),
+                    model_path: "/scene/map/map/gate/05_gate02rico.bmd".into(),
+                    load_flags: 0x1110_0000,
+                    warp_destination_area: Some(3),
+                    source_file: "src/MoveBG/ModelGate.cpp".into(),
+                },
+            ],
+            ..ObjectRegistry::default()
+        };
+        let candidate = Candidate {
+            factory_name: "JellyGate".into(),
+            group_index: 4,
+            record: actor("JellyGate", "GateToRicco", 0),
+            dependencies: Vec::new(),
+            character_records: Vec::new(),
+            character_resource_records: Vec::new(),
+            graph_names: BTreeSet::new(),
+            source_stage: "dolpic10".into(),
+            sort_key: "dolpic10".into(),
+            raw_resource_path: b"map/scene.bin".to_vec(),
+            source_asset_path: "dolpic10.szs!/map/scene.bin".into(),
+            record_path: vec![0],
+        };
+        let mut source = source("dolpic10", document(Vec::new()));
+        source.resources = resources(
+            "dolpic10.szs",
+            &[
+                "map/map/gate/05_gate01.bmd",
+                "map/map/gate/05_gate01.btk",
+                "map/map/gate/05_gate02rico.bmd",
+                "map/map/gate/05_gate02rico.brk",
+                "map/unrelated.bmd",
+            ],
+        );
+
+        let selected = resolve_resources(&candidate, &[&source], &registry, true)
+            .expect("complete painted M portal resource family");
+        assert_eq!(
+            raw_paths(&selected),
+            vec![
+                "map/map/gate/05_gate01.bmd",
+                "map/map/gate/05_gate01.btk",
+                "map/map/gate/05_gate02rico.bmd",
+                "map/map/gate/05_gate02rico.brk",
+            ]
+        );
+        assert_eq!(
+            preview_resource_path(&candidate, &selected, &registry).as_deref(),
+            Some(b"map/map/gate/05_gate02rico.bmd".as_slice())
         );
     }
 
@@ -5001,6 +5143,32 @@ mod tests {
             }),
             "HamuKuri template omitted the mushroom1up instantiated by its manager's loadAfter"
         );
+    }
+
+    #[test]
+    #[ignore = "requires SMS_BASE_ROOT with extracted retail stages and the neighboring SMS decomp"]
+    fn retail_catalog_enables_both_warp_authoring_templates() {
+        let base_root = std::env::var_os("SMS_BASE_ROOT")
+            .map(PathBuf::from)
+            .expect("set SMS_BASE_ROOT to the extracted game's root");
+        let archives = sms_formats::discover_scene_archives(&base_root)
+            .expect("discover extracted retail stage archives");
+        let registry = sms_schema::bundled_object_registry()
+            .expect("load bundled object registry")
+            .registry;
+        let build = ObjectAuthoringCatalog::build_with_base_root(&archives, &registry, &base_root);
+
+        for factory_name in ["MapObjChangeStage", "JellyGate"] {
+            let relevant_warnings = build
+                .warnings
+                .iter()
+                .filter(|warning| warning.message.contains(factory_name))
+                .collect::<Vec<_>>();
+            assert!(
+                build.catalog.find(factory_name).is_some(),
+                "{factory_name} was rejected from the retail-backed catalog: {relevant_warnings:#?}"
+            );
+        }
     }
 
     #[test]

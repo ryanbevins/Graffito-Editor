@@ -1526,6 +1526,43 @@ fn apply_new_authored_cannon_defaults(
     true
 }
 
+fn apply_new_authored_warp_defaults(
+    prototype: &mut sms_formats::JDramaRecord,
+    factory_name: &str,
+) -> Result<(), String> {
+    match factory_name {
+        "JellyGate" if semantic_record_type(&prototype.type_name) == "JellyGate" => {
+            // The first decomp-extracted gate selector is the complete retail
+            // Bianco portal; users can switch to the other safe named variants
+            // in the inspector after placement.
+            prototype.name = "Gate".to_string();
+        }
+        "MapObjChangeStage"
+            if semantic_record_type(&prototype.type_name) == "MapObjChangeStage" =>
+        {
+            let fields = match &mut prototype.payload {
+                sms_formats::JDramaRecordPayload::Actor { fields, .. }
+                | sms_formats::JDramaRecordPayload::Fields { fields } => fields,
+                _ => {
+                    return Err(
+                        "authored warp zone has no editable typed stage_id field".to_string()
+                    )
+                }
+            };
+            let field = fields
+                .iter_mut()
+                .find(|field| field.name == "stage_id")
+                .ok_or_else(|| "authored warp zone is missing field 'stage_id'".to_string())?;
+            let sms_formats::JDramaFieldValue::U32(stage_id) = &mut field.value else {
+                return Err("authored warp zone field 'stage_id' is not a u32".to_string());
+            };
+            *stage_id = 2;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn migrate_legacy_authored_shine_defaults(object: &mut SceneObject) -> Result<bool, String> {
     if object.authoring_defaults_version >= sms_scene::OBJECT_AUTHORING_DEFAULTS_VERSION {
         return Ok(false);
@@ -1846,6 +1883,7 @@ fn object_from_catalog_template(
         .collect::<Vec<_>>();
     rewrite_catalog_graph_names(&mut prototype, &mut dependencies, graph_name_rewrites)?;
     reset_catalog_prototype_transform(&mut prototype, translation)?;
+    apply_new_authored_warp_defaults(&mut prototype, &factory_name)?;
     let uses_versioned_defaults = apply_new_authored_shine_defaults(&mut prototype, &id)?
         || apply_new_authored_cannon_defaults(&mut prototype, &factory_name, &id);
     let mut object = SceneObject::new(id, factory_name);
@@ -6334,6 +6372,46 @@ mod tests {
             authored_world_collision: None,
             source_stage: "fixture0".to_string(),
         }
+    }
+
+    #[test]
+    fn authored_warps_start_with_safe_bianco_destinations() {
+        let mut zone = JDramaRecord {
+            type_name: "MapObjChangeStage".to_string(),
+            name: "retail warp".to_string(),
+            payload: JDramaRecordPayload::Actor {
+                transform: sms_formats::JDramaTransform {
+                    translation: [0.0; 3],
+                    rotation: [0.0; 3],
+                    scale: [1.0; 3],
+                },
+                character_name: "warp character".to_string(),
+                light_map: sms_formats::JDramaLightMap::default(),
+                fields: vec![JDramaField {
+                    name: "stage_id".to_string(),
+                    value: JDramaFieldValue::U32(8),
+                }],
+            },
+        };
+        apply_new_authored_warp_defaults(&mut zone, "MapObjChangeStage").unwrap();
+        let JDramaRecordPayload::Actor { fields, .. } = &zone.payload else {
+            unreachable!()
+        };
+        assert_eq!(
+            fields
+                .iter()
+                .find(|field| field.name == "stage_id")
+                .map(|field| &field.value),
+            Some(&JDramaFieldValue::U32(2))
+        );
+
+        let mut gate = JDramaRecord {
+            type_name: "JellyGate".to_string(),
+            name: "GateToRicco".to_string(),
+            payload: JDramaRecordPayload::Empty,
+        };
+        apply_new_authored_warp_defaults(&mut gate, "JellyGate").unwrap();
+        assert_eq!(gate.name, "Gate");
     }
 
     #[test]
